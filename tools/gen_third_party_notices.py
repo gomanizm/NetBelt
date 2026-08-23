@@ -95,6 +95,12 @@ def license_text(dist):
 
 
 def main():
+    # 出力先のエンコーディングはロケール依存で、英語ロケールの Windows では
+    # cp1252 になり日本語を書けない（GitHub Actions の windows-latest が該当）。
+    # 生成物は UTF-8 と決まっているので、ロケールに関係なく明示する。
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+
     out = []
     out.append("NetBelt サードパーティ ライセンス表示")
     out.append("=" * 78)
