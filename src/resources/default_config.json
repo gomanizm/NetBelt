@@ -1,0 +1,83 @@
+{
+  "config_version": "1.0",
+  "groups": [
+    {
+      "name": "Default",
+      "auto_commands": [],
+      "devices": []
+    },
+    {
+      "name": "本番環境",
+      "auto_commands": [
+        "terminal monitor",
+        "terminal length 0"
+      ],
+      "devices": [
+        {
+          "name": "ルータA",
+          "host": "192.0.2.2",
+          "port": 22,
+          "protocol": "ssh",
+          "username": "admin",
+          "password": "",
+          "ssh_key": "",
+          "macros": []
+        }
+      ]
+    },
+    {
+      "name": "検証環境",
+      "auto_commands": [],
+      "devices": []
+    }
+  ],
+  "global_macros": [
+    {
+      "name": "基本確認",
+      "commands": [
+        "show running-config",
+        "show ip interface brief",
+        "show version"
+      ]
+    }
+  ],
+  "settings": {
+    "terminal": {
+      "background_color": "#000000",
+      "text_color": "#FFFFFF",
+      "font_family": "Consolas",
+      "font_size": 10
+    },
+    "sftp": {
+      "default_download_path": "./downloads",
+      "show_hidden_files": false,
+      "confirm_delete": true,
+      "confirm_overwrite": true
+    },
+    "sftp_server": {
+      "port": 2222,
+      "root_directory": "./sftp_root",
+      "username": "",
+      "password": "",
+      "auto_start": false
+    },
+    "syslog": {
+      "listen_port": 514,
+      "max_messages": 1000,
+      "auto_scroll": true,
+      "auto_start": false,
+      "filters": {
+        "enabled_levels": [
+          "Emergency",
+          "Alert",
+          "Critical",
+          "Error",
+          "Warning",
+          "Notice",
+          "Info",
+          "Debug"
+        ]
+      }
+    }
+  }
+}

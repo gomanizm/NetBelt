@@ -1,0 +1,63 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# Config (個人設定)
+config.json
+
+# SNMP
+snmp_result_*.txt
+
+# MIBキャッシュ
+mib_cache.json
+
+# サーバのルート（機器から受信した config・イメージが入る）
+tftp_root/
+ftp_root/
+sftp_root/
+
+# MIB（ベンダー配布物。再配布の許諾が無いものが多いため追跡しない）
+mibs/*
+!mibs/README.md
+
+# Release
+release/
+*.zip

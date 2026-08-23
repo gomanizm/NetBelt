@@ -1,0 +1,128 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'  # v1.0.0 のようなタグでトリガー
+  workflow_dispatch:  # 手動実行も可能
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+        
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pyinstaller
+        
+    - name: Generate third-party notices
+      run: |
+        python tools/gen_third_party_notices.py > THIRD-PARTY-NOTICES.txt
+
+    - name: Build executable
+      run: |
+        python -m PyInstaller --clean NetBelt.spec
+        
+    - name: Create portable package
+      run: |
+        mkdir portable
+        copy dist\NetBelt.exe portable\
+        copy README.md portable\README.txt
+        copy LICENSE portable\LICENSE.txt
+        copy THIRD-PARTY-NOTICES.txt portable\
+        copy updater.bat portable\
+        
+        REM MIBファイルもコピー
+        xcopy /E /I mibs portable\mibs
+      shell: cmd
+        
+    - name: Create ZIP archive
+      run: |
+        $tag = "${{ github.ref_name }}"
+        $version = $tag -replace '^v', ''
+        $zipName = "NetBelt-v${version}-Windows-Portable.zip"
+        Compress-Archive -Path portable\* -DestinationPath $zipName
+        # 自動更新がダウンロード後に照合するチェックサム
+        $hash = (Get-FileHash -Algorithm SHA256 -Path $zipName).Hash.ToLower()
+        "$hash  $zipName" | Out-File -FilePath "$zipName.sha256" -Encoding ascii -NoNewline
+        Write-Host "SHA-256: $hash"
+      shell: pwsh
+        
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: NetBelt-Portable
+        path: NetBelt-v*-Windows-Portable.zip
+        
+    - name: Create Release
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          NetBelt-v*-Windows-Portable.zip
+          NetBelt-v*-Windows-Portable.zip.sha256
+        body: |
+          ## NetBelt ポータブル版
+          
+          ### 📄 ライセンスと対応するソースコード
+          
+          NetBelt は GNU General Public License v3.0 で配布しています。
+          
+          この実行ファイルには PyQt6 (GPL-3.0)、Qt (LGPL-3.0)、paramiko (LGPL-2.1-or-later)
+          などが組み込まれています。**この実行ファイルに対応するソースコード**は、
+          本リリースに自動添付される Source code アーカイブ、および
+          https://github.com/gomanizm/NetBelt のタグ `${{ github.ref_name }}` で入手できます。
+          ビルドは同梱の `requirements.txt`（バージョン固定済み）と `NetBelt.spec`、
+          Python 3.11 で再現できます。
+          
+          組み込まれた第三者パッケージの一覧・ライセンス本文・配布元は、
+          ZIP 内の `THIRD-PARTY-NOTICES.txt` を参照してください。
+          
+          ### 📦 パッケージ内容
+          - `NetBelt.exe` - アプリケーション本体
+          - `README.txt` - 使い方ガイド
+          - `LICENSE.txt` - NetBelt のライセンス（GPL-3.0）
+          - `THIRD-PARTY-NOTICES.txt` - 同梱した第三者パッケージのライセンス表示
+          - `.sha256` - ZIP のチェックサム。自動更新がダウンロード後に照合し、
+            一致しなければ更新を中止します（破損の検知が目的で、GitHub 自体が
+            侵害された場合の改ざんは検知できません）
+          - `mibs/` - MIB ファイルの配置先（既定では空。README を参照）
+          
+          ### 🚀 インストール方法
+          1. ZIPファイルをダウンロード
+          2. 任意のフォルダに展開
+          3. `NetBelt.exe` をダブルクリックして起動
+          
+          ### 💻 動作環境
+          - Windows 10 / Windows 11 (64bit)
+          - Pythonのインストールは不要
+          - すべての依存ファイルが含まれています
+          
+          ### ✨ 主な機能
+          - SSH、Telnet、シリアル接続に対応
+          - デバイス管理とグループ化
+          - マクロ機能
+          - SNMP Trap / Syslog 受信（カスタムMIB対応）
+          - SFTP ファイル転送
+          
+          ### 📝 初回起動
+          - 初回起動時に `config.json` が自動生成されます
+          - MIB ファイルは同梱していません。`mibs/README.md` の手順で配置してください
+          
+          詳しい使い方は [README.md](https://github.com/gomanizm/NetBelt/blob/main/README.md) をご覧ください。
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
