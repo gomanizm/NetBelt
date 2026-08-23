@@ -123,12 +123,18 @@ GUI に PyQt6（GPL-3.0）を使用しているため、プロジェクト全体
 
 ## サポートについて
 
-これは業務で使うために個人が開発したツールです。**サポートは行いません。**
+**個人が自分の業務効率化のために作ったツール**を、そのまま公開しているものです。
+他人が使うことを主眼に設計してはいないため、UI は日本語のみ、対象は Windows のみで、
+既定値も作者の使い方に合わせてあります。**サポートは行いません。**
 
 - 使い方の質問、導入支援、動作保証には対応できません
 - 不具合の報告は Issue で受け付けますが、**返信や修正をお約束するものではありません**
 - 手が空いたときに、低頻度で修正を行う可能性があります
 - 現状のまま（AS IS）で提供され、いかなる保証もありません（GPL-3.0 の免責条項のとおり）
+
+以上は**作りとサポートの話**で、利用の許諾とは別です。ライセンス上は
+**業務・商用を問わず自由に利用できます**（GPL-3.0 は利用目的を制限しません）。
+社内利用に追加のライセンスは不要で、PyQt6 の商用ライセンスも要りません。
 
 フォークして自分で直していただくのが確実です。GPL-3.0 なのでご自由にどうぞ。
 
@@ -192,7 +198,14 @@ notices, and the reasoning behind the bundling decisions are documented in
 
 ### Support
 
-**None.** Bug reports are welcome as issues, but replies and fixes are not
-promised. This is a personal tool built for the author's own work; fixes may
-happen infrequently, if at all. Forking and fixing it yourself is the reliable
-option — GPL-3.0, so please do.
+**None.** This is a personal tool the author built to speed up their own work,
+published as is. It is not designed with other users in mind: the interface is
+Japanese only, it runs on Windows only, and the defaults suit the author's
+workflow. Bug reports are welcome as issues, but replies and fixes are not
+promised; fixes may happen infrequently, if at all.
+
+That is a statement about design and support, not about permission. **You are
+free to use it commercially and at work** — GPL-3.0 places no restriction on
+purpose, and no additional licence is required, including PyQt6's commercial
+licence. Forking and fixing it yourself is the reliable option — GPL-3.0, so
+please do.
