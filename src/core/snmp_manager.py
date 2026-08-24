@@ -26,6 +26,68 @@ except Exception:
     get_resolver = None
 
 
+# SNMPv3 (USM) で選べるプロトコルの名前。UI のコンボボックスと共有する。
+V3_AUTH_PROTOCOL_NAMES = ("none", "MD5", "SHA", "SHA-224", "SHA-256", "SHA-384", "SHA-512")
+V3_PRIV_PROTOCOL_NAMES = ("none", "DES", "3DES", "AES-128", "AES-192", "AES-256")
+
+
+def resolve_v3_protocols(auth_name: str, priv_name: str):
+    """
+    プロトコル名から pysnmp の USM 定数を引く
+
+    未知の名前を黙って「認証なし」に落とすと、認証失敗の原因が追えなくなる。
+    ここで例外にして表面化させる。
+
+    Args:
+        auth_name: V3_AUTH_PROTOCOL_NAMES のいずれか
+        priv_name: V3_PRIV_PROTOCOL_NAMES のいずれか
+
+    Returns:
+        (認証プロトコル定数, 暗号プロトコル定数) のタプル
+
+    Raises:
+        ValueError: 未知の名前、または認証なしで暗号化を指定した場合
+        RuntimeError: pysnmp が利用できない場合
+    """
+    if not _PYSNMP_AVAILABLE:
+        raise RuntimeError("SNMPライブラリ(pysnmp)を利用できません")
+
+    # SHA-2 系の定数名は「HMAC<出力ビット長>SHA<ダイジェスト長>」の順であり、
+    # SHA-256 は usmHMAC192SHA256AuthProtocol になる（usmHMACSHA256... ではない）。
+    auth_table = {
+        "none": usmNoAuthProtocol,
+        "MD5": usmHMACMD5AuthProtocol,
+        "SHA": usmHMACSHAAuthProtocol,
+        "SHA-224": usmHMAC128SHA224AuthProtocol,
+        "SHA-256": usmHMAC192SHA256AuthProtocol,
+        "SHA-384": usmHMAC256SHA384AuthProtocol,
+        "SHA-512": usmHMAC384SHA512AuthProtocol,
+    }
+    # AES-192/256 は Reeder 版（名前が短い方）を使う。pysnmp のソースが
+    # 「non-standard but used by many vendors」と書いている方で、Cisco 等の
+    # 実装と相互接続するのはこちら。Blumenthal 版は名前に Blumenthal が入る。
+    priv_table = {
+        "none": usmNoPrivProtocol,
+        "DES": usmDESPrivProtocol,
+        "3DES": usm3DESEDEPrivProtocol,
+        "AES-128": usmAesCfb128Protocol,
+        "AES-192": usmAesCfb192Protocol,
+        "AES-256": usmAesCfb256Protocol,
+    }
+
+    if auth_name not in auth_table:
+        raise ValueError(
+            f"未知の認証プロトコル: {auth_name}（選べるのは {', '.join(V3_AUTH_PROTOCOL_NAMES)}）")
+    if priv_name not in priv_table:
+        raise ValueError(
+            f"未知の暗号プロトコル: {priv_name}（選べるのは {', '.join(V3_PRIV_PROTOCOL_NAMES)}）")
+    if auth_name == "none" and priv_name != "none":
+        raise ValueError(
+            "認証なしでは暗号化を使えません（SNMPv3 では authNoPriv 以上が必要です）")
+
+    return auth_table[auth_name], priv_table[priv_name]
+
+
 class SNMPWorker(QThread):
     """SNMP操作を別スレッドで実行するワーカー"""
     
@@ -163,36 +225,22 @@ class SNMPWorker(QThread):
             auth_password = self.params.get('auth_password', '')
             priv_protocol = self.params.get('priv_protocol', 'none')
             priv_password = self.params.get('priv_password', '')
-            
-            # 認証プロトコルの選択
-            if auth_protocol == 'MD5':
-                auth_proto = usmHMACMD5AuthProtocol
-            elif auth_protocol == 'SHA':
-                auth_proto = usmHMACSHAAuthProtocol
-            else:
-                auth_proto = usmNoAuthProtocol
-            
-            # 暗号化プロトコルの選択
-            if priv_protocol == 'DES':
-                priv_proto = usmDESPrivProtocol
-            elif priv_protocol == 'AES':
-                priv_proto = usmAesCfb128Protocol
-            else:
-                priv_proto = usmNoPrivProtocol
-            
-            # 認証データ作成
+
+            auth_proto, priv_proto = resolve_v3_protocols(auth_protocol, priv_protocol)
+
+            # authProtocol / privProtocol は必ず明示的に渡す。pysnmp は
+            # authKey だけ渡すと既定で MD5、privKey だけなら既定で DES を選ぶため。
             if auth_protocol == 'none':
                 return UsmUserData(username)
-            elif priv_protocol == 'none':
+            if priv_protocol == 'none':
                 return UsmUserData(username, auth_password, authProtocol=auth_proto)
-            else:
-                return UsmUserData(
-                    username,
-                    auth_password,
-                    priv_password,
-                    authProtocol=auth_proto,
-                    privProtocol=priv_proto
-                )
+            return UsmUserData(
+                username,
+                auth_password,
+                priv_password,
+                authProtocol=auth_proto,
+                privProtocol=priv_proto
+            )
         
         else:
             raise Exception(f"サポートされていないSNMPバージョン: {version}")
