@@ -214,9 +214,14 @@ class SettingsDialog(QDialog):
             "font_size": self.font_size_spin.value(),
         })
 
-        self.config_manager.set_check_on_startup(self.check_on_startup_box.isChecked())
-        if self._skip_cleared:
-            self.config_manager.set_skipped_version(None)
+        # 更新設定の setter はそれぞれ独立に save_config() を呼ぶ。どれか一つでも
+        # 失敗したら保存失敗として扱う。ターミナル設定の結果だけ返すと、
+        # 更新設定が書けていないのに成功したように見える。
+        if not self.config_manager.set_check_on_startup(
+                self.check_on_startup_box.isChecked()):
+            saved = False
+        if self._skip_cleared and not self.config_manager.set_skipped_version(None):
+            saved = False
 
         return saved
 

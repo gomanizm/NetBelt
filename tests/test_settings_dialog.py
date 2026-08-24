@@ -136,12 +136,22 @@ class SettingsDialogUpdateTabTest(unittest.TestCase):
         return ConfigManager(config_path=os.path.join(d, "config.json"))
 
     def test_check_on_startup_is_restored_and_saved(self):
+        """両方向を確かめる。
+
+        QCheckBox の既定は未チェックなので、False だけを確認しても
+        復元経路を消したことに気づけない。
+        """
         from ui.dialogs.settings_dialog import SettingsDialog
+        for enabled in (True, False):
+            with self.subTest(check_on_startup=enabled):
+                cm = self._manager()
+                cm.set_check_on_startup(enabled)
+                dlg = SettingsDialog(None, config_manager=cm)
+                self.assertEqual(dlg.check_on_startup_box.isChecked(), enabled)
+
         cm = self._manager()
         cm.set_check_on_startup(False)
         dlg = SettingsDialog(None, config_manager=cm)
-        self.assertFalse(dlg.check_on_startup_box.isChecked())
-
         dlg.check_on_startup_box.setChecked(True)
         dlg.save_settings()
         self.assertTrue(cm.get_check_on_startup())
@@ -151,7 +161,9 @@ class SettingsDialogUpdateTabTest(unittest.TestCase):
         cm = self._manager()
         cm.set_skipped_version("1.2.3")
         dlg = SettingsDialog(None, config_manager=cm)
-        self.assertTrue(dlg.clear_skip_button.isVisible() or dlg.clear_skip_button.isEnabled())
+        # offscreen では isVisible() が常に False なので、有効/無効で見る
+        # （スキップが無いときは test_no_skip_shows_a_placeholder が False を見る）
+        self.assertTrue(dlg.clear_skip_button.isEnabled())
         self.assertIn("1.2.3", dlg.skipped_version_label.text())
 
     def test_skip_can_be_cleared(self):
@@ -170,6 +182,25 @@ class SettingsDialogUpdateTabTest(unittest.TestCase):
         self.assertFalse(dlg.clear_skip_button.isEnabled())
         self.assertIn("ありません", dlg.skipped_version_label.text())
 
+
+    def test_clearing_the_skip_does_not_leak_when_cancelled(self):
+        """解除は save_settings で初めて効くこと（2段構えにしている理由）。"""
+        from ui.dialogs.settings_dialog import SettingsDialog
+        cm = self._manager()
+        cm.set_skipped_version("1.2.3")
+        dlg = SettingsDialog(None, config_manager=cm)
+        dlg._on_clear_skip()
+        dlg.reject()
+        self.assertEqual(cm.get_skipped_version(), "1.2.3")
+
+    def test_failed_update_save_is_not_reported_as_success(self):
+        """更新設定だけ保存に失敗しても成功扱いにしないこと。"""
+        from unittest import mock
+        from ui.dialogs.settings_dialog import SettingsDialog
+        cm = self._manager()
+        dlg = SettingsDialog(None, config_manager=cm)
+        cm.set_check_on_startup = mock.Mock(return_value=False)
+        self.assertFalse(dlg.save_settings())
     def test_github_token_is_not_exposed(self):
         """平文で残るのでダイアログには出さない。"""
         from ui.dialogs.settings_dialog import SettingsDialog
