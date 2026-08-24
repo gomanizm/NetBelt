@@ -32,6 +32,22 @@ V3_PRIV_PROTOCOL_NAMES = ("none", "DES", "3DES", "AES-128", "AES-192", "AES-256"
 # RFC 3414 が USM のパスワードに要求する最小長
 V3_PASSWORD_MIN_LENGTH = 8
 
+def _clean_communities(communities):
+    """コミュニティ一覧から空文字と重複を落とす（順序は保つ）
+
+    空文字を登録すると「コミュニティ無しの Trap を受け入れる」設定が
+    意図せず作れてしまう。重複はそのぶん余計な行を pysnmp へ登録する。
+    """
+    cleaned = []
+    for community in communities:
+        if not isinstance(community, str):
+            continue
+        community = community.strip()
+        if community and community not in cleaned:
+            cleaned.append(community)
+    return cleaned
+
+
 # pysnmp は v1 Trap を v1ToV2 変換に通すとき snmpTrapCommunity を合成し、
 # コミュニティ文字列そのものを varbind として足す。v1/v2c ではこれが
 # 唯一の認証情報で、CSV/JSON/TXT のエクスポートはチケットや報告書へ回る
@@ -311,7 +327,8 @@ class SNMPTrapReceiver(QThread):
         # None（未指定）と []（v1/v2c を受けない）は別物。or で書くと
         # [] が既定値へ落ちるため、Trap のバージョンに v3 を選んで
         # パネルが [] を渡しても public の v1/v2c Trap が通ってしまう。
-        self.communities = ['public'] if communities is None else list(communities)
+        self.communities = (['public'] if communities is None
+                            else _clean_communities(communities))
         self.v3_users = list(v3_users or [])
         self._running = False
         self._engine = None
@@ -541,6 +558,11 @@ class SNMPTrapReceiver(QThread):
         finally:
             self._running = False
             self._close_engine()
+            # 同じ受信機をもう一度 start() したとき、前回の停止要求が
+            # 残っていると jobStarted の直後に jobFinished して即終了する。
+            with self._state_lock:
+                self._job_started = False
+                self._stop_requested = False
             # 例外で抜けたときも必ず知らせる。ここを成功経路だけに
             # 置くと、受信が死んでも画面は「受信中」のまま残る。
             self.stopped.emit()
@@ -734,10 +756,25 @@ class SNMPManager(QObject):
             # （実行中の QThread を破棄するとプロセスごと落ちる）。
             print("[SNMPManager] 警告: Trap受信スレッドが5秒以内に終了しませんでした。"
                   "強制終了はせず、終了するまで参照を保持します")
-            self._retired_receivers.append(receiver)
+            self._retire(receiver)
 
         self.trap_receiver = None
         self.operation_started.emit("SNMP Trap受信停止")
+
+    def _retire(self, receiver):
+        """止まりきらなかった受信スレッドを、終わるまで手放さずに持つ
+
+        実行中の QThread を破棄するとプロセスごと落ちるため参照を残すが、
+        刈らないと単調に増え続け、終了時に実行中のスレッドを抱えたまま
+        プロセスが終わる。終わったら自分で外れるようにしておく。
+        """
+        self._retired_receivers.append(receiver)
+        receiver.finished.connect(lambda: self._forget(receiver))
+
+    def _forget(self, receiver):
+        """終わった受信スレッドを保持リストから外す"""
+        if receiver in self._retired_receivers:
+            self._retired_receivers.remove(receiver)
     
     def is_trap_receiver_running(self) -> bool:
         """Trap受信が実行中かどうか"""

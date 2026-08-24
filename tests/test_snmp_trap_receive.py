@@ -253,13 +253,59 @@ class SnmpTrapReceiveTest(unittest.TestCase):
         self.assertTrue(got, "許可したコミュニティの Trap も届かない")
 
     def test_stop_shuts_down_thread(self):
+        """停止でスレッドが実際に終わること。
+
+        以前は m.trap_receiver を見ていたが、stop_trap_receiver() は wait が
+        タイムアウトしても必ず None を入れるので assertFalse(None) になり、
+        スレッドが生き残っていても通っていた。receiver を直接掴んで見る。
+        """
         m, _port = self._start()
+        receiver = m.trap_receiver
+        self.assertTrue(receiver.isRunning(), "起動していない")
+
         m.stop_trap_receiver()
+
+        self.assertTrue(receiver.wait(5000), "停止しても受信スレッドが終わらない")
+        self.assertFalse(receiver.isRunning())
+
+    def test_a_retired_receiver_is_dropped_when_it_ends(self):
+        """止まりきらなかったスレッドを、終わったあとも抱え続けないこと。"""
+        from core.snmp_manager import SNMPManager, SNMPTrapReceiver
+        m = SNMPManager()
+        self._managers.append(m)
+        receiver = SNMPTrapReceiver(free_udp_port(), ["public"])
+
+        m._retire(receiver)
+        self.assertIn(receiver, m._retired_receivers)
+
+        receiver.finished.emit()
+        self.assertNotIn(receiver, m._retired_receivers,
+                         "終わった受信スレッドを抱えたまま")
+
+    def test_blank_and_duplicate_communities_are_dropped(self):
+        """空文字を登録すると「合言葉なしを受け入れる」設定が作れてしまう。"""
+        from core.snmp_manager import SNMPTrapReceiver
+        r = SNMPTrapReceiver(free_udp_port(),
+                             ["public", "  ", "public", "", " ops "])
+        self.assertEqual(r.communities, ["public", "ops"])
+
+    def test_a_restarted_receiver_forgets_the_old_stop_request(self):
+        """再 start() で、前回の停止要求が残って即終了しないこと。"""
+        from core.snmp_manager import SNMPTrapReceiver
+        r = SNMPTrapReceiver(free_udp_port(), ["public"])
+        self.addCleanup(r.wait, 3000)
+        self.addCleanup(r.stop)
+        self.assertTrue(r.bind())
+        r.start()
         deadline = time.time() + 5
-        while m.trap_receiver and m.trap_receiver.isRunning() and time.time() < deadline:
+        while time.time() < deadline and not r.isRunning():
             time.sleep(0.05)
-        self.assertFalse(m.trap_receiver and m.trap_receiver.isRunning(),
-                         "停止しても受信スレッドが動き続けている")
+        r.stop()
+        self.assertTrue(r.wait(5000), "停止できない")
+
+        self.assertFalse(r._stop_requested,
+                         "停止要求が残っていて次回の起動が即終了する")
+        self.assertFalse(r._job_started, "ジョブ状態が残っている")
 
 
 if __name__ == "__main__":
