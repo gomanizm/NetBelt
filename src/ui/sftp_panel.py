@@ -50,21 +50,52 @@ class SFTPPanel(QWidget):
         # ドラッグ&ドロップを有効化
         self.setAcceptDrops(True)
     
+    @classmethod
+    def normalize_sftp_settings(cls, settings) -> dict:
+        """
+        settings.sftp を検証し、妥当でないものを既定値で埋める
+        
+        config.json は手で編集できるため、型の違う値が入りうる。
+        真偽値のつもりの "no" は文字列として真になり、null を
+        QCheckBox.setChecked() へ渡すと例外になる。設定ダイアログも
+        この結果を使う（生値を渡すとダイアログが開けなくなる）。
+        
+        Args:
+            settings: settings.sftp 相当の dict（None や dict 以外も受け付ける）
+        
+        Returns:
+            4キーすべてが妥当な値で埋まった dict
+        """
+        merged = dict(cls.SFTP_SETTING_DEFAULTS)
+        if not isinstance(settings, dict):
+            return merged
+        
+        path = settings.get("default_download_path")
+        if isinstance(path, str) and path.strip():
+            merged["default_download_path"] = path.strip()
+        
+        # 真偽値は bool のみ受理する。0/1 や "no" を通すと、
+        # 画面の表示と実際の動作が食い違う
+        for key in ("show_hidden_files", "confirm_delete", "confirm_overwrite"):
+            value = settings.get(key)
+            if isinstance(value, bool):
+                merged[key] = value
+        
+        return merged
+    
     def _get_sftp_setting(self, key: str, default):
         """
         settings.sftp から設定値を取得する
         
         Args:
             key: 設定キー
-            default: config に無いときの値
+            default: 未使用（正規化後の既定値を使う。呼び出し側の可読性のために残す）
         
         Returns:
-            設定値
+            正規化済みの設定値
         """
-        if not self.config_manager:
-            return default
-        value = self.config_manager.get_server_settings("sftp").get(key)
-        return default if value is None else value
+        raw = self.config_manager.get_server_settings("sftp") if self.config_manager else {}
+        return self.normalize_sftp_settings(raw)[key]
     
     def _init_ui(self):
         """UIを初期化"""

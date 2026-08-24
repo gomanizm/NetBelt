@@ -224,18 +224,15 @@ class SettingsDialog(QDialog):
         self._update_color_buttons()
         self._update_preview()
 
-        sftp_defaults = SFTPPanel.SFTP_SETTING_DEFAULTS
-        sftp = self.config_manager.get_server_settings("sftp") if self.config_manager else {}
+        # 生値を渡すと、null や "yes" で setChecked() / setText() が例外になり
+        # ダイアログ自体が開かなくなる。パネルと同じ正規化を通す
+        raw_sftp = self.config_manager.get_server_settings("sftp") if self.config_manager else {}
+        sftp = SFTPPanel.normalize_sftp_settings(raw_sftp)
 
-        download_path = sftp.get("default_download_path")
-        self.download_path_edit.setText(
-            download_path if download_path else sftp_defaults["default_download_path"])
-        self.show_hidden_box.setChecked(
-            sftp.get("show_hidden_files", sftp_defaults["show_hidden_files"]))
-        self.confirm_delete_box.setChecked(
-            sftp.get("confirm_delete", sftp_defaults["confirm_delete"]))
-        self.confirm_overwrite_box.setChecked(
-            sftp.get("confirm_overwrite", sftp_defaults["confirm_overwrite"]))
+        self.download_path_edit.setText(sftp["default_download_path"])
+        self.show_hidden_box.setChecked(sftp["show_hidden_files"])
+        self.confirm_delete_box.setChecked(sftp["confirm_delete"])
+        self.confirm_overwrite_box.setChecked(sftp["confirm_overwrite"])
 
         self._skip_cleared = False
         if self.config_manager:

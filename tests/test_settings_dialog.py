@@ -262,6 +262,24 @@ class SettingsDialogSftpTabTest(unittest.TestCase):
                 dlg.save_settings()
                 self.assertEqual(
                     cm.get_server_settings("sftp")["confirm_overwrite"], not enabled)
+
+    def test_broken_sftp_values_do_not_break_the_dialog(self):
+        """壊れた値でダイアログが開けなくなっていた（setChecked に null が渡る）。"""
+        from ui.sftp_panel import SFTPPanel
+        from ui.dialogs.settings_dialog import SettingsDialog
+        defaults = SFTPPanel.SFTP_SETTING_DEFAULTS
+        cm = self._manager()
+        cm.set_server_settings("sftp", {
+            "show_hidden_files": None, "confirm_delete": "yes",
+            "default_download_path": 123})
+
+        dlg = SettingsDialog(None, config_manager=cm)
+        self.assertEqual(dlg.show_hidden_box.isChecked(),
+                         defaults["show_hidden_files"])
+        self.assertEqual(dlg.confirm_delete_box.isChecked(),
+                         defaults["confirm_delete"])
+        self.assertEqual(dlg.download_path_edit.text(),
+                         defaults["default_download_path"])
     def test_sftp_defaults_match_the_panel(self):
         from ui.dialogs.settings_dialog import SettingsDialog
         from ui.sftp_panel import SFTPPanel

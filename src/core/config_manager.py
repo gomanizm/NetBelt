@@ -245,6 +245,13 @@ class ConfigManager:
         Returns:
             保存成功時True、失敗時False
         """
+        # 読み込みに失敗した状態で保存すると、破損扱いになった元ファイルを
+        # デフォルト設定で上書きしてしまう。終了時のレイアウト保存など
+        # ユーザーが意識しない経路からも呼ばれるため、ここで一律に断る。
+        if self.load_error:
+            print("[WARN] 設定ファイルの読み込みに失敗しているため保存しません")
+            return False
+        
         try:
             # 保存用に設定をコピー（パスワードを暗号化）
             save_config = json.loads(json.dumps(self.config))

@@ -197,6 +197,24 @@ class SftpClientSettingsTest(unittest.TestCase):
             panel.dropEvent(event)
         upload.assert_called_once_with("C:/tmp/既存.cfg")
 
+    def test_broken_boolean_settings_fall_back_to_defaults(self):
+        """config.json は手で編集できるので型違いが来る。"""
+        for broken in ("no", "yes", 0, 1, None):
+            with self.subTest(show_hidden_files=broken):
+                panel, _ = self._panel({"show_hidden_files": broken})
+                panel._update_file_list([self._entry(".hidden"), self._entry("見える.txt")])
+                self.assertEqual(panel.model.rowCount(), 1,
+                                 "壊れた値が真として扱われている")
+
+    def test_broken_download_path_falls_back_to_default(self):
+        from ui.sftp_panel import SFTPPanel
+        for broken in (123, "", "   ", None):
+            with self.subTest(default_download_path=broken):
+                panel, _ = self._panel({"default_download_path": broken})
+                self.assertEqual(
+                    panel._get_sftp_setting("default_download_path", None),
+                    SFTPPanel.SFTP_SETTING_DEFAULTS["default_download_path"])
+
 
 if __name__ == "__main__":
     unittest.main()
