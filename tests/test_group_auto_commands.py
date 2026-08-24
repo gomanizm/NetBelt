@@ -48,6 +48,15 @@ class SetGroupAutoCommandsTest(unittest.TestCase):
         cm.get_group = original_get_group
         self.assertEqual(cm.get_group("参照非依存")["auto_commands"], ["show ip int br"])
 
+    def test_stored_commands_are_a_copy(self):
+        """呼び出し側が渡したリストを後から変更しても保存済みの値が変わらないこと。"""
+        cm, _ = self._new_manager()
+        cm.add_group("コピー確認")
+        commands = ["show clock"]
+        cm.set_group_auto_commands("コピー確認", commands)
+        commands.append("reload")
+        self.assertEqual(cm.get_group("コピー確認")["auto_commands"], ["show clock"])
+
     def test_rename_group_keeps_auto_commands(self):
         cm, _ = self._new_manager()
         cm.add_group("旧名", ["terminal monitor"])
