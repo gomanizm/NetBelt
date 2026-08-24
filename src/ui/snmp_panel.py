@@ -15,6 +15,29 @@ from core.mib_resolver import get_resolver, MIBResolver
 from core.snmp_manager import v3_password_error
 
 
+# pysnmp が渡す securityModel / securityLevel の値
+_SECURITY_MODELS = {'1': 'v1', '2': 'v2c', '3': 'v3'}
+_SECURITY_LEVELS = {'1': 'noAuthNoPriv', '2': 'authNoPriv', '3': 'authPriv'}
+
+
+def describe_trap_security(trap_data: dict) -> str:
+    """Trap がどの版・どの保護レベルで届いたかを1行で表す
+
+    v1/v2c の security_name は受信側が内部で振った名前であって
+    コミュニティそのものではないので出さない（コミュニティは実質的な
+    認証情報なので、表示にもエクスポートにも載せない方針）。
+    v3 のユーザ名は秘密ではないため出す。
+    """
+    model = _SECURITY_MODELS.get(str(trap_data.get('security_model', '')), '')
+    if model != 'v3':
+        return model
+
+    level = _SECURITY_LEVELS.get(str(trap_data.get('security_level', '')), '')
+    text = f'v3 {level}'.strip()
+    name = trap_data.get('security_name', '')
+    return f'{text} / {name}' if name else text
+
+
 class SNMPResultTableModel(QAbstractTableModel):
     """SNMP GET/WALK結果テーブルモデル"""
     
@@ -380,7 +403,8 @@ class SNMPPanel(QWidget):
         self.trap_tree.doubleClicked.connect(self._on_trap_tree_double_clicked)  # ダブルクリックで展開/折りたたみ
         
         # ヘッダー設定
-        self.trap_tree_model.setHorizontalHeaderLabels(["時刻", "送信元IP", "Trap OID / VarBind", "値"])
+        self.trap_tree_model.setHorizontalHeaderLabels(
+            ["時刻", "送信元IP", "セキュリティ", "Trap OID / VarBind", "値"])
         header = self.trap_tree.header()
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         header.setStretchLastSection(True)  # 最後の列を伸縮
@@ -717,7 +741,8 @@ class SNMPPanel(QWidget):
     
     def _on_trap_clear_clicked(self):
         self.trap_tree_model.clear()
-        self.trap_tree_model.setHorizontalHeaderLabels(["時刻", "送信元IP", "Trap OID / VarBind", "値"])
+        self.trap_tree_model.setHorizontalHeaderLabels(
+            ["時刻", "送信元IP", "セキュリティ", "Trap OID / VarBind", "値"])
         self.trap_data_list.clear()
     
     def _on_trap_expand_all_clicked(self):
@@ -776,28 +801,26 @@ class SNMPPanel(QWidget):
             writer = csv.writer(f)
             
             # ヘッダー
-            writer.writerow(['時刻', '送信元IP', 'Trap OID', 'VarBind OID', 'VarBind 値'])
+            writer.writerow(['時刻', '送信元IP', '送信元ポート', 'セキュリティ',
+                             'Trap OID', 'VarBind OID', 'VarBind 値'])
             
             # データ（新しい順＝trap_data_listの順）
             for trap in self.trap_data_list:
                 timestamp = trap['timestamp']
                 source_ip = trap['source_ip']
+                source_port = trap.get('source_port', '')
+                security = trap.get('security', '')
                 trap_oid = trap['trap_oid']
                 varbinds = trap['varbinds']
+                head = [timestamp, source_ip, source_port, security, trap_oid]
                 
                 # VarBindsがある場合は各VarBindを1行として出力
                 if varbinds:
                     for vb in varbinds:
-                        writer.writerow([
-                            timestamp,
-                            source_ip,
-                            trap_oid,
-                            vb['oid'],
-                            vb['value']
-                        ])
+                        writer.writerow(head + [vb['oid'], vb['value']])
                 else:
                     # VarBindsがない場合は1行だけ出力
-                    writer.writerow([timestamp, source_ip, trap_oid, '', ''])
+                    writer.writerow(head + ['', ''])
     
     def _export_to_json(self, file_path: str):
         """JSON形式でエクスポート"""
@@ -819,6 +842,8 @@ class SNMPPanel(QWidget):
             for i, trap in enumerate(self.trap_data_list, 1):
                 timestamp = trap['timestamp']
                 source_ip = trap['source_ip']
+                source_port = trap.get('source_port', '')
+                security = trap.get('security', '')
                 trap_oid = trap['trap_oid']
                 varbinds = trap['varbinds']
                 
@@ -827,7 +852,9 @@ class SNMPPanel(QWidget):
                 
                 f.write(f"[{i}] Trap受信\n")
                 f.write(f"  時刻: {timestamp}\n")
-                f.write(f"  送信元IP: {source_ip}\n")
+                f.write(f"  送信元: {source_ip}:{source_port}\n")
+                if security:
+                    f.write(f"  セキュリティ: {security}\n")
                 f.write(f"  Trap OID: {trap_name}\n")
                 f.write(f"            ({trap_oid})\n")
                 
@@ -871,6 +898,8 @@ class SNMPPanel(QWidget):
         """TrapデータをツリーViewに追加"""
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         source_ip = trap_data.get('source_ip', '')
+        source_port = trap_data.get('source_port', 0)
+        security = describe_trap_security(trap_data)
         trap_oid = trap_data.get('trap_oid', 'N/A')
         varbinds = trap_data.get('varbinds', [])
         
@@ -878,6 +907,8 @@ class SNMPPanel(QWidget):
         self.trap_data_list.insert(0, {
             'timestamp': timestamp,
             'source_ip': source_ip,
+            'source_port': source_port,
+            'security': security,
             'trap_oid': trap_oid,
             'varbinds': varbinds
         })
@@ -892,12 +923,14 @@ class SNMPPanel(QWidget):
         # 親アイテム作成（Trap情報）
         timestamp_item = QStandardItem(timestamp)
         source_ip_item = QStandardItem(source_ip)
+        security_item = QStandardItem(security)
         trap_oid_item = QStandardItem(trap_name)
         varbinds_count = f"{len(filtered_vbs)} VarBinds" if filtered_vbs else "VarBindsなし"
         value_item = QStandardItem(varbinds_count)
         
         # 親行をツリーのルートに挿入（最新を先頭に）
-        self.trap_tree_model.insertRow(0, [timestamp_item, source_ip_item, trap_oid_item, value_item])
+        self.trap_tree_model.insertRow(0, [timestamp_item, source_ip_item,
+                                          security_item, trap_oid_item, value_item])
         
         # 各VarBindを子アイテムとして追加
         for vb in filtered_vbs:
@@ -910,11 +943,13 @@ class SNMPPanel(QWidget):
             # 子アイテム作成（1行につき1つのVarBind）
             child_timestamp = QStandardItem("")  # 空
             child_source = QStandardItem("")  # 空
+            child_security = QStandardItem("")  # 空
             child_oid = QStandardItem(oid_name)
             child_value = QStandardItem(value)
             
             # 親の最初の列に子行を追加
-            timestamp_item.appendRow([child_timestamp, child_source, child_oid, child_value])
+            timestamp_item.appendRow([child_timestamp, child_source,
+                                      child_security, child_oid, child_value])
     
     def _on_trap_receiver_started(self):
         """Trap受信開始時の処理"""

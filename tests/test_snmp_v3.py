@@ -896,5 +896,111 @@ class TrapTabV3UiTest(unittest.TestCase):
         self.assertTrue(panel.trap_stop_button.isHidden(), "停止ボタンが残っている")
 
 
+class TrapSecurityDisplayTest(unittest.TestCase):
+    """受信した Trap の版と保護レベルが画面とエクスポートに出ること。
+
+    core は security_name / security_level / security_model と送信元ポートを
+    Trap ごとに埋めているのに、パネルが1つも拾っていなかった。v3 Trap を
+    受信できても、それが v3 だったのか v2c だったのかを利用者が判別できない。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import os
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PyQt6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    _windows = []
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._windows.clear()
+
+    def _panel(self):
+        from unittest import mock
+        from ui.main_window import MainWindow
+        with mock.patch.object(MainWindow, "_check_for_updates_on_startup"):
+            window = MainWindow()
+        type(self)._windows.append(window)
+        return window.snmp_panel
+
+    def _trap(self, model, level, name):
+        return {"source_ip": "192.0.2.10", "source_port": 51515,
+                "trap_oid": "1.3.6.1.6.3.1.1.5.1",
+                "security_model": model, "security_level": level,
+                "security_name": name,
+                "varbinds": [{"oid": "1.3.6.1.2.1.1.5.0",
+                              "value": "device", "type": "OctetString"}]}
+
+    def test_describe_reports_the_version_and_level(self):
+        from ui.snmp_panel import describe_trap_security
+        cases = (
+            (("3", "3", "netbelt-v3"), "v3 authPriv / netbelt-v3"),
+            (("3", "2", "netbelt-v3"), "v3 authNoPriv / netbelt-v3"),
+            (("3", "1", "netbelt-v3"), "v3 noAuthNoPriv / netbelt-v3"),
+            (("2", "1", "netbelt-v2c-0"), "v2c"),
+            (("1", "1", "netbelt-v2c-0"), "v1"),
+            (("", "", ""), ""),
+        )
+        for (model, level, name), expected in cases:
+            with self.subTest(model=model, level=level):
+                self.assertEqual(
+                    describe_trap_security(self._trap(model, level, name)),
+                    expected)
+
+    def test_a_v2c_trap_does_not_show_the_internal_security_name(self):
+        """v1/v2c の security_name は受信側が振った内部名なので出さない。"""
+        from ui.snmp_panel import describe_trap_security
+        text = describe_trap_security(self._trap("2", "1", "netbelt-v2c-0"))
+        self.assertNotIn("netbelt-v2c-0", text)
+
+    def test_the_tree_shows_the_security_column(self):
+        panel = self._panel()
+        panel._add_trap_to_tree(self._trap("3", "3", "netbelt-v3"))
+        headers = [panel.trap_tree_model.horizontalHeaderItem(i).text()
+                   for i in range(panel.trap_tree_model.columnCount())]
+        self.assertIn("セキュリティ", headers)
+        column = headers.index("セキュリティ")
+        self.assertEqual(panel.trap_tree_model.item(0, column).text(),
+                         "v3 authPriv / netbelt-v3")
+
+    def test_the_csv_export_carries_the_security_and_port(self):
+        import csv
+        import tempfile
+        import os
+        panel = self._panel()
+        panel._add_trap_to_tree(self._trap("3", "3", "netbelt-v3"))
+
+        fd, path = tempfile.mkstemp(suffix=".csv")
+        os.close(fd)
+        self.addCleanup(os.unlink, path)
+        panel._export_to_csv(path)
+
+        with open(path, encoding="utf-8", newline="") as f:
+            rows = list(csv.reader(f))
+        self.assertIn("セキュリティ", rows[0])
+        self.assertIn("送信元ポート", rows[0])
+        self.assertIn("v3 authPriv / netbelt-v3", rows[1])
+        self.assertIn("51515", rows[1])
+
+    def test_the_json_export_carries_the_security_and_port(self):
+        import json as json_module
+        import tempfile
+        import os
+        panel = self._panel()
+        panel._add_trap_to_tree(self._trap("3", "3", "netbelt-v3"))
+
+        fd, path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        self.addCleanup(os.unlink, path)
+        panel._export_to_json(path)
+
+        with open(path, encoding="utf-8") as f:
+            data = json_module.load(f)
+        self.assertEqual(data[0]["security"], "v3 authPriv / netbelt-v3")
+        self.assertEqual(data[0]["source_port"], 51515)
+
+
 if __name__ == "__main__":
     unittest.main()
