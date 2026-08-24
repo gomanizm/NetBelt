@@ -611,6 +611,63 @@ class TrapTabV3UiTest(unittest.TestCase):
         self.assertEqual(args[0][1], ["public"])
         self.assertEqual(len(args[0][2]), 1)
 
+    def test_trap_v3_username_without_engine_ids_is_refused(self):
+        """v3 Trap は送信元の EngineID を登録しないと1件も受信できない
+        （実測で確認済み）。原因の分かりにくい「起動したのに何も来ない」
+        を避けるため、実行前に止めること。"""
+        from unittest import mock
+        panel = self._panel()
+        panel.snmp_manager = mock.Mock()
+        panel.snmp_manager.start_trap_receiver.return_value = True
+        panel.mib_loading = False
+        panel.mib_loaded = True
+        panel.trap_version_combo.setCurrentText("v3")
+        panel.trap_v3_username_edit.setText("netbelt-v3")
+
+        with mock.patch("ui.snmp_panel.QMessageBox.warning") as warn:
+            panel._on_trap_start_clicked()
+        warn.assert_called_once()
+        panel.snmp_manager.start_trap_receiver.assert_not_called()
+
+    def test_trap_v3_priv_without_auth_is_refused(self):
+        """SNMPv3 では authNoPriv 以上でないと暗号化できない。"""
+        from unittest import mock
+        panel = self._panel()
+        panel.snmp_manager = mock.Mock()
+        panel.snmp_manager.start_trap_receiver.return_value = True
+        panel.mib_loading = False
+        panel.mib_loaded = True
+        panel.trap_version_combo.setCurrentText("両方")
+        panel.trap_v3_username_edit.setText("netbelt-v3")
+        panel.trap_v3_engine_ids_edit.setPlainText("8000000001020304")
+        panel.trap_v3_auth_combo.setCurrentIndex(
+            [k for _l, k in panel.AUTH_PROTOCOL_CHOICES].index("none"))
+        panel.trap_v3_priv_combo.setCurrentIndex(
+            [k for _l, k in panel.PRIV_PROTOCOL_CHOICES].index("AES-128"))
+
+        with mock.patch("ui.snmp_panel.QMessageBox.warning") as warn:
+            panel._on_trap_start_clicked()
+        warn.assert_called_once()
+        panel.snmp_manager.start_trap_receiver.assert_not_called()
+
+    def test_trap_v1v2c_skips_v3_validation_even_without_engine_ids(self):
+        """バージョン選択が v1/v2c のときは v3 の入力を検証しない。"""
+        from unittest import mock
+        panel = self._panel()
+        panel.snmp_manager = mock.Mock()
+        panel.snmp_manager.start_trap_receiver.return_value = True
+        panel.mib_loading = False
+        panel.mib_loaded = True
+        panel.trap_version_combo.setCurrentText("v1/v2c")
+        panel.trap_v3_username_edit.setText("netbelt-v3")
+        panel.trap_v3_priv_combo.setCurrentIndex(
+            [k for _l, k in panel.PRIV_PROTOCOL_CHOICES].index("AES-128"))
+
+        with mock.patch("ui.snmp_panel.QMessageBox.warning") as warn:
+            panel._on_trap_start_clicked()
+        warn.assert_not_called()
+        panel.snmp_manager.start_trap_receiver.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

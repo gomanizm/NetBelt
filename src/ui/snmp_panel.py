@@ -442,6 +442,29 @@ class SNMPPanel(QWidget):
             'priv_password': self.v3_priv_password_edit.text(),
         }
 
+    def _trap_v3_input_error(self):
+        """
+        Trap 受信の v3 入力に問題があればその説明を返す（無ければ None）
+
+        v3 Trap は送信元機器の EngineID を登録しないと1件も受信できない
+        （実測で確認済み）。黙って受信を開始すると「起動したのに何も
+        来ない」という原因の分かりにくい状態になるため、実行前に止める。
+        認証なしでの暗号化も SNMPv3 では成立しない。
+        """
+        version = self.trap_version_combo.currentText()
+        if version == 'v1/v2c':
+            return None
+
+        username = self.trap_v3_username_edit.text().strip()
+        if username and not self._collect_trap_v3_users()[0]['engine_ids']:
+            return ("v3 Trap を受信するには、送信元機器の EngineID を"
+                    "1行に1つ登録してください。")
+        if (self.trap_v3_auth_combo.currentData() == "none"
+                and self.trap_v3_priv_combo.currentData() != "none"):
+            return ("認証なしでは暗号化を使えません。\n"
+                    "認証方式を選ぶか、暗号方式を「なし」にしてください。")
+        return None
+
     def _collect_trap_v3_users(self) -> list:
         """
         Trap 受信用の v3 ユーザ定義を組み立てる
@@ -604,6 +627,11 @@ class SNMPPanel(QWidget):
                 "MIB読み込み中", 
                 "MIBをバックグラウンドで読み込み中です。\n完了までお待ちください。"
             )
+            return
+
+        v3_error = self._trap_v3_input_error()
+        if v3_error:
+            QMessageBox.warning(self, "エラー", v3_error)
             return
         
         # Trap受信を開始
