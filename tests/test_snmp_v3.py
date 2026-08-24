@@ -878,6 +878,35 @@ class TrapTabV3UiTest(unittest.TestCase):
                 self.assertIn(bad, warn.call_args[0][2])
                 panel.snmp_manager.start_trap_receiver.assert_not_called()
 
+
+    def test_the_start_button_waits_for_the_thread_to_actually_end(self):
+        """止まりきる前に開始できると、掴んだままのポートで bind に失敗する。
+
+        stop_trap_receiver() は5秒待って終わらなければ参照だけ手放すので、
+        そこで開始ボタンを戻すと、まだポートを掴んでいるスレッドが残った
+        状態で開始できてしまう。
+        """
+        from unittest import mock
+        panel = self._panel()
+        panel.snmp_manager = mock.Mock()
+        panel.trap_start_button.setVisible(False)
+        panel.trap_stop_button.setVisible(True)
+
+        panel._on_trap_stop_clicked()
+
+        self.assertTrue(panel.trap_start_button.isHidden(),
+                        "終わる前に開始ボタンが戻っている")
+        self.assertFalse(panel.trap_stop_button.isEnabled(),
+                         "停止要求済みなのに停止ボタンが押せる")
+
+        # 実際に終わると stopped が来る（run() の finally から必ず出る）
+        panel._on_trap_receiver_stopped()
+
+        self.assertFalse(panel.trap_start_button.isHidden(),
+                         "終わったのに開始ボタンが戻らない")
+        self.assertIn("停止中", panel.trap_status_label.text())
+        self.assertTrue(panel.trap_stop_button.isEnabled())
+
     def test_the_panel_stops_showing_receiving_when_the_receiver_ends(self):
         """受信が自分で終わったときも表示を戻すこと。
 

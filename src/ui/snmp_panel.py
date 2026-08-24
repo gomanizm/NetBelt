@@ -724,18 +724,26 @@ class SNMPPanel(QWidget):
     
     
     def _on_trap_stop_clicked(self):
+        # 開始ボタンはここでは戻さない。停止要求から実際の終了までは
+        # 間があり、待ち受けポートを掴んだままのスレッドが残っている
+        # 状態で開始すると bind に失敗する。終了は stopped で分かる。
+        self.trap_stop_button.setEnabled(False)
+        self.trap_status_label.setText("⏳ 停止しています...")
+        self.trap_status_label.setStyleSheet(
+            "color: #ff9800; font-weight: bold; font-size: 14px;")
         if self.snmp_manager:
             self.snmp_manager.stop_trap_receiver()
-        self._show_trap_stopped()
 
     def _show_trap_stopped(self):
         """受信していない状態の表示に戻す
 
-        利用者が止めたときだけでなく、受信スレッドが自分で終わったときにも
-        呼ぶ。片方だけだと、受信が死んでいるのに「受信中」の表示が残る。
+        受信スレッドが実際に終わったときに呼ぶ。利用者が止めた場合も、
+        スレッドが自分で死んだ場合も、run() の finally から出る stopped が
+        ここへ来る。片方だけだと、受信が死んでいるのに表示が残る。
         """
         self.trap_start_button.setVisible(True)
         self.trap_stop_button.setVisible(False)
+        self.trap_stop_button.setEnabled(True)
         self.trap_status_label.setText("🔴 停止中")
         self.trap_status_label.setStyleSheet("color: #f44336; font-weight: bold; font-size: 14px;")
     
