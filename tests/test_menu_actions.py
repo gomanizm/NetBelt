@@ -95,14 +95,45 @@ class MenuActionsTest(unittest.TestCase):
         self.assertEqual(
             w.config_manager.config["settings"]["ui_layout"], {"tool_tab": 2})
 
-    def test_terminal_settings_are_applied_at_startup(self):
-        """起動時に config の外観設定がターミナルへ乗ること。"""
+    def test_apply_terminal_settings_from_config_reads_the_config(self):
+        """メソッド単体: config の値をターミナルへ渡すこと。"""
         w = self._window()
         w.config_manager.set_server_settings(
             "terminal", {"font_family": "Courier New", "font_size": 15})
         w._apply_terminal_settings_from_config()
         self.assertEqual(
             w.terminal_widget.tab_widget.widget(0).font().pointSize(), 15)
+
+    def test_terminal_settings_are_applied_when_the_window_opens(self):
+        """起動時の配線そのものを見る。
+
+        上のテストはメソッドを直接呼ぶので、__init__ からの呼び出しを
+        削除しても落ちない。ユーザーから見える「起動したら設定が効いている」
+        という振る舞いは、窓を実際に開いて確かめないと守れない。
+        """
+        from PyQt6.QtGui import QColor, QPalette
+        from ui.main_window import MainWindow
+        from core.config_manager import ConfigManager
+
+        d = tempfile.mkdtemp(prefix="netbelt-startup-")
+        path = os.path.join(d, "config.json")
+        # 窓を開く前に config へ書いておく
+        ConfigManager(config_path=path).set_server_settings("terminal", {
+            "font_family": "Courier New", "font_size": 15,
+            "background_color": "#112233", "text_color": "#445566"})
+
+        with mock.patch("ui.main_window.ConfigManager") as fake, \
+             mock.patch.object(MainWindow, "_check_for_updates_on_startup"):
+            fake.return_value = ConfigManager(config_path=path)
+            w = MainWindow()
+
+        home = w.terminal_widget.tab_widget.widget(0)
+        self.assertEqual(home.font().family(), "Courier New")
+        self.assertEqual(home.font().pointSize(), 15)
+        self.assertEqual(home.palette().color(QPalette.ColorRole.Base),
+                         QColor("#112233"))
+        self.assertEqual(home.palette().color(QPalette.ColorRole.Text),
+                         QColor("#445566"))
 
 
 class PasteGuardTest(unittest.TestCase):
