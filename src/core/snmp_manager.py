@@ -249,52 +249,77 @@ class SNMPWorker(QThread):
 class SNMPTrapReceiver(QThread):
     """
     SNMP Trap受信スレッド
-    
-    Python標準のUDPソケットでパケットを受信し、pyasn1/pysnmpでデコードする実装
+
+    pysnmp のエンジン（SnmpEngine + ntfrcv + AsyncoreDispatcher）で受信する。
+    v3 は scopedPDU が暗号化され得るため、生ソケットで BER デコードする方式では
+    中身を取り出せない。USM の復号経路を持つエンジンに載せる必要がある。
     """
-    
+
     # シグナル定義
     trap_received = pyqtSignal(dict)  # Trap情報
     error_occurred = pyqtSignal(str)  # エラーメッセージ
     started = pyqtSignal()  # 開始通知
     stopped = pyqtSignal()  # 停止通知
-    
-    def __init__(self, port: int = 162, communities: List[str] = None):
+
+    # ディスパッチャを止めるときのジョブID（pysnmp の慣例で 1 を使う）
+    _JOB_ID = 1
+
+    def __init__(self, port: int = 162, communities: List[str] = None,
+                 v3_users: List[dict] = None):
+        """
+        Args:
+            port: 受信ポート
+            communities: 許可する v1/v2c コミュニティ名のリスト
+            v3_users: v3 ユーザの定義リスト。各要素は
+                {"username", "auth_protocol", "auth_password",
+                 "priv_protocol", "priv_password", "engine_ids"}
+        """
         super().__init__()
         self.port = port
         self.communities = communities or ['public']
+        self.v3_users = list(v3_users or [])
         self._running = False
-        self._socket = None
-    
+        self._engine = None
+        self._transport = None
+        # observer で拾った直近のセキュリティ情報（表示用の参考値）
+        self._last_security = {}
+
     def _is_allowed_community(self, community: str) -> bool:
         """受信した Trap のコミュニティが許可一覧に含まれるか。
 
-        SNMPv1/v2c のコミュニティは平文で流れるため強固な認証ではないが、
-        誤送信や別システムの Trap を弾く実用的な効果がある。
-        SNMP の仕様どおり大文字小文字は区別する。
+        照合そのものは pysnmp の USM/community 層が行うが、許可一覧の
+        意味づけをここに残しておく（SNMP の仕様どおり大文字小文字は区別する）。
         """
         return community in self.communities
 
     def bind(self) -> bool:
-        """待ち受けソケットを用意する。
+        """待ち受けを用意する。
 
         呼び出し元スレッドで実行し、失敗を戻り値で返す。スレッドの中で
         バインドすると成否を呼び出し側へ返せず、ポートが使用中でも UI は
         「受信中」の表示のまま何も待ち受けない状態になる。
         """
+        if not _PYSNMP_AVAILABLE:
+            self.error_occurred.emit("SNMPライブラリ(pysnmp)を利用できません")
+            return False
+
         try:
-            self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            set_exclusive_bind(self._socket)
-            self._socket.bind(('0.0.0.0', self.port))
-            self._socket.settimeout(1.0)  # 1秒タイムアウト
+            self._engine = engine.SnmpEngine()
+            self._transport = udp.UdpTransport()
+
+            # pysnmp は自前のソケットへ無条件に REUSEADDR 系のオプションを立てる。
+            # Windows ではそれだけだと他プロセスの待ち受けポートを奪えてしまうので、
+            # 排他バインドへ差し替える（set_exclusive_bind が REUSEADDR を戻す）。
+            set_exclusive_bind(self._transport.socket)
+            self._transport.openServerMode(('0.0.0.0', self.port))
+            config.addTransport(self._engine, udp.domainName, self._transport)
+
+            self._register_credentials()
+            self._register_observer()
+            ntfrcv.NotificationReceiver(self._engine, self._on_notification)
             return True
-        except OSError as e:
-            try:
-                if self._socket:
-                    self._socket.close()
-            except Exception:
-                pass
-            self._socket = None
+        except Exception as e:
+            self._close_engine()
             self.error_occurred.emit(f"ポート {self.port} で待ち受けできません: {e}")
             return False
 
@@ -383,68 +408,58 @@ class SNMPTrapReceiver(QThread):
         """Trap受信スレッドのメイン処理"""
         try:
             print(f"[SNMPTrapReceiver] 開始: ポート{self.port}")
-            if self._socket is None and not self.bind():
+            if self._engine is None and not self.bind():
                 return
-            
-            print(f"[SNMPTrapReceiver] UDPソケット作成完了: 0.0.0.0:{self.port}")
-            # コミュニティ文字列は SNMPv1/v2c の合言葉であり実質的な認証情報。
-            # 凍結ビルドでは stdout が %LOCALAPPDATA% 配下のログへ恒久保存され、
-            # 不具合報告への添付などで流出するため、値そのものは出さない。
+
+            # コミュニティ文字列と v3 のパスワードは実質的な認証情報。
+            # 凍結ビルドでは stdout がログへ恒久保存されるため値は出さない。
             print(f"[SNMPTrapReceiver] 許可コミュニティ: {len(self.communities)}件")
+            print(f"[SNMPTrapReceiver] v3ユーザ: {len(self.v3_users)}件")
             print(f"[SNMPTrapReceiver] Trap受信待機中...")
-            
+
             self._running = True
+            self._engine.transportDispatcher.jobStarted(self._JOB_ID)
             self.started.emit()
-            
-            while self._running:
-                try:
-                    # パケット受信
-                    data, addr = self._socket.recvfrom(65535)
-                    print(f"[SNMPTrapReceiver] ★★★ パケット受信 ★★★")
-                    print(f"[SNMPTrapReceiver] 送信元: {addr[0]}:{addr[1]}")
-                    print(f"[SNMPTrapReceiver] データ長: {len(data)} bytes")
-                    
-                    # pysnmpでSNMPパケットを解析
-                    trap_data = self._parse_snmp_trap(data, addr)
-                    
-                    if trap_data:
-                        # シグナル発行
-                        self.trap_received.emit(trap_data)
-                        print(f"[SNMPTrapReceiver] シグナル発行完了")
-                    else:
-                        print(f"[SNMPTrapReceiver] パケット解析失敗")
-                
-                except socket.timeout:
-                    # タイムアウトは正常（継続）
-                    continue
-                except Exception as e:
-                    if self._running:
-                        print(f"[SNMPTrapReceiver] パケット処理エラー: {str(e)}")
-                        import traceback
-                        traceback.print_exc()
-            
+
+            self._engine.transportDispatcher.runDispatcher()
+
             print(f"[SNMPTrapReceiver] 正常終了")
             self.stopped.emit()
-        
+
         except Exception as e:
             print(f"[SNMPTrapReceiver] エラー: {str(e)}")
             import traceback
             traceback.print_exc()
             self.error_occurred.emit(f"Trap受信エラー: {str(e)}")
-        
+
         finally:
-            # クリーンアップ
-            if self._socket:
-                try:
-                    self._socket.close()
-                except:
-                    pass
-    
+            self._running = False
+            self._close_engine()
+
+    def _close_engine(self):
+        """エンジンとトランスポートを片付ける"""
+        if self._engine is not None:
+            try:
+                self._engine.transportDispatcher.closeDispatcher()
+            except Exception:
+                pass
+        self._engine = None
+        self._transport = None
+
     def stop(self):
-        """Trap受信を停止"""
+        """Trap受信を停止
+
+        jobFinished でディスパッチャのジョブを終わらせると runDispatcher() が
+        戻る。検知はディスパッチャのタイマ分解能（0.5秒）の周期。
+        """
         print(f"[SNMPTrapReceiver] 停止要求")
         self._running = False
-    
+        if self._engine is not None:
+            try:
+                self._engine.transportDispatcher.jobFinished(self._JOB_ID)
+            except Exception:
+                pass
+
     def _parse_snmp_trap(self, data: bytes, addr: tuple) -> Optional[dict]:
         """
         SNMPパケットを解析
@@ -619,13 +634,15 @@ class SNMPManager(QObject):
         """操作が実行中かどうか"""
         return self.worker is not None and self.worker.isRunning()
     
-    def start_trap_receiver(self, port: int = 162, communities: List[str] = None):
+    def start_trap_receiver(self, port: int = 162, communities: List[str] = None,
+                            v3_users: List[dict] = None):
         """
         SNMP Trap受信を開始
         
         Args:
             port: 受信ポート (デフォルト: 162)
             communities: 許可するコミュニティ名のリスト
+            v3_users: v3 ユーザの定義リスト（SNMPTrapReceiver の docstring 参照）
         """
         if self.trap_receiver and self.trap_receiver.isRunning():
             self.error_occurred.emit("既にTrap受信が実行中です")
@@ -638,7 +655,7 @@ class SNMPManager(QObject):
             print(f"[SNMP] ファイアウォール: {_msg}")
         except Exception as _e:
             print(f"[SNMP] ファイアウォール設定エラー: {_e}")
-        self.trap_receiver = SNMPTrapReceiver(port, communities)
+        self.trap_receiver = SNMPTrapReceiver(port, communities, v3_users)
         self.trap_receiver.trap_received.connect(self.trap_received.emit)
         self.trap_receiver.error_occurred.connect(self.error_occurred.emit)
         self.trap_receiver.started.connect(self.trap_receiver_started.emit)
