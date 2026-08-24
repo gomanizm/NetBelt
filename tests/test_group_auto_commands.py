@@ -262,6 +262,23 @@ class GroupEditWiringTest(unittest.TestCase):
         # 元のグループは残っている
         self.assertIsNotNone(w.config_manager.get_group("A"))
 
+    def test_unchanged_commands_are_not_reported_as_a_lost_change(self):
+        """値が変わっていなければ、保存に失敗しても失われる変更は無い。"""
+        from unittest import mock
+        from PyQt6.QtWidgets import QDialog
+        w = self._window()
+        w.config_manager.add_group("無変更", ["show clock"])
+        dlg = mock.Mock()
+        dlg.exec.return_value = QDialog.DialogCode.Accepted
+        dlg.get_group_name.return_value = "無変更"
+        dlg.get_auto_commands.return_value = ["show clock"]   # 変更なし
+        w.config_manager.save_config = mock.Mock(return_value=False)
+        patch_dialog = mock.patch("ui.main_window.GroupDialog", return_value=dlg)
+        patch_warn = mock.patch("ui.main_window.QMessageBox.warning")
+        with patch_dialog, patch_warn as warn:
+            w._on_edit_group("無変更")
+        self.assertNotIn("セッション", warn.call_args[0][2])
+
 
 if __name__ == "__main__":
     unittest.main()

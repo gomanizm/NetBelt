@@ -1012,7 +1012,10 @@ class MainWindow(QMainWindow):
         if not self.config_manager.set_group_auto_commands(new_group_name, new_auto_commands):
             # こちらも「対象が無い」場合と「保存失敗」の両方で False になる。
             group_now = self.config_manager.get_group(new_group_name)
-            applied = (group_now is not None
+            # 元から同じ値なら、保存に失敗しても失われる変更は無い。
+            # 「セッション中のみ有効」と案内しないよう、値が実際に変わったかも見る。
+            applied = (auto_commands != new_auto_commands
+                       and group_now is not None
                        and group_now.get("auto_commands") == new_auto_commands)
             self._warn_change_failed("自動実行コマンドの保存", applied)
             return
