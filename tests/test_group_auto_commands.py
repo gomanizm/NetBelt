@@ -64,5 +64,43 @@ class SetGroupAutoCommandsTest(unittest.TestCase):
         self.assertEqual(cm.get_group("新名")["auto_commands"], ["terminal monitor"])
 
 
+class GroupDialogAutoCommandsTest(unittest.TestCase):
+    """GroupDialog の自動実行コマンド入力欄。"""
+
+    @classmethod
+    def setUpClass(cls):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PyQt6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_existing_commands_are_shown_one_per_line(self):
+        from ui.dialogs.group_dialog import GroupDialog
+        dlg = GroupDialog(None, group_name="本番環境",
+                          auto_commands=["terminal monitor", "terminal length 0"])
+        self.assertEqual(dlg.auto_commands_edit.toPlainText(),
+                         "terminal monitor\nterminal length 0")
+
+    def test_getter_strips_and_drops_blank_lines(self):
+        from ui.dialogs.group_dialog import GroupDialog
+        dlg = GroupDialog(None)
+        dlg.auto_commands_edit.setPlainText("  show clock  \n\n\tshow version\n   \n")
+        self.assertEqual(dlg.get_auto_commands(), ["show clock", "show version"])
+
+    def test_empty_is_allowed(self):
+        """auto_commands は空が正常状態なので、空欄で OK を押せること。"""
+        from ui.dialogs.group_dialog import GroupDialog
+        dlg = GroupDialog(None)
+        dlg.name_edit.setText("空でも通る")
+        dlg.auto_commands_edit.setPlainText("")
+        dlg._on_ok()
+        self.assertEqual(dlg.result(), int(dlg.DialogCode.Accepted))
+        self.assertEqual(dlg.get_auto_commands(), [])
+
+    def test_omitting_auto_commands_defaults_to_empty(self):
+        from ui.dialogs.group_dialog import GroupDialog
+        dlg = GroupDialog(None, group_name="既存")
+        self.assertEqual(dlg.get_auto_commands(), [])
+
+
 if __name__ == "__main__":
     unittest.main()

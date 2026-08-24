@@ -1,31 +1,34 @@
 """グループ追加/編集ダイアログ"""
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QFormLayout,
-    QLineEdit, QPushButton, QHBoxLayout, QMessageBox
+    QLineEdit, QPushButton, QHBoxLayout, QMessageBox, QTextEdit, QLabel
 )
-from typing import Optional
+from typing import Optional, List
 
 class GroupDialog(QDialog):
     """グループ追加/編集ダイアログ"""
     
-    def __init__(self, parent=None, group_name: Optional[str] = None, existing_groups: list = None):
+    def __init__(self, parent=None, group_name: Optional[str] = None,
+                 existing_groups: list = None, auto_commands: List[str] = None):
         """
         初期化
-        
+
         Args:
             parent: 親ウィジェット
             group_name: 編集時のグループ名（新規追加時はNone）
             existing_groups: 既存のグループ名リスト（重複チェック用）
+            auto_commands: 編集時の自動実行コマンド（新規追加時はNone）
         """
         super().__init__(parent)
         self.group_name = group_name
         self.existing_groups = existing_groups or []
+        self.auto_commands = list(auto_commands or [])
         self.is_edit_mode = group_name is not None
-        
+
         self.setWindowTitle("グループ編集" if self.is_edit_mode else "グループ追加")
         self.setModal(True)
-        self.resize(400, 150)
-        
+        self.resize(500, 400)
+
         self._create_ui()
         self._load_data()
     
@@ -41,7 +44,26 @@ class GroupDialog(QDialog):
         form_layout.addRow("グループ名:", self.name_edit)
         
         layout.addLayout(form_layout)
-        
+
+        # 自動実行コマンド
+        layout.addWidget(QLabel("自動実行コマンド:"))
+        layout.addWidget(QLabel(
+            "1行に1コマンド。このグループの機器へ SSH / Telnet で接続した直後に、"
+            "上から順に送信されます。空欄でも構いません。"))
+
+        self.auto_commands_edit = QTextEdit()
+        self.auto_commands_edit.setPlaceholderText(
+            "terminal length 0\nterminal monitor")
+        layout.addWidget(self.auto_commands_edit)
+
+        # config.json の auto_commands は暗号化されない（暗号化されるのは機器の
+        # パスワードのみ）。秘密情報を書かせないよう明示する。
+        warning = QLabel(
+            "※ ここに書いた内容は config.json に平文で保存されます。"
+            "パスワードなどの秘密情報は書かないでください。")
+        warning.setWordWrap(True)
+        layout.addWidget(warning)
+
         # OK/キャンセルボタン
         button_layout = QHBoxLayout()
         button_layout.addStretch()
@@ -60,6 +82,7 @@ class GroupDialog(QDialog):
         """データを読み込み（編集モード時）"""
         if self.is_edit_mode and self.group_name:
             self.name_edit.setText(self.group_name)
+        self.auto_commands_edit.setPlainText("\n".join(self.auto_commands))
     
     def _on_ok(self):
         """OKボタン押下時の処理"""
@@ -94,3 +117,8 @@ class GroupDialog(QDialog):
     def get_group_name(self) -> str:
         """入力されたグループ名を取得"""
         return self.name_edit.text().strip()
+
+    def get_auto_commands(self) -> List[str]:
+        """入力された自動実行コマンドを取得（空行は除く。空リストもあり得る）"""
+        lines = self.auto_commands_edit.toPlainText().split("\n")
+        return [line.strip() for line in lines if line.strip()]
