@@ -32,6 +32,12 @@ V3_PRIV_PROTOCOL_NAMES = ("none", "DES", "3DES", "AES-128", "AES-192", "AES-256"
 # RFC 3414 が USM のパスワードに要求する最小長
 V3_PASSWORD_MIN_LENGTH = 8
 
+# pysnmp は v1 Trap を v1ToV2 変換に通すとき snmpTrapCommunity を合成し、
+# コミュニティ文字列そのものを varbind として足す。v1/v2c ではこれが
+# 唯一の認証情報で、CSV/JSON/TXT のエクスポートはチケットや報告書へ回る
+# ため、値は表示にもファイルにも載せない。
+SNMP_TRAP_COMMUNITY_OID = '1.3.6.1.6.3.18.1.4.0'
+
 
 def resolve_v3_protocols(auth_name: str, priv_name: str):
     """
@@ -465,6 +471,12 @@ class SNMPTrapReceiver(QThread):
             oid_str = oid.prettyPrint()
             value_str = val.prettyPrint()
             value_type = val.__class__.__name__
+
+            # 合成されたコミュニティは落とす（送信元アドレスを合成する
+            # snmpTrapAddress は障害解析に要るので残す。プロキシ経由だと
+            # 送信元 IP と agent-addr は別物になる）
+            if oid_str == SNMP_TRAP_COMMUNITY_OID:
+                continue
 
             if oid_str == '1.3.6.1.2.1.1.3.0':      # sysUpTime
                 trap_data['timestamp'] = value_str

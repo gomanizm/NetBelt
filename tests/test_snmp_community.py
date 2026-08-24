@@ -44,6 +44,21 @@ def trap_bytes(community):
     return encoder.encode(msg)
 
 
+def v1_trap_bytes(community):
+    """指定したコミュニティを持つ SNMPv1 Trap のバイト列を組み立てる。"""
+    from pyasn1.codec.ber import encoder
+    from pysnmp.proto import api
+
+    pMod = api.protoModules[api.protoVersion1]
+    pdu = pMod.TrapPDU()
+    pMod.apiTrapPDU.setDefaults(pdu)
+    msg = pMod.Message()
+    pMod.apiMessage.setDefaults(msg)
+    pMod.apiMessage.setCommunity(msg, community)
+    pMod.apiMessage.setPDU(msg, pdu)
+    return encoder.encode(msg)
+
+
 class SnmpCommunityFilterTest(unittest.TestCase):
     """許可コミュニティのフィルタが受信ループで実際に効くこと。"""
 
@@ -146,6 +161,51 @@ class SnmpCommunityFilterTest(unittest.TestCase):
                          "空リストが既定値へ落ちている")
         self.assertFalse(self._send_and_wait(port, "public", got, False),
                          "v1/v2c を受けない設定なのに public の Trap を受理した")
+
+    def test_a_v1_trap_does_not_expose_its_community(self):
+        """v1 Trap のコミュニティを画面にもエクスポートにも載せないこと。
+
+        pysnmp は v1 Trap を v2c へ変換する際に snmpTrapCommunity
+        （1.3.6.1.6.3.18.1.4.0）を合成し、コミュニティ文字列そのものを
+        varbind として足す。v1/v2c ではこれが唯一の認証情報であり、
+        varbinds はそのまま CSV / JSON / TXT へ書き出される。
+        """
+        from PyQt6.QtWidgets import QApplication
+        _m, port, got = self._start(["s3cret-community"])
+
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.sendto(v1_trap_bytes("s3cret-community"), ("127.0.0.1", port))
+        s.close()
+        deadline = time.time() + 3
+        while time.time() < deadline and not got:
+            QApplication.processEvents()
+            time.sleep(0.02)
+        self.assertTrue(got, "v1 Trap が届かない")
+
+        oids = [vb["oid"] for vb in got[-1]["varbinds"]]
+        values = [vb["value"] for vb in got[-1]["varbinds"]]
+        self.assertNotIn("1.3.6.1.6.3.18.1.4.0", oids,
+                         "snmpTrapCommunity が varbind に残っている")
+        self.assertNotIn("s3cret-community", values,
+                         "コミュニティ文字列が値として残っている")
+
+    def test_a_v1_trap_still_reports_the_agent_address(self):
+        """送信元アドレスは残す。プロキシ経由だと送信元 IP と別物になる。"""
+        from PyQt6.QtWidgets import QApplication
+        _m, port, got = self._start(["s3cret-community"])
+
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.sendto(v1_trap_bytes("s3cret-community"), ("127.0.0.1", port))
+        s.close()
+        deadline = time.time() + 3
+        while time.time() < deadline and not got:
+            QApplication.processEvents()
+            time.sleep(0.02)
+        self.assertTrue(got)
+
+        oids = [vb["oid"] for vb in got[-1]["varbinds"]]
+        self.assertIn("1.3.6.1.6.3.18.1.3.0", oids,
+                      "snmpTrapAddress まで落としている")
     def test_parsed_trap_keeps_source_and_varbinds(self):
         """受理した Trap の中身がこれまでどおり取り出せること。"""
         _m, port, got = self._start(["public"])
