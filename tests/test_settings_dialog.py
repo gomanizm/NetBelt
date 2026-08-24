@@ -122,5 +122,60 @@ class SettingsDialogTerminalTabTest(unittest.TestCase):
         self.assertNotEqual(dlg.result(), int(dlg.DialogCode.Accepted))
 
 
+class SettingsDialogUpdateTabTest(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PyQt6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    def _manager(self):
+        from core.config_manager import ConfigManager
+        d = tempfile.mkdtemp(prefix="netbelt-settingsupd-")
+        return ConfigManager(config_path=os.path.join(d, "config.json"))
+
+    def test_check_on_startup_is_restored_and_saved(self):
+        from ui.dialogs.settings_dialog import SettingsDialog
+        cm = self._manager()
+        cm.set_check_on_startup(False)
+        dlg = SettingsDialog(None, config_manager=cm)
+        self.assertFalse(dlg.check_on_startup_box.isChecked())
+
+        dlg.check_on_startup_box.setChecked(True)
+        dlg.save_settings()
+        self.assertTrue(cm.get_check_on_startup())
+
+    def test_skipped_version_is_shown_when_present(self):
+        from ui.dialogs.settings_dialog import SettingsDialog
+        cm = self._manager()
+        cm.set_skipped_version("1.2.3")
+        dlg = SettingsDialog(None, config_manager=cm)
+        self.assertTrue(dlg.clear_skip_button.isVisible() or dlg.clear_skip_button.isEnabled())
+        self.assertIn("1.2.3", dlg.skipped_version_label.text())
+
+    def test_skip_can_be_cleared(self):
+        from ui.dialogs.settings_dialog import SettingsDialog
+        cm = self._manager()
+        cm.set_skipped_version("1.2.3")
+        dlg = SettingsDialog(None, config_manager=cm)
+        dlg._on_clear_skip()
+        dlg.save_settings()
+        self.assertIsNone(cm.get_skipped_version())
+
+    def test_no_skip_shows_a_placeholder(self):
+        from ui.dialogs.settings_dialog import SettingsDialog
+        cm = self._manager()
+        dlg = SettingsDialog(None, config_manager=cm)
+        self.assertFalse(dlg.clear_skip_button.isEnabled())
+        self.assertIn("ありません", dlg.skipped_version_label.text())
+
+    def test_github_token_is_not_exposed(self):
+        """平文で残るのでダイアログには出さない。"""
+        from ui.dialogs.settings_dialog import SettingsDialog
+        dlg = SettingsDialog(None, config_manager=self._manager())
+        self.assertFalse(hasattr(dlg, "github_token_edit"))
+
+
 if __name__ == "__main__":
     unittest.main()

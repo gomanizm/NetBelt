@@ -6,7 +6,7 @@ config.json の settings 配下のうち、これまで GUI から編集でき�
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QTabWidget, QWidget,
     QPushButton, QSpinBox, QFontComboBox, QColorDialog, QLabel, QTextEdit,
-    QMessageBox
+    QMessageBox, QCheckBox
 )
 from PyQt6.QtGui import QColor, QFont
 
@@ -41,6 +41,7 @@ class SettingsDialog(QDialog):
 
         self.tabs = QTabWidget()
         self.tabs.addTab(self._create_terminal_tab(), "ターミナル")
+        self.tabs.addTab(self._create_update_tab(), "更新")
         layout.addWidget(self.tabs)
 
         button_layout = QHBoxLayout()
@@ -128,6 +129,48 @@ class SettingsDialog(QDialog):
         self.preview.setStyleSheet(
             f"background-color: {self._background_color}; color: {self._text_color};")
 
+    def _create_update_tab(self) -> QWidget:
+        """更新タブを作る"""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        self.check_on_startup_box = QCheckBox("起動時に更新を確認する")
+        layout.addWidget(self.check_on_startup_box)
+
+        layout.addWidget(QLabel("スキップ中のバージョン:"))
+        skip_layout = QHBoxLayout()
+        self.skipped_version_label = QLabel()
+        skip_layout.addWidget(self.skipped_version_label)
+        skip_layout.addStretch()
+        self.clear_skip_button = QPushButton("スキップを解除")
+        self.clear_skip_button.clicked.connect(self._on_clear_skip)
+        skip_layout.addWidget(self.clear_skip_button)
+        layout.addLayout(skip_layout)
+
+        # GitHub のトークンはここに出さない。config.json には平文で残るうえ、
+        # 環境変数 GITHUB_TOKEN が優先される仕組みがあるため。
+        layout.addStretch()
+        return widget
+
+    def _on_clear_skip(self):
+        """スキップ中のバージョンを解除する（保存は save_settings で行う）"""
+        self._skip_cleared = True
+        self._update_skip_display(None)
+
+    def _update_skip_display(self, version):
+        """
+        スキップ表示を更新する
+
+        Args:
+            version: スキップ中のバージョン文字列。無ければ None
+        """
+        if version:
+            self.skipped_version_label.setText(f"v{version}")
+            self.clear_skip_button.setEnabled(True)
+        else:
+            self.skipped_version_label.setText("ありません")
+            self.clear_skip_button.setEnabled(False)
+
     def _load_data(self):
         """config から現在値を読み込む"""
         raw = self.config_manager.get_server_settings("terminal") if self.config_manager else {}
@@ -144,6 +187,13 @@ class SettingsDialog(QDialog):
         self._update_color_buttons()
         self._update_preview()
 
+        self._skip_cleared = False
+        if self.config_manager:
+            self.check_on_startup_box.setChecked(self.config_manager.get_check_on_startup())
+            self._update_skip_display(self.config_manager.get_skipped_version())
+        else:
+            self._update_skip_display(None)
+
     def save_settings(self) -> bool:
         """
         入力内容を config へ保存する
@@ -157,12 +207,18 @@ class SettingsDialog(QDialog):
         if not self.config_manager:
             return False
 
-        return self.config_manager.set_server_settings("terminal", {
+        saved = self.config_manager.set_server_settings("terminal", {
             "background_color": self._background_color,
             "text_color": self._text_color,
             "font_family": self.font_combo.currentFont().family(),
             "font_size": self.font_size_spin.value(),
         })
+
+        self.config_manager.set_check_on_startup(self.check_on_startup_box.isChecked())
+        if self._skip_cleared:
+            self.config_manager.set_skipped_version(None)
+
+        return saved
 
     def _on_ok(self):
         """OKボタン押下時の処理"""
