@@ -110,6 +110,63 @@ class SftpClientSettingsTest(unittest.TestCase):
         self.assertTrue(panel._get_sftp_setting("confirm_delete", True))
         self.assertFalse(panel._get_sftp_setting("show_hidden_files", False))
 
+    def test_hidden_files_are_still_protected_from_overwrite(self):
+        """表示していないだけで上書き保護が外れてはいけない。"""
+        from PyQt6.QtWidgets import QMessageBox
+        panel, _ = self._panel()   # 隠しファイルは非表示（既定）
+        panel._update_file_list([self._entry("visible.txt"), self._entry(".hidden.cfg")])
+        self.assertEqual(panel.model.rowCount(), 1, "隠しファイルは表示されない")
+
+        with mock.patch("ui.sftp_panel.QMessageBox.question",
+                        return_value=QMessageBox.StandardButton.No) as question:
+            panel._upload_with_confirmation("C:/tmp/.hidden.cfg")
+        question.assert_called_once()
+        panel.sftp_manager.upload_file.assert_not_called()
+
+    def test_same_name_directory_is_not_called_an_overwrite(self):
+        """同名がディレクトリなら上書きにはならない（upload は失敗する）。"""
+        panel, _ = self._panel()
+        panel._update_file_list([self._entry("conf", is_dir=True)])
+        with mock.patch("ui.sftp_panel.QMessageBox.question") as question:
+            panel._upload_with_confirmation("C:/tmp/conf")
+        question.assert_not_called()
+
+    def test_second_upload_of_the_same_name_in_one_drop_is_confirmed(self):
+        """一覧の取り直しが間に合わない間も確認すること。"""
+        from PyQt6.QtWidgets import QMessageBox
+        panel, _ = self._panel()
+        panel._update_file_list([])
+        with mock.patch("ui.sftp_panel.QMessageBox.question") as question:
+            panel._upload_with_confirmation("C:/tmp/a/same.cfg")
+        question.assert_not_called()
+
+        with mock.patch("ui.sftp_panel.QMessageBox.question",
+                        return_value=QMessageBox.StandardButton.No) as question:
+            panel._upload_with_confirmation("C:/tmp/b/same.cfg")
+        question.assert_called_once()
+
+    def test_clear_drops_the_listing_cache(self):
+        """再接続直後に古い名前で判定しないこと。"""
+        panel, _ = self._panel()
+        panel._update_file_list([self._entry("残骸.cfg")])
+        panel.clear()
+        self.assertEqual(panel._current_entries, {})
+
+    def test_drop_goes_through_the_overwrite_confirmation(self):
+        """ドラッグ&ドロップ経路もボタンと同じ確認を通ること。"""
+        panel, _ = self._panel()
+        panel._update_file_list([self._entry("既存.cfg")])
+
+        event = mock.Mock()
+        url = mock.Mock()
+        url.toLocalFile.return_value = "C:/tmp/既存.cfg"
+        event.mimeData.return_value.urls.return_value = [url]
+
+        with mock.patch("ui.sftp_panel.os.path.isfile", return_value=True), \
+             mock.patch.object(panel, "_upload_with_confirmation") as upload:
+            panel.dropEvent(event)
+        upload.assert_called_once_with("C:/tmp/既存.cfg")
+
 
 if __name__ == "__main__":
     unittest.main()

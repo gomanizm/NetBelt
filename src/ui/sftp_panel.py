@@ -37,8 +37,10 @@ class SFTPPanel(QWidget):
         self.config_manager = config_manager
         self.sftp_manager: Optional[SFTPManager] = None
         self.current_device = ""
-        # 表示中のディレクトリにあるファイル名。上書き確認の判定に使う
-        self._current_file_names = set()
+        # リモートの現在のディレクトリにある名前 -> ディレクトリか否か。
+        # 上書き確認の判定に使う。表示フィルタとは別に持つ（隠しファイルを
+        # 非表示にしているだけで上書き保護が外れてはいけない）
+        self._current_entries = {}
         
         # UI初期化
         self._init_ui()
@@ -189,6 +191,8 @@ class SFTPPanel(QWidget):
         self.progress_bar.setVisible(False)
         self.sftp_manager = None
         self.current_device = ""
+        # 残しておくと、次の接続で一覧を取る前に古い名前で上書き判定してしまう
+        self._current_entries = {}
     
     def _update_file_list(self, file_list: list):
         """
@@ -197,14 +201,16 @@ class SFTPPanel(QWidget):
         Args:
             file_list: ファイル情報のリスト
         """
+        # 上書き確認は「リモートに何があるか」の話なので、表示フィルタを
+        # かける前の一覧から作る。隠しファイルを非表示にしているだけで
+        # ドットファイルが無警告で上書きされてはいけない
+        self._current_entries = {f['name']: bool(f['is_dir']) for f in file_list}
+        
         # 隠しファイルの扱い（settings.sftp.show_hidden_files）
         show_hidden = self._get_sftp_setting(
             "show_hidden_files", self.SFTP_SETTING_DEFAULTS["show_hidden_files"])
         if not show_hidden:
             file_list = [f for f in file_list if not f['name'].startswith('.')]
-        
-        # 上書き確認に使うため、表示中の名前を保持する
-        self._current_file_names = {f['name'] for f in file_list}
         
         # モデルをクリア
         self.model.removeRows(0, self.model.rowCount())
@@ -404,7 +410,10 @@ class SFTPPanel(QWidget):
         name = os.path.basename(file_path)
         confirm = self._get_sftp_setting(
             "confirm_overwrite", self.SFTP_SETTING_DEFAULTS["confirm_overwrite"])
-        if confirm and name in self._current_file_names:
+        # 同名でもディレクトリなら上書きではなく単に失敗するので、
+        # 「上書きしますか」とは聞かない
+        overwrites_file = self._current_entries.get(name) is False
+        if confirm and overwrites_file:
             reply = QMessageBox.question(
                 self,
                 "上書き確認",
@@ -415,6 +424,10 @@ class SFTPPanel(QWidget):
             if reply != QMessageBox.StandardButton.Yes:
                 return
         
+        # アップロード完了後に sftp_manager が一覧を取り直すが、1回のドロップで
+        # 複数送る間は間に合わない。送った名前をその場で載せて、同じドロップ内の
+        # 同名2件目以降にも確認が出るようにする
+        self._current_entries[name] = False
         self.sftp_manager.upload_file(file_path)
     
     def _on_download(self):
