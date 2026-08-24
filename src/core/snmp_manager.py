@@ -334,6 +334,37 @@ class SNMPTrapReceiver(QThread):
         # 未登録のコミュニティは pysnmp 側で弾かれる（大文字小文字は区別される）。
         for index, community in enumerate(self.communities):
             config.addV1System(self._engine, f"netbelt-v2c-{index}", community)
+        # v3: USM ユーザ行のキーは (securityEngineId, securityName) の組なので、
+        # engineID ごとに登録が要る。Trap では送信側の機器が authoritative engine
+        # になるため、受信側は送信元の engineID を事前に知っている必要がある。
+        # securityEngineId を省略した登録や「五つのゼロ」のワイルドカードでは
+        # 受信できないことを実測で確認済み。
+        from pysnmp.proto.rfc1902 import OctetString
+
+        for user in self.v3_users:
+            username = user.get("username", "").strip()
+            if not username:
+                continue
+
+            auth_proto, priv_proto = resolve_v3_protocols(
+                user.get("auth_protocol", "none"), user.get("priv_protocol", "none"))
+            auth_key = user.get("auth_password") or None
+            priv_key = user.get("priv_password") or None
+
+            # securityEngineId 無しでも1回登録する（送信用・将来の INFORM 用）。
+            # 公式サンプル multiple-usm-users.py と同じ構成。
+            security_engine_ids = [None]
+            for engine_id in user.get("engine_ids", []):
+                engine_id = engine_id.strip()
+                if engine_id:
+                    security_engine_ids.append(OctetString(hexValue=engine_id))
+
+            for security_engine_id in security_engine_ids:
+                config.addV3User(
+                    self._engine, username,
+                    auth_proto, auth_key,
+                    priv_proto, priv_key,
+                    securityEngineId=security_engine_id)
 
     def _register_observer(self):
         """受信メッセージのセキュリティ情報を拾う

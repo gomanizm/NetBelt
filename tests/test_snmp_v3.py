@@ -403,5 +403,133 @@ class SnmpPanelV3UiTest(unittest.TestCase):
         self.assertEqual(kwargs["community"], "netbelt-ro")
 
 
+class V3TrapReceiveTest(unittest.TestCase):
+    """v3 Trap を実際に送って受け取れること。"""
+
+    USER = "netbelt-v3"
+    AUTHKEY = "authpass12345"
+    PRIVKEY = "privpass12345"
+    SENDER_ENGINE_ID = "8000000001020304"
+
+    @classmethod
+    def setUpClass(cls):
+        import os
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PyQt6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    _managers = []
+
+    @classmethod
+    def tearDownClass(cls):
+        from PyQt6.QtWidgets import QApplication
+        for m in cls._managers:
+            m.stop_trap_receiver()
+        QApplication.processEvents()
+        cls._managers.clear()
+
+    def setUp(self):
+        from unittest import mock
+        fw = mock.patch("core.firewall.ensure_inbound_allow",
+                        return_value=(True, "test stub"))
+        fw.start()
+        self.addCleanup(fw.stop)
+
+    def _free_port(self):
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        return port
+
+    def _v3_user(self, engine_ids):
+        return {"username": self.USER, "auth_protocol": "SHA-256",
+                "auth_password": self.AUTHKEY, "priv_protocol": "AES-128",
+                "priv_password": self.PRIVKEY, "engine_ids": engine_ids}
+
+    def _start(self, engine_ids):
+        import time
+        from core.snmp_manager import SNMPManager
+        m = SNMPManager()
+        self._managers.append(m)
+        self.addCleanup(m.stop_trap_receiver)
+        port = self._free_port()
+        self.assertTrue(m.start_trap_receiver(port, ["public"],
+                                              [self._v3_user(engine_ids)]))
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if m.trap_receiver and m.trap_receiver.isRunning():
+                break
+            time.sleep(0.05)
+        got = []
+        m.trap_received.connect(got.append)
+        return m, port, got
+
+    def _send_v3_trap(self, port, auth_password):
+        from pysnmp.hlapi import (SnmpEngine, UsmUserData, UdpTransportTarget,
+                                  ContextData, NotificationType, ObjectIdentity,
+                                  sendNotification, usmHMAC192SHA256AuthProtocol,
+                                  usmAesCfb128Protocol)
+        from pysnmp.proto.rfc1902 import OctetString
+        sender = SnmpEngine(OctetString(hexValue=self.SENDER_ENGINE_ID))
+        next(sendNotification(
+            sender,
+            UsmUserData(self.USER, auth_password, self.PRIVKEY,
+                        authProtocol=usmHMAC192SHA256AuthProtocol,
+                        privProtocol=usmAesCfb128Protocol),
+            UdpTransportTarget(("127.0.0.1", port)), ContextData(), "trap",
+            NotificationType(ObjectIdentity("1.3.6.1.6.3.1.1.5.1"))))
+
+    def _wait(self, got, expect_more, before, timeout=4):
+        import time
+        from PyQt6.QtWidgets import QApplication
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            QApplication.processEvents()
+            if expect_more and len(got) > before:
+                return True
+            time.sleep(0.02)
+        QApplication.processEvents()
+        return len(got) > before
+
+    def test_v3_trap_is_received_when_the_engine_id_is_registered(self):
+        _m, port, got = self._start([self.SENDER_ENGINE_ID])
+        self._send_v3_trap(port, self.AUTHKEY)
+        self.assertTrue(self._wait(got, True, 0), "v3 Trap を受信できない")
+        self.assertTrue(got[-1]["varbinds"])
+
+    def test_v3_trap_reports_the_security_level(self):
+        _m, port, got = self._start([self.SENDER_ENGINE_ID])
+        self._send_v3_trap(port, self.AUTHKEY)
+        self.assertTrue(self._wait(got, True, 0))
+        trap = got[-1]
+        self.assertEqual(trap["security_name"], self.USER)
+        self.assertEqual(trap["security_level"], "3")   # authPriv
+        self.assertEqual(trap["security_model"], "3")   # USM
+
+    def test_v3_trap_with_a_wrong_password_is_dropped(self):
+        _m, port, got = self._start([self.SENDER_ENGINE_ID])
+        self._send_v3_trap(port, "wrongpassword1")
+        self.assertFalse(self._wait(got, False, 0, timeout=2),
+                         "認証に失敗した v3 Trap が受理された")
+
+    def test_v3_trap_from_an_unregistered_engine_id_is_dropped(self):
+        """engineID を登録していない送信元からは受けられない（実測で確定した仕様）。"""
+        _m, port, got = self._start(["80000000AABBCCDD"])
+        self._send_v3_trap(port, self.AUTHKEY)
+        self.assertFalse(self._wait(got, False, 0, timeout=2))
+
+    def test_v2c_still_works_alongside_v3(self):
+        """v1/v2c と v3 を同じポートで同時に受けられること。"""
+        import socket
+        from tests.test_snmp_community import trap_bytes
+        _m, port, got = self._start([self.SENDER_ENGINE_ID])
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.sendto(trap_bytes("public"), ("127.0.0.1", port))
+        s.close()
+        self.assertTrue(self._wait(got, True, 0))
+
+
 if __name__ == "__main__":
     unittest.main()
