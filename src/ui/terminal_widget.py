@@ -256,6 +256,12 @@ class TerminalWidget(QWidget):
         "font_size": 10,
     }
 
+    # フォントサイズの上下限（settings.terminal.font_size）。表示メニューの
+    # 拡大/縮小（MainWindow）と設定ダイアログの QSpinBox（Task 7）が同じ範囲を
+    # 使うため、数値の実体はここへ一本化する。
+    FONT_SIZE_MIN = 6
+    FONT_SIZE_MAX = 32
+
     # タブが閉じられたときのシグナル（機器名を送信）
     tab_closed = pyqtSignal(str)
     # マクロ実行要求シグナル（機器名、マクロ名）
@@ -351,9 +357,11 @@ class TerminalWidget(QWidget):
         if isinstance(family, str) and family.strip():
             merged["font_family"] = family.strip()
 
-        # bool は int の派生なので明示的に除く（True が 1pt になるのを防ぐ）
+        # bool は int の派生なので明示的に除く（True が 1pt になるのを防ぐ）。
+        # 手編集で極端な値（例: 1000）が入っても描画が壊れないよう上下限も見る。
         size = settings.get("font_size")
-        if isinstance(size, int) and not isinstance(size, bool) and size > 0:
+        if (isinstance(size, int) and not isinstance(size, bool)
+                and self.FONT_SIZE_MIN <= size <= self.FONT_SIZE_MAX):
             merged["font_size"] = size
 
         for key in ("background_color", "text_color"):

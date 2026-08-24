@@ -102,6 +102,18 @@ class TerminalSettingsTest(unittest.TestCase):
         self.assertEqual(home.font().family(), defaults["font_family"])
         self.assertEqual(home.font().pointSize(), defaults["font_size"])
 
+    def test_font_size_outside_the_allowed_range_falls_back_to_the_default(self):
+        """設定ダイアログや手編集で範囲外の font_size が来ても既定値へ戻ること。"""
+        from ui.terminal_widget import TerminalWidget
+        defaults = TerminalWidget.DEFAULT_TERMINAL_SETTINGS
+        for out_of_range in (1000, 3):
+            w = self._widget()
+            w.apply_terminal_settings({"font_size": out_of_range})
+            home = w.tab_widget.widget(0)
+            self.assertEqual(
+                home.font().pointSize(), defaults["font_size"],
+                f"font_size={out_of_range} は既定値へ戻るはず")
+
 
 if __name__ == "__main__":
     unittest.main()
