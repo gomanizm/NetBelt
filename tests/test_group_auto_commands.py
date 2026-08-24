@@ -221,6 +221,7 @@ class GroupEditWiringTest(unittest.TestCase):
             w._on_edit_group("元の名前")
         warn.assert_called_once()
         reload_tree.assert_called_once()
+        self.assertIn("セッション", warn.call_args[0][2])
 
     def test_tree_is_refreshed_when_saving_commands_fails(self):
         """改名なしでコマンド保存だけ失敗した場合も同じ。"""
@@ -239,6 +240,27 @@ class GroupEditWiringTest(unittest.TestCase):
             w._on_edit_group("保存失敗")
         warn.assert_called_once()
         reload_tree.assert_called_once()
+        self.assertIn("セッション", warn.call_args[0][2])
+
+    def test_duplicate_name_is_not_reported_as_a_save_failure(self):
+        """rename_group は重複名でも False。保存失敗と混同した案内をしないこと。"""
+        from unittest import mock
+        from PyQt6.QtWidgets import QDialog
+        w = self._window()
+        w.config_manager.add_group("A", [])
+        w.config_manager.add_group("B", [])
+        dlg = mock.Mock()
+        dlg.exec.return_value = QDialog.DialogCode.Accepted
+        dlg.get_group_name.return_value = "B"   # 既存名へ改名しようとする
+        dlg.get_auto_commands.return_value = []
+        with mock.patch("ui.main_window.GroupDialog", return_value=dlg), \
+             mock.patch("ui.main_window.QMessageBox.warning") as warn:
+            w._on_edit_group("A")
+        message = warn.call_args[0][2]
+        self.assertNotIn("セッション", message)
+        self.assertIn("失敗", message)
+        # 元のグループは残っている
+        self.assertIsNotNone(w.config_manager.get_group("A"))
 
 
 if __name__ == "__main__":

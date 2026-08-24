@@ -951,22 +951,29 @@ class MainWindow(QMainWindow):
             else:
                 QMessageBox.warning(self, "エラー", "グループの追加に失敗しました。")
 
-    def _warn_save_failed(self, what: str):
+    def _warn_change_failed(self, what: str, applied_in_memory: bool):
         """
-        設定の保存に失敗したことを知らせる
+        設定の変更に失敗したことを知らせる
 
         ConfigManager の各 mutator は save_config() の前に in-memory の設定を
-        書き換える。そのため保存に失敗しても実行中の状態は変更後になっており、
-        ツリーだけ古いまま残ると UI と挙動が食い違う。合わせ直してから知らせる。
+        書き換えるため、戻り値の False だけでは「保存だけ失敗した（実行中の
+        状態は変更済み）」と「そもそも変更が適用されなかった」を区別できない。
+        呼び出し側が事後状態を見て判定し、ここへ渡す。
+
+        どちらの場合もツリーを実行中の状態へ合わせ直してから知らせる。
 
         Args:
             what: 失敗した操作の名前（例: "グループ名の変更"）
+            applied_in_memory: 実行中の設定には変更が適用されているか
         """
         self._load_devices()
-        QMessageBox.warning(
-            self, "エラー",
-            f"{what}を設定ファイルへ保存できませんでした。\n"
-            "変更はこのセッション中のみ有効で、アプリを終了すると失われます。")
+        if applied_in_memory:
+            QMessageBox.warning(
+                self, "エラー",
+                f"{what}を設定ファイルへ保存できませんでした。\n"
+                "変更はこのセッション中のみ有効で、アプリを終了すると失われます。")
+        else:
+            QMessageBox.warning(self, "エラー", f"{what}に失敗しました。")
 
     def _on_edit_group(self, group_name: str):
         """
@@ -994,12 +1001,20 @@ class MainWindow(QMainWindow):
         # 「既に存在します」と判定されて False が返り、誤った警告が出るため。
         if new_group_name != group_name:
             if not self.config_manager.rename_group(group_name, new_group_name):
-                self._warn_save_failed("グループ名の変更")
+                # rename_group は「保存失敗」のほか「対象が無い」「新名が重複」でも
+                # False を返す。実行中の設定に改名が反映されているかで見分ける。
+                renamed = (self.config_manager.get_group(group_name) is None
+                           and self.config_manager.get_group(new_group_name) is not None)
+                self._warn_change_failed("グループ名の変更", renamed)
                 return
 
         # 自動実行コマンドは改名後の名前で保存する
         if not self.config_manager.set_group_auto_commands(new_group_name, new_auto_commands):
-            self._warn_save_failed("自動実行コマンドの保存")
+            # こちらも「対象が無い」場合と「保存失敗」の両方で False になる。
+            group_now = self.config_manager.get_group(new_group_name)
+            applied = (group_now is not None
+                       and group_now.get("auto_commands") == new_auto_commands)
+            self._warn_change_failed("自動実行コマンドの保存", applied)
             return
 
         self._load_devices()
