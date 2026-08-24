@@ -298,6 +298,87 @@ class SNMPTrapReceiver(QThread):
             self.error_occurred.emit(f"ポート {self.port} で待ち受けできません: {e}")
             return False
 
+    def _register_credentials(self):
+        """許可するコミュニティと v3 ユーザをエンジンへ登録する"""
+        # v1/v2c: コミュニティごとに securityName を分けて登録する。
+        # 未登録のコミュニティは pysnmp 側で弾かれる（大文字小文字は区別される）。
+        for index, community in enumerate(self.communities):
+            config.addV1System(self._engine, f"netbelt-v2c-{index}", community)
+
+    def _register_observer(self):
+        """受信メッセージのセキュリティ情報を拾う
+
+        ntfrcv のコールバックには securityName / securityLevel が渡らないため、
+        observer で別途拾う。両者は別呼び出しなので、Trap が近接すると
+        取り違えうる。表示用の参考情報としてのみ使うこと。
+        """
+        def _observe(snmp_engine, execpoint, variables, cb_ctx):
+            self._last_security = {
+                'security_name': str(variables.get('securityName', '')),
+                'security_level': str(variables.get('securityLevel', '')),
+                'security_model': str(variables.get('securityModel', '')),
+            }
+            address = variables.get('transportAddress')
+            self._last_security['source_ip'] = str(address[0]) if address else ''
+
+        self._engine.observer.registerObserver(
+            _observe, 'rfc3412.receiveMessage:request')
+
+    def _on_notification(self, snmp_engine, state_reference,
+                         context_engine_id, context_name, var_binds, cb_ctx):
+        """ntfrcv から呼ばれる通知コールバック
+
+        ntfrcv はコールバックのアリティを例外ベースで判定し、TypeError が出ると
+        「引数の数が違う」とみなして呼び直す。本体で TypeError を漏らすと
+        同じ通知が二度処理されるため、ここで握りつぶす。
+        """
+        try:
+            self.trap_received.emit(self._build_trap_data(var_binds))
+        except TypeError as e:
+            print(f"[SNMPTrapReceiver] 通知処理エラー: {e}")
+        except Exception as e:
+            print(f"[SNMPTrapReceiver] 通知処理エラー: {e}")
+
+    def _build_trap_data(self, var_binds) -> dict:
+        """
+        受信した VarBinds を trap_data の形へ整える
+
+        Args:
+            var_binds: (ObjectName, ObjectSyntax) のシーケンス
+
+        Returns:
+            trap_received で emit する dict
+        """
+        security = dict(self._last_security)
+        trap_data = {
+            'source_ip': security.pop('source_ip', ''),
+            'source_port': self.port,
+            'timestamp': None,
+            'trap_oid': None,
+            'varbinds': [],
+            'received_at': datetime.now().isoformat(),
+        }
+        # security_name / security_level / security_model を足す
+        trap_data.update(security)
+
+        for oid, val in var_binds:
+            oid_str = oid.prettyPrint()
+            value_str = val.prettyPrint()
+            value_type = val.__class__.__name__
+
+            if oid_str == '1.3.6.1.2.1.1.3.0':      # sysUpTime
+                trap_data['timestamp'] = value_str
+            elif oid_str == '1.3.6.1.6.3.1.1.4.1.0':  # snmpTrapOID
+                trap_data['trap_oid'] = value_str
+
+            trap_data['varbinds'].append({
+                'oid': oid_str,
+                'value': value_str,
+                'type': value_type,
+            })
+
+        return trap_data
+
     def run(self):
         """Trap受信スレッドのメイン処理"""
         try:
