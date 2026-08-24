@@ -1123,9 +1123,10 @@ class MainWindow(QMainWindow):
         Args:
             delta: 増減量（+1 / -1）
         """
-        settings = self.config_manager.get_server_settings("terminal")
-        default_size = self.terminal_widget.DEFAULT_TERMINAL_SETTINGS["font_size"]
-        current = settings.get("font_size", default_size)
+        # config の生値ではなく、いま適用されている正規化済みの値を基準にする。
+        # 生値は手編集で壊れていることがあり（"12" / null / true / 1000）、
+        # そのまま加算すると TypeError で落ちるか、表示と無関係な値へ飛ぶ。
+        current = self.terminal_widget.current_terminal_settings()["font_size"]
         new_size = max(self.FONT_SIZE_MIN, min(self.FONT_SIZE_MAX, current + delta))
         if new_size == current:
             self.status_bar.showMessage(
@@ -1134,9 +1135,13 @@ class MainWindow(QMainWindow):
 
         # settings 全体を置換する update_settings ではなく、浅いマージの
         # set_server_settings を使う（ui_layout など他のセクションを消さないため）
-        self.config_manager.set_server_settings("terminal", {"font_size": new_size})
+        saved = self.config_manager.set_server_settings("terminal", {"font_size": new_size})
         self._apply_terminal_settings_from_config()
-        self.status_bar.showMessage(f"フォントサイズ: {new_size}pt")
+        if saved:
+            self.status_bar.showMessage(f"フォントサイズ: {new_size}pt")
+        else:
+            self.status_bar.showMessage(
+                f"フォントサイズ: {new_size}pt（設定ファイルへ保存できませんでした）")
 
     def _on_font_size_increase(self):
         """フォントサイズを1pt大きくする"""

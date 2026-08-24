@@ -76,12 +76,16 @@ class MenuActionsTest(unittest.TestCase):
     def test_font_size_stops_at_the_limits(self):
         from ui.main_window import MainWindow
         w = self._window()
+        # 増減は「いま適用されている値」を基準にするので、config へ書いたあと
+        # 適用まで行って初めて「上限にいる」状態になる
         w.config_manager.set_server_settings("terminal", {"font_size": MainWindow.FONT_SIZE_MAX})
+        w._apply_terminal_settings_from_config()
         w._on_font_size_increase()
         self.assertEqual(
             w.config_manager.get_server_settings("terminal")["font_size"],
             MainWindow.FONT_SIZE_MAX)
         w.config_manager.set_server_settings("terminal", {"font_size": MainWindow.FONT_SIZE_MIN})
+        w._apply_terminal_settings_from_config()
         w._on_font_size_decrease()
         self.assertEqual(
             w.config_manager.get_server_settings("terminal")["font_size"],
@@ -134,6 +138,37 @@ class MenuActionsTest(unittest.TestCase):
                          QColor("#112233"))
         self.assertEqual(home.palette().color(QPalette.ColorRole.Text),
                          QColor("#445566"))
+
+    def test_font_size_survives_a_corrupted_config_value(self):
+        """メニューは config の生値ではなく実際に適用されている値を基準にすること。
+
+        生値をそのまま加算すると "12" や null で TypeError になり、
+        true や 1000 では表示と無関係な値へ飛ぶ。
+        """
+        from ui.terminal_widget import TerminalWidget
+        default_size = TerminalWidget.DEFAULT_TERMINAL_SETTINGS["font_size"]
+        for broken in ("12", None, True, 1000):
+            with self.subTest(font_size=broken):
+                w = self._window()
+                w.config_manager.set_server_settings("terminal", {"font_size": broken})
+                w._apply_terminal_settings_from_config()
+                w._on_font_size_increase()
+                self.assertEqual(
+                    w.config_manager.get_server_settings("terminal")["font_size"],
+                    default_size + 1)
+                self.assertEqual(
+                    w.terminal_widget.tab_widget.widget(0).font().pointSize(),
+                    default_size + 1)
+
+    def test_font_size_reports_a_failed_save(self):
+        """保存できなかったことを黙らないこと。"""
+        w = self._window()
+        w.config_manager.save_config = mock.Mock(return_value=False)
+        messages = []
+        w.status_bar.showMessage = lambda text, *a: messages.append(text)
+        w._on_font_size_increase()
+        self.assertEqual(len(messages), 1)
+        self.assertIn("保存できませんでした", messages[0])
 
 
 class PasteGuardTest(unittest.TestCase):

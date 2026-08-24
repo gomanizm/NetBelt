@@ -397,6 +397,18 @@ class TerminalWidget(QWidget):
             palette.setColor(QPalette.ColorRole.Text, text_color)
             terminal.setPalette(palette)
 
+    def current_terminal_settings(self) -> dict:
+        """
+        いま実際に適用されている外観設定を返す
+
+        config の生値ではなくこちらを基準にすること。生値は手編集で壊れている
+        可能性があり（文字列・null・bool・範囲外）、そのまま計算に使うと落ちる。
+
+        Returns:
+            正規化済みの設定のコピー
+        """
+        return dict(self._terminal_settings)
+
     def get_current_terminal(self) -> Optional[QTextEdit]:
         """現在表示中のタブのターミナルを返す（タブが無ければ None）"""
         return self.tab_widget.currentWidget()
