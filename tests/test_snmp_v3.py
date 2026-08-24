@@ -192,5 +192,109 @@ class PysnmpUnavailableTest(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("pysnmp", payload)
 
+class SnmpPanelV3UiTest(unittest.TestCase):
+    """GET/WALK の v3 認証 UI。"""
+
+    @classmethod
+    def setUpClass(cls):
+        import os
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PyQt6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    def _panel(self):
+        from unittest import mock
+        from ui.main_window import MainWindow
+        # 起動時の更新チェックは実際に GitHub API を叩くのでモックする
+        with mock.patch.object(MainWindow, "_check_for_updates_on_startup"):
+            return MainWindow().snmp_panel
+
+    def test_auth_tabs_include_a_v3_tab(self):
+        panel = self._panel()
+        titles = [panel.auth_tabs.tabText(i) for i in range(panel.auth_tabs.count())]
+        self.assertIn("v3認証", titles)
+
+    def test_protocol_choices_match_the_core_tables(self):
+        from core.snmp_manager import V3_AUTH_PROTOCOL_NAMES, V3_PRIV_PROTOCOL_NAMES
+        from ui.snmp_panel import SNMPPanel
+        self.assertEqual(
+            tuple(key for _label, key in SNMPPanel.AUTH_PROTOCOL_CHOICES),
+            V3_AUTH_PROTOCOL_NAMES)
+        self.assertEqual(
+            tuple(key for _label, key in SNMPPanel.PRIV_PROTOCOL_CHOICES),
+            V3_PRIV_PROTOCOL_NAMES)
+
+    def test_password_fields_are_masked(self):
+        from PyQt6.QtWidgets import QLineEdit
+        panel = self._panel()
+        self.assertEqual(panel.v3_auth_password_edit.echoMode(),
+                         QLineEdit.EchoMode.Password)
+        self.assertEqual(panel.v3_priv_password_edit.echoMode(),
+                         QLineEdit.EchoMode.Password)
+
+    def test_selecting_v3_switches_to_the_v3_tab(self):
+        panel = self._panel()
+        panel.version_combo.setCurrentText("v3")
+        self.assertEqual(panel.auth_tabs.tabText(panel.auth_tabs.currentIndex()),
+                         "v3認証")
+        panel.version_combo.setCurrentText("v2c")
+        self.assertEqual(panel.auth_tabs.tabText(panel.auth_tabs.currentIndex()),
+                         "v1/v2c認証")
+
+    def test_get_passes_v3_credentials(self):
+        from unittest import mock
+        panel = self._panel()
+        panel.snmp_manager = mock.Mock()
+        panel.host_edit.setText("192.0.2.10")
+        panel.oid_edit.setText("1.3.6.1.2.1.1.1.0")
+        panel.version_combo.setCurrentText("v3")
+        panel.v3_username_edit.setText("netbelt")
+        panel.v3_auth_combo.setCurrentIndex(
+            [k for _l, k in panel.AUTH_PROTOCOL_CHOICES].index("SHA-256"))
+        panel.v3_auth_password_edit.setText("authpass12345")
+        panel.v3_priv_combo.setCurrentIndex(
+            [k for _l, k in panel.PRIV_PROTOCOL_CHOICES].index("AES-128"))
+        panel.v3_priv_password_edit.setText("privpass12345")
+
+        panel._on_get_clicked()
+
+        kwargs = panel.snmp_manager.snmp_get.call_args.kwargs
+        self.assertEqual(kwargs["version"], "v3")
+        self.assertEqual(kwargs["username"], "netbelt")
+        self.assertEqual(kwargs["auth_protocol"], "SHA-256")
+        self.assertEqual(kwargs["auth_password"], "authpass12345")
+        self.assertEqual(kwargs["priv_protocol"], "AES-128")
+        self.assertEqual(kwargs["priv_password"], "privpass12345")
+
+    def test_walk_passes_v3_credentials(self):
+        from unittest import mock
+        panel = self._panel()
+        panel.snmp_manager = mock.Mock()
+        panel.host_edit.setText("192.0.2.10")
+        panel.oid_edit.setText("1.3.6.1.2.1.1")
+        panel.version_combo.setCurrentText("v3")
+        panel.v3_username_edit.setText("netbelt")
+
+        panel._on_walk_clicked()
+
+        kwargs = panel.snmp_manager.snmp_walk.call_args.kwargs
+        self.assertEqual(kwargs["version"], "v3")
+        self.assertEqual(kwargs["username"], "netbelt")
+
+    def test_v2c_still_passes_the_community(self):
+        from unittest import mock
+        panel = self._panel()
+        panel.snmp_manager = mock.Mock()
+        panel.host_edit.setText("192.0.2.10")
+        panel.oid_edit.setText("1.3.6.1.2.1.1.1.0")
+        panel.version_combo.setCurrentText("v2c")
+        panel.community_edit.setText("netbelt-ro")
+
+        panel._on_get_clicked()
+
+        kwargs = panel.snmp_manager.snmp_get.call_args.kwargs
+        self.assertEqual(kwargs["community"], "netbelt-ro")
+
+
 if __name__ == "__main__":
     unittest.main()
