@@ -247,6 +247,21 @@ class SettingsDialogSftpTabTest(unittest.TestCase):
         self.assertTrue(saved["show_hidden_files"])
         self.assertFalse(saved["confirm_delete"])
 
+
+    def test_confirm_overwrite_is_restored_and_saved(self):
+        """復元も保存もテストが無かったキー。両方向で確かめる。"""
+        from ui.dialogs.settings_dialog import SettingsDialog
+        for enabled in (True, False):
+            with self.subTest(confirm_overwrite=enabled):
+                cm = self._manager()
+                cm.set_server_settings("sftp", {"confirm_overwrite": enabled})
+                dlg = SettingsDialog(None, config_manager=cm)
+                self.assertEqual(dlg.confirm_overwrite_box.isChecked(), enabled)
+
+                dlg.confirm_overwrite_box.setChecked(not enabled)
+                dlg.save_settings()
+                self.assertEqual(
+                    cm.get_server_settings("sftp")["confirm_overwrite"], not enabled)
     def test_sftp_defaults_match_the_panel(self):
         from ui.dialogs.settings_dialog import SettingsDialog
         from ui.sftp_panel import SFTPPanel

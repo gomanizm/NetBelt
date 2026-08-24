@@ -171,8 +171,23 @@ class MenuActionsTest(unittest.TestCase):
         self.assertIn("保存できませんでした", messages[0])
 
     def test_every_menu_action_is_connected(self):
-        """スロット未接続のメニュー項目が残っていないこと。"""
+        """スロット未接続のメニュー項目が残っていないこと。
+
+        QMenu.addAction() で作った QAction は Qt 内部の接続を1つ持つので、
+        繋いでいなくても receivers() は 0 にならない。基準値をその場で
+        測ってから比べる（この基準値を前提にしないと何も検知できない）。
+        """
         w = self._window()
+        menus = [a.menu() for a in w.menuBar().actions() if a.menu() is not None]
+        self.assertTrue(menus, "メニューが1つも取れていない")
+
+        # 実際のメニューへ何も繋がない項目を足して基準値を測り、すぐ外す
+        probe = menus[0].addAction("__probe__")
+        baseline = probe.receivers(probe.triggered)
+        menus[0].removeAction(probe)
+        self.assertGreaterEqual(baseline, 1,
+                                "基準値の測り方が Qt の変更で変わっている")
+
         dead = []
         for menu_action in w.menuBar().actions():
             menu = menu_action.menu()
@@ -181,7 +196,7 @@ class MenuActionsTest(unittest.TestCase):
             for action in menu.actions():
                 if action.isSeparator():
                     continue
-                if not action.receivers(action.triggered):
+                if action.receivers(action.triggered) <= baseline:
                     dead.append(f"{menu_action.text()} > {action.text()}")
         self.assertEqual(dead, [], "スロット未接続のメニュー項目: %s" % dead)
 
