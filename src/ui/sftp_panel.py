@@ -41,6 +41,8 @@ class SFTPPanel(QWidget):
         # 上書き確認の判定に使う。表示フィルタとは別に持つ（隠しファイルを
         # 非表示にしているだけで上書き保護が外れてはいけない）
         self._current_entries = {}
+        # 送信を始めたがまだ一覧に現れていない名前。一覧が来たら捨てる
+        self._pending_upload_names = set()
         
         # UI初期化
         self._init_ui()
@@ -172,6 +174,9 @@ class SFTPPanel(QWidget):
                 pass
         
         self.sftp_manager = sftp_manager
+        # 接続先が変わるので、前の接続で観測した一覧は使えない
+        self._current_entries = {}
+        self._pending_upload_names = set()
         self.current_device = device_name
         
         # シグナル接続
@@ -193,6 +198,7 @@ class SFTPPanel(QWidget):
         self.current_device = ""
         # 残しておくと、次の接続で一覧を取る前に古い名前で上書き判定してしまう
         self._current_entries = {}
+        self._pending_upload_names = set()
     
     def _update_file_list(self, file_list: list):
         """
@@ -205,6 +211,8 @@ class SFTPPanel(QWidget):
         # かける前の一覧から作る。隠しファイルを非表示にしているだけで
         # ドットファイルが無警告で上書きされてはいけない
         self._current_entries = {f['name']: bool(f['is_dir']) for f in file_list}
+        # 新しい一覧が真実なので、送信中として覚えていた名前は捨てる
+        self._pending_upload_names.clear()
         
         # 隠しファイルの扱い（settings.sftp.show_hidden_files）
         show_hidden = self._get_sftp_setting(
@@ -411,8 +419,14 @@ class SFTPPanel(QWidget):
         confirm = self._get_sftp_setting(
             "confirm_overwrite", self.SFTP_SETTING_DEFAULTS["confirm_overwrite"])
         # 同名でもディレクトリなら上書きではなく単に失敗するので、
-        # 「上書きしますか」とは聞かない
-        overwrites_file = self._current_entries.get(name) is False
+        # 「上書きしますか」とは聞かない。観測済みの種別が最優先で、
+        # まだ一覧に現れていない送信中の名前も既存ファイルとして扱う
+        known_is_dir = self._current_entries.get(name)
+        if known_is_dir is True:
+            overwrites_file = False
+        else:
+            overwrites_file = (known_is_dir is False
+                               or name in self._pending_upload_names)
         if confirm and overwrites_file:
             reply = QMessageBox.question(
                 self,
@@ -425,9 +439,10 @@ class SFTPPanel(QWidget):
                 return
         
         # アップロード完了後に sftp_manager が一覧を取り直すが、1回のドロップで
-        # 複数送る間は間に合わない。送った名前をその場で載せて、同じドロップ内の
-        # 同名2件目以降にも確認が出るようにする
-        self._current_entries[name] = False
+        # 複数送る間は間に合わない。送信中の名前を別に覚えておき、同じドロップ内の
+        # 同名2件目以降にも確認が出るようにする。_current_entries は
+        # 「最後に観測したリモートの一覧」のまま保つ（種別を汚さないため）
+        self._pending_upload_names.add(name)
         self.sftp_manager.upload_file(file_path)
     
     def _on_download(self):

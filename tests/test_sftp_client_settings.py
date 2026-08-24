@@ -151,6 +151,36 @@ class SftpClientSettingsTest(unittest.TestCase):
         panel._update_file_list([self._entry("残骸.cfg")])
         panel.clear()
         self.assertEqual(panel._current_entries, {})
+        self.assertEqual(panel._pending_upload_names, set())
+
+    def test_upload_does_not_change_the_observed_entry_kind(self):
+        """送信しても「最後に観測した一覧」を書き換えないこと。
+
+        同名ディレクトリへ送って失敗したあと、その名前が「ファイル」として
+        残ると、再試行で誤って上書き確認が出る。
+        """
+        panel, _ = self._panel()
+        panel._update_file_list([self._entry("conf", is_dir=True)])
+        with mock.patch("ui.sftp_panel.QMessageBox.question") as question:
+            panel._upload_with_confirmation("C:/tmp/conf")
+        question.assert_not_called()
+        self.assertIs(panel._current_entries["conf"], True,
+                      "観測した種別が送信で書き換わっている")
+
+        # 一覧が更新される前に再試行しても、まだディレクトリ扱いのまま
+        with mock.patch("ui.sftp_panel.QMessageBox.question") as question:
+            panel._upload_with_confirmation("C:/tmp/conf")
+        question.assert_not_called()
+
+    def test_a_fresh_listing_forgets_pending_uploads(self):
+        """一覧が来たらそれが真実。送信中として覚えていた名前は捨てる。"""
+        panel, _ = self._panel()
+        panel._update_file_list([])
+        panel._upload_with_confirmation("C:/tmp/new.cfg")
+        self.assertIn("new.cfg", panel._pending_upload_names)
+
+        panel._update_file_list([])   # 一覧を取り直した（まだ現れていない）
+        self.assertEqual(panel._pending_upload_names, set())
 
     def test_drop_goes_through_the_overwrite_confirmation(self):
         """ドラッグ&ドロップ経路もボタンと同じ確認を通ること。"""
