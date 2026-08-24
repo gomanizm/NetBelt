@@ -14,47 +14,42 @@ class ServerSettingsTest(unittest.TestCase):
         self.assertEqual(cm2.get_server_settings("tftp_server").get("port"), 69)
 
 
-class SaveRefusedWhenConfigIsBrokenTest(unittest.TestCase):
-    """読み込みに失敗した状態で保存しないこと。
+class BrokenConfigSelfHealsTest(unittest.TestCase):
+    """破損した config.json は「バックアップしてから作り直す」のが仕様。
 
-    破損扱いになった config.json をデフォルト設定で上書きすると、
-    機器リストが消えたように見える。終了時のレイアウト保存など
-    ユーザーが意識しない経路からも save_config() は呼ばれる。
+    起動時のエラーダイアログが「新しい設定を保存すると config.json が
+    再作成されます」と明示しているので、保存を拒否してはいけない。
+    拒否すると復旧手段が無いまま読み取り専用になる。
     """
 
     def _broken_config(self):
-        import os, tempfile
         d = tempfile.mkdtemp(prefix="netbelt-broken-")
         path = os.path.join(d, "config.json")
         with io.open(path, "w", encoding="utf-8") as f:
             f.write('{"groups": [ THIS IS NOT JSON')
         return path
 
-    def test_load_error_is_recorded(self):
-        from core.config_manager import ConfigManager
-        cm = ConfigManager(config_path=self._broken_config())
-        self.assertTrue(cm.load_error, "読み込み失敗が記録されていない")
-
-    def test_save_is_refused_and_the_file_is_untouched(self):
-        from core.config_manager import ConfigManager
+    def test_load_error_is_recorded_and_the_file_is_backed_up(self):
         path = self._broken_config()
-        before = io.open(path, encoding="utf-8").read()
-
         cm = ConfigManager(config_path=path)
-        self.assertFalse(cm.save_config(), "保存を断っていない")
-        self.assertFalse(cm.set_server_settings("terminal", {"font_size": 20}),
-                         "setter 経由の保存も断ること")
+        self.assertTrue(cm.load_error, "読み込み失敗が記録されていない")
+        self.assertTrue(cm.backup_path, "バックアップが作られていない")
+        self.assertTrue(os.path.exists(cm.backup_path))
+        self.assertIn("THIS IS NOT JSON",
+                      io.open(cm.backup_path, encoding="utf-8").read(),
+                      "バックアップに元の内容が残っていない")
 
-        self.assertEqual(io.open(path, encoding="utf-8").read(), before,
-                         "破損した設定ファイルが書き換えられている")
+    def test_saving_recreates_the_config(self):
+        """壊れたまま読み取り専用にせず、保存できること。"""
+        path = self._broken_config()
+        cm = ConfigManager(config_path=path)
+        self.assertTrue(cm.save_config(), "保存できないと復旧手段が無くなる")
+        self.assertTrue(cm.set_server_settings("terminal", {"font_size": 20}))
 
-    def test_a_healthy_config_still_saves(self):
-        import os, tempfile
-        from core.config_manager import ConfigManager
-        d = tempfile.mkdtemp(prefix="netbelt-ok-")
-        cm = ConfigManager(config_path=os.path.join(d, "config.json"))
-        self.assertFalse(cm.load_error)
-        self.assertTrue(cm.save_config())
+        reloaded = ConfigManager(config_path=path)
+        self.assertIsNone(reloaded.load_error, "作り直した設定が読めない")
+        self.assertEqual(reloaded.get_server_settings("terminal")["font_size"], 20)
+
 
 if __name__ == "__main__":
     unittest.main()
