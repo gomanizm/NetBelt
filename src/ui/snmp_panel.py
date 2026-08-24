@@ -5,7 +5,7 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTableView, QHeaderView,
     QPushButton, QLineEdit, QLabel, QComboBox, QGroupBox,
     QGridLayout, QMenu, QFileDialog, QMessageBox,
-    QTabWidget, QSpinBox, QTreeView, QProgressDialog
+    QTabWidget, QSpinBox, QTreeView, QProgressDialog, QTextEdit
 )
 from PyQt6.QtCore import Qt, QAbstractTableModel, QModelIndex, QThread, pyqtSignal
 from PyQt6.QtGui import QAction, QStandardItemModel, QStandardItem
@@ -282,9 +282,52 @@ class SNMPPanel(QWidget):
         self.trap_port_spinbox.setRange(1, 65535)
         self.trap_port_spinbox.setValue(162)
         trap_layout.addWidget(self.trap_port_spinbox, 0, 1)
-        trap_layout.addWidget(QLabel("Community:"), 1, 0)
+        trap_layout.addWidget(QLabel("バージョン:"), 1, 0)
+        self.trap_version_combo = QComboBox()
+        self.trap_version_combo.addItems(["両方", "v1/v2c", "v3"])
+        trap_layout.addWidget(self.trap_version_combo, 1, 1)
+
+        trap_layout.addWidget(QLabel("Community:"), 2, 0)
         self.trap_community_edit = QLineEdit("public")
-        trap_layout.addWidget(self.trap_community_edit, 1, 1)
+        trap_layout.addWidget(self.trap_community_edit, 2, 1)
+
+        trap_layout.addWidget(QLabel("v3 ユーザ名:"), 3, 0)
+        self.trap_v3_username_edit = QLineEdit()
+        trap_layout.addWidget(self.trap_v3_username_edit, 3, 1)
+
+        trap_layout.addWidget(QLabel("v3 認証方式:"), 4, 0)
+        self.trap_v3_auth_combo = QComboBox()
+        for label, key in self.AUTH_PROTOCOL_CHOICES:
+            self.trap_v3_auth_combo.addItem(label, key)
+        trap_layout.addWidget(self.trap_v3_auth_combo, 4, 1)
+
+        trap_layout.addWidget(QLabel("v3 認証パスワード:"), 4, 2)
+        self.trap_v3_auth_password_edit = QLineEdit()
+        self.trap_v3_auth_password_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        trap_layout.addWidget(self.trap_v3_auth_password_edit, 4, 3)
+
+        trap_layout.addWidget(QLabel("v3 暗号方式:"), 5, 0)
+        self.trap_v3_priv_combo = QComboBox()
+        for label, key in self.PRIV_PROTOCOL_CHOICES:
+            self.trap_v3_priv_combo.addItem(label, key)
+        trap_layout.addWidget(self.trap_v3_priv_combo, 5, 1)
+
+        trap_layout.addWidget(QLabel("v3 暗号パスワード:"), 5, 2)
+        self.trap_v3_priv_password_edit = QLineEdit()
+        self.trap_v3_priv_password_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        trap_layout.addWidget(self.trap_v3_priv_password_edit, 5, 3)
+
+        trap_layout.addWidget(QLabel("v3 EngineID:"), 6, 0)
+        self.trap_v3_engine_ids_edit = QTextEdit()
+        self.trap_v3_engine_ids_edit.setFixedHeight(60)
+        self.trap_v3_engine_ids_edit.setPlaceholderText("8000000001020304")
+        trap_layout.addWidget(self.trap_v3_engine_ids_edit, 6, 1, 1, 3)
+
+        trap_layout.addWidget(QLabel(
+            "v3 Trap は送信元機器の EngineID を登録しないと受信できません。"
+            "1行に1つ、16進で入力してください（Cisco IOS なら show snmp engineID）。"),
+            7, 0, 1, 4)
+
         trap_group.setLayout(trap_layout)
         layout.addWidget(trap_group)
         
@@ -398,6 +441,29 @@ class SNMPPanel(QWidget):
             'priv_protocol': self.v3_priv_combo.currentData(),
             'priv_password': self.v3_priv_password_edit.text(),
         }
+
+    def _collect_trap_v3_users(self) -> list:
+        """
+        Trap 受信用の v3 ユーザ定義を組み立てる
+
+        Returns:
+            ユーザ定義の dict のリスト（ユーザ名が空なら空リスト）
+        """
+        username = self.trap_v3_username_edit.text().strip()
+        if not username:
+            return []
+
+        lines = self.trap_v3_engine_ids_edit.toPlainText().split("\n")
+        engine_ids = [line.strip() for line in lines if line.strip()]
+
+        return [{
+            'username': username,
+            'auth_protocol': self.trap_v3_auth_combo.currentData(),
+            'auth_password': self.trap_v3_auth_password_edit.text(),
+            'priv_protocol': self.trap_v3_priv_combo.currentData(),
+            'priv_password': self.trap_v3_priv_password_edit.text(),
+            'engine_ids': engine_ids,
+        }]
 
     def _collect_request_params(self) -> dict:
         """
@@ -542,9 +608,13 @@ class SNMPPanel(QWidget):
         
         # Trap受信を開始
         port = self.trap_port_spinbox.value()
-        communities = [self.trap_community_edit.text()]
+        version = self.trap_version_combo.currentText()
+
+        communities = [] if version == "v3" else [self.trap_community_edit.text()]
+        v3_users = [] if version == "v1/v2c" else self._collect_trap_v3_users()
+
         # 起動できなければ表示を変えない（エラーは error_occurred で通知済み）
-        if not self.snmp_manager.start_trap_receiver(port, communities):
+        if not self.snmp_manager.start_trap_receiver(port, communities, v3_users):
             return
         self.trap_start_button.setVisible(False)
         self.trap_stop_button.setVisible(True)

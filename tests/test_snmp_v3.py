@@ -531,5 +531,86 @@ class V3TrapReceiveTest(unittest.TestCase):
         self.assertTrue(self._wait(got, True, 0))
 
 
+class TrapTabV3UiTest(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        import os
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PyQt6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    def _panel(self):
+        from ui.main_window import MainWindow
+        return MainWindow().snmp_panel
+
+    def test_trap_version_combo_defaults_to_both(self):
+        panel = self._panel()
+        self.assertEqual(
+            [panel.trap_version_combo.itemText(i)
+             for i in range(panel.trap_version_combo.count())],
+            ["両方", "v1/v2c", "v3"])
+        self.assertEqual(panel.trap_version_combo.currentText(), "両方")
+
+    def test_engine_ids_are_split_by_line(self):
+        panel = self._panel()
+        panel.trap_v3_username_edit.setText("netbelt-v3")
+        panel.trap_v3_engine_ids_edit.setPlainText(
+            "  8000000001020304 \n\n80000000AABBCCDD\n  \n")
+        users = panel._collect_trap_v3_users()
+        self.assertEqual(len(users), 1)
+        self.assertEqual(users[0]["engine_ids"],
+                         ["8000000001020304", "80000000AABBCCDD"])
+
+    def test_no_v3_user_without_a_username(self):
+        panel = self._panel()
+        panel.trap_v3_username_edit.setText("")
+        self.assertEqual(panel._collect_trap_v3_users(), [])
+
+    def test_v1v2c_only_sends_no_v3_users(self):
+        from unittest import mock
+        panel = self._panel()
+        panel.snmp_manager = mock.Mock()
+        panel.snmp_manager.start_trap_receiver.return_value = True
+        panel.mib_loading = False
+        panel.mib_loaded = True
+        panel.trap_version_combo.setCurrentText("v1/v2c")
+        panel.trap_v3_username_edit.setText("netbelt-v3")
+        panel._on_trap_start_clicked()
+        args = panel.snmp_manager.start_trap_receiver.call_args
+        self.assertEqual(args[0][2], [])
+
+    def test_v3_only_sends_no_communities(self):
+        from unittest import mock
+        panel = self._panel()
+        panel.snmp_manager = mock.Mock()
+        panel.snmp_manager.start_trap_receiver.return_value = True
+        panel.mib_loading = False
+        panel.mib_loaded = True
+        panel.trap_version_combo.setCurrentText("v3")
+        panel.trap_v3_username_edit.setText("netbelt-v3")
+        panel.trap_v3_engine_ids_edit.setPlainText("8000000001020304")
+        panel._on_trap_start_clicked()
+        args = panel.snmp_manager.start_trap_receiver.call_args
+        self.assertEqual(args[0][1], [])
+        self.assertEqual(len(args[0][2]), 1)
+
+    def test_both_sends_communities_and_v3_users(self):
+        from unittest import mock
+        panel = self._panel()
+        panel.snmp_manager = mock.Mock()
+        panel.snmp_manager.start_trap_receiver.return_value = True
+        panel.mib_loading = False
+        panel.mib_loaded = True
+        panel.trap_version_combo.setCurrentText("両方")
+        panel.trap_community_edit.setText("public")
+        panel.trap_v3_username_edit.setText("netbelt-v3")
+        panel.trap_v3_engine_ids_edit.setPlainText("8000000001020304")
+        panel._on_trap_start_clicked()
+        args = panel.snmp_manager.start_trap_receiver.call_args
+        self.assertEqual(args[0][1], ["public"])
+        self.assertEqual(len(args[0][2]), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
