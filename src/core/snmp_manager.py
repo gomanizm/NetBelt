@@ -5,7 +5,6 @@ GET/WALK/Trap受信をサポートし、SNMPv1/v2c/v3に対応
 """
 from PyQt6.QtCore import QObject, pyqtSignal, QThread
 from typing import List, Dict, Optional, Tuple
-import socket
 import threading
 from datetime import datetime
 from .sockets import set_exclusive_bind
@@ -24,6 +23,119 @@ try:
     from .mib_resolver import get_resolver
 except Exception:
     get_resolver = None
+
+
+# SNMPv3 (USM) で選べるプロトコルの名前。UI のコンボボックスと共有する。
+V3_AUTH_PROTOCOL_NAMES = ("none", "MD5", "SHA", "SHA-224", "SHA-256", "SHA-384", "SHA-512")
+V3_PRIV_PROTOCOL_NAMES = ("none", "DES", "3DES", "AES-128", "AES-192", "AES-256")
+
+# RFC 3414 が USM のパスワードに要求する最小長
+V3_PASSWORD_MIN_LENGTH = 8
+
+def _clean_communities(communities):
+    """コミュニティ一覧から空文字と重複を落とす（順序は保つ）
+
+    空文字を登録すると「コミュニティ無しの Trap を受け入れる」設定が
+    意図せず作れてしまう。重複はそのぶん余計な行を pysnmp へ登録する。
+    """
+    # 文字列をそのまま渡されると1文字ずつのコミュニティになる。
+    # 黙って通すと 'public' が p/u/b/l/i/c の6件として登録される。
+    if isinstance(communities, (str, bytes)):
+        raise TypeError("communities はコミュニティ名のリストです"
+                        "（文字列1つではありません）")
+
+    cleaned = []
+    for community in communities:
+        if not isinstance(community, str):
+            continue
+        community = community.strip()
+        if community and community not in cleaned:
+            cleaned.append(community)
+    return cleaned
+
+
+# pysnmp は v1 Trap を v1ToV2 変換に通すとき snmpTrapCommunity を合成し、
+# コミュニティ文字列そのものを varbind として足す。v1/v2c ではこれが
+# 唯一の認証情報で、CSV/JSON/TXT のエクスポートはチケットや報告書へ回る
+# ため、値は表示にもファイルにも載せない。
+SNMP_TRAP_COMMUNITY_OID = '1.3.6.1.6.3.18.1.4.0'
+
+
+def resolve_v3_protocols(auth_name: str, priv_name: str):
+    """
+    プロトコル名から pysnmp の USM 定数を引く
+
+    未知の名前を黙って「認証なし」に落とすと、認証失敗の原因が追えなくなる。
+    ここで例外にして表面化させる。
+
+    Args:
+        auth_name: V3_AUTH_PROTOCOL_NAMES のいずれか
+        priv_name: V3_PRIV_PROTOCOL_NAMES のいずれか
+
+    Returns:
+        (認証プロトコル定数, 暗号プロトコル定数) のタプル
+
+    Raises:
+        ValueError: 未知の名前、または認証なしで暗号化を指定した場合
+        RuntimeError: pysnmp が利用できない場合
+    """
+    if not _PYSNMP_AVAILABLE:
+        raise RuntimeError("SNMPライブラリ(pysnmp)を利用できません")
+
+    # SHA-2 系の定数名は「HMAC<出力ビット長>SHA<ダイジェスト長>」の順であり、
+    # SHA-256 は usmHMAC192SHA256AuthProtocol になる（usmHMACSHA256... ではない）。
+    auth_table = {
+        "none": usmNoAuthProtocol,
+        "MD5": usmHMACMD5AuthProtocol,
+        "SHA": usmHMACSHAAuthProtocol,
+        "SHA-224": usmHMAC128SHA224AuthProtocol,
+        "SHA-256": usmHMAC192SHA256AuthProtocol,
+        "SHA-384": usmHMAC256SHA384AuthProtocol,
+        "SHA-512": usmHMAC384SHA512AuthProtocol,
+    }
+    # AES-192/256 は Reeder 版（名前が短い方）を使う。pysnmp のソースが
+    # 「non-standard but used by many vendors」と書いている方で、Cisco 等の
+    # 実装と相互接続するのはこちら。Blumenthal 版は名前に Blumenthal が入る。
+    priv_table = {
+        "none": usmNoPrivProtocol,
+        "DES": usmDESPrivProtocol,
+        "3DES": usm3DESEDEPrivProtocol,
+        "AES-128": usmAesCfb128Protocol,
+        "AES-192": usmAesCfb192Protocol,
+        "AES-256": usmAesCfb256Protocol,
+    }
+
+    if auth_name not in auth_table:
+        raise ValueError(
+            f"未知の認証プロトコル: {auth_name}（選べるのは {', '.join(V3_AUTH_PROTOCOL_NAMES)}）")
+    if priv_name not in priv_table:
+        raise ValueError(
+            f"未知の暗号プロトコル: {priv_name}（選べるのは {', '.join(V3_PRIV_PROTOCOL_NAMES)}）")
+    if auth_name == "none" and priv_name != "none":
+        raise ValueError(
+            "認証なしでは暗号化を使えません（SNMPv3 では authNoPriv 以上が必要です）")
+
+    return auth_table[auth_name], priv_table[priv_name]
+
+
+def v3_password_error(auth_protocol: str, auth_password: str,
+                      priv_protocol: str, priv_password: str):
+    """
+    v3 のパスワード長を調べ、問題があれば説明を返す（無ければ None）
+
+    RFC 3414 は USM のパスワードに8文字以上を要求している。pysnmp も
+    これに従うが、短いときのエラーが利用者向けでない。空文字は鍵導出の
+    割り算で ZeroDivisionError、1〜7文字は WrongValueError になり、
+    どちらもパスワードが原因だと読み取れない。手前で止める。
+    """
+    for label, protocol, password in (("認証", auth_protocol, auth_password),
+                                      ("暗号", priv_protocol, priv_password)):
+        if not protocol or protocol == "none":
+            continue
+        if len(password or "") < V3_PASSWORD_MIN_LENGTH:
+            return (f"{label}パスワードは{V3_PASSWORD_MIN_LENGTH}文字以上にしてください"
+                    "（SNMPv3 の要件です）。")
+    return None
 
 
 class SNMPWorker(QThread):
@@ -163,36 +275,26 @@ class SNMPWorker(QThread):
             auth_password = self.params.get('auth_password', '')
             priv_protocol = self.params.get('priv_protocol', 'none')
             priv_password = self.params.get('priv_password', '')
-            
-            # 認証プロトコルの選択
-            if auth_protocol == 'MD5':
-                auth_proto = usmHMACMD5AuthProtocol
-            elif auth_protocol == 'SHA':
-                auth_proto = usmHMACSHAAuthProtocol
-            else:
-                auth_proto = usmNoAuthProtocol
-            
-            # 暗号化プロトコルの選択
-            if priv_protocol == 'DES':
-                priv_proto = usmDESPrivProtocol
-            elif priv_protocol == 'AES':
-                priv_proto = usmAesCfb128Protocol
-            else:
-                priv_proto = usmNoPrivProtocol
-            
-            # 認証データ作成
+
+            auth_proto, priv_proto = resolve_v3_protocols(auth_protocol, priv_protocol)
+            password_error = v3_password_error(auth_protocol, auth_password,
+                                               priv_protocol, priv_password)
+            if password_error:
+                raise ValueError(password_error)
+
+            # authProtocol / privProtocol は必ず明示的に渡す。pysnmp は
+            # authKey だけ渡すと既定で MD5、privKey だけなら既定で DES を選ぶため。
             if auth_protocol == 'none':
                 return UsmUserData(username)
-            elif priv_protocol == 'none':
+            if priv_protocol == 'none':
                 return UsmUserData(username, auth_password, authProtocol=auth_proto)
-            else:
-                return UsmUserData(
-                    username,
-                    auth_password,
-                    priv_password,
-                    authProtocol=auth_proto,
-                    privProtocol=priv_proto
-                )
+            return UsmUserData(
+                username,
+                auth_password,
+                priv_password,
+                authProtocol=auth_proto,
+                privProtocol=priv_proto
+            )
         
         else:
             raise Exception(f"サポートされていないSNMPバージョン: {version}")
@@ -201,193 +303,313 @@ class SNMPWorker(QThread):
 class SNMPTrapReceiver(QThread):
     """
     SNMP Trap受信スレッド
-    
-    Python標準のUDPソケットでパケットを受信し、pyasn1/pysnmpでデコードする実装
+
+    pysnmp のエンジン（SnmpEngine + ntfrcv + AsyncoreDispatcher）で受信する。
+    v3 は scopedPDU が暗号化され得るため、生ソケットで BER デコードする方式では
+    中身を取り出せない。USM の復号経路を持つエンジンに載せる必要がある。
     """
-    
+
     # シグナル定義
     trap_received = pyqtSignal(dict)  # Trap情報
     error_occurred = pyqtSignal(str)  # エラーメッセージ
     started = pyqtSignal()  # 開始通知
     stopped = pyqtSignal()  # 停止通知
-    
-    def __init__(self, port: int = 162, communities: List[str] = None):
+
+    # ディスパッチャを止めるときのジョブID（pysnmp の慣例で 1 を使う）
+    _JOB_ID = 1
+
+    def __init__(self, port: int = 162, communities: List[str] = None,
+                 v3_users: List[dict] = None):
+        """
+        Args:
+            port: 受信ポート
+            communities: 許可する v1/v2c コミュニティ名のリスト
+            v3_users: v3 ユーザの定義リスト。各要素は
+                {"username", "auth_protocol", "auth_password",
+                 "priv_protocol", "priv_password", "engine_ids"}
+        """
         super().__init__()
         self.port = port
-        self.communities = communities or ['public']
+        # None（未指定）と []（v1/v2c を受けない）は別物。or で書くと
+        # [] が既定値へ落ちるため、Trap のバージョンに v3 を選んで
+        # パネルが [] を渡しても public の v1/v2c Trap が通ってしまう。
+        self.communities = (['public'] if communities is None
+                            else _clean_communities(communities))
+        self.v3_users = list(v3_users or [])
         self._running = False
-        self._socket = None
-    
-    def _is_allowed_community(self, community: str) -> bool:
-        """受信した Trap のコミュニティが許可一覧に含まれるか。
-
-        SNMPv1/v2c のコミュニティは平文で流れるため強固な認証ではないが、
-        誤送信や別システムの Trap を弾く実用的な効果がある。
-        SNMP の仕様どおり大文字小文字は区別する。
-        """
-        return community in self.communities
+        self._engine = None
+        self._transport = None
+        # jobStarted と停止要求は別スレッドから触るのでロックで守る。
+        # 先に jobFinished を呼ぶと pysnmp 内部で KeyError になり、
+        # ジョブカウンタが不整合のまま runDispatcher() が戻らなくなる。
+        self._state_lock = threading.Lock()
+        self._job_started = False
+        self._stop_requested = False
+        # observer で拾った直近のセキュリティ情報（表示用の参考値）
+        self._last_security = {}
 
     def bind(self) -> bool:
-        """待ち受けソケットを用意する。
+        """待ち受けを用意する。
 
         呼び出し元スレッドで実行し、失敗を戻り値で返す。スレッドの中で
         バインドすると成否を呼び出し側へ返せず、ポートが使用中でも UI は
         「受信中」の表示のまま何も待ち受けない状態になる。
         """
+        if not _PYSNMP_AVAILABLE:
+            self.error_occurred.emit("SNMPライブラリ(pysnmp)を利用できません")
+            return False
+
+        # try の中で落とすと「ポート N で待ち受けできません」に化けて、
+        # ポート競合を探しに行かせてしまう。原因が分かる形で先に止める。
+        for user in self.v3_users:
+            password_error = v3_password_error(
+                user.get("auth_protocol", "none"), user.get("auth_password", ""),
+                user.get("priv_protocol", "none"), user.get("priv_password", ""))
+            if password_error:
+                self.error_occurred.emit(f"v3 ユーザの設定に問題があります: {password_error}")
+                return False
+
         try:
-            self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            set_exclusive_bind(self._socket)
-            self._socket.bind(('0.0.0.0', self.port))
-            self._socket.settimeout(1.0)  # 1秒タイムアウト
+            self._engine = engine.SnmpEngine()
+            self._transport = udp.UdpTransport()
+
+            # pysnmp は自前のソケットへ無条件に REUSEADDR 系のオプションを立てる。
+            # Windows ではそれだけだと他プロセスの待ち受けポートを奪えてしまうので、
+            # 排他バインドへ差し替える（set_exclusive_bind が REUSEADDR を戻す）。
+            set_exclusive_bind(self._transport.socket)
+            self._transport.openServerMode(('0.0.0.0', self.port))
+            config.addTransport(self._engine, udp.domainName, self._transport)
+
+            self._register_credentials()
+            self._register_observer()
+            ntfrcv.NotificationReceiver(self._engine, self._on_notification)
             return True
-        except OSError as e:
-            try:
-                if self._socket:
-                    self._socket.close()
-            except Exception:
-                pass
-            self._socket = None
+        except Exception as e:
+            self._close_engine()
             self.error_occurred.emit(f"ポート {self.port} で待ち受けできません: {e}")
             return False
+
+    def _register_credentials(self):
+        """許可するコミュニティと v3 ユーザをエンジンへ登録する"""
+        # v1/v2c: コミュニティごとに securityName を分けて登録する。
+        # 未登録のコミュニティは pysnmp 側で弾かれる（大文字小文字は区別される）。
+        for index, community in enumerate(self.communities):
+            config.addV1System(self._engine, f"netbelt-v2c-{index}", community)
+        # v3: USM ユーザ行のキーは (securityEngineId, securityName) の組なので、
+        # engineID ごとに登録が要る。Trap では送信側の機器が authoritative engine
+        # になるため、受信側は送信元の engineID を事前に知っている必要がある。
+        # securityEngineId を省略した登録や「五つのゼロ」のワイルドカードでは
+        # 受信できないことを実測で確認済み。
+        from pysnmp.proto.rfc1902 import OctetString
+
+        for user in self.v3_users:
+            username = user.get("username", "").strip()
+            if not username:
+                continue
+
+            auth_proto, priv_proto = resolve_v3_protocols(
+                user.get("auth_protocol", "none"), user.get("priv_protocol", "none"))
+            auth_key = user.get("auth_password") or None
+            priv_key = user.get("priv_password") or None
+
+            # securityEngineId 無しでも1回登録する（送信用・将来の INFORM 用）。
+            # 公式サンプル multiple-usm-users.py と同じ構成。
+            security_engine_ids = [None]
+            for engine_id in user.get("engine_ids", []):
+                # 設定が壊れていて文字列以外が来ても、受信そのものを
+                # 止めない（その要素だけ捨てる）
+                if not isinstance(engine_id, str) or not engine_id.strip():
+                    continue
+                security_engine_ids.append(
+                    OctetString(hexValue=engine_id.strip()))
+
+            for security_engine_id in security_engine_ids:
+                config.addV3User(
+                    self._engine, username,
+                    auth_proto, auth_key,
+                    priv_proto, priv_key,
+                    securityEngineId=security_engine_id)
+
+    def _register_observer(self):
+        """受信メッセージのセキュリティ情報を拾う
+
+        ntfrcv のコールバックには securityName / securityLevel が渡らない
+        ため、observer で別途拾う。pysnmp は observer を processPdu の
+        直前に発火して直後に消すので、同一スレッド・同一コールスタックの
+        あいだだけ有効な値になる（Trap が近接しても取り違えない）。
+
+        observer は pysnmp のディスパッチ経路の中で呼ばれ、ここで例外が
+        出ると runDispatcher() を抜けて受信が完全に止まる。旧実装は
+        受信ループの中で握っていたので1パケットで止まることは無かった。
+        _on_notification と同じ扱いに揃える。
+        """
+        def _observe(snmp_engine, execpoint, variables, cb_ctx):
+            # 先に空にする。失敗したときに前の Trap の値が残ると、
+            # 別の Trap のセキュリティ情報を今の Trap として表示してしまう。
+            self._last_security = {}
+            try:
+                self._capture_security(variables)
+            except Exception as e:
+                print(f"[SNMPTrapReceiver] セキュリティ情報を拾えません: {e}")
+
+        self._engine.observer.registerObserver(
+            _observe, 'rfc3412.receiveMessage:request')
+
+    def _capture_security(self, variables):
+        """observer から渡された変数を _last_security へ写す"""
+        self._last_security = {
+            'security_name': str(variables.get('securityName', '')),
+            'security_level': str(variables.get('securityLevel', '')),
+            'security_model': str(variables.get('securityModel', '')),
+        }
+        # 送信元のアドレスとポート。旧実装は recvfrom の addr をそのまま
+        # 使っていたので、エンジン化で意味が変わらないようここで拾う。
+        address = variables.get('transportAddress')
+        self._last_security['source_ip'] = str(address[0]) if address else ''
+        self._last_security['source_port'] = int(address[1]) if address else 0
+
+    def _on_notification(self, snmp_engine, state_reference,
+                         context_engine_id, context_name, var_binds, cb_ctx):
+        """ntfrcv から呼ばれる通知コールバック
+
+        ntfrcv はコールバックのアリティを例外ベースで判定し、TypeError が出ると
+        「引数の数が違う」とみなして呼び直す。本体で TypeError を漏らすと
+        同じ通知が二度処理されるため、ここで握りつぶす。
+        """
+        try:
+            self.trap_received.emit(self._build_trap_data(var_binds))
+        except TypeError as e:
+            print(f"[SNMPTrapReceiver] 通知処理エラー: {e}")
+        except Exception as e:
+            print(f"[SNMPTrapReceiver] 通知処理エラー: {e}")
+
+    def _build_trap_data(self, var_binds) -> dict:
+        """
+        受信した VarBinds を trap_data の形へ整える
+
+        Args:
+            var_binds: (ObjectName, ObjectSyntax) のシーケンス
+
+        Returns:
+            trap_received で emit する dict
+        """
+        security = dict(self._last_security)
+        trap_data = {
+            'source_ip': security.pop('source_ip', ''),
+            # 待ち受けポートではなく送信元のポート（旧実装と同じ意味）
+            'source_port': security.pop('source_port', 0),
+            'timestamp': None,
+            'trap_oid': None,
+            'varbinds': [],
+            'received_at': datetime.now().isoformat(),
+        }
+        # security_name / security_level / security_model を足す
+        trap_data.update(security)
+
+        for oid, val in var_binds:
+            oid_str = oid.prettyPrint()
+            value_str = val.prettyPrint()
+            value_type = val.__class__.__name__
+
+            # 合成されたコミュニティは落とす（送信元アドレスを合成する
+            # snmpTrapAddress は障害解析に要るので残す。プロキシ経由だと
+            # 送信元 IP と agent-addr は別物になる）
+            if oid_str == SNMP_TRAP_COMMUNITY_OID:
+                continue
+
+            if oid_str == '1.3.6.1.2.1.1.3.0':      # sysUpTime
+                trap_data['timestamp'] = value_str
+            elif oid_str == '1.3.6.1.6.3.1.1.4.1.0':  # snmpTrapOID
+                trap_data['trap_oid'] = value_str
+
+            trap_data['varbinds'].append({
+                'oid': oid_str,
+                'value': value_str,
+                'type': value_type,
+            })
+
+        return trap_data
 
     def run(self):
         """Trap受信スレッドのメイン処理"""
         try:
             print(f"[SNMPTrapReceiver] 開始: ポート{self.port}")
-            if self._socket is None and not self.bind():
+            if self._engine is None and not self.bind():
                 return
-            
-            print(f"[SNMPTrapReceiver] UDPソケット作成完了: 0.0.0.0:{self.port}")
-            # コミュニティ文字列は SNMPv1/v2c の合言葉であり実質的な認証情報。
-            # 凍結ビルドでは stdout が %LOCALAPPDATA% 配下のログへ恒久保存され、
-            # 不具合報告への添付などで流出するため、値そのものは出さない。
+
+            # コミュニティ文字列と v3 のパスワードは実質的な認証情報。
+            # 凍結ビルドでは stdout がログへ恒久保存されるため値は出さない。
             print(f"[SNMPTrapReceiver] 許可コミュニティ: {len(self.communities)}件")
+            print(f"[SNMPTrapReceiver] v3ユーザ: {len(self.v3_users)}件")
             print(f"[SNMPTrapReceiver] Trap受信待機中...")
-            
+
             self._running = True
+            with self._state_lock:
+                self._engine.transportDispatcher.jobStarted(self._JOB_ID)
+                self._job_started = True
+                # ここより前に来ていた停止要求は jobFinished を呼べていない
+                stop_before_start = self._stop_requested
             self.started.emit()
-            
-            while self._running:
-                try:
-                    # パケット受信
-                    data, addr = self._socket.recvfrom(65535)
-                    print(f"[SNMPTrapReceiver] ★★★ パケット受信 ★★★")
-                    print(f"[SNMPTrapReceiver] 送信元: {addr[0]}:{addr[1]}")
-                    print(f"[SNMPTrapReceiver] データ長: {len(data)} bytes")
-                    
-                    # pysnmpでSNMPパケットを解析
-                    trap_data = self._parse_snmp_trap(data, addr)
-                    
-                    if trap_data:
-                        # シグナル発行
-                        self.trap_received.emit(trap_data)
-                        print(f"[SNMPTrapReceiver] シグナル発行完了")
-                    else:
-                        print(f"[SNMPTrapReceiver] パケット解析失敗")
-                
-                except socket.timeout:
-                    # タイムアウトは正常（継続）
-                    continue
-                except Exception as e:
-                    if self._running:
-                        print(f"[SNMPTrapReceiver] パケット処理エラー: {str(e)}")
-                        import traceback
-                        traceback.print_exc()
-            
+
+            if stop_before_start:
+                self._engine.transportDispatcher.jobFinished(self._JOB_ID)
+
+            self._engine.transportDispatcher.runDispatcher()
+
             print(f"[SNMPTrapReceiver] 正常終了")
-            self.stopped.emit()
-        
+
         except Exception as e:
             print(f"[SNMPTrapReceiver] エラー: {str(e)}")
             import traceback
             traceback.print_exc()
             self.error_occurred.emit(f"Trap受信エラー: {str(e)}")
-        
+
         finally:
-            # クリーンアップ
-            if self._socket:
-                try:
-                    self._socket.close()
-                except:
-                    pass
-    
+            self._running = False
+            self._close_engine()
+            # 同じ受信機をもう一度 start() したとき、前回の停止要求が
+            # 残っていると jobStarted の直後に jobFinished して即終了する。
+            with self._state_lock:
+                self._job_started = False
+                self._stop_requested = False
+            # 例外で抜けたときも必ず知らせる。ここを成功経路だけに
+            # 置くと、受信が死んでも画面は「受信中」のまま残る。
+            self.stopped.emit()
+
+    def _close_engine(self):
+        """エンジンとトランスポートを片付ける"""
+        if self._engine is not None:
+            try:
+                self._engine.transportDispatcher.closeDispatcher()
+            except Exception:
+                pass
+        self._engine = None
+        self._transport = None
+
     def stop(self):
-        """Trap受信を停止"""
+        """Trap受信を停止
+
+        jobFinished でディスパッチャのジョブを終わらせると runDispatcher() が
+        戻る。検知はディスパッチャのタイマ分解能（0.5秒）の周期。
+
+        スレッドが jobStarted に到達する前に呼ばれた場合は、ここでは何もせず
+        run() 側に終わらせてもらう。先回りして jobFinished を呼ぶと
+        pysnmp 内部で KeyError になり、ジョブカウンタが合わなくなって
+        runDispatcher() が永久に戻らなくなる。
+        """
         print(f"[SNMPTrapReceiver] 停止要求")
         self._running = False
-    
-    def _parse_snmp_trap(self, data: bytes, addr: tuple) -> Optional[dict]:
-        """
-        SNMPパケットを解析
-        
-        pysnmpのデコーダーを使用して解析
-        """
-        try:
-            from pyasn1.codec.ber import decoder
-            from pysnmp.proto import api
-            
-            # SNMPバージョンを検出
-            msgVer = api.decodeMessageVersion(data)
-            if msgVer not in api.protoModules:
-                print(f"[SNMPTrapReceiver] 未サポートSNMPバージョン: {msgVer}")
-                return None
-            
-            pMod = api.protoModules[msgVer]
-            
-            # SNMPメッセージをデコード
-            reqMsg, _ = decoder.decode(data, asn1Spec=pMod.Message())
-            
-            # コミュニティ取得（v1/v2c）と照合
-            community = pMod.apiMessage.getCommunity(reqMsg)
-            if not self._is_allowed_community(community.prettyPrint()):
-                # 値そのものはログへ出さない（他システムの合言葉であり得るため）。
-                # 送信元だけ残しておけば「なぜ届かないか」の切り分けには足りる。
-                print(f"[SNMPTrapReceiver] 許可されていないコミュニティのため破棄: "
-                      f"from {addr[0]}")
-                return None
-            
-            # PDU取得
-            reqPDU = pMod.apiMessage.getPDU(reqMsg)
-            
-            # Trap情報を整形
-            trap_data = {
-                'source_ip': addr[0],
-                'source_port': addr[1],
-                'timestamp': None,
-                'trap_oid': None,
-                'varbinds': [],
-                'received_at': datetime.now().isoformat()
-            }
-            
-            # VarBinds解析
-            varBinds = pMod.apiPDU.getVarBinds(reqPDU)
-            for oid, val in varBinds:
-                oid_str = oid.prettyPrint()
-                value_str = val.prettyPrint()
-                value_type = val.__class__.__name__
-                
-                print(f"[SNMPTrapReceiver]   {oid_str} = {value_str} ({value_type})")
-                
-                # 特定OIDの処理
-                if oid_str == '1.3.6.1.2.1.1.3.0':  # sysUpTime
-                    trap_data['timestamp'] = value_str
-                elif oid_str == '1.3.6.1.6.3.1.1.4.1.0':  # snmpTrapOID
-                    trap_data['trap_oid'] = value_str
-                
-                trap_data['varbinds'].append({
-                    'oid': oid_str,
-                    'value': value_str,
-                    'type': value_type
-                })
-            
-            print(f"[SNMPTrapReceiver] Trap OID: {trap_data['trap_oid']}")
-            return trap_data
-        
-        except Exception as e:
-            print(f"[SNMPTrapReceiver] SNMP解析エラー: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            return None
+
+        with self._state_lock:
+            self._stop_requested = True
+            if not self._job_started:
+                return
+
+        if self._engine is not None:
+            try:
+                self._engine.transportDispatcher.jobFinished(self._JOB_ID)
+            except Exception:
+                pass
 
 
 class SNMPManager(QObject):
@@ -490,13 +712,15 @@ class SNMPManager(QObject):
         """操作が実行中かどうか"""
         return self.worker is not None and self.worker.isRunning()
     
-    def start_trap_receiver(self, port: int = 162, communities: List[str] = None):
+    def start_trap_receiver(self, port: int = 162, communities: List[str] = None,
+                            v3_users: List[dict] = None):
         """
         SNMP Trap受信を開始
         
         Args:
             port: 受信ポート (デフォルト: 162)
             communities: 許可するコミュニティ名のリスト
+            v3_users: v3 ユーザの定義リスト（SNMPTrapReceiver の docstring 参照）
         """
         if self.trap_receiver and self.trap_receiver.isRunning():
             self.error_occurred.emit("既にTrap受信が実行中です")
@@ -509,7 +733,7 @@ class SNMPManager(QObject):
             print(f"[SNMP] ファイアウォール: {_msg}")
         except Exception as _e:
             print(f"[SNMP] ファイアウォール設定エラー: {_e}")
-        self.trap_receiver = SNMPTrapReceiver(port, communities)
+        self.trap_receiver = SNMPTrapReceiver(port, communities, v3_users)
         self.trap_receiver.trap_received.connect(self.trap_received.emit)
         self.trap_receiver.error_occurred.connect(self.error_occurred.emit)
         self.trap_receiver.started.connect(self.trap_receiver_started.emit)
@@ -541,10 +765,29 @@ class SNMPManager(QObject):
             # （実行中の QThread を破棄するとプロセスごと落ちる）。
             print("[SNMPManager] 警告: Trap受信スレッドが5秒以内に終了しませんでした。"
                   "強制終了はせず、終了するまで参照を保持します")
-            self._retired_receivers.append(receiver)
+            self._retire(receiver)
 
         self.trap_receiver = None
         self.operation_started.emit("SNMP Trap受信停止")
+
+    def _retire(self, receiver):
+        """止まりきらなかった受信スレッドを、終わるまで手放さずに持つ
+
+        実行中の QThread を破棄するとプロセスごと落ちるため参照を残すが、
+        刈らないと単調に増え続け、終了時に実行中のスレッドを抱えたまま
+        プロセスが終わる。終わったら自分で外れるようにしておく。
+        """
+        self._retired_receivers.append(receiver)
+        receiver.finished.connect(lambda: self._forget(receiver))
+        # wait() が諦めた直後、connect を張る前に終わっていると
+        # finished を取り逃す。ここで見ておけばどちらの順でも外れる。
+        if receiver.isFinished():
+            self._forget(receiver)
+
+    def _forget(self, receiver):
+        """終わった受信スレッドを保持リストから外す"""
+        if receiver in self._retired_receivers:
+            self._retired_receivers.remove(receiver)
     
     def is_trap_receiver_running(self) -> bool:
         """Trap受信が実行中かどうか"""

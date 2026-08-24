@@ -26,12 +26,44 @@
 
 ### 受信サーバ / 転送
 - **Syslog 受信** — UDP / TCP、レベルフィルタ付き（既定 514）
-- **SNMP Trap 受信** — MIB による OID の名前解決、CSV エクスポート（既定 162/UDP）
-- **SNMP GET / WALK** — 任意の OID の取得と巡回、結果の CSV / JSON / テキスト出力
+- **SNMP Trap 受信** — v1 / v2c / v3（USM）に対応。MIB による OID の名前解決、CSV エクスポート（既定 162/UDP）
+- **SNMP GET / WALK** — v1 / v2c / v3（USM）に対応。任意の OID の取得と巡回、結果の CSV / JSON / テキスト出力
 - **TFTP サーバ** — ネットワーク機器の config / イメージ授受（既定 69/UDP）
 - **FTP サーバ** — 同上。匿名・認証の両対応（既定 21/TCP）
 - **SFTP サーバ / クライアント** — 双方向のファイル転送、転送履歴（既定 2222/TCP）
 - **ツールエリアのタブ化・切り離し** — 各サーバのパネルを別ウィンドウへ分離可能
+
+#### SNMPv3 について
+
+GET / WALK は認証に MD5 / SHA-1 / SHA-224 / SHA-256 / SHA-384 / SHA-512、
+暗号化に DES / 3DES / AES-128 / AES-192 / AES-256 が使えます
+（AES-192 / AES-256 はベンダー実装で広く使われている Reeder 方式です）。
+実際に使える方式は接続先機器の実装に依存します。
+SNMP パネルでバージョンに v3 を選ぶと「v3認証」タブが有効になり、
+v1/v2c 認証タブは無効になります。ユーザ名は必須で、認証なしでの暗号化は
+選べません（実行前に警告して止まります）。
+
+Trap 受信のバージョン選択は「両方」「v1/v2c」「v3」から選べ、既定は
+「両方」です。「両方」で v3 のユーザを設定すると、v1/v2c と v3 を同一
+ポートで同時に受信します。v3 のユーザを設定しなければ v1/v2c だけを
+受信します。
+
+**Trap を v3 で受信する場合は、送信元機器の EngineID の登録が必要です。**
+SNMPv3 の Trap では送信側が authoritative engine となるため、受信側が
+あらかじめ機器の EngineID を知っていないと復号・認証ができません。
+Cisco IOS なら `show snmp engineID` で確認できます。EngineID は偶数桁の
+16進で（例: `8000000001020304`）、複数台から受ける場合は1行に1つずつ
+入力してください。v3 のユーザ名を入力したまま EngineID を登録せずに
+受信を開始しようとすると、警告が出て止まります。v3 の受信を有効に
+するには、まずユーザ名を設定し、その上で EngineID を登録してから
+開始してください。
+
+v3 の認証情報は保存されません。アプリを起動するたびに入力が必要です。
+
+受信した Trap の一覧には、どの版・どの保護レベルで届いたかを示す
+「セキュリティ」列があり、v3 の場合はユーザ名も出ます（例:
+`v3 authPriv / netbelt`）。この列はエクスポートにも含まれます。
+パスワードと、v1/v2c のコミュニティ文字列は出ません。
 
 ### その他
 - **ポートチェッカー** — この PC のポートが空いているかを調べます（ツール → ポートチェッカー）。指定ポートへ実際にバインドを試し、使用中なら `netstat` と `tasklist` で占有しているプロセスを特定します。Syslog・TFTP・SNMP Trap などの受信サーバが起動できないときの切り分け用です。リモート機器へのポートスキャンではありません
@@ -156,19 +188,52 @@ application and a set of daemons.
 
 - **Terminal** — SSH, Telnet and serial, with device grouping, tabs, command macros
   and session logging
-- **Receivers** — Syslog (UDP/TCP 514) with level filtering; SNMP trap (UDP 162)
-  with MIB name resolution, community filtering and CSV export
+- **Receivers** — Syslog (UDP/TCP 514) with level filtering; SNMP trap (UDP 162,
+  v1/v2c/v3 with USM) with MIB name resolution, community filtering and CSV export
 - **File transfer** — TFTP (UDP 69), FTP (TCP 21) and SFTP (TCP 2222) servers,
   plus an SFTP client, for moving configs and images to and from network devices
 - **Auto commands** — commands registered per group are sent right after connecting (e.g. `terminal length 0`). Configure them by right-clicking a group in the tree and choosing 「グループを編集」 ("Edit group"). Applies to SSH and Telnet. They are stored in plain text in `config.json`, so do not put passwords there.
 - **Copy / paste** — `Ctrl+Shift+C` / `Ctrl+Shift+V`, following terminal-emulator convention: `Ctrl+C` in a terminal tab is left free to send an interrupt (0x03) to the device. Paste only works on a connected tab.
-- **SNMP GET / WALK** — fetch or walk arbitrary OIDs, export results as CSV / JSON / text
+- **SNMP GET / WALK** — v1/v2c/v3 with USM; fetch or walk arbitrary OIDs, export results as CSV / JSON / text
 - **Port checker** — checks whether a port on this PC is free (Tools → ポートチェッカー). It attempts a real bind, and when the port is taken it identifies the owning process via `netstat` and `tasklist`. Meant for troubleshooting why a receiving server (Syslog, TFTP, SNMP Trap, …) will not start. It is not a port scanner for remote devices.
 - **Settings** — terminal colors and font, SFTP client behavior, and the startup update check (Tools → 設定)
 - Passwords are encrypted with **Windows DPAPI**, tied to the OS user account
 - SSH host keys are verified on a **trust-on-first-use** basis
 - Update checks against GitHub Releases, with **SHA-256 verification** of the
   downloaded package
+
+#### SNMPv3
+
+GET/WALK support authentication with MD5, SHA-1, SHA-224, SHA-256, SHA-384
+or SHA-512, and encryption with DES, 3DES, AES-128, AES-192 or AES-256
+(AES-192 and AES-256 use the Reeder variant, the one most vendor
+implementations use). Which of these are actually usable depends on
+the device you connect to. Selecting v3 in the SNMP panel enables the "v3"
+auth tab and disables the v1/v2c one. A username is required, and
+encryption cannot be selected without authentication — the app blocks
+the request and warns instead.
+
+Trap version selection is "Both" / "v1/v2c" / "v3", defaulting to **Both**.
+With a v3 user configured, "Both" receives v1/v2c and v3 traps on the same
+port at the same time; without one it receives v1/v2c only.
+
+**Receiving v3 traps requires registering the sending device's EngineID.**
+In SNMPv3 traps the sender is the authoritative engine, so the receiver
+must already know the device's EngineID to authenticate and decrypt the
+message. On Cisco IOS, `show snmp engineID` shows it. EngineIDs are
+entered as even-length hex (e.g. `8000000001020304`), one per line for
+multiple devices. Starting the receiver with a v3 username but no
+EngineID registered will warn and refuse to start. To enable v3
+reception, set the username first, then register the EngineID,
+then start the receiver.
+
+v3 credentials are never saved to disk — they must be re-entered every
+time the app starts.
+
+The trap list has a security column showing which version and protection
+level each trap arrived with, including the v3 username (e.g.
+`v3 authPriv / netbelt`). It is carried into the exports too. Passwords
+and v1/v2c community strings are not shown anywhere.
 
 ### Requirements
 

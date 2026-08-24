@@ -13,27 +13,7 @@ import unittest.mock
 
 sys.path.insert(0, "src")
 
-
-def free_udp_port():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
-
-
-def trap_bytes(community="public"):
-    from pyasn1.codec.ber import encoder
-    from pysnmp.proto import api
-
-    pMod = api.protoModules[api.protoVersion2c]
-    pdu = pMod.TrapPDU()
-    pMod.apiTrapPDU.setDefaults(pdu)
-    msg = pMod.Message()
-    pMod.apiMessage.setDefaults(msg)
-    pMod.apiMessage.setCommunity(msg, community)
-    pMod.apiMessage.setPDU(msg, pdu)
-    return encoder.encode(msg)
+from conftest import free_udp_port, trap_bytes   # noqa: E402
 
 
 class SnmpTrapReceiveTest(unittest.TestCase):
@@ -88,6 +68,117 @@ class SnmpTrapReceiveTest(unittest.TestCase):
             time.sleep(0.02)
         return box
 
+
+    def test_an_observer_failure_does_not_stop_the_receiver(self):
+        """observer で例外が出ても受信を続けること。
+
+        observer は pysnmp のディスパッチ経路の中で呼ばれ、そこでの例外は
+        PySnmpError として runDispatcher() から再送出される。旧実装は
+        受信ループの中で握っていたので1パケットで止まることは無かったが、
+        エンジンへ載せ替えた際にその保護が外れていた。
+        """
+        m, port = self._start()
+        receiver = m.trap_receiver
+        got = []
+        m.trap_received.connect(got.append)
+
+        with unittest.mock.patch.object(receiver, "_capture_security",
+                                        side_effect=RuntimeError("boom")):
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.sendto(trap_bytes("public"), ("127.0.0.1", port))
+            s.close()
+            self.assertTrue(self._pump(got), "observer の例外で Trap が失われた")
+
+        self.assertTrue(receiver.isRunning(), "observer の例外で受信が止まった")
+
+    def test_stopped_is_emitted_when_the_dispatcher_raises(self):
+        """例外で終わったことも stopped で伝わること。
+
+        stopped を成功経路だけで emit していたため、受信スレッドが死んでも
+        パネルは「🔵 受信中」の表示のままだった。
+        """
+        from PyQt6.QtWidgets import QApplication
+        from core.snmp_manager import SNMPTrapReceiver
+
+        receiver = SNMPTrapReceiver(free_udp_port(), ["public"])
+        self.addCleanup(receiver.wait, 3000)
+        self.addCleanup(receiver.stop)
+        self.assertTrue(receiver.bind(), "バインドできない")
+
+        seen = []
+        receiver.stopped.connect(lambda: seen.append(True))
+        receiver._engine.transportDispatcher.runDispatcher = (
+            unittest.mock.Mock(side_effect=RuntimeError("boom")))
+        receiver.start()
+
+        deadline = time.time() + 5
+        while time.time() < deadline and not seen:
+            QApplication.processEvents()
+            time.sleep(0.02)
+        receiver.wait(3000)
+        QApplication.processEvents()
+        self.assertTrue(seen, "例外で終わったのに stopped が出ない")
+
+    def test_retiring_a_thread_that_already_ended_does_not_keep_it(self):
+        """wait() が諦めた直後に終わった場合、finished を取り逃す。
+
+        connect を張る前に終わっていると signal は二度と来ないので、
+        刈るはずのリストに残り続ける（単調増加を直したつもりで直っていない）。
+        """
+        from core.snmp_manager import SNMPManager, SNMPTrapReceiver
+        m = SNMPManager()
+        self._managers.append(m)
+        receiver = SNMPTrapReceiver(free_udp_port(), ["public"])
+        self.assertTrue(receiver.bind())
+        receiver.start()
+        deadline = time.time() + 5
+        while time.time() < deadline and not receiver.isRunning():
+            time.sleep(0.05)
+        receiver.stop()
+        self.assertTrue(receiver.wait(5000), "止まらない")
+        self.assertTrue(receiver.isFinished(), "終わっていない")
+
+        # ここが「wait が諦めた直後に終わった」状態にあたる
+        m._retire(receiver)
+        self.assertNotIn(receiver, m._retired_receivers,
+                         "終わったスレッドを抱えたまま")
+
+    def test_a_bare_string_is_not_taken_as_a_list_of_communities(self):
+        """'public' をそのまま渡すと p/u/b/l/i/c の6件になってしまう。"""
+        from core.snmp_manager import SNMPTrapReceiver
+        with self.assertRaises(TypeError):
+            SNMPTrapReceiver(free_udp_port(), "public")
+
+    def test_security_info_is_not_carried_over_between_traps(self):
+        """セキュリティ情報を拾えなかった Trap に、前の Trap の値を出さないこと。
+
+        observer の例外を握るようにした副作用。握ったまま _last_security を
+        残すと、v2c で来た Trap が「v3 authPriv」と表示されうる。
+        """
+        m, port = self._start()
+        receiver = m.trap_receiver
+        got = []
+        m.trap_received.connect(got.append)
+
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.sendto(trap_bytes("public"), ("127.0.0.1", port))
+        s.close()
+        self.assertTrue(self._pump(got), "1件目が届かない")
+        self.assertTrue(got[0].get("security_name"), "1件目にセキュリティ情報が無い")
+
+        second = []
+        m.trap_received.connect(second.append)
+        with unittest.mock.patch.object(receiver, "_capture_security",
+                                        side_effect=RuntimeError("boom")):
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.sendto(trap_bytes("public"), ("127.0.0.1", port))
+            s.close()
+            self.assertTrue(self._pump(second), "2件目が届かない")
+
+        self.assertEqual(second[-1].get("security_name", ""), "",
+                         "前の Trap のセキュリティ情報を持ち越している")
+        self.assertEqual(second[-1].get("source_port", 0), 0,
+                         "前の Trap の送信元ポートを持ち越している")
     def test_receiver_thread_stays_alive(self):
         """起動直後に例外で死んでいないこと（本件の回帰テスト）。"""
         m, _port = self._start()
@@ -104,6 +195,23 @@ class SnmpTrapReceiveTest(unittest.TestCase):
             [e for e in errors if "not defined" in e or "NameError" in e], [],
             "受信ループが例外で落ちている: %s" % errors)
 
+
+    def test_stop_right_after_start_does_not_hang(self):
+        """起動直後に止めてもスレッドが残らないこと。
+
+        pysnmp の jobFinished を jobStarted より先に呼ぶと内部で KeyError に
+        なり、握り潰すとジョブカウンタが合わなくなって runDispatcher() が
+        永久に戻らない。生ソケット実装には無かった、エンジン化で入った危険。
+
+        SNMPManager.stop_trap_receiver() はタイムアウト時に参照を捨てるので、
+        そちら経由では気づけない。レシーバを直接止めて確かめる。
+        """
+        m, _port = self._start()
+        receiver = m.trap_receiver
+        receiver.stop()
+        self.assertTrue(receiver.wait(10000),
+                        "停止要求から10秒経っても受信スレッドが終わらない")
+        self.assertFalse(receiver.isRunning())
     def test_trap_is_received_and_parsed(self):
         """実際に Trap を送って受け取れること。"""
         m, port = self._start(["public"])
@@ -119,6 +227,74 @@ class SnmpTrapReceiveTest(unittest.TestCase):
         self.assertEqual(got[0]["source_ip"], "127.0.0.1")
         self.assertTrue(got[0]["varbinds"], "varbinds が空")
 
+
+    def test_source_port_is_the_senders_port(self):
+        """待ち受けポートではなく送信元のポートを載せること。
+
+        生ソケット実装は recvfrom の addr[1] を使っていた。エンジンへ
+        載せ替えたときに待ち受けポート固定へ変わってしまい、
+        キーの存在しか見ていない既存テストでは気づけなかった。
+        """
+        m, port = self._start(["public"])
+        got = []
+        m.trap_received.connect(got.append)
+
+        sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.addCleanup(sender.close)
+        sender.bind(("127.0.0.1", 0))
+        sender_port = sender.getsockname()[1]
+        sender.sendto(trap_bytes("public"), ("127.0.0.1", port))
+
+        self.assertTrue(self._pump(got), "Trap が届かない")
+        self.assertEqual(got[-1]["source_port"], sender_port)
+        self.assertNotEqual(got[-1]["source_port"], port,
+                            "待ち受けポートを送信元として載せている")
+
+    def test_a_v3_user_without_a_username_is_ignored(self):
+        """ユーザ名が空の要素があっても受信そのものは始まること。"""
+        import time
+        from core.snmp_manager import SNMPManager
+        m = SNMPManager()
+        self._managers.append(m)
+        self.addCleanup(m.stop_trap_receiver)
+        port = free_udp_port()
+        blank = {"username": "   ", "auth_protocol": "none",
+                 "priv_protocol": "none", "engine_ids": ["8000000001020304"]}
+        self.assertTrue(m.start_trap_receiver(port, ["public"], [blank]))
+
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if m.trap_receiver and m.trap_receiver.isRunning():
+                break
+            time.sleep(0.05)
+        self.assertTrue(m.trap_receiver.isRunning())
+
+        # v1/v2c 側は普段どおり動く
+        got = []
+        m.trap_received.connect(got.append)
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.sendto(trap_bytes("public"), ("127.0.0.1", port))
+        s.close()
+        self.assertTrue(self._pump(got))
+
+    def test_a_broken_engine_id_does_not_stop_the_receiver(self):
+        """設定が壊れていても、その要素だけ捨てて受信を続けること。"""
+        import time
+        from core.snmp_manager import SNMPManager
+        m = SNMPManager()
+        self._managers.append(m)
+        self.addCleanup(m.stop_trap_receiver)
+        port = free_udp_port()
+        user = {"username": "netbelt-v3", "auth_protocol": "none",
+                "priv_protocol": "none", "engine_ids": [None, 123, "   "]}
+        self.assertTrue(m.start_trap_receiver(port, ["public"], [user]))
+
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if m.trap_receiver and m.trap_receiver.isRunning():
+                break
+            time.sleep(0.05)
+        self.assertTrue(m.trap_receiver.isRunning())
     def test_trap_with_wrong_community_is_dropped(self):
         """許可していないコミュニティの Trap は受信ループでも弾かれること。"""
         m, port = self._start(["allowed-only"])
@@ -138,13 +314,59 @@ class SnmpTrapReceiveTest(unittest.TestCase):
         self.assertTrue(got, "許可したコミュニティの Trap も届かない")
 
     def test_stop_shuts_down_thread(self):
+        """停止でスレッドが実際に終わること。
+
+        以前は m.trap_receiver を見ていたが、stop_trap_receiver() は wait が
+        タイムアウトしても必ず None を入れるので assertFalse(None) になり、
+        スレッドが生き残っていても通っていた。receiver を直接掴んで見る。
+        """
         m, _port = self._start()
+        receiver = m.trap_receiver
+        self.assertTrue(receiver.isRunning(), "起動していない")
+
         m.stop_trap_receiver()
+
+        self.assertTrue(receiver.wait(5000), "停止しても受信スレッドが終わらない")
+        self.assertFalse(receiver.isRunning())
+
+    def test_a_retired_receiver_is_dropped_when_it_ends(self):
+        """止まりきらなかったスレッドを、終わったあとも抱え続けないこと。"""
+        from core.snmp_manager import SNMPManager, SNMPTrapReceiver
+        m = SNMPManager()
+        self._managers.append(m)
+        receiver = SNMPTrapReceiver(free_udp_port(), ["public"])
+
+        m._retire(receiver)
+        self.assertIn(receiver, m._retired_receivers)
+
+        receiver.finished.emit()
+        self.assertNotIn(receiver, m._retired_receivers,
+                         "終わった受信スレッドを抱えたまま")
+
+    def test_blank_and_duplicate_communities_are_dropped(self):
+        """空文字を登録すると「合言葉なしを受け入れる」設定が作れてしまう。"""
+        from core.snmp_manager import SNMPTrapReceiver
+        r = SNMPTrapReceiver(free_udp_port(),
+                             ["public", "  ", "public", "", " ops "])
+        self.assertEqual(r.communities, ["public", "ops"])
+
+    def test_a_restarted_receiver_forgets_the_old_stop_request(self):
+        """再 start() で、前回の停止要求が残って即終了しないこと。"""
+        from core.snmp_manager import SNMPTrapReceiver
+        r = SNMPTrapReceiver(free_udp_port(), ["public"])
+        self.addCleanup(r.wait, 3000)
+        self.addCleanup(r.stop)
+        self.assertTrue(r.bind())
+        r.start()
         deadline = time.time() + 5
-        while m.trap_receiver and m.trap_receiver.isRunning() and time.time() < deadline:
+        while time.time() < deadline and not r.isRunning():
             time.sleep(0.05)
-        self.assertFalse(m.trap_receiver and m.trap_receiver.isRunning(),
-                         "停止しても受信スレッドが動き続けている")
+        r.stop()
+        self.assertTrue(r.wait(5000), "停止できない")
+
+        self.assertFalse(r._stop_requested,
+                         "停止要求が残っていて次回の起動が即終了する")
+        self.assertFalse(r._job_started, "ジョブ状態が残っている")
 
 
 if __name__ == "__main__":

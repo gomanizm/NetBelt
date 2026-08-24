@@ -135,6 +135,94 @@ class RestartOnSamePortTest(unittest.TestCase):
             m.stop()   # 間を置かずに次のサイクルへ
 
 
+class ExclusiveBindOverridesReuseAddrTest(unittest.TestCase):
+    """SO_REUSEADDR が既に立っているソケットにも排他バインドを効かせられること。
+
+    pysnmp は自前のトランスポートソケットへ無条件に SO_REUSEADDR を立てる
+    （pysnmp/carrier/asyncore/base.py）。Windows ではその状態で
+    SO_EXCLUSIVEADDRUSE を立てようとすると WinError 10022 になるため、
+    先に SO_REUSEADDR を戻す必要がある。
+    """
+
+    def test_can_be_applied_after_so_reuseaddr(self):
+        import socket
+        import sys
+        from core.sockets import set_exclusive_bind
+
+        if sys.platform != "win32":
+            self.skipTest("SO_EXCLUSIVEADDRUSE は Windows のみ")
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.addCleanup(sock.close)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+        set_exclusive_bind(sock)
+
+        self.assertEqual(
+            sock.getsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE), 1,
+            "SO_REUSEADDR 済みのソケットに SO_EXCLUSIVEADDRUSE を立てられていない")
+        self.assertEqual(
+            sock.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR), 0,
+            "SO_REUSEADDR が戻されていない")
+
+    def test_our_port_cannot_be_stolen_by_a_reuseaddr_socket(self):
+        """待ち受け中のポートを他プロセスに奪われないこと。
+
+        これが set_exclusive_bind の目的。Windows の SO_REUSEADDR は
+        待ち受け中のポートへの二重バインドを許すため、こちらが
+        SO_EXCLUSIVEADDRUSE を立てておかないと横取りされる。
+
+        逆向き（他人のポートを自分が奪わないこと）を見ても意味が無い。
+        Windows は修正の有無に関わらずそちらを拒否するため、
+        テストとして何も検知しない（実測で確認）。
+        """
+        import socket
+        import sys
+        from core.sockets import set_exclusive_bind
+
+        if sys.platform != "win32":
+            self.skipTest("SO_EXCLUSIVEADDRUSE は Windows のみ")
+
+        ours = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.addCleanup(ours.close)
+        # pysnmp が自前のトランスポートへ立てるのと同じ状態から始める
+        ours.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        set_exclusive_bind(ours)
+        ours.bind(("0.0.0.0", 0))
+        port = ours.getsockname()[1]
+
+        thief = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.addCleanup(thief.close)
+        thief.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+        with self.assertRaises(OSError):
+            thief.bind(("0.0.0.0", port))
+
+
+    def test_a_tcp_port_is_protected_too(self):
+        """TCP の待ち受け（SFTP サーバなど）でも同じ保護が効くこと。"""
+        import socket
+        import sys
+        from core.sockets import set_exclusive_bind
+
+        if sys.platform != "win32":
+            self.skipTest("SO_EXCLUSIVEADDRUSE は Windows のみ")
+
+        ours = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.addCleanup(ours.close)
+        ours.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        set_exclusive_bind(ours)
+        ours.bind(("0.0.0.0", 0))
+        ours.listen(1)
+        port = ours.getsockname()[1]
+
+        thief = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.addCleanup(thief.close)
+        thief.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+        with self.assertRaises(OSError):
+            thief.bind(("0.0.0.0", port))
+
 class ServersUseExclusiveBindTest(unittest.TestCase):
     """各サーバが SO_REUSEADDR ではなく共通ヘルパーを使っていること。"""
 

@@ -5,13 +5,37 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTableView, QHeaderView,
     QPushButton, QLineEdit, QLabel, QComboBox, QGroupBox,
     QGridLayout, QMenu, QFileDialog, QMessageBox,
-    QTabWidget, QSpinBox, QTreeView, QProgressDialog
+    QTabWidget, QSpinBox, QTreeView, QProgressDialog, QTextEdit
 )
 from PyQt6.QtCore import Qt, QAbstractTableModel, QModelIndex, QThread, pyqtSignal
 from PyQt6.QtGui import QAction, QStandardItemModel, QStandardItem
 from datetime import datetime
 import json
 from core.mib_resolver import get_resolver, MIBResolver
+from core.snmp_manager import v3_password_error
+
+
+# pysnmp が渡す securityModel / securityLevel の値
+_SECURITY_MODELS = {'1': 'v1', '2': 'v2c', '3': 'v3'}
+_SECURITY_LEVELS = {'1': 'noAuthNoPriv', '2': 'authNoPriv', '3': 'authPriv'}
+
+
+def describe_trap_security(trap_data: dict) -> str:
+    """Trap がどの版・どの保護レベルで届いたかを1行で表す
+
+    v1/v2c の security_name は受信側が内部で振った名前であって
+    コミュニティそのものではないので出さない（コミュニティは実質的な
+    認証情報なので、表示にもエクスポートにも載せない方針）。
+    v3 のユーザ名は秘密ではないため出す。
+    """
+    model = _SECURITY_MODELS.get(str(trap_data.get('security_model', '')), '')
+    if model != 'v3':
+        return model
+
+    level = _SECURITY_LEVELS.get(str(trap_data.get('security_level', '')), '')
+    text = f'v3 {level}'.strip()
+    name = trap_data.get('security_name', '')
+    return f'{text} / {name}' if name else text
 
 
 class SNMPResultTableModel(QAbstractTableModel):
@@ -78,7 +102,27 @@ class MIBLoaderThread(QThread):
 
 class SNMPPanel(QWidget):
     """SNMPパネル"""
-    
+
+    # v3 認証コンボの選択肢。(表示ラベル, core へ渡すキー) の組。
+    # キーは core.snmp_manager の V3_*_PROTOCOL_NAMES と一致させること。
+    AUTH_PROTOCOL_CHOICES = (
+        ("なし", "none"),
+        ("MD5", "MD5"),
+        ("SHA-1", "SHA"),
+        ("SHA-224", "SHA-224"),
+        ("SHA-256", "SHA-256"),
+        ("SHA-384", "SHA-384"),
+        ("SHA-512", "SHA-512"),
+    )
+    PRIV_PROTOCOL_CHOICES = (
+        ("なし", "none"),
+        ("DES", "DES"),
+        ("3DES", "3DES"),
+        ("AES-128", "AES-128"),
+        ("AES-192", "AES-192"),
+        ("AES-256", "AES-256"),
+    )
+
     def __init__(self, parent=None, config_manager=None):
         super().__init__(parent)
         self.config_manager = config_manager
@@ -139,7 +183,7 @@ class SNMPPanel(QWidget):
         layout.addWidget(conn_group)
         
         # 認証タブ
-        auth_tabs = QTabWidget()
+        self.auth_tabs = QTabWidget()
         
         # v1/v2c認証
         v2c_widget = QWidget()
@@ -149,8 +193,41 @@ class SNMPPanel(QWidget):
         v2c_layout.addWidget(self.community_edit, 0, 1)
         v2c_layout.setRowStretch(1, 1)  # 空白を下に押しやる
         v2c_widget.setLayout(v2c_layout)
-        auth_tabs.addTab(v2c_widget, "v1/v2c認証")
-        
+        self.auth_tabs.addTab(v2c_widget, "v1/v2c認証")
+
+        # v3認証
+        v3_widget = QWidget()
+        v3_layout = QGridLayout()
+        v3_layout.addWidget(QLabel("ユーザ名:"), 0, 0)
+        self.v3_username_edit = QLineEdit()
+        v3_layout.addWidget(self.v3_username_edit, 0, 1)
+
+        v3_layout.addWidget(QLabel("認証方式:"), 1, 0)
+        self.v3_auth_combo = QComboBox()
+        for label, key in self.AUTH_PROTOCOL_CHOICES:
+            self.v3_auth_combo.addItem(label, key)
+        v3_layout.addWidget(self.v3_auth_combo, 1, 1)
+
+        v3_layout.addWidget(QLabel("認証パスワード:"), 1, 2)
+        self.v3_auth_password_edit = QLineEdit()
+        self.v3_auth_password_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        v3_layout.addWidget(self.v3_auth_password_edit, 1, 3)
+
+        v3_layout.addWidget(QLabel("暗号方式:"), 2, 0)
+        self.v3_priv_combo = QComboBox()
+        for label, key in self.PRIV_PROTOCOL_CHOICES:
+            self.v3_priv_combo.addItem(label, key)
+        v3_layout.addWidget(self.v3_priv_combo, 2, 1)
+
+        v3_layout.addWidget(QLabel("暗号パスワード:"), 2, 2)
+        self.v3_priv_password_edit = QLineEdit()
+        self.v3_priv_password_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        v3_layout.addWidget(self.v3_priv_password_edit, 2, 3)
+
+        v3_layout.setRowStretch(3, 1)
+        v3_widget.setLayout(v3_layout)
+        self.auth_tabs.addTab(v3_widget, "v3認証")
+
         # プリセット
         preset_widget = QWidget()
         preset_layout = QVBoxLayout()
@@ -170,9 +247,13 @@ class SNMPPanel(QWidget):
         preset_layout.addLayout(preset_h)
         preset_layout.addStretch()  # 空白を下に押しやる
         preset_widget.setLayout(preset_layout)
-        auth_tabs.addTab(preset_widget, "プリセットOID")
+        self.auth_tabs.addTab(preset_widget, "プリセットOID")
         
-        layout.addWidget(auth_tabs)
+        layout.addWidget(self.auth_tabs)
+
+        # 起動直後の選択（v2c）に合わせておく。呼ばないと両方のタブが
+        # 有効なままで、どちらを入力すべきか分からない
+        self._on_version_changed(self.version_combo.currentText())
         
         # OID入力
         oid_group = QGroupBox("OID")
@@ -225,9 +306,52 @@ class SNMPPanel(QWidget):
         self.trap_port_spinbox.setRange(1, 65535)
         self.trap_port_spinbox.setValue(162)
         trap_layout.addWidget(self.trap_port_spinbox, 0, 1)
-        trap_layout.addWidget(QLabel("Community:"), 1, 0)
+        trap_layout.addWidget(QLabel("バージョン:"), 1, 0)
+        self.trap_version_combo = QComboBox()
+        self.trap_version_combo.addItems(["両方", "v1/v2c", "v3"])
+        trap_layout.addWidget(self.trap_version_combo, 1, 1)
+
+        trap_layout.addWidget(QLabel("Community:"), 2, 0)
         self.trap_community_edit = QLineEdit("public")
-        trap_layout.addWidget(self.trap_community_edit, 1, 1)
+        trap_layout.addWidget(self.trap_community_edit, 2, 1)
+
+        trap_layout.addWidget(QLabel("v3 ユーザ名:"), 3, 0)
+        self.trap_v3_username_edit = QLineEdit()
+        trap_layout.addWidget(self.trap_v3_username_edit, 3, 1)
+
+        trap_layout.addWidget(QLabel("v3 認証方式:"), 4, 0)
+        self.trap_v3_auth_combo = QComboBox()
+        for label, key in self.AUTH_PROTOCOL_CHOICES:
+            self.trap_v3_auth_combo.addItem(label, key)
+        trap_layout.addWidget(self.trap_v3_auth_combo, 4, 1)
+
+        trap_layout.addWidget(QLabel("v3 認証パスワード:"), 4, 2)
+        self.trap_v3_auth_password_edit = QLineEdit()
+        self.trap_v3_auth_password_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        trap_layout.addWidget(self.trap_v3_auth_password_edit, 4, 3)
+
+        trap_layout.addWidget(QLabel("v3 暗号方式:"), 5, 0)
+        self.trap_v3_priv_combo = QComboBox()
+        for label, key in self.PRIV_PROTOCOL_CHOICES:
+            self.trap_v3_priv_combo.addItem(label, key)
+        trap_layout.addWidget(self.trap_v3_priv_combo, 5, 1)
+
+        trap_layout.addWidget(QLabel("v3 暗号パスワード:"), 5, 2)
+        self.trap_v3_priv_password_edit = QLineEdit()
+        self.trap_v3_priv_password_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        trap_layout.addWidget(self.trap_v3_priv_password_edit, 5, 3)
+
+        trap_layout.addWidget(QLabel("v3 EngineID:"), 6, 0)
+        self.trap_v3_engine_ids_edit = QTextEdit()
+        self.trap_v3_engine_ids_edit.setFixedHeight(60)
+        self.trap_v3_engine_ids_edit.setPlaceholderText("8000000001020304")
+        trap_layout.addWidget(self.trap_v3_engine_ids_edit, 6, 1, 1, 3)
+
+        trap_layout.addWidget(QLabel(
+            "v3 Trap は送信元機器の EngineID を登録しないと受信できません。"
+            "1行に1つ、16進で入力してください（Cisco IOS なら show snmp engineID）。"),
+            7, 0, 1, 4)
+
         trap_group.setLayout(trap_layout)
         layout.addWidget(trap_group)
         
@@ -279,7 +403,8 @@ class SNMPPanel(QWidget):
         self.trap_tree.doubleClicked.connect(self._on_trap_tree_double_clicked)  # ダブルクリックで展開/折りたたみ
         
         # ヘッダー設定
-        self.trap_tree_model.setHorizontalHeaderLabels(["時刻", "送信元IP", "Trap OID / VarBind", "値"])
+        self.trap_tree_model.setHorizontalHeaderLabels(
+            ["時刻", "送信元IP", "セキュリティ", "Trap OID / VarBind", "値"])
         header = self.trap_tree.header()
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         header.setStretchLastSection(True)  # 最後の列を伸縮
@@ -296,7 +421,138 @@ class SNMPPanel(QWidget):
         return widget
     
     def _on_version_changed(self, version: str):
-        pass  # v3対応は簡略化
+        """
+        バージョン選択に合わせて認証タブを切り替える
+
+        Args:
+            version: 'v1' / 'v2c' / 'v3'
+        """
+        titles = [self.auth_tabs.tabText(i) for i in range(self.auth_tabs.count())]
+        target = "v3認証" if version == "v3" else "v1/v2c認証"
+        if target in titles:
+            self.auth_tabs.setCurrentIndex(titles.index(target))
+
+        # 使わない方のタブは無効にして、どちらを入力すべきかを明示する
+        for i, title in enumerate(titles):
+            if title == "v1/v2c認証":
+                self.auth_tabs.setTabEnabled(i, version != "v3")
+            elif title == "v3認証":
+                self.auth_tabs.setTabEnabled(i, version == "v3")
+
+    def _v3_input_error(self):
+        """
+        v3 の入力に問題があればその説明を返す（無ければ None）
+
+        ユーザ名が空のままだと UsmUserData('') の noAuthNoPriv になり、
+        まともに設定された機器では必ず失敗する。原因が分かりにくいので
+        実行前に止める。認証なしで暗号化も SNMPv3 では成立しない。
+        """
+        if self.version_combo.currentText() != 'v3':
+            return None
+        if not self.v3_username_edit.text().strip():
+            return "SNMPv3 のユーザ名を入力してください。"
+        if (self.v3_auth_combo.currentData() == "none"
+                and self.v3_priv_combo.currentData() != "none"):
+            return ("認証なしでは暗号化を使えません。\n"
+                    "認証方式を選ぶか、暗号方式を「なし」にしてください。")
+        return v3_password_error(
+            self.v3_auth_combo.currentData(), self.v3_auth_password_edit.text(),
+            self.v3_priv_combo.currentData(), self.v3_priv_password_edit.text())
+    
+    def _collect_v3_params(self) -> dict:
+        """GET/WALK 用の v3 認証パラメータを集める"""
+        return {
+            'username': self.v3_username_edit.text().strip(),
+            'auth_protocol': self.v3_auth_combo.currentData(),
+            'auth_password': self.v3_auth_password_edit.text(),
+            'priv_protocol': self.v3_priv_combo.currentData(),
+            'priv_password': self.v3_priv_password_edit.text(),
+        }
+
+    def _trap_v3_input_error(self):
+        """
+        Trap 受信の v3 入力に問題があればその説明を返す（無ければ None）
+
+        v3 Trap は送信元機器の EngineID を登録しないと1件も受信できない
+        （実測で確認済み）。黙って受信を開始すると「起動したのに何も
+        来ない」という原因の分かりにくい状態になるため、実行前に止める。
+        認証なしでの暗号化も SNMPv3 では成立しない。
+        """
+        version = self.trap_version_combo.currentText()
+        if version == 'v1/v2c':
+            return None
+
+        # v3 を実際に使うかどうかはユーザ名の有無で決まる。ここを先に
+        # 決めないと、v3 を使うつもりの無い「両方」の利用者が、暗号方式を
+        # 触っただけで受信を始められなくなる。
+        username = self.trap_v3_username_edit.text().strip()
+        if not username:
+            if version == 'v3':
+                return ("v3 を選んだ場合は、v3 のユーザ名を入力してください。\n"
+                        "v1/v2c だけを受けるならバージョンを「v1/v2c」にしてください。")
+            return None
+
+        engine_ids = self._collect_trap_v3_users()[0]['engine_ids']
+        if not engine_ids:
+            return ("v3 Trap を受信するには、送信元機器の EngineID を"
+                    "1行に1つ登録してください。")
+
+        # 16進として読めない値は core で例外になり、bind 失敗としてしか
+        # 伝わらない。ここで具体的に指摘する。
+        for engine_id in engine_ids:
+            if len(engine_id) % 2 or not all(c in "0123456789abcdefABCDEF"
+                                             for c in engine_id):
+                return ("EngineID は偶数桁の16進で入力してください。\n"
+                        f"読めない値: {engine_id}")
+
+        if (self.trap_v3_auth_combo.currentData() == "none"
+                and self.trap_v3_priv_combo.currentData() != "none"):
+            return ("認証なしでは暗号化を使えません。\n"
+                    "認証方式を選ぶか、暗号方式を「なし」にしてください。")
+        return v3_password_error(
+            self.trap_v3_auth_combo.currentData(),
+            self.trap_v3_auth_password_edit.text(),
+            self.trap_v3_priv_combo.currentData(),
+            self.trap_v3_priv_password_edit.text())
+
+    def _collect_trap_v3_users(self) -> list:
+        """
+        Trap 受信用の v3 ユーザ定義を組み立てる
+
+        Returns:
+            ユーザ定義の dict のリスト（ユーザ名が空なら空リスト）
+        """
+        username = self.trap_v3_username_edit.text().strip()
+        if not username:
+            return []
+
+        lines = self.trap_v3_engine_ids_edit.toPlainText().split("\n")
+        engine_ids = [line.strip() for line in lines if line.strip()]
+
+        return [{
+            'username': username,
+            'auth_protocol': self.trap_v3_auth_combo.currentData(),
+            'auth_password': self.trap_v3_auth_password_edit.text(),
+            'priv_protocol': self.trap_v3_priv_combo.currentData(),
+            'priv_password': self.trap_v3_priv_password_edit.text(),
+            'engine_ids': engine_ids,
+        }]
+
+    def _collect_request_params(self) -> dict:
+        """
+        GET/WALK 共通のリクエストパラメータを組み立てる
+
+        バージョンごとに必要なものだけを入れる。v3 に community を
+        混ぜても今の core は無視するが、意味の無い値を運ぶと
+        後から読む人を迷わせる。
+        """
+        version = self.version_combo.currentText()
+        params = {'port': self.port_spinbox.value(), 'version': version}
+        if version == 'v3':
+            params.update(self._collect_v3_params())
+        else:
+            params['community'] = self.community_edit.text()
+        return params
     
     def _on_preset_changed(self, preset: str):
         if "sysDescr" in preset:
@@ -315,8 +571,12 @@ class SNMPPanel(QWidget):
             QMessageBox.warning(self, "エラー", "ホストを入力してください。")
             return
         oids = [o.strip() for o in self.oid_edit.text().split(',')]
-        params = {'port': self.port_spinbox.value(), 'version': self.version_combo.currentText(),
-                  'community': self.community_edit.text()}
+        v3_error = self._v3_input_error()
+        if v3_error:
+            QMessageBox.warning(self, "エラー", v3_error)
+            return
+
+        params = self._collect_request_params()
         self.snmp_manager.snmp_get(host, oids, **params)
         self.status_label.setText("GET実行中...")
     
@@ -329,8 +589,12 @@ class SNMPPanel(QWidget):
             QMessageBox.warning(self, "エラー", "ホストを入力してください。")
             return
         oid = self.oid_edit.text().strip()
-        params = {'port': self.port_spinbox.value(), 'version': self.version_combo.currentText(),
-                  'community': self.community_edit.text()}
+        v3_error = self._v3_input_error()
+        if v3_error:
+            QMessageBox.warning(self, "エラー", v3_error)
+            return
+
+        params = self._collect_request_params()
         self.snmp_manager.snmp_walk(host, oid, **params)
         self.status_label.setText("WALK実行中...")
     
@@ -414,12 +678,21 @@ class SNMPPanel(QWidget):
                 "MIBをバックグラウンドで読み込み中です。\n完了までお待ちください。"
             )
             return
+
+        v3_error = self._trap_v3_input_error()
+        if v3_error:
+            QMessageBox.warning(self, "エラー", v3_error)
+            return
         
         # Trap受信を開始
         port = self.trap_port_spinbox.value()
-        communities = [self.trap_community_edit.text()]
+        version = self.trap_version_combo.currentText()
+
+        communities = [] if version == "v3" else [self.trap_community_edit.text()]
+        v3_users = [] if version == "v1/v2c" else self._collect_trap_v3_users()
+
         # 起動できなければ表示を変えない（エラーは error_occurred で通知済み）
-        if not self.snmp_manager.start_trap_receiver(port, communities):
+        if not self.snmp_manager.start_trap_receiver(port, communities, v3_users):
             return
         self.trap_start_button.setVisible(False)
         self.trap_stop_button.setVisible(True)
@@ -451,16 +724,33 @@ class SNMPPanel(QWidget):
     
     
     def _on_trap_stop_clicked(self):
+        # 開始ボタンはここでは戻さない。停止要求から実際の終了までは
+        # 間があり、待ち受けポートを掴んだままのスレッドが残っている
+        # 状態で開始すると bind に失敗する。終了は stopped で分かる。
+        self.trap_stop_button.setEnabled(False)
+        self.trap_status_label.setText("⏳ 停止しています...")
+        self.trap_status_label.setStyleSheet(
+            "color: #ff9800; font-weight: bold; font-size: 14px;")
         if self.snmp_manager:
             self.snmp_manager.stop_trap_receiver()
+
+    def _show_trap_stopped(self):
+        """受信していない状態の表示に戻す
+
+        受信スレッドが実際に終わったときに呼ぶ。利用者が止めた場合も、
+        スレッドが自分で死んだ場合も、run() の finally から出る stopped が
+        ここへ来る。片方だけだと、受信が死んでいるのに表示が残る。
+        """
         self.trap_start_button.setVisible(True)
         self.trap_stop_button.setVisible(False)
+        self.trap_stop_button.setEnabled(True)
         self.trap_status_label.setText("🔴 停止中")
         self.trap_status_label.setStyleSheet("color: #f44336; font-weight: bold; font-size: 14px;")
     
     def _on_trap_clear_clicked(self):
         self.trap_tree_model.clear()
-        self.trap_tree_model.setHorizontalHeaderLabels(["時刻", "送信元IP", "Trap OID / VarBind", "値"])
+        self.trap_tree_model.setHorizontalHeaderLabels(
+            ["時刻", "送信元IP", "セキュリティ", "Trap OID / VarBind", "値"])
         self.trap_data_list.clear()
     
     def _on_trap_expand_all_clicked(self):
@@ -519,28 +809,26 @@ class SNMPPanel(QWidget):
             writer = csv.writer(f)
             
             # ヘッダー
-            writer.writerow(['時刻', '送信元IP', 'Trap OID', 'VarBind OID', 'VarBind 値'])
+            writer.writerow(['時刻', '送信元IP', '送信元ポート', 'セキュリティ',
+                             'Trap OID', 'VarBind OID', 'VarBind 値'])
             
             # データ（新しい順＝trap_data_listの順）
             for trap in self.trap_data_list:
                 timestamp = trap['timestamp']
                 source_ip = trap['source_ip']
+                source_port = trap.get('source_port', '')
+                security = trap.get('security', '')
                 trap_oid = trap['trap_oid']
                 varbinds = trap['varbinds']
+                head = [timestamp, source_ip, source_port, security, trap_oid]
                 
                 # VarBindsがある場合は各VarBindを1行として出力
                 if varbinds:
                     for vb in varbinds:
-                        writer.writerow([
-                            timestamp,
-                            source_ip,
-                            trap_oid,
-                            vb['oid'],
-                            vb['value']
-                        ])
+                        writer.writerow(head + [vb['oid'], vb['value']])
                 else:
                     # VarBindsがない場合は1行だけ出力
-                    writer.writerow([timestamp, source_ip, trap_oid, '', ''])
+                    writer.writerow(head + ['', ''])
     
     def _export_to_json(self, file_path: str):
         """JSON形式でエクスポート"""
@@ -562,6 +850,8 @@ class SNMPPanel(QWidget):
             for i, trap in enumerate(self.trap_data_list, 1):
                 timestamp = trap['timestamp']
                 source_ip = trap['source_ip']
+                source_port = trap.get('source_port', '')
+                security = trap.get('security', '')
                 trap_oid = trap['trap_oid']
                 varbinds = trap['varbinds']
                 
@@ -570,7 +860,9 @@ class SNMPPanel(QWidget):
                 
                 f.write(f"[{i}] Trap受信\n")
                 f.write(f"  時刻: {timestamp}\n")
-                f.write(f"  送信元IP: {source_ip}\n")
+                f.write(f"  送信元: {source_ip}:{source_port}\n")
+                if security:
+                    f.write(f"  セキュリティ: {security}\n")
                 f.write(f"  Trap OID: {trap_name}\n")
                 f.write(f"            ({trap_oid})\n")
                 
@@ -614,6 +906,8 @@ class SNMPPanel(QWidget):
         """TrapデータをツリーViewに追加"""
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         source_ip = trap_data.get('source_ip', '')
+        source_port = trap_data.get('source_port', 0)
+        security = describe_trap_security(trap_data)
         trap_oid = trap_data.get('trap_oid', 'N/A')
         varbinds = trap_data.get('varbinds', [])
         
@@ -621,6 +915,8 @@ class SNMPPanel(QWidget):
         self.trap_data_list.insert(0, {
             'timestamp': timestamp,
             'source_ip': source_ip,
+            'source_port': source_port,
+            'security': security,
             'trap_oid': trap_oid,
             'varbinds': varbinds
         })
@@ -635,12 +931,14 @@ class SNMPPanel(QWidget):
         # 親アイテム作成（Trap情報）
         timestamp_item = QStandardItem(timestamp)
         source_ip_item = QStandardItem(source_ip)
+        security_item = QStandardItem(security)
         trap_oid_item = QStandardItem(trap_name)
         varbinds_count = f"{len(filtered_vbs)} VarBinds" if filtered_vbs else "VarBindsなし"
         value_item = QStandardItem(varbinds_count)
         
         # 親行をツリーのルートに挿入（最新を先頭に）
-        self.trap_tree_model.insertRow(0, [timestamp_item, source_ip_item, trap_oid_item, value_item])
+        self.trap_tree_model.insertRow(0, [timestamp_item, source_ip_item,
+                                          security_item, trap_oid_item, value_item])
         
         # 各VarBindを子アイテムとして追加
         for vb in filtered_vbs:
@@ -653,11 +951,13 @@ class SNMPPanel(QWidget):
             # 子アイテム作成（1行につき1つのVarBind）
             child_timestamp = QStandardItem("")  # 空
             child_source = QStandardItem("")  # 空
+            child_security = QStandardItem("")  # 空
             child_oid = QStandardItem(oid_name)
             child_value = QStandardItem(value)
             
             # 親の最初の列に子行を追加
-            timestamp_item.appendRow([child_timestamp, child_source, child_oid, child_value])
+            timestamp_item.appendRow([child_timestamp, child_source,
+                                      child_security, child_oid, child_value])
     
     def _on_trap_receiver_started(self):
         """Trap受信開始時の処理"""
@@ -665,7 +965,8 @@ class SNMPPanel(QWidget):
     
     def _on_trap_receiver_stopped(self):
         """Trap受信停止時の処理"""
-        print("[SNMPPanel] Trap受信が正常に停止しました")
+        print("[SNMPPanel] Trap受信が停止しました")
+        self._show_trap_stopped()
     
     def _on_error_occurred(self, error: str):
         QMessageBox.warning(self, "警告", error)

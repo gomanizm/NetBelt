@@ -6,8 +6,14 @@
 プロセスごと落ちることがある（実測で access violation）。
 
 そのため QApplication はセッション全体で1つだけ作り、最後まで保持する。
+
+Trap のバイト列を組み立てるヘルパもここに置く。複数のテストモジュールが
+使うが、`from tests.xxx import` はリポジトリルートが sys.path に入る
+起動方法（python -m pytest）でしか通らず、素の pytest では
+ModuleNotFoundError になる。conftest は pytest が必ず import できる。
 """
 import os
+import socket
 import threading
 
 import pytest
@@ -44,3 +50,38 @@ def qapp():
     if leftovers:
         print("\n[conftest] 終了時に非デーモンスレッドが残っています: %s"
               % ", ".join(t.name for t in leftovers))
+
+
+def free_udp_port():
+    """空いている UDP ポートを1つ調べて返す。"""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def _trap_bytes(proto_version, community):
+    from pyasn1.codec.ber import encoder
+    from pysnmp.proto import api
+
+    pMod = api.protoModules[proto_version]
+    pdu = pMod.TrapPDU()
+    pMod.apiTrapPDU.setDefaults(pdu)
+    msg = pMod.Message()
+    pMod.apiMessage.setDefaults(msg)
+    pMod.apiMessage.setCommunity(msg, community)
+    pMod.apiMessage.setPDU(msg, pdu)
+    return encoder.encode(msg)
+
+
+def trap_bytes(community="public"):
+    """指定したコミュニティを持つ SNMPv2c Trap のバイト列。"""
+    from pysnmp.proto import api
+    return _trap_bytes(api.protoVersion2c, community)
+
+
+def v1_trap_bytes(community="public"):
+    """指定したコミュニティを持つ SNMPv1 Trap のバイト列。"""
+    from pysnmp.proto import api
+    return _trap_bytes(api.protoVersion1, community)
