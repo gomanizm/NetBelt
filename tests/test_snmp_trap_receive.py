@@ -88,6 +88,56 @@ class SnmpTrapReceiveTest(unittest.TestCase):
             time.sleep(0.02)
         return box
 
+
+    def test_an_observer_failure_does_not_stop_the_receiver(self):
+        """observer で例外が出ても受信を続けること。
+
+        observer は pysnmp のディスパッチ経路の中で呼ばれ、そこでの例外は
+        PySnmpError として runDispatcher() から再送出される。旧実装は
+        受信ループの中で握っていたので1パケットで止まることは無かったが、
+        エンジンへ載せ替えた際にその保護が外れていた。
+        """
+        m, port = self._start()
+        receiver = m.trap_receiver
+        got = []
+        m.trap_received.connect(got.append)
+
+        with unittest.mock.patch.object(receiver, "_capture_security",
+                                        side_effect=RuntimeError("boom")):
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.sendto(trap_bytes("public"), ("127.0.0.1", port))
+            s.close()
+            self.assertTrue(self._pump(got), "observer の例外で Trap が失われた")
+
+        self.assertTrue(receiver.isRunning(), "observer の例外で受信が止まった")
+
+    def test_stopped_is_emitted_when_the_dispatcher_raises(self):
+        """例外で終わったことも stopped で伝わること。
+
+        stopped を成功経路だけで emit していたため、受信スレッドが死んでも
+        パネルは「🔵 受信中」の表示のままだった。
+        """
+        from PyQt6.QtWidgets import QApplication
+        from core.snmp_manager import SNMPTrapReceiver
+
+        receiver = SNMPTrapReceiver(free_udp_port(), ["public"])
+        self.addCleanup(receiver.wait, 3000)
+        self.addCleanup(receiver.stop)
+        self.assertTrue(receiver.bind(), "バインドできない")
+
+        seen = []
+        receiver.stopped.connect(lambda: seen.append(True))
+        receiver._engine.transportDispatcher.runDispatcher = (
+            unittest.mock.Mock(side_effect=RuntimeError("boom")))
+        receiver.start()
+
+        deadline = time.time() + 5
+        while time.time() < deadline and not seen:
+            QApplication.processEvents()
+            time.sleep(0.02)
+        receiver.wait(3000)
+        QApplication.processEvents()
+        self.assertTrue(seen, "例外で終わったのに stopped が出ない")
     def test_receiver_thread_stays_alive(self):
         """起動直後に例外で死んでいないこと（本件の回帰テスト）。"""
         m, _port = self._start()

@@ -410,24 +410,37 @@ class SNMPTrapReceiver(QThread):
     def _register_observer(self):
         """受信メッセージのセキュリティ情報を拾う
 
-        ntfrcv のコールバックには securityName / securityLevel が渡らないため、
-        observer で別途拾う。両者は別呼び出しなので、Trap が近接すると
-        取り違えうる。表示用の参考情報としてのみ使うこと。
+        ntfrcv のコールバックには securityName / securityLevel が渡らない
+        ため、observer で別途拾う。pysnmp は observer を processPdu の
+        直前に発火して直後に消すので、同一スレッド・同一コールスタックの
+        あいだだけ有効な値になる（Trap が近接しても取り違えない）。
+
+        observer は pysnmp のディスパッチ経路の中で呼ばれ、ここで例外が
+        出ると runDispatcher() を抜けて受信が完全に止まる。旧実装は
+        受信ループの中で握っていたので1パケットで止まることは無かった。
+        _on_notification と同じ扱いに揃える。
         """
         def _observe(snmp_engine, execpoint, variables, cb_ctx):
-            self._last_security = {
-                'security_name': str(variables.get('securityName', '')),
-                'security_level': str(variables.get('securityLevel', '')),
-                'security_model': str(variables.get('securityModel', '')),
-            }
-            # 送信元のアドレスとポート。旧実装は recvfrom の addr をそのまま
-            # 使っていたので、エンジン化で意味が変わらないようここで拾う。
-            address = variables.get('transportAddress')
-            self._last_security['source_ip'] = str(address[0]) if address else ''
-            self._last_security['source_port'] = int(address[1]) if address else 0
+            try:
+                self._capture_security(variables)
+            except Exception as e:
+                print(f"[SNMPTrapReceiver] セキュリティ情報を拾えません: {e}")
 
         self._engine.observer.registerObserver(
             _observe, 'rfc3412.receiveMessage:request')
+
+    def _capture_security(self, variables):
+        """observer から渡された変数を _last_security へ写す"""
+        self._last_security = {
+            'security_name': str(variables.get('securityName', '')),
+            'security_level': str(variables.get('securityLevel', '')),
+            'security_model': str(variables.get('securityModel', '')),
+        }
+        # 送信元のアドレスとポート。旧実装は recvfrom の addr をそのまま
+        # 使っていたので、エンジン化で意味が変わらないようここで拾う。
+        address = variables.get('transportAddress')
+        self._last_security['source_ip'] = str(address[0]) if address else ''
+        self._last_security['source_port'] = int(address[1]) if address else 0
 
     def _on_notification(self, snmp_engine, state_reference,
                          context_engine_id, context_name, var_binds, cb_ctx):
@@ -518,7 +531,6 @@ class SNMPTrapReceiver(QThread):
             self._engine.transportDispatcher.runDispatcher()
 
             print(f"[SNMPTrapReceiver] 正常終了")
-            self.stopped.emit()
 
         except Exception as e:
             print(f"[SNMPTrapReceiver] エラー: {str(e)}")
@@ -529,6 +541,9 @@ class SNMPTrapReceiver(QThread):
         finally:
             self._running = False
             self._close_engine()
+            # 例外で抜けたときも必ず知らせる。ここを成功経路だけに
+            # 置くと、受信が死んでも画面は「受信中」のまま残る。
+            self.stopped.emit()
 
     def _close_engine(self):
         """エンジンとトランスポートを片付ける"""

@@ -878,6 +878,23 @@ class TrapTabV3UiTest(unittest.TestCase):
                 self.assertIn(bad, warn.call_args[0][2])
                 panel.snmp_manager.start_trap_receiver.assert_not_called()
 
+    def test_the_panel_stops_showing_receiving_when_the_receiver_ends(self):
+        """受信が自分で終わったときも表示を戻すこと。
+
+        isVisible() は窓を show していない offscreen では常に False なので、
+        setVisible の指定がそのまま出る isHidden() で見る。
+        """
+        panel = self._panel()
+        panel.trap_status_label.setText("🔵 受信中 (ポート 162)")
+        panel.trap_start_button.setVisible(False)
+        panel.trap_stop_button.setVisible(True)
+
+        panel._on_trap_receiver_stopped()
+
+        self.assertIn("停止中", panel.trap_status_label.text())
+        self.assertFalse(panel.trap_start_button.isHidden(), "開始ボタンが戻らない")
+        self.assertTrue(panel.trap_stop_button.isHidden(), "停止ボタンが残っている")
+
 
 if __name__ == "__main__":
     unittest.main()

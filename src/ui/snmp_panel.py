@@ -702,6 +702,14 @@ class SNMPPanel(QWidget):
     def _on_trap_stop_clicked(self):
         if self.snmp_manager:
             self.snmp_manager.stop_trap_receiver()
+        self._show_trap_stopped()
+
+    def _show_trap_stopped(self):
+        """受信していない状態の表示に戻す
+
+        利用者が止めたときだけでなく、受信スレッドが自分で終わったときにも
+        呼ぶ。片方だけだと、受信が死んでいるのに「受信中」の表示が残る。
+        """
         self.trap_start_button.setVisible(True)
         self.trap_stop_button.setVisible(False)
         self.trap_status_label.setText("🔴 停止中")
@@ -914,7 +922,8 @@ class SNMPPanel(QWidget):
     
     def _on_trap_receiver_stopped(self):
         """Trap受信停止時の処理"""
-        print("[SNMPPanel] Trap受信が正常に停止しました")
+        print("[SNMPPanel] Trap受信が停止しました")
+        self._show_trap_stopped()
     
     def _on_error_occurred(self, error: str):
         QMessageBox.warning(self, "警告", error)
