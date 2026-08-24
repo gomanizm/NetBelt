@@ -591,7 +591,7 @@ class V3TrapReceiveTest(unittest.TestCase):
     def test_v2c_still_works_alongside_v3(self):
         """v1/v2c と v3 を同じポートで同時に受けられること。"""
         import socket
-        from tests.test_snmp_community import trap_bytes
+        from conftest import trap_bytes
         _m, port, got = self._start([self.SENDER_ENGINE_ID])
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.sendto(trap_bytes("public"), ("127.0.0.1", port))

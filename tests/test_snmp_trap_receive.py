@@ -13,27 +13,7 @@ import unittest.mock
 
 sys.path.insert(0, "src")
 
-
-def free_udp_port():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
-
-
-def trap_bytes(community="public"):
-    from pyasn1.codec.ber import encoder
-    from pysnmp.proto import api
-
-    pMod = api.protoModules[api.protoVersion2c]
-    pdu = pMod.TrapPDU()
-    pMod.apiTrapPDU.setDefaults(pdu)
-    msg = pMod.Message()
-    pMod.apiMessage.setDefaults(msg)
-    pMod.apiMessage.setCommunity(msg, community)
-    pMod.apiMessage.setPDU(msg, pdu)
-    return encoder.encode(msg)
+from conftest import free_udp_port, trap_bytes   # noqa: E402
 
 
 class SnmpTrapReceiveTest(unittest.TestCase):
