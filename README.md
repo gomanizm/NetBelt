@@ -35,20 +35,23 @@
 GET / WALK は認証に MD5 / SHA-1 / SHA-224 / SHA-256 / SHA-384 / SHA-512、
 暗号化に DES / 3DES / AES-128 / AES-192 / AES-256 が使えます
 （AES-192 / AES-256 はベンダー実装で広く使われている Reeder 方式です）。
+実際に使える方式は接続先機器の実装に依存します。
 SNMP パネルでバージョンに v3 を選ぶと「v3認証」タブが有効になり、
 v1/v2c 認証タブは無効になります。ユーザ名は必須で、認証なしでの暗号化は
 選べません（実行前に警告して止まります）。
 
 Trap 受信のバージョン選択は「両方」「v1/v2c」「v3」から選べ、既定は
-「両方」です。「両方」は v1/v2c と v3 を同一ポートで同時に受信します。
+「両方」です。「両方」で v3 のユーザを設定すると、v1/v2c と v3 を同一
+ポートで同時に受信します。v3 のユーザを設定しなければ v1/v2c だけを
+受信します。
 
 **Trap を v3 で受信する場合は、送信元機器の EngineID の登録が必要です。**
 SNMPv3 の Trap では送信側が authoritative engine となるため、受信側が
 あらかじめ機器の EngineID を知っていないと復号・認証ができません。
 Cisco IOS なら `show snmp engineID` で確認できます。EngineID は偶数桁の
 16進で（例: `8000000001020304`）、複数台から受ける場合は1行に1つずつ
-入力してください。登録しないまま受信を開始しようとすると警告が出て
-止まります。
+入力してください。v3 のユーザ名を入力したまま EngineID を登録せずに
+受信を開始しようとすると、警告が出て止まります。
 
 v3 の認証情報は保存されません。アプリを起動するたびに入力が必要です。
 
@@ -190,21 +193,23 @@ application and a set of daemons.
 GET/WALK support authentication with MD5, SHA-1, SHA-224, SHA-256, SHA-384
 or SHA-512, and encryption with DES, 3DES, AES-128, AES-192 or AES-256
 (AES-192 and AES-256 use the Reeder variant, the one most vendor
-implementations use). Selecting v3 in the SNMP panel enables the "v3"
+implementations use). Which of these are actually usable depends on
+the device you connect to. Selecting v3 in the SNMP panel enables the "v3"
 auth tab and disables the v1/v2c one. A username is required, and
 encryption cannot be selected without authentication — the app blocks
 the request and warns instead.
 
-Trap version selection is "Both" / "v1/v2c" / "v3", defaulting to **Both**,
-which receives v1/v2c and v3 traps on the same port at the same time.
+Trap version selection is "Both" / "v1/v2c" / "v3", defaulting to **Both**.
+With a v3 user configured, "Both" receives v1/v2c and v3 traps on the same
+port at the same time; without one it receives v1/v2c only.
 
 **Receiving v3 traps requires registering the sending device's EngineID.**
 In SNMPv3 traps the sender is the authoritative engine, so the receiver
 must already know the device's EngineID to authenticate and decrypt the
 message. On Cisco IOS, `show snmp engineID` shows it. EngineIDs are
 entered as even-length hex (e.g. `8000000001020304`), one per line for
-multiple devices. Starting the receiver without one registered will warn
-and refuse to start.
+multiple devices. Starting the receiver with a v3 username but no
+EngineID registered will warn and refuse to start.
 
 v3 credentials are never saved to disk — they must be re-entered every
 time the app starts.
