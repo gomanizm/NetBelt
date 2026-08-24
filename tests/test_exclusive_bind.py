@@ -165,8 +165,17 @@ class ExclusiveBindOverridesReuseAddrTest(unittest.TestCase):
             sock.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR), 0,
             "SO_REUSEADDR が戻されていない")
 
-    def test_port_cannot_be_stolen_after_the_override(self):
-        """他プロセスが素の bind で握っているポートを奪わないこと。"""
+    def test_our_port_cannot_be_stolen_by_a_reuseaddr_socket(self):
+        """待ち受け中のポートを他プロセスに奪われないこと。
+
+        これが set_exclusive_bind の目的。Windows の SO_REUSEADDR は
+        待ち受け中のポートへの二重バインドを許すため、こちらが
+        SO_EXCLUSIVEADDRUSE を立てておかないと横取りされる。
+
+        逆向き（他人のポートを自分が奪わないこと）を見ても意味が無い。
+        Windows は修正の有無に関わらずそちらを拒否するため、
+        テストとして何も検知しない（実測で確認）。
+        """
         import socket
         import sys
         from core.sockets import set_exclusive_bind
@@ -174,15 +183,17 @@ class ExclusiveBindOverridesReuseAddrTest(unittest.TestCase):
         if sys.platform != "win32":
             self.skipTest("SO_EXCLUSIVEADDRUSE は Windows のみ")
 
-        victim = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.addCleanup(victim.close)
-        victim.bind(("0.0.0.0", 0))
-        port = victim.getsockname()[1]
+        ours = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.addCleanup(ours.close)
+        # pysnmp が自前のトランスポートへ立てるのと同じ状態から始める
+        ours.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        set_exclusive_bind(ours)
+        ours.bind(("0.0.0.0", 0))
+        port = ours.getsockname()[1]
 
         thief = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.addCleanup(thief.close)
         thief.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        set_exclusive_bind(thief)
 
         with self.assertRaises(OSError):
             thief.bind(("0.0.0.0", port))
