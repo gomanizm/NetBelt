@@ -110,7 +110,14 @@ class GroupDialogAutoCommandsTest(unittest.TestCase):
         dlg = GroupDialog(None)
         self.assertTrue(dlg.auto_commands_help_label.wordWrap())
         self.assertTrue(dlg.auto_commands_warning_label.wordWrap())
-        self.assertLessEqual(dlg.minimumSizeHint().width(), 500)
+
+        # 絶対値のしきい値はフォント・DPI・Qt スタイルで揺れるため、
+        # 「折り返さなかった場合に必要な幅」と相対比較する。
+        # 折り返しが効いていなければ最小幅はこの値以上になる。
+        help_label = dlg.auto_commands_help_label
+        unwrapped_width = help_label.fontMetrics().boundingRect(
+            help_label.text()).width()
+        self.assertLess(dlg.minimumSizeHint().width(), unwrapped_width)
 
     def test_plaintext_warning_is_shown(self):
         """auto_commands は暗号化されないので、注意書きを消してはいけない。"""
