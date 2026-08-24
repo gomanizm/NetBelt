@@ -1093,9 +1093,10 @@ class MainWindow(QMainWindow):
         from .terminal_widget import InteractiveTerminal
 
         terminal = self.terminal_widget.get_current_terminal()
-        # ホームタブは読み取り専用の QTextEdit で送信先を持たない
-        if not isinstance(terminal, InteractiveTerminal):
-            self.status_bar.showMessage("ペーストできるのは接続中のタブだけです")
+        # ホームタブは読み取り専用の QTextEdit で送信先を持たない。
+        # 接続タブでも再接続待機中は送信できない（can_send_input が見分ける）。
+        if not isinstance(terminal, InteractiveTerminal) or not terminal.can_send_input():
+            self.status_bar.showMessage("ペーストできるのは接続中のターミナルタブだけです")
             return
         terminal.custom_paste()
 

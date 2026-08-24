@@ -37,6 +37,19 @@ class InteractiveTerminal(QTextEdit):
         if enabled:
             self._input_enabled = True  # 再接続モードではEnterキーを受け付ける
     
+    def can_send_input(self) -> bool:
+        """
+        いま機器へ文字を送れる状態か
+
+        再接続待機中は Enter による再接続だけを受け付ける（切断中に送信すると
+        バナーが増殖するため）。keyPressEvent と同じ条件をここへ集約し、
+        ペースト経路が迂回しないようにする。
+
+        Returns:
+            送信できるならTrue
+        """
+        return self._input_enabled and not self._reconnect_mode
+
     def mouseReleaseEvent(self, event):
         """マウスリリース後、カーソルを末尾に戻す"""
         # デフォルトの動作（テキスト選択）を実行
@@ -56,7 +69,7 @@ class InteractiveTerminal(QTextEdit):
         clipboard = QApplication.clipboard()
         text = clipboard.text()
         
-        if text and self._input_enabled:
+        if text and self.can_send_input():
             # ペーストされたテキストを1文字ずつ送信
             for char in text:
                 if char == '\n' or char == '\r':
@@ -87,7 +100,7 @@ class InteractiveTerminal(QTextEdit):
         # 貼り付け（カスタムペースト機能を使用）
         paste_action = QAction("貼り付け", self)
         paste_action.triggered.connect(self.custom_paste)
-        paste_action.setEnabled(self._input_enabled)
+        paste_action.setEnabled(self.can_send_input())
         menu.addAction(paste_action)
         
         menu.addSeparator()

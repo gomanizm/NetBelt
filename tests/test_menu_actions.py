@@ -42,14 +42,100 @@ class MenuActionsTest(unittest.TestCase):
     def test_paste_sends_to_the_current_interactive_terminal(self):
         w = self._window()
         terminal = w.terminal_widget.create_terminal_tab("ルータA")
+        terminal.set_input_enabled(True)   # 接続成功を模す
         with mock.patch.object(terminal, "custom_paste") as paste_call:
             w._on_paste()
         paste_call.assert_called_once()
+
+    def test_paste_is_ignored_on_a_tab_that_never_connected(self):
+        """タブはあるがまだ接続していない状態でも、黙って無視しないこと。"""
+        w = self._window()
+        w.terminal_widget.create_terminal_tab("未接続")
+        messages = []
+        w.status_bar.showMessage = lambda text, *a: messages.append(text)
+        w._on_paste()
+        self.assertEqual(len(messages), 1)
 
     def test_paste_is_ignored_on_the_home_tab(self):
         """ホームタブは読み取り専用の QTextEdit で custom_paste を持たない。"""
         w = self._window()
         w._on_paste()  # 例外が出ないこと
+
+
+class PasteGuardTest(unittest.TestCase):
+    """再接続待機中はペーストで送信しないこと。
+
+    keyPressEvent は再接続待機中に Enter 以外を捨てるのに、custom_paste は
+    _input_enabled しか見ておらず素通りしていた。切断済みの接続へ
+    クリップボードの中身がそのまま流れる。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PyQt6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    def _terminal(self, connected=True, reconnecting=False):
+        from ui.terminal_widget import InteractiveTerminal
+        terminal = InteractiveTerminal()
+        terminal.set_input_enabled(connected)
+        if reconnecting:
+            terminal.set_reconnect_mode(True)
+        return terminal
+
+    def test_can_send_input_tracks_both_flags(self):
+        self.assertTrue(self._terminal().can_send_input())
+        self.assertFalse(self._terminal(connected=False).can_send_input())
+        # 再接続モードは _input_enabled を True へ戻すので、それだけでは足りない
+        self.assertFalse(self._terminal(reconnecting=True).can_send_input())
+
+    def test_paste_sends_nothing_while_waiting_to_reconnect(self):
+        from PyQt6.QtWidgets import QApplication
+        terminal = self._terminal(reconnecting=True)
+        self.assertTrue(terminal._input_enabled, "再接続モードは入力を有効へ戻す")
+        sent = []
+        terminal.key_pressed.connect(sent.append)
+        QApplication.clipboard().setText("show running-config")
+        terminal.custom_paste()
+        self.assertEqual(sent, [])
+
+    def test_paste_sends_while_connected(self):
+        from PyQt6.QtWidgets import QApplication
+        terminal = self._terminal()
+        sent = []
+        terminal.key_pressed.connect(sent.append)
+        QApplication.clipboard().setText("show version")
+        terminal.custom_paste()
+        self.assertEqual("".join(sent), "show version")
+
+    def test_context_menu_paste_is_disabled_while_waiting_to_reconnect(self):
+        """右クリック経路も同じ条件で塞がっていること。"""
+        from PyQt6.QtGui import QContextMenuEvent
+        from PyQt6.QtCore import QPoint
+        terminal = self._terminal(reconnecting=True)
+        captured = {}
+
+        def fake_exec(menu, *args, **kwargs):
+            captured["items"] = [(a.text(), a.isEnabled()) for a in menu.actions()]
+            return None
+
+        with mock.patch("PyQt6.QtWidgets.QMenu.exec", fake_exec):
+            terminal.contextMenuEvent(QContextMenuEvent(
+                QContextMenuEvent.Reason.Mouse, QPoint(1, 1)))
+        self.assertIn(("貼り付け", False), captured["items"])
+
+    def test_menu_paste_explains_why_nothing_happened(self):
+        """メニューからのペーストは理由を伝えること（無反応にしない）。"""
+        w = MenuActionsTest._window(self)
+        terminal = w.terminal_widget.create_terminal_tab("ルータA")
+        terminal.set_input_enabled(True)
+        terminal.set_reconnect_mode(True)
+        messages = []
+        w.status_bar.showMessage = lambda text, *a: messages.append(text)
+        w._on_paste()
+        self.assertEqual(len(messages), 1)
+        self.assertIn("接続中", messages[0])
 
 
 if __name__ == "__main__":
