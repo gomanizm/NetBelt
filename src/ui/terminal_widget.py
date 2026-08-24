@@ -37,6 +37,19 @@ class InteractiveTerminal(QTextEdit):
         if enabled:
             self._input_enabled = True  # 再接続モードではEnterキーを受け付ける
     
+    def can_send_input(self) -> bool:
+        """
+        いま機器へ文字を送れる状態か
+
+        再接続待機中は Enter による再接続だけを受け付ける（切断中に送信すると
+        バナーが増殖するため）。keyPressEvent と同じ条件をここへ集約し、
+        ペースト経路が迂回しないようにする。
+
+        Returns:
+            送信できるならTrue
+        """
+        return self._input_enabled and not self._reconnect_mode
+
     def mouseReleaseEvent(self, event):
         """マウスリリース後、カーソルを末尾に戻す"""
         # デフォルトの動作（テキスト選択）を実行
@@ -56,7 +69,7 @@ class InteractiveTerminal(QTextEdit):
         clipboard = QApplication.clipboard()
         text = clipboard.text()
         
-        if text and self._input_enabled:
+        if text and self.can_send_input():
             # ペーストされたテキストを1文字ずつ送信
             for char in text:
                 if char == '\n' or char == '\r':
@@ -87,7 +100,7 @@ class InteractiveTerminal(QTextEdit):
         # 貼り付け（カスタムペースト機能を使用）
         paste_action = QAction("貼り付け", self)
         paste_action.triggered.connect(self.custom_paste)
-        paste_action.setEnabled(self._input_enabled)
+        paste_action.setEnabled(self.can_send_input())
         menu.addAction(paste_action)
         
         menu.addSeparator()
@@ -234,6 +247,21 @@ class InteractiveTerminal(QTextEdit):
 
 
 class TerminalWidget(QWidget):
+    # settings.terminal のキーと既定値。src/resources/default_config.json と
+    # config_manager.py のフォールバック辞書に合わせてある。
+    DEFAULT_TERMINAL_SETTINGS = {
+        "background_color": "#000000",
+        "text_color": "#FFFFFF",
+        "font_family": "Consolas",
+        "font_size": 10,
+    }
+
+    # フォントサイズの上下限（settings.terminal.font_size）。表示メニューの
+    # 拡大/縮小（MainWindow）と設定ダイアログの QSpinBox（Task 7）が同じ範囲を
+    # 使うため、数値の実体はここへ一本化する。
+    FONT_SIZE_MIN = 6
+    FONT_SIZE_MAX = 32
+
     # タブが閉じられたときのシグナル（機器名を送信）
     tab_closed = pyqtSignal(str)
     # マクロ実行要求シグナル（機器名、マクロ名）
@@ -250,6 +278,8 @@ class TerminalWidget(QWidget):
         self._terminals: Dict[str, InteractiveTerminal] = {}  # 機器名 -> ターミナル
         self._log_files: Dict[str, object] = {}  # 機器名 -> ログファイルハンドル
         self._log_dialogs: Dict[str, object] = {}  # 機器名 -> ログ記録ダイアログ
+        # ターミナルの外観設定。_create_terminal が参照するので _create_ui より先に持つ
+        self._terminal_settings = dict(self.DEFAULT_TERMINAL_SETTINGS)
         self._create_ui()
     
     def _create_ui(self):
@@ -290,19 +320,104 @@ class TerminalWidget(QWidget):
             terminal = QTextEdit()
             terminal.setReadOnly(True)
         
-        # フォント設定
-        font = QFont("Consolas", 10)
+        # フォント設定（_terminal_settings を参照する。設定変更後に作られる
+        # タブも同じ外観になるようにするため）
+        settings = self._terminal_settings
+        font = QFont(settings["font_family"], settings["font_size"])
         font.setStyleHint(QFont.StyleHint.Monospace)
         terminal.setFont(font)
-        
-        # 配色設定（黒背景・白文字）
+
+        # 配色設定
         palette = terminal.palette()
-        palette.setColor(QPalette.ColorRole.Base, QColor(0, 0, 0))
-        palette.setColor(QPalette.ColorRole.Text, QColor(255, 255, 255))
+        palette.setColor(QPalette.ColorRole.Base, QColor(settings["background_color"]))
+        palette.setColor(QPalette.ColorRole.Text, QColor(settings["text_color"]))
         terminal.setPalette(palette)
-        
+
         return terminal
-    
+
+    @classmethod
+    def normalize_terminal_settings(cls, settings) -> dict:
+        """
+        設定値を検証し、妥当でないものを既定値で埋める
+
+        設定ダイアログもこの結果を表示・保存する。生値をそのまま扱うと、
+        ターミナルの見た目と設定画面の表示が食い違い、何も変えずに OK を
+        押しただけで壊れた値が書き戻される。
+
+        config.json は手で編集できるため、空文字・0・不正な色名といった値が
+        入ってくる。そのまま使うと読めない配色や不自然なフォントになるので、
+        キーごとに型と値を確かめ、通らなかったものは既定値へ戻す。
+
+        Args:
+            settings: settings.terminal 相当の dict（None や dict 以外も受け付ける）
+
+        Returns:
+            4キーすべてが妥当な値で埋まった dict
+        """
+        merged = dict(cls.DEFAULT_TERMINAL_SETTINGS)
+        if not isinstance(settings, dict):
+            return merged
+
+        family = settings.get("font_family")
+        if isinstance(family, str) and family.strip():
+            merged["font_family"] = family.strip()
+
+        # bool は int の派生なので明示的に除く（True が 1pt になるのを防ぐ）。
+        # 手編集で極端な値（例: 1000）が入っても描画が壊れないよう上下限も見る。
+        size = settings.get("font_size")
+        if (isinstance(size, int) and not isinstance(size, bool)
+                and cls.FONT_SIZE_MIN <= size <= cls.FONT_SIZE_MAX):
+            merged["font_size"] = size
+
+        for key in ("background_color", "text_color"):
+            value = settings.get(key)
+            if isinstance(value, str) and QColor(value).isValid():
+                merged[key] = value
+
+        return merged
+
+    def apply_terminal_settings(self, settings: dict):
+        """
+        ターミナルの外観設定を全タブへ適用する
+
+        既存タブだけでなく、以降に作られるタブにも同じ設定が乗る。
+
+        Args:
+            settings: settings.terminal 相当の dict。欠けているキーは既定値を使う
+        """
+        merged = self.normalize_terminal_settings(settings)
+        self._terminal_settings = merged
+
+        font = QFont(merged["font_family"], merged["font_size"])
+        font.setStyleHint(QFont.StyleHint.Monospace)
+        background = QColor(merged["background_color"])
+        text_color = QColor(merged["text_color"])
+
+        # _terminals にはホームタブが入らないため、タブを直接走査する
+        for i in range(self.tab_widget.count()):
+            terminal = self.tab_widget.widget(i)
+            terminal.setFont(font)
+            palette = terminal.palette()
+            palette.setColor(QPalette.ColorRole.Base, background)
+            palette.setColor(QPalette.ColorRole.Text, text_color)
+            terminal.setPalette(palette)
+
+    def current_terminal_settings(self) -> dict:
+        """
+        いま実際に適用されている外観設定を返す
+
+        config の生値ではなくこちらを基準にすること。生値は手編集で壊れている
+        可能性があり（文字列・null・bool・範囲外）、そのまま計算に使うと落ちる。
+
+        Returns:
+            正規化済みの設定のコピー
+        """
+        return dict(self._terminal_settings)
+
+    def get_current_terminal(self) -> Optional[QTextEdit]:
+        """現在表示中のタブのターミナルを返す（タブが無ければ None）"""
+        return self.tab_widget.currentWidget()
+
     def create_terminal_tab(self, device_name: str) -> InteractiveTerminal:
         """
         新しいターミナルタブを作成

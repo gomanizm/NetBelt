@@ -15,23 +15,87 @@ from core.sftp_manager import SFTPManager
 class SFTPPanel(QWidget):
     """SFTPファイルブラウザパネル"""
     
-    def __init__(self, parent=None):
+    # settings.sftp の既定値。src/resources/default_config.json に合わせてある
+    SFTP_SETTING_DEFAULTS = {
+        "default_download_path": "./downloads",
+        "show_hidden_files": False,
+        "confirm_delete": True,
+        "confirm_overwrite": True,
+    }
+    
+    def __init__(self, parent=None, config_manager=None):
         """
         初期化
         
         Args:
             parent: 親ウィジェット
+            config_manager: 設定マネージャ（settings.sftp を読むために使う。
+                None のときは既定値で動く）
         """
         super().__init__(parent)
         
+        self.config_manager = config_manager
         self.sftp_manager: Optional[SFTPManager] = None
         self.current_device = ""
+        # リモートの現在のディレクトリにある名前 -> ディレクトリか否か。
+        # 上書き確認の判定に使う。表示フィルタとは別に持つ（隠しファイルを
+        # 非表示にしているだけで上書き保護が外れてはいけない）
+        self._current_entries = {}
+        # 送信を始めたがまだ一覧に現れていない名前。一覧が来たら捨てる
+        self._pending_upload_names = set()
         
         # UI初期化
         self._init_ui()
         
         # ドラッグ&ドロップを有効化
         self.setAcceptDrops(True)
+    
+    @classmethod
+    def normalize_sftp_settings(cls, settings) -> dict:
+        """
+        settings.sftp を検証し、妥当でないものを既定値で埋める
+        
+        config.json は手で編集できるため、型の違う値が入りうる。
+        真偽値のつもりの "no" は文字列として真になり、null を
+        QCheckBox.setChecked() へ渡すと例外になる。設定ダイアログも
+        この結果を使う（生値を渡すとダイアログが開けなくなる）。
+        
+        Args:
+            settings: settings.sftp 相当の dict（None や dict 以外も受け付ける）
+        
+        Returns:
+            4キーすべてが妥当な値で埋まった dict
+        """
+        merged = dict(cls.SFTP_SETTING_DEFAULTS)
+        if not isinstance(settings, dict):
+            return merged
+        
+        path = settings.get("default_download_path")
+        if isinstance(path, str) and path.strip():
+            merged["default_download_path"] = path.strip()
+        
+        # 真偽値は bool のみ受理する。0/1 や "no" を通すと、
+        # 画面の表示と実際の動作が食い違う
+        for key in ("show_hidden_files", "confirm_delete", "confirm_overwrite"):
+            value = settings.get(key)
+            if isinstance(value, bool):
+                merged[key] = value
+        
+        return merged
+    
+    def _get_sftp_setting(self, key: str, default):
+        """
+        settings.sftp から設定値を取得する
+        
+        Args:
+            key: 設定キー
+            default: 未使用（正規化後の既定値を使う。呼び出し側の可読性のために残す）
+        
+        Returns:
+            正規化済みの設定値
+        """
+        raw = self.config_manager.get_server_settings("sftp") if self.config_manager else {}
+        return self.normalize_sftp_settings(raw)[key]
     
     def _init_ui(self):
         """UIを初期化"""
@@ -141,6 +205,9 @@ class SFTPPanel(QWidget):
                 pass
         
         self.sftp_manager = sftp_manager
+        # 接続先が変わるので、前の接続で観測した一覧は使えない
+        self._current_entries = {}
+        self._pending_upload_names = set()
         self.current_device = device_name
         
         # シグナル接続
@@ -160,6 +227,9 @@ class SFTPPanel(QWidget):
         self.progress_bar.setVisible(False)
         self.sftp_manager = None
         self.current_device = ""
+        # 残しておくと、次の接続で一覧を取る前に古い名前で上書き判定してしまう
+        self._current_entries = {}
+        self._pending_upload_names = set()
     
     def _update_file_list(self, file_list: list):
         """
@@ -168,6 +238,19 @@ class SFTPPanel(QWidget):
         Args:
             file_list: ファイル情報のリスト
         """
+        # 上書き確認は「リモートに何があるか」の話なので、表示フィルタを
+        # かける前の一覧から作る。隠しファイルを非表示にしているだけで
+        # ドットファイルが無警告で上書きされてはいけない
+        self._current_entries = {f['name']: bool(f['is_dir']) for f in file_list}
+        # 新しい一覧が真実なので、送信中として覚えていた名前は捨てる
+        self._pending_upload_names.clear()
+        
+        # 隠しファイルの扱い（settings.sftp.show_hidden_files）
+        show_hidden = self._get_sftp_setting(
+            "show_hidden_files", self.SFTP_SETTING_DEFAULTS["show_hidden_files"])
+        if not show_hidden:
+            file_list = [f for f in file_list if not f['name'].startswith('.')]
+        
         # モデルをクリア
         self.model.removeRows(0, self.model.rowCount())
         
@@ -354,7 +437,44 @@ class SFTPPanel(QWidget):
         )
         
         if file_path:
-            self.sftp_manager.upload_file(file_path)
+            self._upload_with_confirmation(file_path)
+    
+    def _upload_with_confirmation(self, file_path: str):
+        """
+        上書き確認を挟んでアップロードする
+        
+        Args:
+            file_path: ローカルのファイルパス
+        """
+        name = os.path.basename(file_path)
+        confirm = self._get_sftp_setting(
+            "confirm_overwrite", self.SFTP_SETTING_DEFAULTS["confirm_overwrite"])
+        # 同名でもディレクトリなら上書きではなく単に失敗するので、
+        # 「上書きしますか」とは聞かない。観測済みの種別が最優先で、
+        # まだ一覧に現れていない送信中の名前も既存ファイルとして扱う
+        known_is_dir = self._current_entries.get(name)
+        if known_is_dir is True:
+            overwrites_file = False
+        else:
+            overwrites_file = (known_is_dir is False
+                               or name in self._pending_upload_names)
+        if confirm and overwrites_file:
+            reply = QMessageBox.question(
+                self,
+                "上書き確認",
+                f"リモートに '{name}' が既にあります。上書きしますか？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+        
+        # アップロード完了後に sftp_manager が一覧を取り直すが、1回のドロップで
+        # 複数送る間は間に合わない。送信中の名前を別に覚えておき、同じドロップ内の
+        # 同名2件目以降にも確認が出るようにする。_current_entries は
+        # 「最後に観測したリモートの一覧」のまま保つ（種別を汚さないため）
+        self._pending_upload_names.add(name)
+        self.sftp_manager.upload_file(file_path)
     
     def _on_download(self):
         """ダウンロードボタンがクリックされた"""
@@ -384,11 +504,16 @@ class SFTPPanel(QWidget):
         if not self.sftp_manager:
             return
         
-        # 保存先を選択
+        # 保存先を選択（settings.sftp.default_download_path を初期位置に使う）
+        download_dir = self._get_sftp_setting(
+            "default_download_path",
+            self.SFTP_SETTING_DEFAULTS["default_download_path"])
+        suggested = os.path.join(download_dir, file_info['name'])
+        
         local_path, _ = QFileDialog.getSaveFileName(
             self,
             "ファイルを保存",
-            file_info['name'],
+            suggested,
             "すべてのファイル (*.*)"
         )
         
@@ -438,19 +563,22 @@ class SFTPPanel(QWidget):
         if not self.sftp_manager:
             return
         
-        # 確認ダイアログ
-        reply = QMessageBox.question(
-            self,
-            "削除確認",
-            f"'{file_info['name']}' を削除しますか？",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No
-        )
+        # 確認ダイアログ（settings.sftp.confirm_delete）
+        if self._get_sftp_setting(
+                "confirm_delete", self.SFTP_SETTING_DEFAULTS["confirm_delete"]):
+            reply = QMessageBox.question(
+                self,
+                "削除確認",
+                f"'{file_info['name']}' を削除しますか？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
         
-        if reply == QMessageBox.StandardButton.Yes:
-            current_path = self.sftp_manager.get_current_path()
-            item_path = f"{current_path}/{file_info['name']}" if current_path != "/" else f"/{file_info['name']}"
-            self.sftp_manager.delete_item(item_path, file_info['is_dir'])
+        current_path = self.sftp_manager.get_current_path()
+        item_path = f"{current_path}/{file_info['name']}" if current_path != "/" else f"/{file_info['name']}"
+        self.sftp_manager.delete_item(item_path, file_info['is_dir'])
     
     def _on_rename_selected(self, file_info: dict):
         """
@@ -532,7 +660,7 @@ class SFTPPanel(QWidget):
         for url in urls:
             file_path = url.toLocalFile()
             if os.path.isfile(file_path):
-                self.sftp_manager.upload_file(file_path)
+                self._upload_with_confirmation(file_path)
     
     @staticmethod
     def _format_size(size: int) -> str:

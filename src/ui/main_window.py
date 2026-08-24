@@ -15,6 +15,7 @@ from .snmp_panel import SNMPPanel
 from .dialogs.device_dialog import DeviceDialog
 from .dialogs.group_dialog import GroupDialog
 from .dialogs.macro_dialog import MacroDialog
+from .dialogs.settings_dialog import SettingsDialog
 from core.config_manager import ConfigManager
 from core.ssh_connection import SSHConnection
 from core.serial_connection import SerialConnection
@@ -89,6 +90,12 @@ class MainWindow(QMainWindow):
     update_check_error = pyqtSignal(str)
     no_update_available = pyqtSignal()
     run_auto_commands_requested = pyqtSignal(str)  # 接続後の自動実行コマンド要求
+
+    # ターミナルのフォントサイズの上下限（settings.terminal.font_size）。
+    # 数値の実体は TerminalWidget 側にあり、ここでは参照するだけにして
+    # 二重定義を避ける。
+    FONT_SIZE_MIN = TerminalWidget.FONT_SIZE_MIN
+    FONT_SIZE_MAX = TerminalWidget.FONT_SIZE_MAX
     
     def __init__(self):
         super().__init__()
@@ -142,6 +149,9 @@ class MainWindow(QMainWindow):
         # 設定から接続先リストを読み込み
         self._load_devices()
         
+        # ターミナルの外観設定（config の settings.terminal）を反映
+        self._apply_terminal_settings_from_config()
+
         # 起動時の更新チェック（非同期）
         self._check_for_updates_on_startup()
 
@@ -200,9 +210,16 @@ class MainWindow(QMainWindow):
         file_menu.addAction("終了(&X)", self.close)
         
         # 編集メニュー
+        # 端末ソフトの慣習に合わせて Ctrl+Shift+C / Ctrl+Shift+V を使う。
+        # Ctrl+C はターミナルから機器へ 0x03（中断）として送られるので奪わない。
         edit_menu = menubar.addMenu("編集(&E)")
-        edit_menu.addAction("コピー(&C)")
-        edit_menu.addAction("ペースト(&P)")
+        self.copy_action = edit_menu.addAction("コピー(&C)")
+        self.copy_action.setShortcut("Ctrl+Shift+C")
+        self.copy_action.triggered.connect(self._on_copy)
+
+        self.paste_action = edit_menu.addAction("ペースト(&P)")
+        self.paste_action.setShortcut("Ctrl+Shift+V")
+        self.paste_action.triggered.connect(self._on_paste)
         
         # 表示メニュー
         view_menu = menubar.addMenu("表示(&V)")
@@ -235,15 +252,18 @@ class MainWindow(QMainWindow):
         self.toggle_tool_area_action.triggered.connect(self._toggle_tool_area)
         
         view_menu.addSeparator()
-        view_menu.addAction("フォントサイズ拡大")
-        view_menu.addAction("フォントサイズ縮小")
+        self.font_increase_action = view_menu.addAction("フォントサイズ拡大")
+        self.font_increase_action.triggered.connect(self._on_font_size_increase)
+        self.font_decrease_action = view_menu.addAction("フォントサイズ縮小")
+        self.font_decrease_action.triggered.connect(self._on_font_size_decrease)
         
         # ツールメニュー
         tools_menu = menubar.addMenu("ツール(&T)")
         tools_menu.addAction("マクロ設定(&M)", self._on_macro_settings)
         tools_menu.addAction("ポートチェッカー(&P)", self._on_port_checker)
         tools_menu.addSeparator()
-        tools_menu.addAction("設定")
+        self.settings_action = tools_menu.addAction("設定")
+        self.settings_action.triggered.connect(self._on_settings)
         
         # ログメニュー
         log_menu = menubar.addMenu("ログ(&L)")
@@ -311,7 +331,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(splitter)
         
         # 各ツールをスクロール内包でタブに収める（QDockWidget は廃止）
-        self.sftp_panel = SFTPPanel()
+        self.sftp_panel = SFTPPanel(config_manager=self.config_manager)
         self.sftp_server_panel = SFTPServerPanel()
         self.tftp_server_panel = TFTPServerPanel(config_manager=self.config_manager)
         self.ftp_server_panel = FTPServerPanel(config_manager=self.config_manager)
@@ -935,44 +955,97 @@ class MainWindow(QMainWindow):
         """グループ追加ダイアログを表示"""
         # 既存のグループ名リストを取得
         existing_groups = [g["name"] for g in self.config_manager.get_groups()]
-        
+
         # ダイアログ表示
         dialog = GroupDialog(self, existing_groups=existing_groups)
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            # グループ名を取得
+            # グループ名と自動実行コマンドを取得
             group_name = dialog.get_group_name()
-            
+            auto_commands = dialog.get_auto_commands()
+
             # 設定に追加
-            if self.config_manager.add_group(group_name):
+            if self.config_manager.add_group(group_name, auto_commands):
                 # ツリーを再読み込み
                 self._load_devices()
                 self.status_bar.showMessage(f"グループ '{group_name}' を追加しました")
             else:
                 QMessageBox.warning(self, "エラー", "グループの追加に失敗しました。")
-    
+
+    def _warn_change_failed(self, what: str, applied_in_memory: bool):
+        """
+        設定の変更に失敗したことを知らせる
+
+        ConfigManager の各 mutator は save_config() の前に in-memory の設定を
+        書き換えるため、戻り値の False だけでは「保存だけ失敗した（実行中の
+        状態は変更済み）」と「そもそも変更が適用されなかった」を区別できない。
+        呼び出し側が事後状態を見て判定し、ここへ渡す。
+
+        どちらの場合もツリーを実行中の状態へ合わせ直してから知らせる。
+
+        Args:
+            what: 失敗した操作の名前（例: "グループ名の変更"）
+            applied_in_memory: 実行中の設定には変更が適用されているか
+        """
+        self._load_devices()
+        if applied_in_memory:
+            QMessageBox.warning(
+                self, "エラー",
+                f"{what}を設定ファイルへ保存できませんでした。\n"
+                "変更はこのセッション中のみ有効で、アプリを終了すると失われます。")
+        else:
+            QMessageBox.warning(self, "エラー", f"{what}に失敗しました。")
+
     def _on_edit_group(self, group_name: str):
         """
         グループ編集ダイアログを表示
-        
+
         Args:
             group_name: 編集対象のグループ名
         """
-        # 既存のグループ名リストを取得
+        # 既存のグループ名リストと、現在の自動実行コマンドを取得
         existing_groups = [g["name"] for g in self.config_manager.get_groups()]
-        
+        group = self.config_manager.get_group(group_name)
+        auto_commands = list(group.get("auto_commands", [])) if group else []
+
         # ダイアログ表示
-        dialog = GroupDialog(self, group_name=group_name, existing_groups=existing_groups)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            # 新しいグループ名を取得
-            new_group_name = dialog.get_group_name()
-            
-            # 設定を更新
-            if self.config_manager.rename_group(group_name, new_group_name):
-                # ツリーを再読み込み
-                self._load_devices()
-                self.status_bar.showMessage(f"グループ名を '{group_name}' から '{new_group_name}' に変更しました")
-            else:
-                QMessageBox.warning(self, "エラー", "グループ名の変更に失敗しました。")
+        dialog = GroupDialog(self, group_name=group_name,
+                             existing_groups=existing_groups,
+                             auto_commands=auto_commands)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        new_group_name = dialog.get_group_name()
+        new_auto_commands = dialog.get_auto_commands()
+
+        # 改名は名前が変わったときだけ行う。同じ名前で rename_group を呼ぶと
+        # 「既に存在します」と判定されて False が返り、誤った警告が出るため。
+        if new_group_name != group_name:
+            if not self.config_manager.rename_group(group_name, new_group_name):
+                # rename_group は「保存失敗」のほか「対象が無い」「新名が重複」でも
+                # False を返す。実行中の設定に改名が反映されているかで見分ける。
+                renamed = (self.config_manager.get_group(group_name) is None
+                           and self.config_manager.get_group(new_group_name) is not None)
+                self._warn_change_failed("グループ名の変更", renamed)
+                return
+
+        # 自動実行コマンドは改名後の名前で保存する
+        if not self.config_manager.set_group_auto_commands(new_group_name, new_auto_commands):
+            # こちらも「対象が無い」場合と「保存失敗」の両方で False になる。
+            group_now = self.config_manager.get_group(new_group_name)
+            # 元から同じ値なら、保存に失敗しても失われる変更は無い。
+            # 「セッション中のみ有効」と案内しないよう、値が実際に変わったかも見る。
+            applied = (auto_commands != new_auto_commands
+                       and group_now is not None
+                       and group_now.get("auto_commands") == new_auto_commands)
+            self._warn_change_failed("自動実行コマンドの保存", applied)
+            return
+
+        self._load_devices()
+        if new_group_name != group_name:
+            self.status_bar.showMessage(
+                f"グループ '{group_name}' を '{new_group_name}' に変更しました")
+        else:
+            self.status_bar.showMessage(f"グループ '{group_name}' を更新しました")
     
     def _on_delete_group(self, group_name: str):
         """
@@ -1021,6 +1094,78 @@ class MainWindow(QMainWindow):
         """ログ記録停止メニューがクリックされたときの処理"""
         self.terminal_widget.stop_log_recording()
     
+    def _on_copy(self):
+        """現在のターミナルの選択範囲をクリップボードへコピーする"""
+        terminal = self.terminal_widget.get_current_terminal()
+        if terminal is None:
+            return
+        terminal.copy()
+
+    def _on_paste(self):
+        """クリップボードの内容を現在のターミナルから機器へ送信する"""
+        from .terminal_widget import InteractiveTerminal
+
+        terminal = self.terminal_widget.get_current_terminal()
+        # ホームタブは読み取り専用の QTextEdit で送信先を持たない。
+        # 接続タブでも再接続待機中は送信できない（can_send_input が見分ける）。
+        if not isinstance(terminal, InteractiveTerminal) or not terminal.can_send_input():
+            self.status_bar.showMessage("ペーストできるのは接続中のターミナルタブだけです")
+            return
+        terminal.custom_paste()
+
+    def _apply_terminal_settings_from_config(self):
+        """config の settings.terminal をターミナルへ適用する"""
+        self.terminal_widget.apply_terminal_settings(
+            self.config_manager.get_server_settings("terminal"))
+
+    def _change_font_size(self, delta: int):
+        """
+        ターミナルのフォントサイズを変更して保存する
+
+        Args:
+            delta: 増減量（+1 / -1）
+        """
+        # config の生値ではなく、いま適用されている正規化済みの値を基準にする。
+        # 生値は手編集で壊れていることがあり（"12" / null / true / 1000）、
+        # そのまま加算すると TypeError で落ちるか、表示と無関係な値へ飛ぶ。
+        current = self.terminal_widget.current_terminal_settings()["font_size"]
+        new_size = max(self.FONT_SIZE_MIN, min(self.FONT_SIZE_MAX, current + delta))
+        if new_size == current:
+            self.status_bar.showMessage(
+                f"フォントサイズは {current}pt です（{self.FONT_SIZE_MIN}〜{self.FONT_SIZE_MAX}pt）")
+            return
+
+        # settings 全体を置換する update_settings ではなく、浅いマージの
+        # set_server_settings を使う（ui_layout など他のセクションを消さないため）
+        saved = self.config_manager.set_server_settings("terminal", {"font_size": new_size})
+        self._apply_terminal_settings_from_config()
+        if saved:
+            self.status_bar.showMessage(f"フォントサイズ: {new_size}pt")
+        else:
+            self.status_bar.showMessage(
+                f"フォントサイズ: {new_size}pt（設定ファイルへ保存できませんでした）")
+
+    def _on_font_size_increase(self):
+        """フォントサイズを1pt大きくする"""
+        self._change_font_size(1)
+
+    def _on_font_size_decrease(self):
+        """フォントサイズを1pt小さくする"""
+        self._change_font_size(-1)
+
+    def _on_settings(self):
+        """設定ダイアログを表示する
+
+        config.json の読み込みに失敗していても開く。破損時はロード時に
+        バックアップを取ったうえでデフォルト設定で動く仕様で、起動時の
+        ダイアログも「新しい設定を保存すると config.json が再作成されます」と
+        案内している。ここで塞ぐと復旧手段が無くなる。
+        """
+        dialog = SettingsDialog(self, config_manager=self.config_manager)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._apply_terminal_settings_from_config()
+            self.status_bar.showMessage("設定を保存しました")
+
     def _on_macro_settings(self):
         """マクロ設定メニューがクリックされたときの処理"""
         # 現在アクティブなタブを取得

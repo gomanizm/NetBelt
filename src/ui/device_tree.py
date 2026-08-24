@@ -308,7 +308,7 @@ class DeviceTree(QWidget):
             return
         
         menu = QMenu(self)
-        edit_action = menu.addAction("グループ名を変更")
+        edit_action = menu.addAction("グループを編集")
         
         # Defaultグループは削除不可
         delete_action = None
