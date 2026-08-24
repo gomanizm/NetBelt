@@ -66,8 +66,41 @@ class TerminalSettingsTest(unittest.TestCase):
     def test_get_current_terminal_returns_the_visible_widget(self):
         w = self._widget()
         self.assertIs(w.get_current_terminal(), w.tab_widget.widget(0))
-        term = w.create_terminal_tab("ルータA")
-        self.assertIs(w.get_current_terminal(), term)
+
+        # タブ1枚だけだと currentWidget() と widget(0) が一致してしまい、
+        # index を固定した実装と見分けられない。2枚作って切り替えて確かめる。
+        first = w.create_terminal_tab("ルータA")
+        second = w.create_terminal_tab("ルータB")
+        self.assertIs(w.get_current_terminal(), second)
+        w.tab_widget.setCurrentIndex(w.tab_widget.indexOf(first))
+        self.assertIs(w.get_current_terminal(), first)
+
+    def test_invalid_values_fall_back_to_defaults(self):
+        """config.json は手で編集できるので壊れた値が来る前提で守る。"""
+        from PyQt6.QtGui import QColor, QPalette
+        from ui.terminal_widget import TerminalWidget
+        w = self._widget()
+        w.apply_terminal_settings({
+            "background_color": "not-a-color", "text_color": "",
+            "font_family": "   ", "font_size": 0})
+        home = w.tab_widget.widget(0)
+        defaults = TerminalWidget.DEFAULT_TERMINAL_SETTINGS
+        self.assertEqual(home.font().family(), defaults["font_family"])
+        self.assertEqual(home.font().pointSize(), defaults["font_size"])
+        self.assertEqual(home.palette().color(QPalette.ColorRole.Base),
+                         QColor(defaults["background_color"]))
+        self.assertEqual(home.palette().color(QPalette.ColorRole.Text),
+                         QColor(defaults["text_color"]))
+
+    def test_settings_that_are_not_a_dict_are_ignored(self):
+        """get_server_settings が空や None を返しても落ちないこと。"""
+        from ui.terminal_widget import TerminalWidget
+        w = self._widget()
+        w.apply_terminal_settings(None)
+        home = w.tab_widget.widget(0)
+        defaults = TerminalWidget.DEFAULT_TERMINAL_SETTINGS
+        self.assertEqual(home.font().family(), defaults["font_family"])
+        self.assertEqual(home.font().pointSize(), defaults["font_size"])
 
 
 if __name__ == "__main__":

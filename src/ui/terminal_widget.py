@@ -316,6 +316,40 @@ class TerminalWidget(QWidget):
 
         return terminal
 
+    def _normalize_terminal_settings(self, settings) -> dict:
+        """
+        設定値を検証し、妥当でないものを既定値で埋める
+
+        config.json は手で編集できるため、空文字・0・不正な色名といった値が
+        入ってくる。そのまま使うと読めない配色や不自然なフォントになるので、
+        キーごとに型と値を確かめ、通らなかったものは既定値へ戻す。
+
+        Args:
+            settings: settings.terminal 相当の dict（None や dict 以外も受け付ける）
+
+        Returns:
+            4キーすべてが妥当な値で埋まった dict
+        """
+        merged = dict(self.DEFAULT_TERMINAL_SETTINGS)
+        if not isinstance(settings, dict):
+            return merged
+
+        family = settings.get("font_family")
+        if isinstance(family, str) and family.strip():
+            merged["font_family"] = family
+
+        # bool は int の派生なので明示的に除く（True が 1pt になるのを防ぐ）
+        size = settings.get("font_size")
+        if isinstance(size, int) and not isinstance(size, bool) and size > 0:
+            merged["font_size"] = size
+
+        for key in ("background_color", "text_color"):
+            value = settings.get(key)
+            if isinstance(value, str) and QColor(value).isValid():
+                merged[key] = value
+
+        return merged
+
     def apply_terminal_settings(self, settings: dict):
         """
         ターミナルの外観設定を全タブへ適用する
@@ -325,10 +359,7 @@ class TerminalWidget(QWidget):
         Args:
             settings: settings.terminal 相当の dict。欠けているキーは既定値を使う
         """
-        merged = dict(self.DEFAULT_TERMINAL_SETTINGS)
-        for key in self.DEFAULT_TERMINAL_SETTINGS:
-            if settings.get(key) is not None:
-                merged[key] = settings[key]
+        merged = self._normalize_terminal_settings(settings)
         self._terminal_settings = merged
 
         font = QFont(merged["font_family"], merged["font_size"])
