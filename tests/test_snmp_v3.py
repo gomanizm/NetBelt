@@ -540,9 +540,32 @@ class TrapTabV3UiTest(unittest.TestCase):
         from PyQt6.QtWidgets import QApplication
         cls.app = QApplication.instance() or QApplication([])
 
+    # 作った MainWindow はクラス終了まで保持する。snmp_panel だけ受け取って
+    # 窓を捨てると、GC のタイミングで C++ 側のウィジェットが破棄され、
+    # あとから触ると「wrapped C/C++ object ... has been deleted」で落ちる。
+    _windows = []
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._windows.clear()
+
+    def setUp(self):
+        from unittest import mock
+        # 受信開始の経路は検証に失敗するとモーダルを出す。offscreen では
+        # 誰も閉じられないので、テストが「失敗」ではなく「ハング」になる。
+        # 個々のテストがさらに patch すればそちらが優先される。
+        warn = mock.patch("ui.snmp_panel.QMessageBox.warning")
+        warn.start()
+        self.addCleanup(warn.stop)
+
     def _panel(self):
+        from unittest import mock
         from ui.main_window import MainWindow
-        return MainWindow().snmp_panel
+        # 起動時の更新チェックは実際に GitHub API を叩くのでモックする
+        with mock.patch.object(MainWindow, "_check_for_updates_on_startup"):
+            window = MainWindow()
+        type(self)._windows.append(window)
+        return window.snmp_panel
 
     def test_trap_version_combo_defaults_to_both(self):
         panel = self._panel()
