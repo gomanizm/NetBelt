@@ -336,7 +336,7 @@ class TerminalWidget(QWidget):
 
         family = settings.get("font_family")
         if isinstance(family, str) and family.strip():
-            merged["font_family"] = family
+            merged["font_family"] = family.strip()
 
         # bool は int の派生なので明示的に除く（True が 1pt になるのを防ぐ）
         size = settings.get("font_size")
