@@ -329,7 +329,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(splitter)
         
         # 各ツールをスクロール内包でタブに収める（QDockWidget は廃止）
-        self.sftp_panel = SFTPPanel()
+        self.sftp_panel = SFTPPanel(config_manager=self.config_manager)
         self.sftp_server_panel = SFTPServerPanel()
         self.tftp_server_panel = TFTPServerPanel(config_manager=self.config_manager)
         self.ftp_server_panel = FTPServerPanel(config_manager=self.config_manager)
