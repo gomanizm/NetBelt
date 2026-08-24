@@ -51,7 +51,9 @@ SNMPv3 の Trap では送信側が authoritative engine となるため、受信
 Cisco IOS なら `show snmp engineID` で確認できます。EngineID は偶数桁の
 16進で（例: `8000000001020304`）、複数台から受ける場合は1行に1つずつ
 入力してください。v3 のユーザ名を入力したまま EngineID を登録せずに
-受信を開始しようとすると、警告が出て止まります。
+受信を開始しようとすると、警告が出て止まります。v3 の受信を有効に
+するには、まずユーザ名を設定し、その上で EngineID を登録してから
+開始してください。
 
 v3 の認証情報は保存されません。アプリを起動するたびに入力が必要です。
 
@@ -209,7 +211,9 @@ must already know the device's EngineID to authenticate and decrypt the
 message. On Cisco IOS, `show snmp engineID` shows it. EngineIDs are
 entered as even-length hex (e.g. `8000000001020304`), one per line for
 multiple devices. Starting the receiver with a v3 username but no
-EngineID registered will warn and refuse to start.
+EngineID registered will warn and refuse to start. To enable v3
+reception, set the username first, then register the EngineID,
+then start the receiver.
 
 v3 credentials are never saved to disk — they must be re-entered every
 time the app starts.
