@@ -22,16 +22,21 @@ def set_exclusive_bind(sock) -> None:
     """
     if sys.platform != "win32":
         return
-    # SO_REUSEADDR が既に立っていると SO_EXCLUSIVEADDRUSE の設定が
-    # WinError 10022 で失敗する。pysnmp は自前のトランスポートソケットへ
-    # 無条件にこれを立てるため、先に戻しておく。
-    try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
-    except OSError as e:
-        print(f"[Socket] SO_REUSEADDR を解除できませんでした: {e}")
     opt = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
     if opt is None:
         return
+
+    # SO_REUSEADDR が既に立っていると SO_EXCLUSIVEADDRUSE の設定が
+    # WinError 10022 で失敗する。pysnmp は自前のトランスポートソケットへ
+    # 無条件にこれを立てるため、先に戻しておく。戻せなければ排他バインドも
+    # 必ず失敗するので、同じ原因で二重に警告せずここで打ち切る。
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+    except OSError as e:
+        print(f"[Socket] SO_REUSEADDR を解除できませんでした: {e}"
+              " (このポートは他プロセスに奪われる可能性があります)")
+        return
+
     try:
         sock.setsockopt(socket.SOL_SOCKET, opt, 1)
     except OSError as e:

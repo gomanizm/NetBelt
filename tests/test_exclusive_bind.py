@@ -199,6 +199,30 @@ class ExclusiveBindOverridesReuseAddrTest(unittest.TestCase):
             thief.bind(("0.0.0.0", port))
 
 
+    def test_a_tcp_port_is_protected_too(self):
+        """TCP の待ち受け（SFTP サーバなど）でも同じ保護が効くこと。"""
+        import socket
+        import sys
+        from core.sockets import set_exclusive_bind
+
+        if sys.platform != "win32":
+            self.skipTest("SO_EXCLUSIVEADDRUSE は Windows のみ")
+
+        ours = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.addCleanup(ours.close)
+        ours.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        set_exclusive_bind(ours)
+        ours.bind(("0.0.0.0", 0))
+        ours.listen(1)
+        port = ours.getsockname()[1]
+
+        thief = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.addCleanup(thief.close)
+        thief.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+        with self.assertRaises(OSError):
+            thief.bind(("0.0.0.0", port))
+
 class ServersUseExclusiveBindTest(unittest.TestCase):
     """各サーバが SO_REUSEADDR ではなく共通ヘルパーを使っていること。"""
 
