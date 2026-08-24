@@ -1154,18 +1154,13 @@ class MainWindow(QMainWindow):
         self._change_font_size(-1)
 
     def _on_settings(self):
-        """設定ダイアログを表示する"""
-        # config.json の読み込みに失敗している状態で保存すると、破損扱いになった
-        # 元ファイルがデフォルト設定で上書きされ、機器リストが消えたように見える
-        if self.config_manager.load_error:
-            QMessageBox.warning(
-                self,
-                "設定を変更できません",
-                "設定ファイルの読み込みに失敗しているため、設定を変更できません。\n"
-                "アプリを再起動するか、バックアップから config.json を復元してください。"
-            )
-            return
+        """設定ダイアログを表示する
 
+        config.json の読み込みに失敗していても開く。破損時はロード時に
+        バックアップを取ったうえでデフォルト設定で動く仕様で、起動時の
+        ダイアログも「新しい設定を保存すると config.json が再作成されます」と
+        案内している。ここで塞ぐと復旧手段が無くなる。
+        """
         dialog = SettingsDialog(self, config_manager=self.config_manager)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self._apply_terminal_settings_from_config()

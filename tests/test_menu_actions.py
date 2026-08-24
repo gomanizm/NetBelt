@@ -208,15 +208,21 @@ class MenuActionsTest(unittest.TestCase):
         dialog_class.assert_called_once()
         self.assertIs(dialog_class.call_args.kwargs["config_manager"], w.config_manager)
 
-    def test_settings_dialog_is_blocked_when_the_config_failed_to_load(self):
-        """破損した config をデフォルト設定で上書きしないため。"""
+    def test_settings_dialog_opens_even_after_a_load_error(self):
+        """読み込みに失敗していても設定を直せること。
+
+        破損時はロード時にバックアップを取ってデフォルト設定で動く仕様で、
+        起動時のダイアログもそう案内している。ここで塞ぐと、壊れた
+        config.json を抱えたまま何も保存できなくなる。
+        """
         w = self._window()
         w.config_manager.load_error = "読み込みエラー"
         with mock.patch("ui.main_window.SettingsDialog") as dialog_class, \
              mock.patch("ui.main_window.QMessageBox.warning") as warn:
+            dialog_class.return_value.exec.return_value = 0
             w._on_settings()
-        dialog_class.assert_not_called()
-        warn.assert_called_once()
+        dialog_class.assert_called_once()
+        warn.assert_not_called()
 
     def test_settings_dialog_reapplies_terminal_settings_on_accept(self):
         from PyQt6.QtWidgets import QDialog
