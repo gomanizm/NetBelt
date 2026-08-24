@@ -51,5 +51,68 @@ class BrokenConfigSelfHealsTest(unittest.TestCase):
         self.assertEqual(reloaded.get_server_settings("terminal")["font_size"], 20)
 
 
+
+class BrokenSettingTypesTest(unittest.TestCase):
+    """手編集で型が壊れていても落ちないこと。
+
+    設定を「読む」側は正規化していたが、ConfigManager の境界を素通しに
+    していたため、settings.terminal が文字列だと保存で AttributeError、
+    check_on_startup が "yes" だと設定ダイアログが TypeError で開けなかった。
+    """
+
+    def _manager_with(self, patch):
+        d = tempfile.mkdtemp(prefix="netbelt-badtype-")
+        path = os.path.join(d, "config.json")
+        cm = ConfigManager(config_path=path)
+        cm.config.update(patch)
+        cm.save_config()
+        return ConfigManager(config_path=path)
+
+    def test_saving_survives_a_non_dict_section(self):
+        for broken in ("broken", [], 5, None):
+            with self.subTest(terminal=broken):
+                cm = self._manager_with({"settings": {"terminal": broken}})
+                self.assertEqual(cm.get_server_settings("terminal"), {})
+                self.assertTrue(cm.set_server_settings("terminal", {"font_size": 12}))
+                self.assertEqual(
+                    cm.get_server_settings("terminal")["font_size"], 12)
+
+    def test_saving_survives_a_non_dict_settings_root(self):
+        cm = self._manager_with({"settings": "broken"})
+        self.assertEqual(cm.get_server_settings("terminal"), {})
+        self.assertTrue(cm.set_server_settings("terminal", {"font_size": 12}))
+
+    def test_check_on_startup_is_always_a_bool(self):
+        for broken in ("yes", None, 1, [], {}):
+            with self.subTest(check_on_startup=broken):
+                cm = self._manager_with(
+                    {"update_settings": {"check_on_startup": broken}})
+                value = cm.get_check_on_startup()
+                self.assertIsInstance(value, bool)
+                self.assertTrue(value, "壊れた値は既定（True）へ倒す")
+
+    def test_real_booleans_are_kept(self):
+        for kept in (True, False):
+            with self.subTest(check_on_startup=kept):
+                cm = self._manager_with(
+                    {"update_settings": {"check_on_startup": kept}})
+                self.assertIs(cm.get_check_on_startup(), kept)
+
+    def test_skipped_version_is_a_string_or_none(self):
+        for broken in (123, [], {}, ""):
+            with self.subTest(skipped_version=broken):
+                cm = self._manager_with(
+                    {"update_settings": {"skipped_version": broken}})
+                self.assertIsNone(cm.get_skipped_version())
+
+        cm = self._manager_with({"update_settings": {"skipped_version": "1.2.3"}})
+        self.assertEqual(cm.get_skipped_version(), "1.2.3")
+
+    def test_a_non_dict_update_settings_does_not_break(self):
+        cm = self._manager_with({"update_settings": "broken"})
+        self.assertIs(cm.get_check_on_startup(), True)
+        self.assertTrue(cm.set_check_on_startup(False))
+        self.assertIs(cm.get_check_on_startup(), False)
+
 if __name__ == "__main__":
     unittest.main()

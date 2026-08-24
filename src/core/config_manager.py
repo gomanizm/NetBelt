@@ -378,7 +378,8 @@ class ConfigManager:
             }
             self.save_config()
         
-        return self.config.get("update_settings", {})
+        stored = self.config.get("update_settings")
+        return stored if isinstance(stored, dict) else {}
     
     def update_update_settings(self, settings: Dict) -> bool:
         """
@@ -390,23 +391,29 @@ class ConfigManager:
         Returns:
             更新成功時True、失敗時False
         """
-        if "update_settings" not in self.config:
+        if not isinstance(self.config.get("update_settings"), dict):
             self.config["update_settings"] = {}
         
         self.config["update_settings"].update(settings)
         return self.save_config()
     
     def get_check_on_startup(self) -> bool:
-        """起動時の更新チェック設定を取得"""
-        return self.get_update_settings().get("check_on_startup", True)
+        """起動時の更新チェック設定を取得
+
+        手編集で bool 以外が入っていても bool を返す。生値を
+        QCheckBox.setChecked() へ渡すと TypeError になるため。
+        """
+        value = self.get_update_settings().get("check_on_startup", True)
+        return value if isinstance(value, bool) else True
     
     def set_check_on_startup(self, enabled: bool) -> bool:
         """起動時の更新チェック設定を変更"""
         return self.update_update_settings({"check_on_startup": enabled})
     
     def get_skipped_version(self) -> Optional[str]:
-        """スキップされたバージョンを取得"""
-        return self.get_update_settings().get("skipped_version")
+        """スキップ中のバージョンを取得（文字列でなければ None）"""
+        value = self.get_update_settings().get("skipped_version")
+        return value if isinstance(value, str) and value else None
     
     def set_skipped_version(self, version: Optional[str]) -> bool:
         """スキップするバージョンを設定"""
@@ -555,14 +562,44 @@ class ConfigManager:
         self.config["settings"] = settings
         return self.save_config()
     
+    def _settings_section(self, key, create=False):
+        """
+        settings.<key> を dict として返す
+
+        config.json は手で編集できるため、settings 自体や各セクションが
+        dict でなくなっていることがある。そのまま .update() すると
+        AttributeError で落ちるので、ここで型を保証する。
+
+        Args:
+            key: セクション名
+            create: 壊れていた場合に config を作り直すか（書き込み時は True）
+
+        Returns:
+            セクションの dict。create=False で壊れていれば空 dict
+        """
+        settings = self.config.get("settings")
+        if not isinstance(settings, dict):
+            if not create:
+                return {}
+            settings = {}
+            self.config["settings"] = settings
+
+        section = settings.get(key)
+        if not isinstance(section, dict):
+            if not create:
+                return {}
+            section = {}
+            settings[key] = section
+
+        return section
+    
     def get_server_settings(self, key):
         """サーバー設定 dict を返す（key='tftp_server'/'ftp_server'/'sftp_server'）。"""
-        return self.config.get("settings", {}).get(key, {})
+        return self._settings_section(key)
     
     def set_server_settings(self, key, values):
         """サーバー設定をマージして保存する。"""
-        settings = self.config.setdefault("settings", {})
-        settings.setdefault(key, {}).update(values)
+        self._settings_section(key, create=True).update(values)
         return self.save_config()
     
     def move_device(self, source_group_name: str, target_group_name: str, device_name: str) -> bool:
