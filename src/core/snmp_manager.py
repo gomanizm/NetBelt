@@ -355,9 +355,12 @@ class SNMPTrapReceiver(QThread):
             # 公式サンプル multiple-usm-users.py と同じ構成。
             security_engine_ids = [None]
             for engine_id in user.get("engine_ids", []):
-                engine_id = engine_id.strip()
-                if engine_id:
-                    security_engine_ids.append(OctetString(hexValue=engine_id))
+                # 設定が壊れていて文字列以外が来ても、受信そのものを
+                # 止めない（その要素だけ捨てる）
+                if not isinstance(engine_id, str) or not engine_id.strip():
+                    continue
+                security_engine_ids.append(
+                    OctetString(hexValue=engine_id.strip()))
 
             for security_engine_id in security_engine_ids:
                 config.addV3User(
@@ -379,8 +382,11 @@ class SNMPTrapReceiver(QThread):
                 'security_level': str(variables.get('securityLevel', '')),
                 'security_model': str(variables.get('securityModel', '')),
             }
+            # 送信元のアドレスとポート。旧実装は recvfrom の addr をそのまま
+            # 使っていたので、エンジン化で意味が変わらないようここで拾う。
             address = variables.get('transportAddress')
             self._last_security['source_ip'] = str(address[0]) if address else ''
+            self._last_security['source_port'] = int(address[1]) if address else 0
 
         self._engine.observer.registerObserver(
             _observe, 'rfc3412.receiveMessage:request')
@@ -413,7 +419,8 @@ class SNMPTrapReceiver(QThread):
         security = dict(self._last_security)
         trap_data = {
             'source_ip': security.pop('source_ip', ''),
-            'source_port': self.port,
+            # 待ち受けポートではなく送信元のポート（旧実装と同じ意味）
+            'source_port': security.pop('source_port', 0),
             'timestamp': None,
             'trap_oid': None,
             'varbinds': [],

@@ -136,6 +136,74 @@ class SnmpTrapReceiveTest(unittest.TestCase):
         self.assertEqual(got[0]["source_ip"], "127.0.0.1")
         self.assertTrue(got[0]["varbinds"], "varbinds が空")
 
+
+    def test_source_port_is_the_senders_port(self):
+        """待ち受けポートではなく送信元のポートを載せること。
+
+        生ソケット実装は recvfrom の addr[1] を使っていた。エンジンへ
+        載せ替えたときに待ち受けポート固定へ変わってしまい、
+        キーの存在しか見ていない既存テストでは気づけなかった。
+        """
+        m, port = self._start(["public"])
+        got = []
+        m.trap_received.connect(got.append)
+
+        sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.addCleanup(sender.close)
+        sender.bind(("127.0.0.1", 0))
+        sender_port = sender.getsockname()[1]
+        sender.sendto(trap_bytes("public"), ("127.0.0.1", port))
+
+        self.assertTrue(self._pump(got), "Trap が届かない")
+        self.assertEqual(got[-1]["source_port"], sender_port)
+        self.assertNotEqual(got[-1]["source_port"], port,
+                            "待ち受けポートを送信元として載せている")
+
+    def test_a_v3_user_without_a_username_is_ignored(self):
+        """ユーザ名が空の要素があっても受信そのものは始まること。"""
+        import time
+        from core.snmp_manager import SNMPManager
+        m = SNMPManager()
+        self._managers.append(m)
+        self.addCleanup(m.stop_trap_receiver)
+        port = free_udp_port()
+        blank = {"username": "   ", "auth_protocol": "none",
+                 "priv_protocol": "none", "engine_ids": ["8000000001020304"]}
+        self.assertTrue(m.start_trap_receiver(port, ["public"], [blank]))
+
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if m.trap_receiver and m.trap_receiver.isRunning():
+                break
+            time.sleep(0.05)
+        self.assertTrue(m.trap_receiver.isRunning())
+
+        # v1/v2c 側は普段どおり動く
+        got = []
+        m.trap_received.connect(got.append)
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.sendto(trap_bytes("public"), ("127.0.0.1", port))
+        s.close()
+        self.assertTrue(self._pump(got))
+
+    def test_a_broken_engine_id_does_not_stop_the_receiver(self):
+        """設定が壊れていても、その要素だけ捨てて受信を続けること。"""
+        import time
+        from core.snmp_manager import SNMPManager
+        m = SNMPManager()
+        self._managers.append(m)
+        self.addCleanup(m.stop_trap_receiver)
+        port = free_udp_port()
+        user = {"username": "netbelt-v3", "auth_protocol": "none",
+                "priv_protocol": "none", "engine_ids": [None, 123, "   "]}
+        self.assertTrue(m.start_trap_receiver(port, ["public"], [user]))
+
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if m.trap_receiver and m.trap_receiver.isRunning():
+                break
+            time.sleep(0.05)
+        self.assertTrue(m.trap_receiver.isRunning())
     def test_trap_with_wrong_community_is_dropped(self):
         """許可していないコミュニティの Trap は受信ループでも弾かれること。"""
         m, port = self._start(["allowed-only"])
