@@ -935,44 +935,62 @@ class MainWindow(QMainWindow):
         """グループ追加ダイアログを表示"""
         # 既存のグループ名リストを取得
         existing_groups = [g["name"] for g in self.config_manager.get_groups()]
-        
+
         # ダイアログ表示
         dialog = GroupDialog(self, existing_groups=existing_groups)
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            # グループ名を取得
+            # グループ名と自動実行コマンドを取得
             group_name = dialog.get_group_name()
-            
+            auto_commands = dialog.get_auto_commands()
+
             # 設定に追加
-            if self.config_manager.add_group(group_name):
+            if self.config_manager.add_group(group_name, auto_commands):
                 # ツリーを再読み込み
                 self._load_devices()
                 self.status_bar.showMessage(f"グループ '{group_name}' を追加しました")
             else:
                 QMessageBox.warning(self, "エラー", "グループの追加に失敗しました。")
-    
+
     def _on_edit_group(self, group_name: str):
         """
         グループ編集ダイアログを表示
-        
+
         Args:
             group_name: 編集対象のグループ名
         """
-        # 既存のグループ名リストを取得
+        # 既存のグループ名リストと、現在の自動実行コマンドを取得
         existing_groups = [g["name"] for g in self.config_manager.get_groups()]
-        
+        group = self.config_manager.get_group(group_name)
+        auto_commands = list(group.get("auto_commands", [])) if group else []
+
         # ダイアログ表示
-        dialog = GroupDialog(self, group_name=group_name, existing_groups=existing_groups)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            # 新しいグループ名を取得
-            new_group_name = dialog.get_group_name()
-            
-            # 設定を更新
-            if self.config_manager.rename_group(group_name, new_group_name):
-                # ツリーを再読み込み
-                self._load_devices()
-                self.status_bar.showMessage(f"グループ名を '{group_name}' から '{new_group_name}' に変更しました")
-            else:
+        dialog = GroupDialog(self, group_name=group_name,
+                             existing_groups=existing_groups,
+                             auto_commands=auto_commands)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        new_group_name = dialog.get_group_name()
+        new_auto_commands = dialog.get_auto_commands()
+
+        # 改名は名前が変わったときだけ行う。同じ名前で rename_group を呼ぶと
+        # 「既に存在します」と判定されて False が返り、誤った警告が出るため。
+        if new_group_name != group_name:
+            if not self.config_manager.rename_group(group_name, new_group_name):
                 QMessageBox.warning(self, "エラー", "グループ名の変更に失敗しました。")
+                return
+
+        # 自動実行コマンドは改名後の名前で保存する
+        if not self.config_manager.set_group_auto_commands(new_group_name, new_auto_commands):
+            QMessageBox.warning(self, "エラー", "自動実行コマンドの保存に失敗しました。")
+            return
+
+        self._load_devices()
+        if new_group_name != group_name:
+            self.status_bar.showMessage(
+                f"グループ '{group_name}' を '{new_group_name}' に変更しました")
+        else:
+            self.status_bar.showMessage(f"グループ '{group_name}' を更新しました")
     
     def _on_delete_group(self, group_name: str):
         """

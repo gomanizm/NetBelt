@@ -126,5 +126,84 @@ class GroupDialogAutoCommandsTest(unittest.TestCase):
         self.assertIn("平文", dlg.auto_commands_warning_label.text())
 
 
+class GroupEditWiringTest(unittest.TestCase):
+    """main_window のグループ追加/編集がコマンドを保存すること。"""
+
+    @classmethod
+    def setUpClass(cls):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PyQt6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    def _window(self):
+        from unittest import mock
+        from ui.main_window import MainWindow
+        from core.config_manager import ConfigManager
+        d = tempfile.mkdtemp(prefix="netbelt-groupwire-")
+        # 起動時の更新チェックは実際に GitHub API を叩くのでモックする
+        with mock.patch("ui.main_window.ConfigManager") as fake, \
+             mock.patch.object(MainWindow, "_check_for_updates_on_startup"):
+            fake.return_value = ConfigManager(config_path=os.path.join(d, "config.json"))
+            return MainWindow()
+
+    def test_add_group_passes_auto_commands(self):
+        from unittest import mock
+        from PyQt6.QtWidgets import QDialog
+        w = self._window()
+        dlg = mock.Mock()
+        dlg.exec.return_value = QDialog.DialogCode.Accepted
+        dlg.get_group_name.return_value = "新グループ"
+        dlg.get_auto_commands.return_value = ["terminal length 0"]
+        with mock.patch("ui.main_window.GroupDialog", return_value=dlg):
+            w._on_add_group()
+        self.assertEqual(
+            w.config_manager.get_group("新グループ")["auto_commands"],
+            ["terminal length 0"])
+
+    def test_edit_group_saves_auto_commands_under_the_new_name(self):
+        from unittest import mock
+        from PyQt6.QtWidgets import QDialog
+        w = self._window()
+        w.config_manager.add_group("編集前", ["show version"])
+        dlg = mock.Mock()
+        dlg.exec.return_value = QDialog.DialogCode.Accepted
+        dlg.get_group_name.return_value = "編集後"
+        dlg.get_auto_commands.return_value = ["show clock"]
+        with mock.patch("ui.main_window.GroupDialog", return_value=dlg):
+            w._on_edit_group("編集前")
+        self.assertIsNone(w.config_manager.get_group("編集前"))
+        self.assertEqual(
+            w.config_manager.get_group("編集後")["auto_commands"], ["show clock"])
+
+    def test_editing_only_commands_does_not_warn(self):
+        """名前を変えずに OK を押しても警告が出ないこと（既存バグの回帰防止）。"""
+        from unittest import mock
+        from PyQt6.QtWidgets import QDialog
+        w = self._window()
+        w.config_manager.add_group("同じ名前", [])
+        dlg = mock.Mock()
+        dlg.exec.return_value = QDialog.DialogCode.Accepted
+        dlg.get_group_name.return_value = "同じ名前"
+        dlg.get_auto_commands.return_value = ["terminal length 0"]
+        with mock.patch("ui.main_window.GroupDialog", return_value=dlg), \
+             mock.patch("ui.main_window.QMessageBox.warning") as warn:
+            w._on_edit_group("同じ名前")
+        warn.assert_not_called()
+        self.assertEqual(
+            w.config_manager.get_group("同じ名前")["auto_commands"],
+            ["terminal length 0"])
+
+    def test_edit_group_passes_existing_commands_to_the_dialog(self):
+        from unittest import mock
+        from PyQt6.QtWidgets import QDialog
+        w = self._window()
+        w.config_manager.add_group("既存コマンドあり", ["terminal monitor"])
+        dlg = mock.Mock()
+        dlg.exec.return_value = QDialog.DialogCode.Rejected
+        with mock.patch("ui.main_window.GroupDialog", return_value=dlg) as ctor:
+            w._on_edit_group("既存コマンドあり")
+        self.assertEqual(ctor.call_args.kwargs["auto_commands"], ["terminal monitor"])
+
+
 if __name__ == "__main__":
     unittest.main()
