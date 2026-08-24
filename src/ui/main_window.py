@@ -89,6 +89,12 @@ class MainWindow(QMainWindow):
     update_check_error = pyqtSignal(str)
     no_update_available = pyqtSignal()
     run_auto_commands_requested = pyqtSignal(str)  # 接続後の自動実行コマンド要求
+
+    # ターミナルのフォントサイズの上下限（settings.terminal.font_size）。
+    # 数値の実体は TerminalWidget 側にあり、ここでは参照するだけにして
+    # 二重定義を避ける。
+    FONT_SIZE_MIN = TerminalWidget.FONT_SIZE_MIN
+    FONT_SIZE_MAX = TerminalWidget.FONT_SIZE_MAX
     
     def __init__(self):
         super().__init__()
@@ -142,6 +148,9 @@ class MainWindow(QMainWindow):
         # 設定から接続先リストを読み込み
         self._load_devices()
         
+        # ターミナルの外観設定（config の settings.terminal）を反映
+        self._apply_terminal_settings_from_config()
+
         # 起動時の更新チェック（非同期）
         self._check_for_updates_on_startup()
 
@@ -242,8 +251,10 @@ class MainWindow(QMainWindow):
         self.toggle_tool_area_action.triggered.connect(self._toggle_tool_area)
         
         view_menu.addSeparator()
-        view_menu.addAction("フォントサイズ拡大")
-        view_menu.addAction("フォントサイズ縮小")
+        self.font_increase_action = view_menu.addAction("フォントサイズ拡大")
+        self.font_increase_action.triggered.connect(self._on_font_size_increase)
+        self.font_decrease_action = view_menu.addAction("フォントサイズ縮小")
+        self.font_decrease_action.triggered.connect(self._on_font_size_decrease)
         
         # ツールメニュー
         tools_menu = menubar.addMenu("ツール(&T)")
@@ -1099,6 +1110,41 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage("ペーストできるのは接続中のターミナルタブだけです")
             return
         terminal.custom_paste()
+
+    def _apply_terminal_settings_from_config(self):
+        """config の settings.terminal をターミナルへ適用する"""
+        self.terminal_widget.apply_terminal_settings(
+            self.config_manager.get_server_settings("terminal"))
+
+    def _change_font_size(self, delta: int):
+        """
+        ターミナルのフォントサイズを変更して保存する
+
+        Args:
+            delta: 増減量（+1 / -1）
+        """
+        settings = self.config_manager.get_server_settings("terminal")
+        default_size = self.terminal_widget.DEFAULT_TERMINAL_SETTINGS["font_size"]
+        current = settings.get("font_size", default_size)
+        new_size = max(self.FONT_SIZE_MIN, min(self.FONT_SIZE_MAX, current + delta))
+        if new_size == current:
+            self.status_bar.showMessage(
+                f"フォントサイズは {current}pt です（{self.FONT_SIZE_MIN}〜{self.FONT_SIZE_MAX}pt）")
+            return
+
+        # settings 全体を置換する update_settings ではなく、浅いマージの
+        # set_server_settings を使う（ui_layout など他のセクションを消さないため）
+        self.config_manager.set_server_settings("terminal", {"font_size": new_size})
+        self._apply_terminal_settings_from_config()
+        self.status_bar.showMessage(f"フォントサイズ: {new_size}pt")
+
+    def _on_font_size_increase(self):
+        """フォントサイズを1pt大きくする"""
+        self._change_font_size(1)
+
+    def _on_font_size_decrease(self):
+        """フォントサイズを1pt小さくする"""
+        self._change_font_size(-1)
 
     def _on_macro_settings(self):
         """マクロ設定メニューがクリックされたときの処理"""

@@ -61,6 +61,49 @@ class MenuActionsTest(unittest.TestCase):
         w = self._window()
         w._on_paste()  # 例外が出ないこと
 
+    def test_font_size_increase_and_decrease(self):
+        w = self._window()
+        w.config_manager.set_server_settings("terminal", {"font_size": 10})
+        w._on_font_size_increase()
+        self.assertEqual(
+            w.config_manager.get_server_settings("terminal")["font_size"], 11)
+        self.assertEqual(
+            w.terminal_widget.tab_widget.widget(0).font().pointSize(), 11)
+        w._on_font_size_decrease()
+        self.assertEqual(
+            w.config_manager.get_server_settings("terminal")["font_size"], 10)
+
+    def test_font_size_stops_at_the_limits(self):
+        from ui.main_window import MainWindow
+        w = self._window()
+        w.config_manager.set_server_settings("terminal", {"font_size": MainWindow.FONT_SIZE_MAX})
+        w._on_font_size_increase()
+        self.assertEqual(
+            w.config_manager.get_server_settings("terminal")["font_size"],
+            MainWindow.FONT_SIZE_MAX)
+        w.config_manager.set_server_settings("terminal", {"font_size": MainWindow.FONT_SIZE_MIN})
+        w._on_font_size_decrease()
+        self.assertEqual(
+            w.config_manager.get_server_settings("terminal")["font_size"],
+            MainWindow.FONT_SIZE_MIN)
+
+    def test_font_size_does_not_wipe_other_settings(self):
+        """set_server_settings は浅いマージなので ui_layout が消えないこと。"""
+        w = self._window()
+        w.config_manager.config.setdefault("settings", {})["ui_layout"] = {"tool_tab": 2}
+        w._on_font_size_increase()
+        self.assertEqual(
+            w.config_manager.config["settings"]["ui_layout"], {"tool_tab": 2})
+
+    def test_terminal_settings_are_applied_at_startup(self):
+        """起動時に config の外観設定がターミナルへ乗ること。"""
+        w = self._window()
+        w.config_manager.set_server_settings(
+            "terminal", {"font_family": "Courier New", "font_size": 15})
+        w._apply_terminal_settings_from_config()
+        self.assertEqual(
+            w.terminal_widget.tab_widget.widget(0).font().pointSize(), 15)
+
 
 class PasteGuardTest(unittest.TestCase):
     """再接続待機中はペーストで送信しないこと。
