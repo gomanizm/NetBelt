@@ -5,7 +5,6 @@ GET/WALK/Trap受信をサポートし、SNMPv1/v2c/v3に対応
 """
 from PyQt6.QtCore import QObject, pyqtSignal, QThread
 from typing import List, Dict, Optional, Tuple
-import socket
 import threading
 from datetime import datetime
 from .sockets import set_exclusive_bind
@@ -459,79 +458,6 @@ class SNMPTrapReceiver(QThread):
                 self._engine.transportDispatcher.jobFinished(self._JOB_ID)
             except Exception:
                 pass
-
-    def _parse_snmp_trap(self, data: bytes, addr: tuple) -> Optional[dict]:
-        """
-        SNMPパケットを解析
-        
-        pysnmpのデコーダーを使用して解析
-        """
-        try:
-            from pyasn1.codec.ber import decoder
-            from pysnmp.proto import api
-            
-            # SNMPバージョンを検出
-            msgVer = api.decodeMessageVersion(data)
-            if msgVer not in api.protoModules:
-                print(f"[SNMPTrapReceiver] 未サポートSNMPバージョン: {msgVer}")
-                return None
-            
-            pMod = api.protoModules[msgVer]
-            
-            # SNMPメッセージをデコード
-            reqMsg, _ = decoder.decode(data, asn1Spec=pMod.Message())
-            
-            # コミュニティ取得（v1/v2c）と照合
-            community = pMod.apiMessage.getCommunity(reqMsg)
-            if not self._is_allowed_community(community.prettyPrint()):
-                # 値そのものはログへ出さない（他システムの合言葉であり得るため）。
-                # 送信元だけ残しておけば「なぜ届かないか」の切り分けには足りる。
-                print(f"[SNMPTrapReceiver] 許可されていないコミュニティのため破棄: "
-                      f"from {addr[0]}")
-                return None
-            
-            # PDU取得
-            reqPDU = pMod.apiMessage.getPDU(reqMsg)
-            
-            # Trap情報を整形
-            trap_data = {
-                'source_ip': addr[0],
-                'source_port': addr[1],
-                'timestamp': None,
-                'trap_oid': None,
-                'varbinds': [],
-                'received_at': datetime.now().isoformat()
-            }
-            
-            # VarBinds解析
-            varBinds = pMod.apiPDU.getVarBinds(reqPDU)
-            for oid, val in varBinds:
-                oid_str = oid.prettyPrint()
-                value_str = val.prettyPrint()
-                value_type = val.__class__.__name__
-                
-                print(f"[SNMPTrapReceiver]   {oid_str} = {value_str} ({value_type})")
-                
-                # 特定OIDの処理
-                if oid_str == '1.3.6.1.2.1.1.3.0':  # sysUpTime
-                    trap_data['timestamp'] = value_str
-                elif oid_str == '1.3.6.1.6.3.1.1.4.1.0':  # snmpTrapOID
-                    trap_data['trap_oid'] = value_str
-                
-                trap_data['varbinds'].append({
-                    'oid': oid_str,
-                    'value': value_str,
-                    'type': value_type
-                })
-            
-            print(f"[SNMPTrapReceiver] Trap OID: {trap_data['trap_oid']}")
-            return trap_data
-        
-        except Exception as e:
-            print(f"[SNMPTrapReceiver] SNMP解析エラー: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            return None
 
 
 class SNMPManager(QObject):

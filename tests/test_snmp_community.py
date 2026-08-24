@@ -6,16 +6,30 @@
 
 （v2c のコミュニティは平文で流れるため強固な認証ではないが、誤送信や
 別システムの Trap を弾く実用的な効果はある。）
+
+以前は private な _parse_snmp_trap() を直接呼んでいたが、Trap 受信を
+pysnmp のエンジンへ載せ替えた際に、実際に UDP で送って受信ループを通す
+end-to-end 形式へ移した。照合が pysnmp 側の community 登録に移ったため、
+自前の関数を呼ぶだけでは経路を一度も通らなくなったため。
 """
+import socket
 import sys
+import time
 import unittest
+import unittest.mock
 
 sys.path.insert(0, "src")
 
-ADDR = ("192.0.2.10", 4242)
+
+def free_udp_port():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
 
 
-def _trap_bytes(community):
+def trap_bytes(community):
     """指定したコミュニティを持つ SNMPv2c Trap のバイト列を組み立てる。"""
     from pyasn1.codec.ber import encoder
     from pysnmp.proto import api
@@ -31,45 +45,101 @@ def _trap_bytes(community):
 
 
 class SnmpCommunityFilterTest(unittest.TestCase):
-    def _receiver(self, communities):
-        from core.snmp_manager import SNMPTrapReceiver
-        return SNMPTrapReceiver(port=0, communities=communities)
+    """許可コミュニティのフィルタが受信ループで実際に効くこと。"""
+
+    @classmethod
+    def setUpClass(cls):
+        import os
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PyQt6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    # 作った SNMPManager はクラス終了まで保持する（tests/test_snmp_trap_receive.py
+    # と同じ理由。破棄済み QObject へのシグナル配送でプロセスごと落ちるため）。
+    _managers = []
+
+    @classmethod
+    def tearDownClass(cls):
+        from PyQt6.QtWidgets import QApplication
+        for m in cls._managers:
+            m.stop_trap_receiver()
+        QApplication.processEvents()
+        cls._managers.clear()
+
+    def setUp(self):
+        fw = unittest.mock.patch("core.firewall.ensure_inbound_allow",
+                                 return_value=(True, "test stub"))
+        fw.start()
+        self.addCleanup(fw.stop)
+
+    def _start(self, communities):
+        from core.snmp_manager import SNMPManager
+        m = SNMPManager()
+        self._managers.append(m)
+        self.addCleanup(m.stop_trap_receiver)
+        port = free_udp_port()
+        self.assertTrue(m.start_trap_receiver(port, communities))
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if m.trap_receiver and m.trap_receiver.isRunning():
+                break
+            time.sleep(0.05)
+        got = []
+        m.trap_received.connect(got.append)
+        return m, port, got
+
+    def _send_and_wait(self, port, community, got, expect_more, timeout=3):
+        """Trap を送り、受信件数が増えるか（増えないか）を判定する。"""
+        from PyQt6.QtWidgets import QApplication
+        before = len(got)
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.sendto(trap_bytes(community), ("127.0.0.1", port))
+        s.close()
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            QApplication.processEvents()
+            if expect_more and len(got) > before:
+                return True
+            time.sleep(0.02)
+        QApplication.processEvents()
+        return len(got) > before
 
     def test_matching_community_is_accepted(self):
-        r = self._receiver(["public"])
-        self.assertIsNotNone(r._parse_snmp_trap(_trap_bytes("public"), ADDR),
-                             "許可したコミュニティの Trap が受理されない")
+        _m, port, got = self._start(["public"])
+        self.assertTrue(self._send_and_wait(port, "public", got, True),
+                        "許可したコミュニティの Trap が受理されない")
 
     def test_mismatched_community_is_dropped(self):
-        r = self._receiver(["secret-community"])
-        self.assertIsNone(r._parse_snmp_trap(_trap_bytes("public"), ADDR),
-                          "許可していないコミュニティの Trap が受理された")
+        _m, port, got = self._start(["secret-community"])
+        self.assertFalse(self._send_and_wait(port, "public", got, False),
+                         "許可していないコミュニティの Trap が受理された")
 
     def test_multiple_allowed_communities(self):
-        r = self._receiver(["public", "netbelt", "ops"])
+        _m, port, got = self._start(["public", "netbelt", "ops"])
         for c in ("public", "netbelt", "ops"):
             with self.subTest(community=c):
-                self.assertIsNotNone(r._parse_snmp_trap(_trap_bytes(c), ADDR))
-        self.assertIsNone(r._parse_snmp_trap(_trap_bytes("other"), ADDR))
+                self.assertTrue(self._send_and_wait(port, c, got, True))
+        self.assertFalse(self._send_and_wait(port, "other", got, False))
 
     def test_community_match_is_case_sensitive(self):
         """コミュニティ名は大文字小文字を区別する（SNMP の仕様どおり）。"""
-        r = self._receiver(["Public"])
-        self.assertIsNone(r._parse_snmp_trap(_trap_bytes("public"), ADDR))
+        _m, port, got = self._start(["Public"])
+        self.assertFalse(self._send_and_wait(port, "public", got, False))
 
     def test_default_is_public(self):
         """未指定なら public のみを許可する（従来の既定を維持）。"""
-        r = self._receiver(None)
-        self.assertIsNotNone(r._parse_snmp_trap(_trap_bytes("public"), ADDR))
-        self.assertIsNone(r._parse_snmp_trap(_trap_bytes("private"), ADDR))
+        _m, port, got = self._start(None)
+        self.assertTrue(self._send_and_wait(port, "public", got, True))
+        self.assertFalse(self._send_and_wait(port, "private", got, False))
 
     def test_parsed_trap_keeps_source_and_varbinds(self):
         """受理した Trap の中身がこれまでどおり取り出せること。"""
-        r = self._receiver(["public"])
-        got = r._parse_snmp_trap(_trap_bytes("public"), ADDR)
-        self.assertEqual(got["source_ip"], ADDR[0])
-        self.assertEqual(got["source_port"], ADDR[1])
-        self.assertIn("varbinds", got)
+        _m, port, got = self._start(["public"])
+        self.assertTrue(self._send_and_wait(port, "public", got, True))
+        trap = got[-1]
+        self.assertEqual(trap["source_ip"], "127.0.0.1")
+        self.assertIn("source_port", trap)
+        self.assertIn("varbinds", trap)
 
 
 if __name__ == "__main__":
