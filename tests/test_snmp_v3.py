@@ -163,5 +163,34 @@ class PrepareAuthDataTest(unittest.TestCase):
         self.assertEqual(w._prepare_auth_data("v2c").mpModel, 1)
 
 
+
+class PysnmpUnavailableTest(unittest.TestCase):
+    """pysnmp を import できない環境での振る舞い。
+
+    snmp_manager.py は pysnmp の import を try/except で囲み、失敗しても
+    モジュール自体は読める作りになっている。その分岐を固定する。
+    """
+
+    def test_resolve_raises_when_pysnmp_is_missing(self):
+        from unittest import mock
+        import core.snmp_manager as snmp_manager
+        with mock.patch.object(snmp_manager, "_PYSNMP_AVAILABLE", False):
+            with self.assertRaises(RuntimeError):
+                snmp_manager.resolve_v3_protocols("SHA", "AES-128")
+
+    def test_worker_reports_the_missing_library_instead_of_raising(self):
+        """利用者にはエラー文字列で伝わり、例外は外へ出ないこと。"""
+        from unittest import mock
+        import core.snmp_manager as snmp_manager
+        worker = snmp_manager.SNMPWorker("get", {"version": "v3"})
+        results = []
+        worker.result_ready.connect(lambda ok, payload: results.append((ok, payload)))
+        with mock.patch.object(snmp_manager, "_PYSNMP_AVAILABLE", False):
+            worker.run()
+        self.assertEqual(len(results), 1)
+        ok, payload = results[0]
+        self.assertFalse(ok)
+        self.assertIn("pysnmp", payload)
+
 if __name__ == "__main__":
     unittest.main()
