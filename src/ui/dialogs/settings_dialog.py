@@ -5,7 +5,8 @@ config.json の settings 配下のうち、これまで GUI から編集でき�
 """
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QTabWidget, QWidget,
-    QPushButton, QSpinBox, QFontComboBox, QColorDialog, QLabel, QTextEdit
+    QPushButton, QSpinBox, QFontComboBox, QColorDialog, QLabel, QTextEdit,
+    QMessageBox
 )
 from PyQt6.QtGui import QColor, QFont
 
@@ -129,14 +130,16 @@ class SettingsDialog(QDialog):
 
     def _load_data(self):
         """config から現在値を読み込む"""
-        defaults = TerminalWidget.DEFAULT_TERMINAL_SETTINGS
-        terminal = self.config_manager.get_server_settings("terminal") if self.config_manager else {}
+        raw = self.config_manager.get_server_settings("terminal") if self.config_manager else {}
+        # 生値ではなく、ターミナルが実際に使う正規化済みの値を表示する。
+        # 生値のままだと "not-a-color" や 1000 がそのまま画面に出て、
+        # 何も変えずに OK を押しただけで壊れた値を書き戻してしまう。
+        terminal = TerminalWidget.normalize_terminal_settings(raw)
 
-        self._background_color = terminal.get("background_color") or defaults["background_color"]
-        self._text_color = terminal.get("text_color") or defaults["text_color"]
-        self.font_combo.setCurrentFont(
-            QFont(terminal.get("font_family") or defaults["font_family"]))
-        self.font_size_spin.setValue(terminal.get("font_size") or defaults["font_size"])
+        self._background_color = terminal["background_color"]
+        self._text_color = terminal["text_color"]
+        self.font_combo.setCurrentFont(QFont(terminal["font_family"]))
+        self.font_size_spin.setValue(terminal["font_size"])
 
         self._update_color_buttons()
         self._update_preview()
@@ -165,3 +168,9 @@ class SettingsDialog(QDialog):
         """OKボタン押下時の処理"""
         if self.save_settings():
             self.accept()
+            return
+        # 黙って閉じないままだと、OK が効かない理由が利用者に伝わらない
+        QMessageBox.warning(
+            self, "エラー",
+            "設定を保存できませんでした。\n"
+            "設定ファイルに書き込めない可能性があります。")

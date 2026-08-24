@@ -335,9 +335,14 @@ class TerminalWidget(QWidget):
 
         return terminal
 
-    def _normalize_terminal_settings(self, settings) -> dict:
+    @classmethod
+    def normalize_terminal_settings(cls, settings) -> dict:
         """
         設定値を検証し、妥当でないものを既定値で埋める
+
+        設定ダイアログもこの結果を表示・保存する。生値をそのまま扱うと、
+        ターミナルの見た目と設定画面の表示が食い違い、何も変えずに OK を
+        押しただけで壊れた値が書き戻される。
 
         config.json は手で編集できるため、空文字・0・不正な色名といった値が
         入ってくる。そのまま使うと読めない配色や不自然なフォントになるので、
@@ -349,7 +354,7 @@ class TerminalWidget(QWidget):
         Returns:
             4キーすべてが妥当な値で埋まった dict
         """
-        merged = dict(self.DEFAULT_TERMINAL_SETTINGS)
+        merged = dict(cls.DEFAULT_TERMINAL_SETTINGS)
         if not isinstance(settings, dict):
             return merged
 
@@ -361,7 +366,7 @@ class TerminalWidget(QWidget):
         # 手編集で極端な値（例: 1000）が入っても描画が壊れないよう上下限も見る。
         size = settings.get("font_size")
         if (isinstance(size, int) and not isinstance(size, bool)
-                and self.FONT_SIZE_MIN <= size <= self.FONT_SIZE_MAX):
+                and cls.FONT_SIZE_MIN <= size <= cls.FONT_SIZE_MAX):
             merged["font_size"] = size
 
         for key in ("background_color", "text_color"):
@@ -380,7 +385,7 @@ class TerminalWidget(QWidget):
         Args:
             settings: settings.terminal 相当の dict。欠けているキーは既定値を使う
         """
-        merged = self._normalize_terminal_settings(settings)
+        merged = self.normalize_terminal_settings(settings)
         self._terminal_settings = merged
 
         font = QFont(merged["font_family"], merged["font_size"])

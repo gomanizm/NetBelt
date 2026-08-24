@@ -14,6 +14,14 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+# offscreen QPA はシステムのフォントを自動では拾わない（実測でフォントDB 0件）。
+# QFontComboBox が項目を1つも持てず、currentFont() が "Sans Serif" に化けるため、
+# フォントを扱うテストが原理的に検証不能になる。フォントディレクトリを教える。
+# 存在しない環境（非Windows）では何もしない。
+_font_dir = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
+if os.path.isdir(_font_dir):
+    os.environ.setdefault("QT_QPA_FONTDIR", _font_dir)
+
 
 @pytest.fixture(scope="session", autouse=True)
 def qapp():
