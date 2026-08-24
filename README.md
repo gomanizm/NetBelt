@@ -57,6 +57,11 @@ Cisco IOS なら `show snmp engineID` で確認できます。EngineID は偶数
 
 v3 の認証情報は保存されません。アプリを起動するたびに入力が必要です。
 
+受信した Trap の一覧には、どの版・どの保護レベルで届いたかを示す
+「セキュリティ」列があり、v3 の場合はユーザ名も出ます（例:
+`v3 authPriv / netbelt`）。この列はエクスポートにも含まれます。
+パスワードと、v1/v2c のコミュニティ文字列は出ません。
+
 ### その他
 - パスワードは **Windows DPAPI** で暗号化して保存（OS・ユーザーアカウントに紐付け）
 - SSH ホストキーの **TOFU**（Trust On First Use）検証
@@ -217,6 +222,11 @@ then start the receiver.
 
 v3 credentials are never saved to disk — they must be re-entered every
 time the app starts.
+
+The trap list has a security column showing which version and protection
+level each trap arrived with, including the v3 username (e.g.
+`v3 authPriv / netbelt`). It is carried into the exports too. Passwords
+and v1/v2c community strings are not shown anywhere.
 
 ### Requirements
 

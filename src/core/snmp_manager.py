@@ -38,6 +38,12 @@ def _clean_communities(communities):
     空文字を登録すると「コミュニティ無しの Trap を受け入れる」設定が
     意図せず作れてしまう。重複はそのぶん余計な行を pysnmp へ登録する。
     """
+    # 文字列をそのまま渡されると1文字ずつのコミュニティになる。
+    # 黙って通すと 'public' が p/u/b/l/i/c の6件として登録される。
+    if isinstance(communities, (str, bytes)):
+        raise TypeError("communities はコミュニティ名のリストです"
+                        "（文字列1つではありません）")
+
     cleaned = []
     for community in communities:
         if not isinstance(community, str):
@@ -438,6 +444,9 @@ class SNMPTrapReceiver(QThread):
         _on_notification と同じ扱いに揃える。
         """
         def _observe(snmp_engine, execpoint, variables, cb_ctx):
+            # 先に空にする。失敗したときに前の Trap の値が残ると、
+            # 別の Trap のセキュリティ情報を今の Trap として表示してしまう。
+            self._last_security = {}
             try:
                 self._capture_security(variables)
             except Exception as e:
@@ -770,6 +779,10 @@ class SNMPManager(QObject):
         """
         self._retired_receivers.append(receiver)
         receiver.finished.connect(lambda: self._forget(receiver))
+        # wait() が諦めた直後、connect を張る前に終わっていると
+        # finished を取り逃す。ここで見ておけばどちらの順でも外れる。
+        if receiver.isFinished():
+            self._forget(receiver)
 
     def _forget(self, receiver):
         """終わった受信スレッドを保持リストから外す"""

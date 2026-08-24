@@ -118,6 +118,67 @@ class SnmpTrapReceiveTest(unittest.TestCase):
         receiver.wait(3000)
         QApplication.processEvents()
         self.assertTrue(seen, "例外で終わったのに stopped が出ない")
+
+    def test_retiring_a_thread_that_already_ended_does_not_keep_it(self):
+        """wait() が諦めた直後に終わった場合、finished を取り逃す。
+
+        connect を張る前に終わっていると signal は二度と来ないので、
+        刈るはずのリストに残り続ける（単調増加を直したつもりで直っていない）。
+        """
+        from core.snmp_manager import SNMPManager, SNMPTrapReceiver
+        m = SNMPManager()
+        self._managers.append(m)
+        receiver = SNMPTrapReceiver(free_udp_port(), ["public"])
+        self.assertTrue(receiver.bind())
+        receiver.start()
+        deadline = time.time() + 5
+        while time.time() < deadline and not receiver.isRunning():
+            time.sleep(0.05)
+        receiver.stop()
+        self.assertTrue(receiver.wait(5000), "止まらない")
+        self.assertTrue(receiver.isFinished(), "終わっていない")
+
+        # ここが「wait が諦めた直後に終わった」状態にあたる
+        m._retire(receiver)
+        self.assertNotIn(receiver, m._retired_receivers,
+                         "終わったスレッドを抱えたまま")
+
+    def test_a_bare_string_is_not_taken_as_a_list_of_communities(self):
+        """'public' をそのまま渡すと p/u/b/l/i/c の6件になってしまう。"""
+        from core.snmp_manager import SNMPTrapReceiver
+        with self.assertRaises(TypeError):
+            SNMPTrapReceiver(free_udp_port(), "public")
+
+    def test_security_info_is_not_carried_over_between_traps(self):
+        """セキュリティ情報を拾えなかった Trap に、前の Trap の値を出さないこと。
+
+        observer の例外を握るようにした副作用。握ったまま _last_security を
+        残すと、v2c で来た Trap が「v3 authPriv」と表示されうる。
+        """
+        m, port = self._start()
+        receiver = m.trap_receiver
+        got = []
+        m.trap_received.connect(got.append)
+
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.sendto(trap_bytes("public"), ("127.0.0.1", port))
+        s.close()
+        self.assertTrue(self._pump(got), "1件目が届かない")
+        self.assertTrue(got[0].get("security_name"), "1件目にセキュリティ情報が無い")
+
+        second = []
+        m.trap_received.connect(second.append)
+        with unittest.mock.patch.object(receiver, "_capture_security",
+                                        side_effect=RuntimeError("boom")):
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.sendto(trap_bytes("public"), ("127.0.0.1", port))
+            s.close()
+            self.assertTrue(self._pump(second), "2件目が届かない")
+
+        self.assertEqual(second[-1].get("security_name", ""), "",
+                         "前の Trap のセキュリティ情報を持ち越している")
+        self.assertEqual(second[-1].get("source_port", 0), 0,
+                         "前の Trap の送信元ポートを持ち越している")
     def test_receiver_thread_stays_alive(self):
         """起動直後に例外で死んでいないこと（本件の回帰テスト）。"""
         m, _port = self._start()
