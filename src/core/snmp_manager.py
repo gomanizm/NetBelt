@@ -275,7 +275,10 @@ class SNMPTrapReceiver(QThread):
         """
         super().__init__()
         self.port = port
-        self.communities = communities or ['public']
+        # None（未指定）と []（v1/v2c を受けない）は別物。or で書くと
+        # [] が既定値へ落ちるため、Trap のバージョンに v3 を選んで
+        # パネルが [] を渡しても public の v1/v2c Trap が通ってしまう。
+        self.communities = ['public'] if communities is None else list(communities)
         self.v3_users = list(v3_users or [])
         self._running = False
         self._engine = None
@@ -288,14 +291,6 @@ class SNMPTrapReceiver(QThread):
         self._stop_requested = False
         # observer で拾った直近のセキュリティ情報（表示用の参考値）
         self._last_security = {}
-
-    def _is_allowed_community(self, community: str) -> bool:
-        """受信した Trap のコミュニティが許可一覧に含まれるか。
-
-        照合そのものは pysnmp の USM/community 層が行うが、許可一覧の
-        意味づけをここに残しておく（SNMP の仕様どおり大文字小文字は区別する）。
-        """
-        return community in self.communities
 
     def bind(self) -> bool:
         """待ち受けを用意する。

@@ -132,6 +132,20 @@ class SnmpCommunityFilterTest(unittest.TestCase):
         self.assertTrue(self._send_and_wait(port, "public", got, True))
         self.assertFalse(self._send_and_wait(port, "private", got, False))
 
+
+    def test_an_empty_list_allows_no_community(self):
+        """空リストは「v1/v2c を受けない」であって、既定の public ではない。
+
+        Trap のバージョンに v3 を選ぶとパネルは [] を渡す。ここが既定値へ
+        落ちると、認証も暗号も要求しない public の v2c Trap が黙って通る。
+        v3 を選んだ利用者からはコミュニティ欄が使われていないように見えるので、
+        public が有効なことに気づく手掛かりが画面上に無い。
+        """
+        m, port, got = self._start([])
+        self.assertEqual(m.trap_receiver.communities, [],
+                         "空リストが既定値へ落ちている")
+        self.assertFalse(self._send_and_wait(port, "public", got, False),
+                         "v1/v2c を受けない設定なのに public の Trap を受理した")
     def test_parsed_trap_keeps_source_and_varbinds(self):
         """受理した Trap の中身がこれまでどおり取り出せること。"""
         _m, port, got = self._start(["public"])
