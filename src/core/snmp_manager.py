@@ -29,6 +29,9 @@ except Exception:
 V3_AUTH_PROTOCOL_NAMES = ("none", "MD5", "SHA", "SHA-224", "SHA-256", "SHA-384", "SHA-512")
 V3_PRIV_PROTOCOL_NAMES = ("none", "DES", "3DES", "AES-128", "AES-192", "AES-256")
 
+# RFC 3414 が USM のパスワードに要求する最小長
+V3_PASSWORD_MIN_LENGTH = 8
+
 
 def resolve_v3_protocols(auth_name: str, priv_name: str):
     """
@@ -85,6 +88,26 @@ def resolve_v3_protocols(auth_name: str, priv_name: str):
             "認証なしでは暗号化を使えません（SNMPv3 では authNoPriv 以上が必要です）")
 
     return auth_table[auth_name], priv_table[priv_name]
+
+
+def v3_password_error(auth_protocol: str, auth_password: str,
+                      priv_protocol: str, priv_password: str):
+    """
+    v3 のパスワード長を調べ、問題があれば説明を返す（無ければ None）
+
+    RFC 3414 は USM のパスワードに8文字以上を要求している。pysnmp も
+    これに従うが、短いときのエラーが利用者向けでない。空文字は鍵導出の
+    割り算で ZeroDivisionError、1〜7文字は WrongValueError になり、
+    どちらもパスワードが原因だと読み取れない。手前で止める。
+    """
+    for label, protocol, password in (("認証", auth_protocol, auth_password),
+                                      ("暗号", priv_protocol, priv_password)):
+        if not protocol or protocol == "none":
+            continue
+        if len(password or "") < V3_PASSWORD_MIN_LENGTH:
+            return (f"{label}パスワードは{V3_PASSWORD_MIN_LENGTH}文字以上にしてください"
+                    "（SNMPv3 の要件です）。")
+    return None
 
 
 class SNMPWorker(QThread):
@@ -226,6 +249,10 @@ class SNMPWorker(QThread):
             priv_password = self.params.get('priv_password', '')
 
             auth_proto, priv_proto = resolve_v3_protocols(auth_protocol, priv_protocol)
+            password_error = v3_password_error(auth_protocol, auth_password,
+                                               priv_protocol, priv_password)
+            if password_error:
+                raise ValueError(password_error)
 
             # authProtocol / privProtocol は必ず明示的に渡す。pysnmp は
             # authKey だけ渡すと既定で MD5、privKey だけなら既定で DES を選ぶため。
@@ -302,6 +329,16 @@ class SNMPTrapReceiver(QThread):
         if not _PYSNMP_AVAILABLE:
             self.error_occurred.emit("SNMPライブラリ(pysnmp)を利用できません")
             return False
+
+        # try の中で落とすと「ポート N で待ち受けできません」に化けて、
+        # ポート競合を探しに行かせてしまう。原因が分かる形で先に止める。
+        for user in self.v3_users:
+            password_error = v3_password_error(
+                user.get("auth_protocol", "none"), user.get("auth_password", ""),
+                user.get("priv_protocol", "none"), user.get("priv_password", ""))
+            if password_error:
+                self.error_occurred.emit(f"v3 ユーザの設定に問題があります: {password_error}")
+                return False
 
         try:
             self._engine = engine.SnmpEngine()

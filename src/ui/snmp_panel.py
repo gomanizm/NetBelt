@@ -12,6 +12,7 @@ from PyQt6.QtGui import QAction, QStandardItemModel, QStandardItem
 from datetime import datetime
 import json
 from core.mib_resolver import get_resolver, MIBResolver
+from core.snmp_manager import v3_password_error
 
 
 class SNMPResultTableModel(QAbstractTableModel):
@@ -430,7 +431,9 @@ class SNMPPanel(QWidget):
                 and self.v3_priv_combo.currentData() != "none"):
             return ("認証なしでは暗号化を使えません。\n"
                     "認証方式を選ぶか、暗号方式を「なし」にしてください。")
-        return None
+        return v3_password_error(
+            self.v3_auth_combo.currentData(), self.v3_auth_password_edit.text(),
+            self.v3_priv_combo.currentData(), self.v3_priv_password_edit.text())
     
     def _collect_v3_params(self) -> dict:
         """GET/WALK 用の v3 認証パラメータを集める"""
@@ -482,7 +485,11 @@ class SNMPPanel(QWidget):
                 and self.trap_v3_priv_combo.currentData() != "none"):
             return ("認証なしでは暗号化を使えません。\n"
                     "認証方式を選ぶか、暗号方式を「なし」にしてください。")
-        return None
+        return v3_password_error(
+            self.trap_v3_auth_combo.currentData(),
+            self.trap_v3_auth_password_edit.text(),
+            self.trap_v3_priv_combo.currentData(),
+            self.trap_v3_priv_password_edit.text())
 
     def _collect_trap_v3_users(self) -> list:
         """

@@ -122,6 +122,43 @@ class ResolveV3ProtocolsTest(unittest.TestCase):
         self.assertIn("認証", str(ctx.exception))
 
 
+class V3PasswordErrorTest(unittest.TestCase):
+    """v3 のパスワード長の検査。
+
+    RFC 3414 は USM のパスワードに8文字以上を要求する。それより短いと
+    pysnmp は空文字で ZeroDivisionError、1〜7文字で WrongValueError に
+    なり、どちらも利用者には原因が読み取れない（実測）。
+    """
+
+    def test_none_protocols_need_no_password(self):
+        from core.snmp_manager import v3_password_error
+        self.assertIsNone(v3_password_error("none", "", "none", ""))
+
+    def test_a_short_auth_password_is_reported(self):
+        from core.snmp_manager import v3_password_error
+        for password in ("", "1234567"):
+            with self.subTest(password=password):
+                message = v3_password_error("SHA-256", password, "none", "")
+                self.assertIsNotNone(message)
+                self.assertIn("認証", message)
+
+    def test_a_short_priv_password_is_reported(self):
+        from core.snmp_manager import v3_password_error
+        message = v3_password_error("SHA-256", "authpass1", "AES-128", "short")
+        self.assertIsNotNone(message)
+        self.assertIn("暗号", message)
+
+    def test_eight_characters_is_the_boundary(self):
+        """7文字で止め、8文字で通す。境界は認証プロトコルに依らない（実測）。"""
+        from core.snmp_manager import v3_password_error
+        for auth in ("MD5", "SHA", "SHA-256", "SHA-512"):
+            with self.subTest(auth=auth):
+                self.assertIsNotNone(
+                    v3_password_error(auth, "1234567", "none", ""))
+                self.assertIsNone(
+                    v3_password_error(auth, "12345678", "none", ""))
+
+
 class PrepareAuthDataTest(unittest.TestCase):
     """SNMPWorker._prepare_auth_data が正しい UsmUserData を作ること。"""
 
@@ -213,6 +250,19 @@ class SnmpPanelV3UiTest(unittest.TestCase):
     def tearDownClass(cls):
         cls._windows.clear()
 
+    def setUp(self):
+        """モーダルを塞ぐ。
+
+        offscreen でも QMessageBox は exec() で本当にブロックするため、
+        検証が退行して正常入力でも警告を返すようになると、テストが
+        「失敗」ではなく「ハング」になる（実測）。TrapTabV3UiTest では
+        同じ理由で既に塞いであるので、こちらも揃える。
+        """
+        from unittest import mock
+        patcher = mock.patch("ui.snmp_panel.QMessageBox.warning")
+        self.warning = patcher.start()
+        self.addCleanup(patcher.stop)
+
     def _panel(self):
         from unittest import mock
         from ui.main_window import MainWindow
@@ -278,6 +328,24 @@ class SnmpPanelV3UiTest(unittest.TestCase):
         self.assertEqual(kwargs["auth_password"], "authpass12345")
         self.assertEqual(kwargs["priv_protocol"], "AES-128")
         self.assertEqual(kwargs["priv_password"], "privpass12345")
+
+    def test_get_refuses_a_short_v3_password(self):
+        """短いパスワードは pysnmp の読めない例外になるので手前で止める。"""
+        from unittest import mock
+        panel = self._panel()
+        panel.snmp_manager = mock.Mock()
+        panel.host_edit.setText("192.0.2.10")
+        panel.oid_edit.setText("1.3.6.1.2.1.1.1.0")
+        panel.version_combo.setCurrentText("v3")
+        panel.v3_username_edit.setText("netbelt")
+        panel.v3_auth_combo.setCurrentIndex(
+            [k for _l, k in panel.AUTH_PROTOCOL_CHOICES].index("SHA-256"))
+        panel.v3_auth_password_edit.setText("1234567")
+
+        panel._on_get_clicked()
+
+        self.warning.assert_called_once()
+        panel.snmp_manager.snmp_get.assert_not_called()
 
     def test_walk_passes_v3_credentials(self):
         """GET と同じ5キーを確認する。
@@ -529,6 +597,74 @@ class V3TrapReceiveTest(unittest.TestCase):
         s.sendto(trap_bytes("public"), ("127.0.0.1", port))
         s.close()
         self.assertTrue(self._wait(got, True, 0))
+
+
+class ShortV3PasswordTrapTest(unittest.TestCase):
+    """短い v3 パスワードで受信を始めようとしたときの伝わり方。
+
+    以前は bind() の try の中で pysnmp が落ちるため
+    「ポート 162 で待ち受けできません: integer division or modulo by zero」
+    となり、原因と無関係なポート競合の調査へ誘導していた（実測）。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import os
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PyQt6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    _managers = []
+
+    @classmethod
+    def tearDownClass(cls):
+        for m in cls._managers:
+            m.stop_trap_receiver()
+        cls._managers.clear()
+
+    def setUp(self):
+        from unittest import mock
+        fw = mock.patch("core.firewall.ensure_inbound_allow",
+                        return_value=(True, "test stub"))
+        fw.start()
+        self.addCleanup(fw.stop)
+
+    def _try_start(self, auth_password):
+        import socket
+        from core.snmp_manager import SNMPManager
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+
+        m = SNMPManager()
+        type(self)._managers.append(m)
+        self.addCleanup(m.stop_trap_receiver)
+        errors = []
+        m.error_occurred.connect(errors.append)
+        user = {"username": "netbelt-v3", "auth_protocol": "SHA-256",
+                "auth_password": auth_password, "priv_protocol": "none",
+                "priv_password": "", "engine_ids": ["8000000001020304"]}
+        started = m.start_trap_receiver(port, ["public"], [user])
+        return started, errors, port
+
+    def test_a_short_password_is_refused_before_binding(self):
+        for password in ("", "1234567"):
+            with self.subTest(password=password):
+                started, errors, port = self._try_start(password)
+                self.assertFalse(started, "短いパスワードで受信を始めてしまった")
+                self.assertTrue(errors)
+                self.assertIn("パスワード", errors[-1])
+
+    def test_the_message_does_not_blame_the_port(self):
+        """ポート番号を主語にすると、ポート競合を探しに行かせてしまう。"""
+        _started, errors, port = self._try_start("1234567")
+        self.assertTrue(errors)
+        self.assertNotIn(f"ポート {port}", errors[-1])
+
+    def test_a_long_enough_password_still_starts(self):
+        started, errors, _port = self._try_start("authpass12345")
+        self.assertTrue(started, f"正常な設定で起動できない: {errors}")
 
 
 class TrapTabV3UiTest(unittest.TestCase):
