@@ -6,11 +6,12 @@ config.json の settings 配下のうち、これまで GUI から編集でき�
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QTabWidget, QWidget,
     QPushButton, QSpinBox, QFontComboBox, QColorDialog, QLabel, QTextEdit,
-    QMessageBox, QCheckBox
+    QMessageBox, QCheckBox, QLineEdit, QFileDialog
 )
 from PyQt6.QtGui import QColor, QFont
 
 from ..terminal_widget import TerminalWidget
+from ..sftp_panel import SFTPPanel
 
 
 class SettingsDialog(QDialog):
@@ -41,6 +42,7 @@ class SettingsDialog(QDialog):
 
         self.tabs = QTabWidget()
         self.tabs.addTab(self._create_terminal_tab(), "ターミナル")
+        self.tabs.addTab(self._create_sftp_tab(), "SFTPクライアント")
         self.tabs.addTab(self._create_update_tab(), "更新")
         layout.addWidget(self.tabs)
 
@@ -129,6 +131,41 @@ class SettingsDialog(QDialog):
         self.preview.setStyleSheet(
             f"background-color: {self._background_color}; color: {self._text_color};")
 
+    def _create_sftp_tab(self) -> QWidget:
+        """SFTPクライアントタブを作る"""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        form = QFormLayout()
+
+        path_layout = QHBoxLayout()
+        self.download_path_edit = QLineEdit()
+        path_layout.addWidget(self.download_path_edit)
+        browse_button = QPushButton("参照...")
+        browse_button.clicked.connect(self._on_browse_download_path)
+        path_layout.addWidget(browse_button)
+        form.addRow("既定のダウンロード先:", path_layout)
+
+        layout.addLayout(form)
+
+        self.show_hidden_box = QCheckBox("隠しファイル（ドットで始まる名前）を表示する")
+        layout.addWidget(self.show_hidden_box)
+
+        self.confirm_delete_box = QCheckBox("削除の前に確認する")
+        layout.addWidget(self.confirm_delete_box)
+
+        self.confirm_overwrite_box = QCheckBox("アップロードで上書きになるとき確認する")
+        layout.addWidget(self.confirm_overwrite_box)
+
+        layout.addStretch()
+        return widget
+
+    def _on_browse_download_path(self):
+        """ダウンロード先ディレクトリを選ぶ"""
+        directory = QFileDialog.getExistingDirectory(
+            self, "既定のダウンロード先を選択", self.download_path_edit.text())
+        if directory:
+            self.download_path_edit.setText(directory)
+
     def _create_update_tab(self) -> QWidget:
         """更新タブを作る"""
         widget = QWidget()
@@ -187,6 +224,19 @@ class SettingsDialog(QDialog):
         self._update_color_buttons()
         self._update_preview()
 
+        sftp_defaults = SFTPPanel.SFTP_SETTING_DEFAULTS
+        sftp = self.config_manager.get_server_settings("sftp") if self.config_manager else {}
+
+        download_path = sftp.get("default_download_path")
+        self.download_path_edit.setText(
+            download_path if download_path else sftp_defaults["default_download_path"])
+        self.show_hidden_box.setChecked(
+            sftp.get("show_hidden_files", sftp_defaults["show_hidden_files"]))
+        self.confirm_delete_box.setChecked(
+            sftp.get("confirm_delete", sftp_defaults["confirm_delete"]))
+        self.confirm_overwrite_box.setChecked(
+            sftp.get("confirm_overwrite", sftp_defaults["confirm_overwrite"]))
+
         self._skip_cleared = False
         if self.config_manager:
             self.check_on_startup_box.setChecked(self.config_manager.get_check_on_startup())
@@ -214,6 +264,13 @@ class SettingsDialog(QDialog):
             "font_size": self.font_size_spin.value(),
         })
 
+        if not self.config_manager.set_server_settings("sftp", {
+                "default_download_path": self.download_path_edit.text(),
+                "show_hidden_files": self.show_hidden_box.isChecked(),
+                "confirm_delete": self.confirm_delete_box.isChecked(),
+                "confirm_overwrite": self.confirm_overwrite_box.isChecked(),
+        }):
+            saved = False
         # 更新設定の setter はそれぞれ独立に save_config() を呼ぶ。どれか一つでも
         # 失敗したら保存失敗として扱う。ターミナル設定の結果だけ返すと、
         # 更新設定が書けていないのに成功したように見える。

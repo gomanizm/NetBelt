@@ -170,6 +170,48 @@ class MenuActionsTest(unittest.TestCase):
         self.assertEqual(len(messages), 1)
         self.assertIn("保存できませんでした", messages[0])
 
+    def test_every_menu_action_is_connected(self):
+        """スロット未接続のメニュー項目が残っていないこと。"""
+        w = self._window()
+        dead = []
+        for menu_action in w.menuBar().actions():
+            menu = menu_action.menu()
+            if menu is None:
+                continue
+            for action in menu.actions():
+                if action.isSeparator():
+                    continue
+                if not action.receivers(action.triggered):
+                    dead.append(f"{menu_action.text()} > {action.text()}")
+        self.assertEqual(dead, [], "スロット未接続のメニュー項目: %s" % dead)
+
+    def test_settings_dialog_opens(self):
+        w = self._window()
+        with mock.patch("ui.main_window.SettingsDialog") as dialog_class:
+            dialog_class.return_value.exec.return_value = 0
+            w._on_settings()
+        dialog_class.assert_called_once()
+        self.assertIs(dialog_class.call_args.kwargs["config_manager"], w.config_manager)
+
+    def test_settings_dialog_is_blocked_when_the_config_failed_to_load(self):
+        """破損した config をデフォルト設定で上書きしないため。"""
+        w = self._window()
+        w.config_manager.load_error = "読み込みエラー"
+        with mock.patch("ui.main_window.SettingsDialog") as dialog_class, \
+             mock.patch("ui.main_window.QMessageBox.warning") as warn:
+            w._on_settings()
+        dialog_class.assert_not_called()
+        warn.assert_called_once()
+
+    def test_settings_dialog_reapplies_terminal_settings_on_accept(self):
+        from PyQt6.QtWidgets import QDialog
+        w = self._window()
+        with mock.patch("ui.main_window.SettingsDialog") as dialog_class, \
+             mock.patch.object(w, "_apply_terminal_settings_from_config") as reapply:
+            dialog_class.return_value.exec.return_value = QDialog.DialogCode.Accepted
+            w._on_settings()
+        reapply.assert_called_once()
+
 
 class PasteGuardTest(unittest.TestCase):
     """再接続待機中はペーストで送信しないこと。

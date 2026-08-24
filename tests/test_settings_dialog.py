@@ -208,5 +208,70 @@ class SettingsDialogUpdateTabTest(unittest.TestCase):
         self.assertFalse(hasattr(dlg, "github_token_edit"))
 
 
+class SettingsDialogSftpTabTest(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PyQt6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    def _manager(self):
+        from core.config_manager import ConfigManager
+        d = tempfile.mkdtemp(prefix="netbelt-settingssftp-")
+        return ConfigManager(config_path=os.path.join(d, "config.json"))
+
+    def test_sftp_values_are_restored(self):
+        from ui.dialogs.settings_dialog import SettingsDialog
+        cm = self._manager()
+        cm.set_server_settings("sftp", {
+            "default_download_path": "D:/受信", "show_hidden_files": True,
+            "confirm_delete": False, "confirm_overwrite": False})
+        dlg = SettingsDialog(None, config_manager=cm)
+        self.assertEqual(dlg.download_path_edit.text(), "D:/受信")
+        self.assertTrue(dlg.show_hidden_box.isChecked())
+        self.assertFalse(dlg.confirm_delete_box.isChecked())
+        self.assertFalse(dlg.confirm_overwrite_box.isChecked())
+
+    def test_sftp_values_are_saved(self):
+        from ui.dialogs.settings_dialog import SettingsDialog
+        cm = self._manager()
+        dlg = SettingsDialog(None, config_manager=cm)
+        dlg.download_path_edit.setText("E:/保存先")
+        dlg.show_hidden_box.setChecked(True)
+        dlg.confirm_delete_box.setChecked(False)
+        dlg.save_settings()
+
+        saved = cm.get_server_settings("sftp")
+        self.assertEqual(saved["default_download_path"], "E:/保存先")
+        self.assertTrue(saved["show_hidden_files"])
+        self.assertFalse(saved["confirm_delete"])
+
+    def test_sftp_defaults_match_the_panel(self):
+        from ui.dialogs.settings_dialog import SettingsDialog
+        from ui.sftp_panel import SFTPPanel
+        cm = self._manager()
+        cm.config["settings"]["sftp"] = {}
+        dlg = SettingsDialog(None, config_manager=cm)
+        self.assertEqual(dlg.download_path_edit.text(),
+                         SFTPPanel.SFTP_SETTING_DEFAULTS["default_download_path"])
+        self.assertEqual(dlg.confirm_delete_box.isChecked(),
+                         SFTPPanel.SFTP_SETTING_DEFAULTS["confirm_delete"])
+
+    def test_failed_sftp_save_is_not_reported_as_success(self):
+        """SFTP設定だけ保存に失敗しても成功扱いにしないこと。
+
+        terminal タブと同じ set_server_settings を使うため、sftp 側の
+        戻り値だけを False にして terminal 側とは切り分けて確かめる。
+        """
+        from unittest import mock
+        from ui.dialogs.settings_dialog import SettingsDialog
+        cm = self._manager()
+        dlg = SettingsDialog(None, config_manager=cm)
+        cm.set_server_settings = mock.Mock(
+            side_effect=lambda key, values: key != "sftp")
+        self.assertFalse(dlg.save_settings())
+
+
 if __name__ == "__main__":
     unittest.main()

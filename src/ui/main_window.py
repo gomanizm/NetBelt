@@ -15,6 +15,7 @@ from .snmp_panel import SNMPPanel
 from .dialogs.device_dialog import DeviceDialog
 from .dialogs.group_dialog import GroupDialog
 from .dialogs.macro_dialog import MacroDialog
+from .dialogs.settings_dialog import SettingsDialog
 from core.config_manager import ConfigManager
 from core.ssh_connection import SSHConnection
 from core.serial_connection import SerialConnection
@@ -261,7 +262,8 @@ class MainWindow(QMainWindow):
         tools_menu.addAction("マクロ設定(&M)", self._on_macro_settings)
         tools_menu.addAction("ポートチェッカー(&P)", self._on_port_checker)
         tools_menu.addSeparator()
-        tools_menu.addAction("設定")
+        self.settings_action = tools_menu.addAction("設定")
+        self.settings_action.triggered.connect(self._on_settings)
         
         # ログメニュー
         log_menu = menubar.addMenu("ログ(&L)")
@@ -1150,6 +1152,24 @@ class MainWindow(QMainWindow):
     def _on_font_size_decrease(self):
         """フォントサイズを1pt小さくする"""
         self._change_font_size(-1)
+
+    def _on_settings(self):
+        """設定ダイアログを表示する"""
+        # config.json の読み込みに失敗している状態で保存すると、破損扱いになった
+        # 元ファイルがデフォルト設定で上書きされ、機器リストが消えたように見える
+        if self.config_manager.load_error:
+            QMessageBox.warning(
+                self,
+                "設定を変更できません",
+                "設定ファイルの読み込みに失敗しているため、設定を変更できません。\n"
+                "アプリを再起動するか、バックアップから config.json を復元してください。"
+            )
+            return
+
+        dialog = SettingsDialog(self, config_manager=self.config_manager)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._apply_terminal_settings_from_config()
+            self.status_bar.showMessage("設定を保存しました")
 
     def _on_macro_settings(self):
         """マクロ設定メニューがクリックされたときの処理"""
