@@ -204,6 +204,42 @@ class GroupEditWiringTest(unittest.TestCase):
             w._on_edit_group("既存コマンドあり")
         self.assertEqual(ctor.call_args.kwargs["auto_commands"], ["terminal monitor"])
 
+    def test_tree_is_refreshed_when_rename_fails(self):
+        """保存に失敗しても in-memory は変わるので、ツリーを実行中の状態へ合わせ直す。"""
+        from unittest import mock
+        from PyQt6.QtWidgets import QDialog
+        w = self._window()
+        w.config_manager.add_group("元の名前", [])
+        dlg = mock.Mock()
+        dlg.exec.return_value = QDialog.DialogCode.Accepted
+        dlg.get_group_name.return_value = "新しい名前"
+        dlg.get_auto_commands.return_value = []
+        w.config_manager.save_config = mock.Mock(return_value=False)
+        with mock.patch("ui.main_window.GroupDialog", return_value=dlg), \
+             mock.patch("ui.main_window.QMessageBox.warning") as warn, \
+             mock.patch.object(w, "_load_devices") as reload_tree:
+            w._on_edit_group("元の名前")
+        warn.assert_called_once()
+        reload_tree.assert_called_once()
+
+    def test_tree_is_refreshed_when_saving_commands_fails(self):
+        """改名なしでコマンド保存だけ失敗した場合も同じ。"""
+        from unittest import mock
+        from PyQt6.QtWidgets import QDialog
+        w = self._window()
+        w.config_manager.add_group("保存失敗", [])
+        dlg = mock.Mock()
+        dlg.exec.return_value = QDialog.DialogCode.Accepted
+        dlg.get_group_name.return_value = "保存失敗"
+        dlg.get_auto_commands.return_value = ["show clock"]
+        w.config_manager.save_config = mock.Mock(return_value=False)
+        with mock.patch("ui.main_window.GroupDialog", return_value=dlg), \
+             mock.patch("ui.main_window.QMessageBox.warning") as warn, \
+             mock.patch.object(w, "_load_devices") as reload_tree:
+            w._on_edit_group("保存失敗")
+        warn.assert_called_once()
+        reload_tree.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

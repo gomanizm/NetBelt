@@ -951,6 +951,23 @@ class MainWindow(QMainWindow):
             else:
                 QMessageBox.warning(self, "エラー", "グループの追加に失敗しました。")
 
+    def _warn_save_failed(self, what: str):
+        """
+        設定の保存に失敗したことを知らせる
+
+        ConfigManager の各 mutator は save_config() の前に in-memory の設定を
+        書き換える。そのため保存に失敗しても実行中の状態は変更後になっており、
+        ツリーだけ古いまま残ると UI と挙動が食い違う。合わせ直してから知らせる。
+
+        Args:
+            what: 失敗した操作の名前（例: "グループ名の変更"）
+        """
+        self._load_devices()
+        QMessageBox.warning(
+            self, "エラー",
+            f"{what}を設定ファイルへ保存できませんでした。\n"
+            "変更はこのセッション中のみ有効で、アプリを終了すると失われます。")
+
     def _on_edit_group(self, group_name: str):
         """
         グループ編集ダイアログを表示
@@ -977,12 +994,12 @@ class MainWindow(QMainWindow):
         # 「既に存在します」と判定されて False が返り、誤った警告が出るため。
         if new_group_name != group_name:
             if not self.config_manager.rename_group(group_name, new_group_name):
-                QMessageBox.warning(self, "エラー", "グループ名の変更に失敗しました。")
+                self._warn_save_failed("グループ名の変更")
                 return
 
         # 自動実行コマンドは改名後の名前で保存する
         if not self.config_manager.set_group_auto_commands(new_group_name, new_auto_commands):
-            QMessageBox.warning(self, "エラー", "自動実行コマンドの保存に失敗しました。")
+            self._warn_save_failed("自動実行コマンドの保存")
             return
 
         self._load_devices()
