@@ -691,6 +691,57 @@ class TrapTabV3UiTest(unittest.TestCase):
         warn.assert_not_called()
         panel.snmp_manager.start_trap_receiver.assert_called_once()
 
+    def test_trap_v3_alone_without_a_username_is_refused(self):
+        """v3 単独なのに何も入力していないと1件も受信できない。"""
+        from unittest import mock
+        panel = self._panel()
+        panel.snmp_manager = mock.Mock()
+        panel.mib_loading = False
+        panel.mib_loaded = True
+        panel.trap_version_combo.setCurrentText("v3")
+        panel.trap_v3_username_edit.setText("")
+        with mock.patch("ui.snmp_panel.QMessageBox.warning") as warn:
+            panel._on_trap_start_clicked()
+        warn.assert_called_once()
+        panel.snmp_manager.start_trap_receiver.assert_not_called()
+
+    def test_trap_both_without_a_v3_username_is_not_blocked(self):
+        """v3 を使わない「両方」の利用者を、暗号方式の選択で止めないこと。"""
+        from unittest import mock
+        panel = self._panel()
+        panel.snmp_manager = mock.Mock()
+        panel.snmp_manager.start_trap_receiver.return_value = True
+        panel.mib_loading = False
+        panel.mib_loaded = True
+        panel.trap_version_combo.setCurrentText("両方")
+        panel.trap_v3_username_edit.setText("")
+        # v3 を使うつもりは無いが、暗号方式だけ触ってしまった状態
+        panel.trap_v3_priv_combo.setCurrentIndex(
+            [k for _l, k in panel.PRIV_PROTOCOL_CHOICES].index("AES-128"))
+        with mock.patch("ui.snmp_panel.QMessageBox.warning") as warn:
+            panel._on_trap_start_clicked()
+        warn.assert_not_called()
+        panel.snmp_manager.start_trap_receiver.assert_called_once()
+
+    def test_trap_v3_rejects_an_unreadable_engine_id(self):
+        """16進として読めない EngineID は具体的に指摘すること。"""
+        from unittest import mock
+        panel = self._panel()
+        panel.snmp_manager = mock.Mock()
+        panel.mib_loading = False
+        panel.mib_loaded = True
+        panel.trap_version_combo.setCurrentText("v3")
+        panel.trap_v3_username_edit.setText("netbelt-v3")
+        for bad in ("zzzz", "800000000102030"):   # 非16進 / 奇数桁
+            with self.subTest(engine_id=bad):
+                panel.trap_v3_engine_ids_edit.setPlainText(bad)
+                panel.snmp_manager.reset_mock()
+                with mock.patch("ui.snmp_panel.QMessageBox.warning") as warn:
+                    panel._on_trap_start_clicked()
+                warn.assert_called_once()
+                self.assertIn(bad, warn.call_args[0][2])
+                panel.snmp_manager.start_trap_receiver.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

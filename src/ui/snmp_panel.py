@@ -455,10 +455,29 @@ class SNMPPanel(QWidget):
         if version == 'v1/v2c':
             return None
 
+        # v3 を実際に使うかどうかはユーザ名の有無で決まる。ここを先に
+        # 決めないと、v3 を使うつもりの無い「両方」の利用者が、暗号方式を
+        # 触っただけで受信を始められなくなる。
         username = self.trap_v3_username_edit.text().strip()
-        if username and not self._collect_trap_v3_users()[0]['engine_ids']:
+        if not username:
+            if version == 'v3':
+                return ("v3 を選んだ場合は、v3 のユーザ名を入力してください。\n"
+                        "v1/v2c だけを受けるならバージョンを「v1/v2c」にしてください。")
+            return None
+
+        engine_ids = self._collect_trap_v3_users()[0]['engine_ids']
+        if not engine_ids:
             return ("v3 Trap を受信するには、送信元機器の EngineID を"
                     "1行に1つ登録してください。")
+
+        # 16進として読めない値は core で例外になり、bind 失敗としてしか
+        # 伝わらない。ここで具体的に指摘する。
+        for engine_id in engine_ids:
+            if len(engine_id) % 2 or not all(c in "0123456789abcdefABCDEF"
+                                             for c in engine_id):
+                return ("EngineID は偶数桁の16進で入力してください。\n"
+                        f"読めない値: {engine_id}")
+
         if (self.trap_v3_auth_combo.currentData() == "none"
                 and self.trap_v3_priv_combo.currentData() != "none"):
             return ("認証なしでは暗号化を使えません。\n"
