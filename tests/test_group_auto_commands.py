@@ -97,9 +97,26 @@ class GroupDialogAutoCommandsTest(unittest.TestCase):
         self.assertEqual(dlg.get_auto_commands(), [])
 
     def test_omitting_auto_commands_defaults_to_empty(self):
+        """None が空リストへ正規化されること（正規化を怠ると _load_data で落ちる）。"""
         from ui.dialogs.group_dialog import GroupDialog
         dlg = GroupDialog(None, group_name="既存")
+        self.assertEqual(dlg.auto_commands, [])
+        self.assertEqual(dlg.auto_commands_edit.toPlainText(), "")
         self.assertEqual(dlg.get_auto_commands(), [])
+
+    def test_labels_wrap_so_the_dialog_keeps_its_width(self):
+        """折り返さないラベルがあるとテキスト全長が最小幅になり resize() が効かない。"""
+        from ui.dialogs.group_dialog import GroupDialog
+        dlg = GroupDialog(None)
+        self.assertTrue(dlg.auto_commands_help_label.wordWrap())
+        self.assertTrue(dlg.auto_commands_warning_label.wordWrap())
+        self.assertLessEqual(dlg.minimumSizeHint().width(), 500)
+
+    def test_plaintext_warning_is_shown(self):
+        """auto_commands は暗号化されないので、注意書きを消してはいけない。"""
+        from ui.dialogs.group_dialog import GroupDialog
+        dlg = GroupDialog(None)
+        self.assertIn("平文", dlg.auto_commands_warning_label.text())
 
 
 if __name__ == "__main__":

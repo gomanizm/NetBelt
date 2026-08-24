@@ -47,9 +47,14 @@ class GroupDialog(QDialog):
 
         # 自動実行コマンド
         layout.addWidget(QLabel("自動実行コマンド:"))
-        layout.addWidget(QLabel(
+
+        # 折り返しを切ると、ラベルのテキスト全長がダイアログの最小幅になり
+        # resize() の指定が効かなくなる（実測で 500 指定に対し 790 になった）
+        self.auto_commands_help_label = QLabel(
             "1行に1コマンド。このグループの機器へ SSH / Telnet で接続した直後に、"
-            "上から順に送信されます。空欄でも構いません。"))
+            "上から順に送信されます。空欄でも構いません。")
+        self.auto_commands_help_label.setWordWrap(True)
+        layout.addWidget(self.auto_commands_help_label)
 
         self.auto_commands_edit = QTextEdit()
         self.auto_commands_edit.setPlaceholderText(
@@ -58,11 +63,11 @@ class GroupDialog(QDialog):
 
         # config.json の auto_commands は暗号化されない（暗号化されるのは機器の
         # パスワードのみ）。秘密情報を書かせないよう明示する。
-        warning = QLabel(
+        self.auto_commands_warning_label = QLabel(
             "※ ここに書いた内容は config.json に平文で保存されます。"
             "パスワードなどの秘密情報は書かないでください。")
-        warning.setWordWrap(True)
-        layout.addWidget(warning)
+        self.auto_commands_warning_label.setWordWrap(True)
+        layout.addWidget(self.auto_commands_warning_label)
 
         # OK/キャンセルボタン
         button_layout = QHBoxLayout()
