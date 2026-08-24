@@ -280,6 +280,12 @@ class SNMPTrapReceiver(QThread):
         self._running = False
         self._engine = None
         self._transport = None
+        # jobStarted と停止要求は別スレッドから触るのでロックで守る。
+        # 先に jobFinished を呼ぶと pysnmp 内部で KeyError になり、
+        # ジョブカウンタが不整合のまま runDispatcher() が戻らなくなる。
+        self._state_lock = threading.Lock()
+        self._job_started = False
+        self._stop_requested = False
         # observer で拾った直近のセキュリティ情報（表示用の参考値）
         self._last_security = {}
 
@@ -417,8 +423,15 @@ class SNMPTrapReceiver(QThread):
             print(f"[SNMPTrapReceiver] Trap受信待機中...")
 
             self._running = True
-            self._engine.transportDispatcher.jobStarted(self._JOB_ID)
+            with self._state_lock:
+                self._engine.transportDispatcher.jobStarted(self._JOB_ID)
+                self._job_started = True
+                # ここより前に来ていた停止要求は jobFinished を呼べていない
+                stop_before_start = self._stop_requested
             self.started.emit()
+
+            if stop_before_start:
+                self._engine.transportDispatcher.jobFinished(self._JOB_ID)
 
             self._engine.transportDispatcher.runDispatcher()
 
@@ -450,9 +463,20 @@ class SNMPTrapReceiver(QThread):
 
         jobFinished でディスパッチャのジョブを終わらせると runDispatcher() が
         戻る。検知はディスパッチャのタイマ分解能（0.5秒）の周期。
+
+        スレッドが jobStarted に到達する前に呼ばれた場合は、ここでは何もせず
+        run() 側に終わらせてもらう。先回りして jobFinished を呼ぶと
+        pysnmp 内部で KeyError になり、ジョブカウンタが合わなくなって
+        runDispatcher() が永久に戻らなくなる。
         """
         print(f"[SNMPTrapReceiver] 停止要求")
         self._running = False
+
+        with self._state_lock:
+            self._stop_requested = True
+            if not self._job_started:
+                return
+
         if self._engine is not None:
             try:
                 self._engine.transportDispatcher.jobFinished(self._JOB_ID)

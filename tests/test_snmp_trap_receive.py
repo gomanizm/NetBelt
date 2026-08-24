@@ -104,6 +104,23 @@ class SnmpTrapReceiveTest(unittest.TestCase):
             [e for e in errors if "not defined" in e or "NameError" in e], [],
             "受信ループが例外で落ちている: %s" % errors)
 
+
+    def test_stop_right_after_start_does_not_hang(self):
+        """起動直後に止めてもスレッドが残らないこと。
+
+        pysnmp の jobFinished を jobStarted より先に呼ぶと内部で KeyError に
+        なり、握り潰すとジョブカウンタが合わなくなって runDispatcher() が
+        永久に戻らない。生ソケット実装には無かった、エンジン化で入った危険。
+
+        SNMPManager.stop_trap_receiver() はタイムアウト時に参照を捨てるので、
+        そちら経由では気づけない。レシーバを直接止めて確かめる。
+        """
+        m, _port = self._start()
+        receiver = m.trap_receiver
+        receiver.stop()
+        self.assertTrue(receiver.wait(10000),
+                        "停止要求から10秒経っても受信スレッドが終わらない")
+        self.assertFalse(receiver.isRunning())
     def test_trap_is_received_and_parsed(self):
         """実際に Trap を送って受け取れること。"""
         m, port = self._start(["public"])
