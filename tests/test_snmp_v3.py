@@ -45,6 +45,64 @@ class ResolveV3ProtocolsTest(unittest.TestCase):
                 with self.subTest(auth=auth_name, priv=priv_name):
                     resolve_v3_protocols(auth_name, priv_name)
 
+
+    # 実測した OID。定数名ではなく、実際に線に乗る値で固定する。
+    # 名前で固定すると実装の表を写すだけになり、取り違えを検知できない。
+    AUTH_OIDS = {
+        "none":    (1, 3, 6, 1, 6, 3, 10, 1, 1, 1),
+        "MD5":     (1, 3, 6, 1, 6, 3, 10, 1, 1, 2),
+        "SHA":     (1, 3, 6, 1, 6, 3, 10, 1, 1, 3),
+        "SHA-224": (1, 3, 6, 1, 6, 3, 10, 1, 1, 4),
+        "SHA-256": (1, 3, 6, 1, 6, 3, 10, 1, 1, 5),
+        "SHA-384": (1, 3, 6, 1, 6, 3, 10, 1, 1, 6),
+        "SHA-512": (1, 3, 6, 1, 6, 3, 10, 1, 1, 7),
+    }
+    PRIV_OIDS = {
+        "none":    (1, 3, 6, 1, 6, 3, 10, 1, 2, 1),
+        "DES":     (1, 3, 6, 1, 6, 3, 10, 1, 2, 2),
+        "3DES":    (1, 3, 6, 1, 6, 3, 10, 1, 2, 3),
+        "AES-128": (1, 3, 6, 1, 6, 3, 10, 1, 2, 4),
+        # AES-192/256 は Reeder 版。Blumenthal 版は末尾が 1 / 2 になる
+        "AES-192": (1, 3, 6, 1, 4, 1, 9, 12, 6, 1, 101),
+        "AES-256": (1, 3, 6, 1, 4, 1, 9, 12, 6, 1, 102),
+    }
+
+    def test_every_auth_name_maps_to_the_right_wire_protocol(self):
+        """名前と定数の対応を1つずつ固定する。
+
+        pysnmp の定数名は「HMAC<出力ビット長>SHA<ダイジェスト長>」の順で、
+        SHA-256 は usmHMAC192SHA256AuthProtocol。数字が2つ並ぶため
+        取り違えやすく、しかも取り違えても例外は出ない。
+        """
+        from core.snmp_manager import V3_AUTH_PROTOCOL_NAMES, resolve_v3_protocols
+        self.assertEqual(set(V3_AUTH_PROTOCOL_NAMES), set(self.AUTH_OIDS),
+                         "選択肢が増減したらこの表も更新すること")
+        for name, oid in self.AUTH_OIDS.items():
+            with self.subTest(auth=name):
+                auth, _priv = resolve_v3_protocols(name, "none")
+                self.assertEqual(tuple(auth), oid)
+
+    def test_every_priv_name_maps_to_the_right_wire_protocol(self):
+        """AES-192/256 は Reeder 版であること（名前が短い方が非標準）。"""
+        from core.snmp_manager import V3_PRIV_PROTOCOL_NAMES, resolve_v3_protocols
+        self.assertEqual(set(V3_PRIV_PROTOCOL_NAMES), set(self.PRIV_OIDS),
+                         "選択肢が増減したらこの表も更新すること")
+        for name, oid in self.PRIV_OIDS.items():
+            with self.subTest(priv=name):
+                auth_name = "none" if name == "none" else "SHA"
+                _auth, priv = resolve_v3_protocols(auth_name, name)
+                self.assertEqual(tuple(priv), oid)
+
+    def test_aes_is_not_the_blumenthal_variant(self):
+        """取り違えると相互接続できない組み合わせを明示的に弾く。"""
+        from pysnmp.hlapi import (usmAesBlumenthalCfb192Protocol,
+                                  usmAesBlumenthalCfb256Protocol)
+        from core.snmp_manager import resolve_v3_protocols
+        for name, blumenthal in (("AES-192", usmAesBlumenthalCfb192Protocol),
+                                 ("AES-256", usmAesBlumenthalCfb256Protocol)):
+            with self.subTest(priv=name):
+                _auth, priv = resolve_v3_protocols("SHA", name)
+                self.assertNotEqual(tuple(priv), tuple(blumenthal))
     def test_unknown_auth_name_raises(self):
         """黙って noAuth に落とさない（認証失敗の原因が追えなくなるため）。"""
         from core.snmp_manager import resolve_v3_protocols
