@@ -78,7 +78,27 @@ class MIBLoaderThread(QThread):
 
 class SNMPPanel(QWidget):
     """SNMPパネル"""
-    
+
+    # v3 認証コンボの選択肢。(表示ラベル, core へ渡すキー) の組。
+    # キーは core.snmp_manager の V3_*_PROTOCOL_NAMES と一致させること。
+    AUTH_PROTOCOL_CHOICES = (
+        ("なし", "none"),
+        ("MD5", "MD5"),
+        ("SHA-1", "SHA"),
+        ("SHA-224", "SHA-224"),
+        ("SHA-256", "SHA-256"),
+        ("SHA-384", "SHA-384"),
+        ("SHA-512", "SHA-512"),
+    )
+    PRIV_PROTOCOL_CHOICES = (
+        ("なし", "none"),
+        ("DES", "DES"),
+        ("3DES", "3DES"),
+        ("AES-128", "AES-128"),
+        ("AES-192", "AES-192"),
+        ("AES-256", "AES-256"),
+    )
+
     def __init__(self, parent=None, config_manager=None):
         super().__init__(parent)
         self.config_manager = config_manager
@@ -139,7 +159,7 @@ class SNMPPanel(QWidget):
         layout.addWidget(conn_group)
         
         # 認証タブ
-        auth_tabs = QTabWidget()
+        self.auth_tabs = QTabWidget()
         
         # v1/v2c認証
         v2c_widget = QWidget()
@@ -149,8 +169,41 @@ class SNMPPanel(QWidget):
         v2c_layout.addWidget(self.community_edit, 0, 1)
         v2c_layout.setRowStretch(1, 1)  # 空白を下に押しやる
         v2c_widget.setLayout(v2c_layout)
-        auth_tabs.addTab(v2c_widget, "v1/v2c認証")
-        
+        self.auth_tabs.addTab(v2c_widget, "v1/v2c認証")
+
+        # v3認証
+        v3_widget = QWidget()
+        v3_layout = QGridLayout()
+        v3_layout.addWidget(QLabel("ユーザ名:"), 0, 0)
+        self.v3_username_edit = QLineEdit()
+        v3_layout.addWidget(self.v3_username_edit, 0, 1)
+
+        v3_layout.addWidget(QLabel("認証方式:"), 1, 0)
+        self.v3_auth_combo = QComboBox()
+        for label, key in self.AUTH_PROTOCOL_CHOICES:
+            self.v3_auth_combo.addItem(label, key)
+        v3_layout.addWidget(self.v3_auth_combo, 1, 1)
+
+        v3_layout.addWidget(QLabel("認証パスワード:"), 1, 2)
+        self.v3_auth_password_edit = QLineEdit()
+        self.v3_auth_password_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        v3_layout.addWidget(self.v3_auth_password_edit, 1, 3)
+
+        v3_layout.addWidget(QLabel("暗号方式:"), 2, 0)
+        self.v3_priv_combo = QComboBox()
+        for label, key in self.PRIV_PROTOCOL_CHOICES:
+            self.v3_priv_combo.addItem(label, key)
+        v3_layout.addWidget(self.v3_priv_combo, 2, 1)
+
+        v3_layout.addWidget(QLabel("暗号パスワード:"), 2, 2)
+        self.v3_priv_password_edit = QLineEdit()
+        self.v3_priv_password_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        v3_layout.addWidget(self.v3_priv_password_edit, 2, 3)
+
+        v3_layout.setRowStretch(3, 1)
+        v3_widget.setLayout(v3_layout)
+        self.auth_tabs.addTab(v3_widget, "v3認証")
+
         # プリセット
         preset_widget = QWidget()
         preset_layout = QVBoxLayout()
@@ -170,9 +223,9 @@ class SNMPPanel(QWidget):
         preset_layout.addLayout(preset_h)
         preset_layout.addStretch()  # 空白を下に押しやる
         preset_widget.setLayout(preset_layout)
-        auth_tabs.addTab(preset_widget, "プリセットOID")
+        self.auth_tabs.addTab(preset_widget, "プリセットOID")
         
-        layout.addWidget(auth_tabs)
+        layout.addWidget(self.auth_tabs)
         
         # OID入力
         oid_group = QGroupBox("OID")
@@ -296,7 +349,42 @@ class SNMPPanel(QWidget):
         return widget
     
     def _on_version_changed(self, version: str):
-        pass  # v3対応は簡略化
+        """
+        バージョン選択に合わせて認証タブを切り替える
+
+        Args:
+            version: 'v1' / 'v2c' / 'v3'
+        """
+        titles = [self.auth_tabs.tabText(i) for i in range(self.auth_tabs.count())]
+        target = "v3認証" if version == "v3" else "v1/v2c認証"
+        if target in titles:
+            self.auth_tabs.setCurrentIndex(titles.index(target))
+
+        # 使わない方のタブは無効にして、どちらを入力すべきかを明示する
+        for i, title in enumerate(titles):
+            if title == "v1/v2c認証":
+                self.auth_tabs.setTabEnabled(i, version != "v3")
+            elif title == "v3認証":
+                self.auth_tabs.setTabEnabled(i, version == "v3")
+
+    def _collect_v3_params(self) -> dict:
+        """GET/WALK 用の v3 認証パラメータを集める"""
+        return {
+            'username': self.v3_username_edit.text().strip(),
+            'auth_protocol': self.v3_auth_combo.currentData(),
+            'auth_password': self.v3_auth_password_edit.text(),
+            'priv_protocol': self.v3_priv_combo.currentData(),
+            'priv_password': self.v3_priv_password_edit.text(),
+        }
+
+    def _collect_request_params(self) -> dict:
+        """GET/WALK 共通のリクエストパラメータを組み立てる"""
+        version = self.version_combo.currentText()
+        params = {'port': self.port_spinbox.value(), 'version': version,
+                  'community': self.community_edit.text()}
+        if version == 'v3':
+            params.update(self._collect_v3_params())
+        return params
     
     def _on_preset_changed(self, preset: str):
         if "sysDescr" in preset:
@@ -315,8 +403,7 @@ class SNMPPanel(QWidget):
             QMessageBox.warning(self, "エラー", "ホストを入力してください。")
             return
         oids = [o.strip() for o in self.oid_edit.text().split(',')]
-        params = {'port': self.port_spinbox.value(), 'version': self.version_combo.currentText(),
-                  'community': self.community_edit.text()}
+        params = self._collect_request_params()
         self.snmp_manager.snmp_get(host, oids, **params)
         self.status_label.setText("GET実行中...")
     
@@ -329,8 +416,7 @@ class SNMPPanel(QWidget):
             QMessageBox.warning(self, "エラー", "ホストを入力してください。")
             return
         oid = self.oid_edit.text().strip()
-        params = {'port': self.port_spinbox.value(), 'version': self.version_combo.currentText(),
-                  'community': self.community_edit.text()}
+        params = self._collect_request_params()
         self.snmp_manager.snmp_walk(host, oid, **params)
         self.status_label.setText("WALK実行中...")
     
