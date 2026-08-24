@@ -168,7 +168,7 @@ GUI に PyQt6（GPL-3.0）を使用しているため、プロジェクト全体
 
 以上は**作りとサポートの話**で、利用の許諾とは別です。ライセンス上は
 **業務・商用を問わず自由に利用できます**（GPL-3.0 は利用目的を制限しません）。
-社内利用に追加のライセンスは不要で、PyQt6 の商用ライセンスも要りません。
+社内で使う分に追加のライセンスは不要です（[詳しくは LICENSING.md](LICENSING.md)）。
 
 フォークして自分で直していただくのが確実です。GPL-3.0 なのでご自由にどうぞ。
 
@@ -278,6 +278,6 @@ promised; fixes may happen infrequently, if at all.
 
 That is a statement about design and support, not about permission. **You are
 free to use it commercially and at work** — GPL-3.0 places no restriction on
-purpose, and no additional licence is required, including PyQt6's commercial
-licence. Forking and fixing it yourself is the reliable option — GPL-3.0, so
-please do.
+purpose. Using it inside your organisation needs no additional licence; see
+[LICENSING.md](LICENSING.md#english) for the details. Forking and fixing it
+yourself is the reliable option — GPL-3.0, so please do.

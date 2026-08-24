@@ -15,7 +15,7 @@ try:
     from __version__ import __version__, GITHUB_REPO, APP_NAME
 except ImportError:
     # フォールバック
-    __version__ = "1.0.0"
+    __version__ = "1.1.0"
     GITHUB_REPO = "gomanizm/NetBelt"
     APP_NAME = "NetBelt"
 
