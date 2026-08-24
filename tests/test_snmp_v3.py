@@ -202,12 +202,25 @@ class SnmpPanelV3UiTest(unittest.TestCase):
         from PyQt6.QtWidgets import QApplication
         cls.app = QApplication.instance() or QApplication([])
 
+    # 作った MainWindow はクラス終了まで保持する。
+    # snmp_panel だけ受け取って窓を捨てると、GC のタイミングで C++ 側の
+    # ウィジェットが破棄され、あとから触ると
+    # 「wrapped C/C++ object of type QLineEdit has been deleted」で落ちる。
+    # 単体では通るのに全体実行で落ちる、という形で表面化する（実測）。
+    _windows = []
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._windows.clear()
+
     def _panel(self):
         from unittest import mock
         from ui.main_window import MainWindow
         # 起動時の更新チェックは実際に GitHub API を叩くのでモックする
         with mock.patch.object(MainWindow, "_check_for_updates_on_startup"):
-            return MainWindow().snmp_panel
+            window = MainWindow()
+        type(self)._windows.append(window)
+        return window.snmp_panel
 
     def test_auth_tabs_include_a_v3_tab(self):
         panel = self._panel()
@@ -318,6 +331,63 @@ class SnmpPanelV3UiTest(unittest.TestCase):
         self.assertFalse(panel.auth_tabs.isTabEnabled(v3))
         self.assertTrue(panel.auth_tabs.isTabEnabled(preset))
 
+
+    def test_the_initial_version_decides_the_enabled_tab(self):
+        """起動直後から、入力すべきタブだけが有効であること。"""
+        panel = self._panel()
+        titles = [panel.auth_tabs.tabText(i) for i in range(panel.auth_tabs.count())]
+        self.assertEqual(panel.version_combo.currentText(), "v2c")
+        self.assertTrue(panel.auth_tabs.isTabEnabled(titles.index("v1/v2c認証")))
+        self.assertFalse(panel.auth_tabs.isTabEnabled(titles.index("v3認証")))
+
+    def test_v3_without_a_username_is_refused(self):
+        """UsmUserData('') の noAuthNoPriv になる経路を実行前に止めること。"""
+        from unittest import mock
+        panel = self._panel()
+        panel.snmp_manager = mock.Mock()
+        panel.host_edit.setText("192.0.2.10")
+        panel.oid_edit.setText("1.3.6.1.2.1.1.1.0")
+        panel.version_combo.setCurrentText("v3")
+        panel.v3_username_edit.setText("   ")
+
+        for run, sender in ((panel._on_get_clicked, panel.snmp_manager.snmp_get),
+                            (panel._on_walk_clicked, panel.snmp_manager.snmp_walk)):
+            with self.subTest(run=run.__name__):
+                with mock.patch("ui.snmp_panel.QMessageBox.warning") as warn:
+                    run()
+                warn.assert_called_once()
+                sender.assert_not_called()
+
+    def test_v3_priv_without_auth_is_refused(self):
+        """SNMPv3 では authNoPriv 以上でないと暗号化できない。"""
+        from unittest import mock
+        panel = self._panel()
+        panel.snmp_manager = mock.Mock()
+        panel.host_edit.setText("192.0.2.10")
+        panel.oid_edit.setText("1.3.6.1.2.1.1.1.0")
+        panel.version_combo.setCurrentText("v3")
+        panel.v3_username_edit.setText("netbelt-v3")
+        panel.v3_auth_combo.setCurrentIndex(
+            [k for _l, k in panel.AUTH_PROTOCOL_CHOICES].index("none"))
+        panel.v3_priv_combo.setCurrentIndex(
+            [k for _l, k in panel.PRIV_PROTOCOL_CHOICES].index("AES-128"))
+
+        with mock.patch("ui.snmp_panel.QMessageBox.warning") as warn:
+            panel._on_get_clicked()
+        warn.assert_called_once()
+        panel.snmp_manager.snmp_get.assert_not_called()
+
+    def test_v3_does_not_send_a_community(self):
+        """v3 に community は要らない。意味の無い値を運ばないこと。"""
+        from unittest import mock
+        panel = self._panel()
+        panel.snmp_manager = mock.Mock()
+        panel.host_edit.setText("192.0.2.10")
+        panel.oid_edit.setText("1.3.6.1.2.1.1.1.0")
+        panel.version_combo.setCurrentText("v3")
+        panel.v3_username_edit.setText("netbelt-v3")
+        panel._on_get_clicked()
+        self.assertNotIn("community", panel.snmp_manager.snmp_get.call_args.kwargs)
     def test_v2c_still_passes_the_community(self):
         from unittest import mock
         panel = self._panel()

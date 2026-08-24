@@ -226,6 +226,10 @@ class SNMPPanel(QWidget):
         self.auth_tabs.addTab(preset_widget, "プリセットOID")
         
         layout.addWidget(self.auth_tabs)
+
+        # 起動直後の選択（v2c）に合わせておく。呼ばないと両方のタブが
+        # 有効なままで、どちらを入力すべきか分からない
+        self._on_version_changed(self.version_combo.currentText())
         
         # OID入力
         oid_group = QGroupBox("OID")
@@ -367,6 +371,24 @@ class SNMPPanel(QWidget):
             elif title == "v3認証":
                 self.auth_tabs.setTabEnabled(i, version == "v3")
 
+    def _v3_input_error(self):
+        """
+        v3 の入力に問題があればその説明を返す（無ければ None）
+
+        ユーザ名が空のままだと UsmUserData('') の noAuthNoPriv になり、
+        まともに設定された機器では必ず失敗する。原因が分かりにくいので
+        実行前に止める。認証なしで暗号化も SNMPv3 では成立しない。
+        """
+        if self.version_combo.currentText() != 'v3':
+            return None
+        if not self.v3_username_edit.text().strip():
+            return "SNMPv3 のユーザ名を入力してください。"
+        if (self.v3_auth_combo.currentData() == "none"
+                and self.v3_priv_combo.currentData() != "none"):
+            return ("認証なしでは暗号化を使えません。\n"
+                    "認証方式を選ぶか、暗号方式を「なし」にしてください。")
+        return None
+    
     def _collect_v3_params(self) -> dict:
         """GET/WALK 用の v3 認証パラメータを集める"""
         return {
@@ -378,12 +400,19 @@ class SNMPPanel(QWidget):
         }
 
     def _collect_request_params(self) -> dict:
-        """GET/WALK 共通のリクエストパラメータを組み立てる"""
+        """
+        GET/WALK 共通のリクエストパラメータを組み立てる
+
+        バージョンごとに必要なものだけを入れる。v3 に community を
+        混ぜても今の core は無視するが、意味の無い値を運ぶと
+        後から読む人を迷わせる。
+        """
         version = self.version_combo.currentText()
-        params = {'port': self.port_spinbox.value(), 'version': version,
-                  'community': self.community_edit.text()}
+        params = {'port': self.port_spinbox.value(), 'version': version}
         if version == 'v3':
             params.update(self._collect_v3_params())
+        else:
+            params['community'] = self.community_edit.text()
         return params
     
     def _on_preset_changed(self, preset: str):
@@ -403,6 +432,11 @@ class SNMPPanel(QWidget):
             QMessageBox.warning(self, "エラー", "ホストを入力してください。")
             return
         oids = [o.strip() for o in self.oid_edit.text().split(',')]
+        v3_error = self._v3_input_error()
+        if v3_error:
+            QMessageBox.warning(self, "エラー", v3_error)
+            return
+
         params = self._collect_request_params()
         self.snmp_manager.snmp_get(host, oids, **params)
         self.status_label.setText("GET実行中...")
@@ -416,6 +450,11 @@ class SNMPPanel(QWidget):
             QMessageBox.warning(self, "エラー", "ホストを入力してください。")
             return
         oid = self.oid_edit.text().strip()
+        v3_error = self._v3_input_error()
+        if v3_error:
+            QMessageBox.warning(self, "エラー", v3_error)
+            return
+
         params = self._collect_request_params()
         self.snmp_manager.snmp_walk(host, oid, **params)
         self.status_label.setText("WALK実行中...")
