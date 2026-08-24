@@ -135,6 +135,59 @@ class RestartOnSamePortTest(unittest.TestCase):
             m.stop()   # 間を置かずに次のサイクルへ
 
 
+class ExclusiveBindOverridesReuseAddrTest(unittest.TestCase):
+    """SO_REUSEADDR が既に立っているソケットにも排他バインドを効かせられること。
+
+    pysnmp は自前のトランスポートソケットへ無条件に SO_REUSEADDR を立てる
+    （pysnmp/carrier/asyncore/base.py）。Windows ではその状態で
+    SO_EXCLUSIVEADDRUSE を立てようとすると WinError 10022 になるため、
+    先に SO_REUSEADDR を戻す必要がある。
+    """
+
+    def test_can_be_applied_after_so_reuseaddr(self):
+        import socket
+        import sys
+        from core.sockets import set_exclusive_bind
+
+        if sys.platform != "win32":
+            self.skipTest("SO_EXCLUSIVEADDRUSE は Windows のみ")
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.addCleanup(sock.close)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+        set_exclusive_bind(sock)
+
+        self.assertEqual(
+            sock.getsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE), 1,
+            "SO_REUSEADDR 済みのソケットに SO_EXCLUSIVEADDRUSE を立てられていない")
+        self.assertEqual(
+            sock.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR), 0,
+            "SO_REUSEADDR が戻されていない")
+
+    def test_port_cannot_be_stolen_after_the_override(self):
+        """他プロセスが素の bind で握っているポートを奪わないこと。"""
+        import socket
+        import sys
+        from core.sockets import set_exclusive_bind
+
+        if sys.platform != "win32":
+            self.skipTest("SO_EXCLUSIVEADDRUSE は Windows のみ")
+
+        victim = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.addCleanup(victim.close)
+        victim.bind(("0.0.0.0", 0))
+        port = victim.getsockname()[1]
+
+        thief = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.addCleanup(thief.close)
+        thief.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        set_exclusive_bind(thief)
+
+        with self.assertRaises(OSError):
+            thief.bind(("0.0.0.0", port))
+
+
 class ServersUseExclusiveBindTest(unittest.TestCase):
     """各サーバが SO_REUSEADDR ではなく共通ヘルパーを使っていること。"""
 
