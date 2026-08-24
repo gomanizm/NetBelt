@@ -19,8 +19,10 @@
 - **デバイス管理** — グループに整理してツリーから接続
 - **複数タブ** — 複数機器へ同時接続してタブで切り替え
 - **マクロ** — よく使うコマンド列を登録して一括実行
-- **自動実行コマンド** — グループごとに登録したコマンドを、接続直後に自動投入（`terminal length 0` など）。ツリーでグループを右クリック →「グループを編集」から設定します。SSH / Telnet が対象です
+- **自動実行コマンド** — グループごとに登録したコマンドを、接続直後に自動投入（`terminal length 0` など）。ツリーでグループを右クリック →「グループを編集」から設定します。SSH / Telnet が対象です。**config.json に平文で保存されるため、パスワードは書かないでください**
 - **セッションログ** — 画面の内容をファイルへ保存
+- **コピー / ペースト** — `Ctrl+Shift+C` / `Ctrl+Shift+V`。ターミナルの `Ctrl+C` は機器への中断送信（0x03）に使うため、端末ソフトの慣習に合わせています。ペーストは接続中のタブでのみ動きます
+- **フォントサイズ変更** — 表示メニューから 6〜32pt。開いているタブすべてに即反映され、以降に開くタブにも引き継ぎます
 
 ### 受信サーバ / 転送
 - **Syslog 受信** — UDP / TCP、レベルフィルタ付き（既定 514）
@@ -158,7 +160,8 @@ application and a set of daemons.
   with MIB name resolution, community filtering and CSV export
 - **File transfer** — TFTP (UDP 69), FTP (TCP 21) and SFTP (TCP 2222) servers,
   plus an SFTP client, for moving configs and images to and from network devices
-- **Auto commands** — commands registered per group are sent right after connecting (e.g. `terminal length 0`). Configure them by right-clicking a group in the tree and choosing 「グループを編集」 ("Edit group"). Applies to SSH and Telnet.
+- **Auto commands** — commands registered per group are sent right after connecting (e.g. `terminal length 0`). Configure them by right-clicking a group in the tree and choosing 「グループを編集」 ("Edit group"). Applies to SSH and Telnet. They are stored in plain text in `config.json`, so do not put passwords there.
+- **Copy / paste** — `Ctrl+Shift+C` / `Ctrl+Shift+V`, following terminal-emulator convention: `Ctrl+C` in a terminal tab is left free to send an interrupt (0x03) to the device. Paste only works on a connected tab.
 - **SNMP GET / WALK** — fetch or walk arbitrary OIDs, export results as CSV / JSON / text
 - **Port checker** — checks whether a port on this PC is free (Tools → ポートチェッカー). It attempts a real bind, and when the port is taken it identifies the owning process via `netstat` and `tasklist`. Meant for troubleshooting why a receiving server (Syslog, TFTP, SNMP Trap, …) will not start. It is not a port scanner for remote devices.
 - **Settings** — terminal colors and font, SFTP client behavior, and the startup update check (Tools → 設定)
