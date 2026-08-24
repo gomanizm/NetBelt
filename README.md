@@ -24,11 +24,33 @@
 
 ### 受信サーバ / 転送
 - **Syslog 受信** — UDP / TCP、レベルフィルタ付き（既定 514）
-- **SNMP Trap 受信** — MIB による OID の名前解決、CSV エクスポート（既定 162/UDP）
+- **SNMP Trap 受信** — v1 / v2c / v3（USM）に対応。MIB による OID の名前解決、CSV エクスポート（既定 162/UDP）
 - **TFTP サーバ** — ネットワーク機器の config / イメージ授受（既定 69/UDP）
 - **FTP サーバ** — 同上。匿名・認証の両対応（既定 21/TCP）
 - **SFTP サーバ / クライアント** — 双方向のファイル転送、転送履歴（既定 2222/TCP）
 - **ツールエリアのタブ化・切り離し** — 各サーバのパネルを別ウィンドウへ分離可能
+
+#### SNMPv3 について
+
+GET / WALK は認証に MD5 / SHA-1 / SHA-224 / SHA-256 / SHA-384 / SHA-512、
+暗号化に DES / 3DES / AES-128 / AES-192 / AES-256 が使えます
+（AES-192 / AES-256 はベンダー実装で広く使われている Reeder 方式です）。
+SNMP パネルでバージョンに v3 を選ぶと「v3認証」タブが有効になり、
+v1/v2c 認証タブは無効になります。ユーザ名は必須で、認証なしでの暗号化は
+選べません（実行前に警告して止まります）。
+
+Trap 受信のバージョン選択は「両方」「v1/v2c」「v3」から選べ、既定は
+「両方」です。「両方」は v1/v2c と v3 を同一ポートで同時に受信します。
+
+**Trap を v3 で受信する場合は、送信元機器の EngineID の登録が必要です。**
+SNMPv3 の Trap では送信側が authoritative engine となるため、受信側が
+あらかじめ機器の EngineID を知っていないと復号・認証ができません。
+Cisco IOS なら `show snmp engineID` で確認できます。EngineID は偶数桁の
+16進で（例: `8000000001020304`）、複数台から受ける場合は1行に1つずつ
+入力してください。登録しないまま受信を開始しようとすると警告が出て
+止まります。
+
+v3 の認証情報は保存されません。アプリを起動するたびに入力が必要です。
 
 ### その他
 - パスワードは **Windows DPAPI** で暗号化して保存（OS・ユーザーアカウントに紐付け）
@@ -154,14 +176,38 @@ application and a set of daemons.
 
 - **Terminal** — SSH, Telnet and serial, with device grouping, tabs, command macros
   and session logging
-- **Receivers** — Syslog (UDP/TCP 514) with level filtering; SNMP trap (UDP 162)
-  with MIB name resolution, community filtering and CSV export
+- **Receivers** — Syslog (UDP/TCP 514) with level filtering; SNMP trap (UDP 162,
+  v1/v2c/v3 with USM) with MIB name resolution, community filtering and CSV export
 - **File transfer** — TFTP (UDP 69), FTP (TCP 21) and SFTP (TCP 2222) servers,
   plus an SFTP client, for moving configs and images to and from network devices
 - Passwords are encrypted with **Windows DPAPI**, tied to the OS user account
 - SSH host keys are verified on a **trust-on-first-use** basis
 - Update checks against GitHub Releases, with **SHA-256 verification** of the
   downloaded package
+
+#### SNMPv3
+
+GET/WALK support authentication with MD5, SHA-1, SHA-224, SHA-256, SHA-384
+or SHA-512, and encryption with DES, 3DES, AES-128, AES-192 or AES-256
+(AES-192 and AES-256 use the Reeder variant, the one most vendor
+implementations use). Selecting v3 in the SNMP panel enables the "v3"
+auth tab and disables the v1/v2c one. A username is required, and
+encryption cannot be selected without authentication — the app blocks
+the request and warns instead.
+
+Trap version selection is "Both" / "v1/v2c" / "v3", defaulting to **Both**,
+which receives v1/v2c and v3 traps on the same port at the same time.
+
+**Receiving v3 traps requires registering the sending device's EngineID.**
+In SNMPv3 traps the sender is the authoritative engine, so the receiver
+must already know the device's EngineID to authenticate and decrypt the
+message. On Cisco IOS, `show snmp engineID` shows it. EngineIDs are
+entered as even-length hex (e.g. `8000000001020304`), one per line for
+multiple devices. Starting the receiver without one registered will warn
+and refuse to start.
+
+v3 credentials are never saved to disk — they must be re-entered every
+time the app starts.
 
 ### Requirements
 
