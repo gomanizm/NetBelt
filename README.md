@@ -19,18 +19,21 @@
 - **デバイス管理** — グループに整理してツリーから接続
 - **複数タブ** — 複数機器へ同時接続してタブで切り替え
 - **マクロ** — よく使うコマンド列を登録して一括実行
-- **自動実行コマンド** — 接続時に `terminal length 0` などを自動投入
+- **自動実行コマンド** — グループごとに登録したコマンドを、接続直後に自動投入（`terminal length 0` など）。ツリーでグループを右クリック →「グループを編集」から設定します。SSH / Telnet が対象です
 - **セッションログ** — 画面の内容をファイルへ保存
 
 ### 受信サーバ / 転送
 - **Syslog 受信** — UDP / TCP、レベルフィルタ付き（既定 514）
 - **SNMP Trap 受信** — MIB による OID の名前解決、CSV エクスポート（既定 162/UDP）
+- **SNMP GET / WALK** — 任意の OID の取得と巡回、結果の CSV / JSON / テキスト出力
 - **TFTP サーバ** — ネットワーク機器の config / イメージ授受（既定 69/UDP）
 - **FTP サーバ** — 同上。匿名・認証の両対応（既定 21/TCP）
 - **SFTP サーバ / クライアント** — 双方向のファイル転送、転送履歴（既定 2222/TCP）
 - **ツールエリアのタブ化・切り離し** — 各サーバのパネルを別ウィンドウへ分離可能
 
 ### その他
+- **ポートチェッカー** — この PC のポートが空いているかを調べます（ツール → ポートチェッカー）。指定ポートへ実際にバインドを試し、使用中なら `netstat` と `tasklist` で占有しているプロセスを特定します。Syslog・TFTP・SNMP Trap などの受信サーバが起動できないときの切り分け用です。リモート機器へのポートスキャンではありません
+- **設定** — ターミナルの配色とフォント、SFTP クライアントの動作、起動時の更新確認を変更できます（ツール → 設定）
 - パスワードは **Windows DPAPI** で暗号化して保存（OS・ユーザーアカウントに紐付け）
 - SSH ホストキーの **TOFU**（Trust On First Use）検証
 - GitHub Releases を見に行く**自動更新チェック** — ダウンロードした ZIP は SHA-256 で照合し、一致しなければ適用しません
@@ -96,9 +99,6 @@ python -m PyInstaller --clean NetBelt.spec
 python -m pytest tests -q
 ```
 
-リポジトリ直下の `test_*.py` は pytest 用のテストではなく、**対話的に実行する手動確認スクリプト**です
-（実機やサーバへ実際にパケットを投げます）。`pytest.ini` の `testpaths` により自動収集からは除外しています。
-
 ## MIB ファイル
 
 MIB は同梱していません（[理由](LICENSING.md#mib-ファイルを同梱していない理由)）。
@@ -158,6 +158,10 @@ application and a set of daemons.
   with MIB name resolution, community filtering and CSV export
 - **File transfer** — TFTP (UDP 69), FTP (TCP 21) and SFTP (TCP 2222) servers,
   plus an SFTP client, for moving configs and images to and from network devices
+- **Auto commands** — commands registered per group are sent right after connecting (e.g. `terminal length 0`). Configure them by right-clicking a group in the tree and choosing 「グループを編集」 ("Edit group"). Applies to SSH and Telnet.
+- **SNMP GET / WALK** — fetch or walk arbitrary OIDs, export results as CSV / JSON / text
+- **Port checker** — checks whether a port on this PC is free (Tools → ポートチェッカー). It attempts a real bind, and when the port is taken it identifies the owning process via `netstat` and `tasklist`. Meant for troubleshooting why a receiving server (Syslog, TFTP, SNMP Trap, …) will not start. It is not a port scanner for remote devices.
+- **Settings** — terminal colors and font, SFTP client behavior, and the startup update check (Tools → 設定)
 - Passwords are encrypted with **Windows DPAPI**, tied to the OS user account
 - SSH host keys are verified on a **trust-on-first-use** basis
 - Update checks against GitHub Releases, with **SHA-256 verification** of the
