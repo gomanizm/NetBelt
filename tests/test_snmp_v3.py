@@ -267,6 +267,11 @@ class SnmpPanelV3UiTest(unittest.TestCase):
         self.assertEqual(kwargs["priv_password"], "privpass12345")
 
     def test_walk_passes_v3_credentials(self):
+        """GET と同じ5キーを確認する。
+
+        username だけ見ていると、他の4キーを落としても GET のテストが
+        拾ってくれるうちは気づけない。WALK が別経路になった時点で盲目になる。
+        """
         from unittest import mock
         panel = self._panel()
         panel.snmp_manager = mock.Mock()
@@ -274,12 +279,44 @@ class SnmpPanelV3UiTest(unittest.TestCase):
         panel.oid_edit.setText("1.3.6.1.2.1.1")
         panel.version_combo.setCurrentText("v3")
         panel.v3_username_edit.setText("netbelt")
+        panel.v3_auth_combo.setCurrentIndex(
+            [k for _l, k in panel.AUTH_PROTOCOL_CHOICES].index("SHA-256"))
+        panel.v3_auth_password_edit.setText("authpass12345")
+        panel.v3_priv_combo.setCurrentIndex(
+            [k for _l, k in panel.PRIV_PROTOCOL_CHOICES].index("AES-128"))
+        panel.v3_priv_password_edit.setText("privpass12345")
 
         panel._on_walk_clicked()
 
         kwargs = panel.snmp_manager.snmp_walk.call_args.kwargs
         self.assertEqual(kwargs["version"], "v3")
         self.assertEqual(kwargs["username"], "netbelt")
+        self.assertEqual(kwargs["auth_protocol"], "SHA-256")
+        self.assertEqual(kwargs["auth_password"], "authpass12345")
+        self.assertEqual(kwargs["priv_protocol"], "AES-128")
+        self.assertEqual(kwargs["priv_password"], "privpass12345")
+
+    def test_unused_auth_tab_is_disabled(self):
+        """入力すべきタブを取り違えないよう、使わない方は無効にする。
+
+        選択状態だけ見ても、無効化を丸ごと消したことに気づけない。
+        """
+        panel = self._panel()
+        titles = [panel.auth_tabs.tabText(i) for i in range(panel.auth_tabs.count())]
+        v2c = titles.index("v1/v2c認証")
+        v3 = titles.index("v3認証")
+        preset = titles.index("プリセットOID")
+
+        panel.version_combo.setCurrentText("v3")
+        self.assertFalse(panel.auth_tabs.isTabEnabled(v2c))
+        self.assertTrue(panel.auth_tabs.isTabEnabled(v3))
+        self.assertTrue(panel.auth_tabs.isTabEnabled(preset),
+                        "プリセットOID は常に使えること")
+
+        panel.version_combo.setCurrentText("v2c")
+        self.assertTrue(panel.auth_tabs.isTabEnabled(v2c))
+        self.assertFalse(panel.auth_tabs.isTabEnabled(v3))
+        self.assertTrue(panel.auth_tabs.isTabEnabled(preset))
 
     def test_v2c_still_passes_the_community(self):
         from unittest import mock
