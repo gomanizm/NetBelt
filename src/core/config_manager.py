@@ -339,6 +339,28 @@ class ConfigManager:
         
         return result
     
+    def set_group_auto_commands(self, group_name: str, commands: List[str]) -> bool:
+        """
+        グループの自動実行コマンドを設定
+
+        get_group() が返す参照に依存せず、groups を自分で走査して書き換える。
+        将来 get_group() がコピーを返すようになっても壊れないようにするため。
+
+        Args:
+            group_name: グループ名
+            commands: 自動実行コマンドのリスト（空リスト可）
+
+        Returns:
+            設定成功時True、グループが無ければFalse
+        """
+        for group in self.config.get("groups", []):
+            if group.get("name") == group_name:
+                group["auto_commands"] = list(commands)
+                return self.save_config()
+
+        print(f"エラー: グループ '{group_name}' が見つかりません")
+        return False
+    
     def get_update_settings(self) -> Dict:
         """
         更新設定を取得
