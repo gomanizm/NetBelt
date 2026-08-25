@@ -96,22 +96,43 @@ class SSHConnection(QObject):
             # パスワードまたは秘密鍵で認証
             if self.ssh_key:
                 try:
-                    # 鍵タイプを自動判別（RSA, Ed25519, ECDSA, DSA に対応）
+                    # 鍵タイプを自動判別。paramiko 4.0.0 で DSA(DSSKey) は
+                    # 削除されているので並べない。存在しない属性を並べると
+                    # リストを組む時点で AttributeError になり、正常な鍵でも
+                    # 「読み込みエラー」で接続できなくなる。
                     key = None
                     key_errors = []
-                    for key_class in [paramiko.RSAKey, paramiko.Ed25519Key, paramiko.ECDSAKey, paramiko.DSSKey]:
+                    needs_passphrase = False
+                    for key_class in (paramiko.RSAKey, paramiko.Ed25519Key,
+                                      paramiko.ECDSAKey):
                         try:
                             key = key_class.from_private_key_file(self.ssh_key)
                             break
+                        except paramiko.PasswordRequiredException as e:
+                            # 例外の文言に password の語が無いので型で覚えておく
+                            needs_passphrase = True
+                            key_errors.append(f"{key_class.__name__}: {e}")
                         except Exception as e:
                             key_errors.append(f"{key_class.__name__}: {e}")
 
                     if key is None:
-                        self.error_occurred.emit(f"秘密鍵の読み込みエラー: 対応する鍵タイプが見つかりません")
+                        # 集めた理由を捨てない。特にパスフレーズ付きの鍵は
+                        # 「対応する鍵タイプが無い」と出ると原因が分からない。
+                        if needs_passphrase:
+                            self.error_occurred.emit(
+                                "秘密鍵の読み込みエラー: この鍵はパスフレーズで保護されています。"
+                                "パスフレーズ無しの鍵を指定してください。")
+                        else:
+                            self.error_occurred.emit(
+                                "秘密鍵の読み込みエラー: 対応する鍵タイプが見つかりません。\n"
+                                + "\n".join(key_errors))
                         return False
 
                     connect_kwargs['pkey'] = key
-                    connect_kwargs['look_for_keys'] = True
+                    # 指定された鍵だけを使う。True にすると、その鍵が拒否された
+                    # ときに ~/.ssh の別の鍵で認証が通ってしまい、利用者が
+                    # 意図したのと違う身元で接続することになる。
+                    connect_kwargs['look_for_keys'] = False
                 except Exception as e:
                     self.error_occurred.emit(f"秘密鍵の読み込みエラー: {str(e)}")
                     return False
