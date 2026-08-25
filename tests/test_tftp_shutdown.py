@@ -395,6 +395,34 @@ class TftpProtocolEventTest(unittest.TestCase):
             panel._on_error("TFTP起動失敗: ポート 69 は使用中です")
         dialog.assert_called_once()
 
+    def test_a_failure_does_not_touch_the_other_direction(self):
+        """同じ機器が同名ファイルを送受で同時に扱うとき、片方の失敗で
+        もう片方まで壊さないこと。
+
+        通知が方向を持たないと、両方向の履歴をまとめて消してしまう。
+        """
+        from unittest import mock
+        from ui.tftp_server_panel import TFTPServerPanel
+
+        with mock.patch("core.firewall.ensure_inbound_allow",
+                        return_value=(True, "stub")):
+            panel = TFTPServerPanel()
+
+        ip, name = "192.0.2.10", "startup-config"
+        panel._on_tx_started(ip, name, 100, "upload")
+        panel._on_tx_started(ip, name, 100, "download")
+        up_row = panel._active[(ip, name, "upload")]["row"]
+        down_row = panel._active[(ip, name, "download")]["row"]
+
+        panel._on_protocol_event(
+            ip, name, "ダウンロードがタイムアウト", "download")
+
+        self.assertEqual(panel.history.item(down_row, 5).text(), "エラー")
+        self.assertNotEqual(panel.history.item(up_row, 5).text(), "エラー",
+                            "反対方向の転送まで巻き添えにしている")
+        self.assertIn((ip, name, "upload"), panel._active,
+                      "反対方向の転送が台帳から消えている")
+
 
 if __name__ == "__main__":
     unittest.main()

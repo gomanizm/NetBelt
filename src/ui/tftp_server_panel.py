@@ -262,7 +262,8 @@ class TFTPServerPanel(QWidget):
             self.history.setItem(st["row"], 5, QTableWidgetItem("中断"))
         self._add_log("[%s] 停止により中断: %s" % (ip, filename))
 
-    def _on_protocol_event(self, ip: str, filename: str, reason: str):
+    def _on_protocol_event(self, ip: str, filename: str, reason: str,
+                           direction: str = ""):
         """転送ごとのプロトコル事象。ログに残し、該当行だけを確定させる。
 
         機器が勝手に投げてくる要求（auto-install の RRQ など）でも起きるので、
@@ -274,9 +275,10 @@ class TFTPServerPanel(QWidget):
         else:
             self._add_log("[%s] %s" % (ip, reason))
 
-        # 巻き添えにしない。関係する行だけを確定させる。
-        for direction in ("upload", "download"):
-            st = self._active.pop((ip, filename, direction), None)
+        # 巻き添えにしない。方向まで一致する行だけを確定させる。
+        directions = (direction,) if direction else ("upload", "download")
+        for d in directions:
+            st = self._active.pop((ip, filename, d), None)
             if st is not None:
                 self.history.setItem(st["row"], 5, QTableWidgetItem("エラー"))
 

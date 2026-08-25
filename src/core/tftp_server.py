@@ -171,7 +171,7 @@ class TFTPServer:
             _err(xs, addr, 2, "Access violation")
             xs.close()
             self.on_event("protocol_error", addr[0],
-                          (filename, "パス外への書き込みを拒否"))
+                          (filename, "パス外への書き込みを拒否", "upload"))
             return
         if not self.allow_upload:
             _err(xs, addr, 2, "Upload disabled")
@@ -251,14 +251,14 @@ class TFTPServer:
             self.on_event("transfer_complete", addr[0], (filename, received, total, "upload"))
         except socket.timeout:
             self.on_event("protocol_error", addr[0],
-                          (filename, "アップロードがタイムアウト"))
+                          (filename, "アップロードがタイムアウト", "upload"))
         except (OSError, struct.error) as e:
             try:
                 _err(xs, addr, 0, str(e))   # 可能ならクライアントへ ERROR 応答（未定義エラーコード0）
             except Exception:
                 pass                         # xs 自体が原因のエラーなら送信も失敗しうる。二次例外は無視
             self.on_event("protocol_error", addr[0],
-                          (filename, "アップロード失敗: %s" % e))
+                          (filename, "アップロード失敗: %s" % e, "upload"))
         finally:
             if f:
                 f.close()
@@ -304,12 +304,12 @@ class TFTPServer:
         except ValueError:
             _err(xs, addr, 2, "Access violation"); xs.close()
             self.on_event("protocol_error", addr[0],
-                          (filename, "パス外への書き込みを拒否"))
+                          (filename, "パス外への書き込みを拒否", "download"))
             return
         if not self.allow_download or not os.path.isfile(target):
             _err(xs, addr, 1, "File not found"); xs.close()
             self.on_event("protocol_error", addr[0],
-                          (filename, "要求されたファイルがありません")); return
+                          (filename, "要求されたファイルがありません", "download")); return
         neg = self._neg_options(opts)
         if "tsize" in neg:
             neg["tsize"] = str(os.path.getsize(target))  # 実サイズを返す
@@ -364,12 +364,12 @@ class TFTPServer:
             self.on_event("transfer_complete", addr[0], (filename, sent, total, "download"))
         except socket.timeout:
             self.on_event("protocol_error", addr[0],
-                          (filename, "ダウンロードがタイムアウト"))
+                          (filename, "ダウンロードがタイムアウト", "download"))
         except (OSError, struct.error) as e:
             try: _err(xs, addr, 0, str(e))
             except Exception: pass
             self.on_event("protocol_error", addr[0],
-                          (filename, "ダウンロード失敗: %s" % e))
+                          (filename, "ダウンロード失敗: %s" % e, "download"))
         finally:
             xs.close()
 
@@ -393,7 +393,7 @@ class TFTPServerManager(QObject):
     # 利用者が止めたことによる中断。エラーではないので別の口にする
     transfer_interrupted = pyqtSignal(str, str, str)         # ip, filename, direction
     # 転送ごとのプロトコル事象。サーバ障害ではないのでモーダルにはしない
-    protocol_event = pyqtSignal(str, str, str)               # ip, filename, reason
+    protocol_event = pyqtSignal(str, str, str, str)          # ip, filename, reason, direction
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -492,21 +492,20 @@ class TFTPServerManager(QObject):
             # 重複RRQ/WRQ の敗者が出すタイムアウトは、その転送が成功済み or
             # まだ生存兄弟がいる間は握り潰す。全滅（兄弟ゼロ・未完了）なら
             # 本物の失敗として通す。
-            filename, reason = payload
+            filename, reason, direction = payload
             suppress = False
             if filename and "タイムアウト" in reason:
-                # 失敗の通知は方向を持たないので、両方向を見る。
-                # 重複要求の敗者が出すタイムアウトを握り潰すのが目的。
+                # 重複要求の敗者が出すタイムアウトを握り潰す。方向を見ないと、
+                # 同じ機器が同名ファイルを送受で同時に扱ったときに、
+                # 片方の失敗で反対方向まで巻き添えにする。
                 with self._tx_lock:
-                    for direction in ("upload", "download"):
-                        st = self._tx.get((ip, filename, direction))
-                        if st is None:
-                            continue
+                    st = self._tx.get((ip, filename, direction))
+                    if st is not None:
                         st["count"] -= 1
-                        suppress = suppress or st["done"] or st["count"] > 0
+                        suppress = st["done"] or st["count"] > 0
                         if st["count"] <= 0:
                             self._tx.pop((ip, filename, direction), None)
             if not suppress:
-                self.protocol_event.emit(ip, filename, reason)
+                self.protocol_event.emit(ip, filename, reason, direction)
         else:
             self.client_activity.emit(ip, payload)

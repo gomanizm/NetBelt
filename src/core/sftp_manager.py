@@ -48,6 +48,11 @@ class SFTPManager(QObject):
         実行できないことを伝えて戻る。
         """
         if self._sftp_lock.acquire(timeout=self._GUI_WAIT_SECONDS):
+            # 待っているあいだに切断されたら、取れても意味がない
+            if not self.is_connected or self.sftp_client is None:
+                self._sftp_lock.release()
+                self.error_occurred.emit("SFTP接続がありません")
+                return False
             return True
         self.error_occurred.emit(
             f"転送中のため{what}を実行できません。完了してからやり直してください。")
@@ -139,6 +144,10 @@ class SFTPManager(QObject):
             try:
                 # ディレクトリ一覧を取得（転送中なら空くまで待つ）
                 with self._sftp_lock:
+                    # 待っているあいだに切断されたかもしれない。取得前の
+                    # 確認だけでは足りない（起きたら None を触ることになる）。
+                    if not self.is_connected or self.sftp_client is None:
+                        return
                     items = self.sftp_client.listdir_attr(path)
                 
                 # ファイル情報をリストに変換
@@ -204,6 +213,10 @@ class SFTPManager(QObject):
                 # アップロード実行。まとめてドロップされた分はここで
                 # 順番待ちになる（同時に走らせるとチャンネルが壊れる）
                 with self._sftp_lock:
+                    # 待っているあいだに切断されたかもしれない。取得前の
+                    # 確認だけでは足りない（起きたら None を触ることになる）。
+                    if not self.is_connected or self.sftp_client is None:
+                        return
                     self.sftp_client.put(local_path, remote_path,
                                          callback=progress_callback)
                 
@@ -239,6 +252,10 @@ class SFTPManager(QObject):
                     self.transfer_progress.emit(transferred_bytes, total_bytes)
                 
                 with self._sftp_lock:
+                    # 待っているあいだに切断されたかもしれない。取得前の
+                    # 確認だけでは足りない（起きたら None を触ることになる）。
+                    if not self.is_connected or self.sftp_client is None:
+                        return
                     self.sftp_client.get(remote_path, local_path,
                                          callback=progress_callback)
                 

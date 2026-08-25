@@ -188,13 +188,14 @@ class TftpWrqTest(unittest.TestCase):
         # 転送ごとの事象は protocol_event へ移った（サーバ障害用の
         # error_occurred とは別の口。モーダルを出さないため）
         m.protocol_event.connect(
-            lambda ip, fn, reason: errors.append((ip, fn, reason)))
+            lambda ip, fn, reason, d: errors.append((ip, fn, reason, d)))
         ip, fn = "192.0.2.31", "itch-setup.exe"
         for _ in range(4):
             m._on_event("transfer_started", ip, (fn, 100, "download"))
         m._on_event("transfer_complete", ip, (fn, 100, 100, "download"))
         for _ in range(3):
-            m._on_event("protocol_error", ip, (fn, "ダウンロードがタイムアウト"))
+            m._on_event("protocol_error", ip,
+                        (fn, "ダウンロードがタイムアウト", "download"))
         app.processEvents()
         self.assertEqual(len(started), 1)    # 4回の started を1行にコアレス
         self.assertEqual(len(completed), 1)  # 完了は1回だけ通す
@@ -209,12 +210,13 @@ class TftpWrqTest(unittest.TestCase):
         started, errors = [], []
         m.transfer_started.connect(lambda ip, fn, t, d: started.append((ip, fn)))
         m.protocol_event.connect(
-            lambda ip, fn, reason: errors.append((ip, fn, reason)))
+            lambda ip, fn, reason, d: errors.append((ip, fn, reason, d)))
         ip, fn = "192.0.2.31", "x.bin"
         for _ in range(2):
             m._on_event("transfer_started", ip, (fn, 100, "download"))
         for _ in range(2):
-            m._on_event("protocol_error", ip, (fn, "ダウンロードがタイムアウト"))
+            m._on_event("protocol_error", ip,
+                        (fn, "ダウンロードがタイムアウト", "download"))
         app.processEvents()
         self.assertEqual(len(started), 1)
         self.assertEqual(len(errors), 1)     # 全滅なら本物の失敗を1件通す

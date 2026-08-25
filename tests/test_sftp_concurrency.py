@@ -212,5 +212,53 @@ class SftpGuiLockTest(unittest.TestCase):
         self.assertIn("転送中", errors[0])
 
 
+class SftpDisconnectDuringTransferTest(unittest.TestCase):
+    """ロック待ちのスレッドがいる状態で切断しても壊れないこと。
+
+    切断は取得前の確認をすり抜ける。待っているあいだに sftp_client が
+    None になるので、起きたスレッドがそれを触ると例外や偽のエラーを出す。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import os as _os
+        _os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PyQt6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_a_waiting_worker_gives_up_quietly_after_a_disconnect(self):
+        from unittest import mock
+        from PyQt6.QtWidgets import QApplication
+        from core.sftp_manager import SFTPManager
+
+        manager = SFTPManager()
+        manager.is_connected = True
+        manager.sftp_client = mock.Mock()
+        errors = []
+        manager.error_occurred.connect(errors.append)
+
+        # 転送中を模してロックを握る
+        manager._sftp_lock.acquire()
+        local = tempfile.mkdtemp()
+        src = os.path.join(local, "waiting.cfg")
+        with open(src, "wb") as f:
+            f.write(b"x" * 16)
+        manager.upload_file(src, "/waiting.cfg")   # ロック待ちに入る
+        time.sleep(0.3)
+
+        # 待っているあいだに切断（3秒で諦めて戻る）
+        manager.disconnect()
+        manager._sftp_lock.release()              # 転送側が手を離した
+
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            QApplication.processEvents()
+            time.sleep(0.05)
+
+        noisy = [e for e in errors if "NoneType" in e or "AttributeError" in e]
+        self.assertEqual(noisy, [], "切断後に例外が漏れている: %s" % noisy)
+        self.assertIsNone(manager.sftp_client)
+
+
 if __name__ == "__main__":
     unittest.main()
