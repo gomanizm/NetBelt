@@ -797,7 +797,9 @@ class MainWindow(QMainWindow):
                         self.sftp_managers[device_name] = sftp_manager
                         # 現在アクティブなタブの場合はSFTPパネルに表示
                         if self.terminal_widget.get_current_tab_name() == device_name:
-                            self.sftp_panel.set_sftp_manager(sftp_manager, device_name)
+                            self.sftp_panel.set_sftp_manager(
+                                sftp_manager, device_name,
+                                self._describe_target(device_name))
                             # SFTPパネルを表示
                             self._select_tool_tab("sftp")
                         self.status_bar.showMessage(f"{device_name} に接続しました（SFTP有効）")
@@ -813,6 +815,18 @@ class MainWindow(QMainWindow):
                     print(f"  詳細:\n{traceback.format_exc()}")
                     # ステータスバーは通常の接続メッセージのまま
     
+    def _describe_target(self, device_name: str) -> str:
+        """機器の接続先（host:port）を返す。分からなければ空文字。
+
+        SFTP パネルに出して、送り先の取り違えに気づけるようにする。
+        """
+        conn = self.connections.get(device_name)
+        host = getattr(conn, "host", "")
+        if not host:
+            return ""
+        port = getattr(conn, "port", 22)
+        return host if port == 22 else "%s:%s" % (host, port)
+
     def _on_terminal_tab_changed(self, device_name: str) -> None:
         """表示中のターミナルに合わせて SFTP パネルを切り替える
 
@@ -823,7 +837,8 @@ class MainWindow(QMainWindow):
         manager = self.sftp_managers.get(device_name)
         if manager is not None:
             if self.sftp_panel.current_device != device_name:
-                self.sftp_panel.set_sftp_manager(manager, device_name)
+                self.sftp_panel.set_sftp_manager(
+                    manager, device_name, self._describe_target(device_name))
         elif self.sftp_panel.current_device:
             # いま見ている機器に SFTP が無いなら、前の機器のものを残さない
             self.sftp_panel.clear()

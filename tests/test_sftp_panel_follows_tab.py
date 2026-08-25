@@ -59,18 +59,21 @@ class SftpPanelFollowsTabTest(unittest.TestCase):
         QApplication.processEvents()
 
     def _two_devices(self):
+        from core.ssh_connection import SSHConnection
         window = self._window()
         window.terminal_widget.create_terminal_tab("router-A")
         window.terminal_widget.create_terminal_tab("switch-B")
         window.sftp_managers["router-A"] = self._manager("/home/A")
         window.sftp_managers["switch-B"] = self._manager("/home/B")
+        # 接続先を出すために、接続情報も持たせる（例示は RFC 5737）
+        window.connections["router-A"] = SSHConnection(
+            host="192.0.2.10", port=22, username="admin")
+        window.connections["switch-B"] = SSHConnection(
+            host="192.0.2.11", port=2222, username="admin")
 
+        # 接続直後の状態は、タブ切替の経路がそのまま作る
         self._switch(window, "router-A")
-        window.sftp_panel.set_sftp_manager(
-            window.sftp_managers["router-A"], "router-A")
         self._switch(window, "switch-B")
-        window.sftp_panel.set_sftp_manager(
-            window.sftp_managers["switch-B"], "switch-B")
         return window
 
     def test_the_panel_follows_the_terminal_tab(self):
@@ -113,6 +116,46 @@ class SftpPanelFollowsTabTest(unittest.TestCase):
             with self.subTest(tab=name):
                 self._switch(window, name)
                 self.assertEqual(window.sftp_panel.current_device, name)
+
+    def test_the_header_names_the_device_and_address(self):
+        """上部に、どの機器のどのアドレスへ繋いでいるかを出すこと。
+
+        パスの行に機器名を添えるだけでは、本当にその機器かを判断しづらい。
+        ファイルを落とす前に必ず目に入る位置へ出す。
+        """
+        window = self._two_devices()
+
+        self._switch(window, "router-A")
+        header = window.sftp_panel.target_label.text()
+        self.assertIn("router-A", header, "機器名が出ていない: %r" % header)
+        self.assertIn("192.0.2.10", header, "アドレスが出ていない: %r" % header)
+
+    def test_a_nonstandard_port_is_shown(self):
+        """22 番以外のポートは省かないこと（別の機器と紛れる）。"""
+        window = self._two_devices()
+
+        self._switch(window, "switch-B")
+        header = window.sftp_panel.target_label.text()
+        self.assertIn("192.0.2.11:2222", header,
+                      "非標準ポートが出ていない: %r" % header)
+
+    def test_the_standard_port_is_not_noise(self):
+        """22 番は省くこと（毎回出ても情報にならない）。"""
+        window = self._two_devices()
+
+        self._switch(window, "router-A")
+        self.assertNotIn(":22", window.sftp_panel.target_label.text())
+
+    def test_the_header_clears_for_a_device_without_sftp(self):
+        """SFTP を持たない機器では、前の接続先を出したままにしないこと。"""
+        window = self._two_devices()
+        window.terminal_widget.create_terminal_tab("console-C")
+
+        self._switch(window, "console-C")
+
+        self.assertEqual(window.sftp_panel.target_label.text(),
+                         window.sftp_panel.NO_TARGET_TEXT,
+                         "前の機器の接続先が残っている")
 
 
 if __name__ == "__main__":

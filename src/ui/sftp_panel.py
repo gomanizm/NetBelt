@@ -97,6 +97,9 @@ class SFTPPanel(QWidget):
         raw = self.config_manager.get_server_settings("sftp") if self.config_manager else {}
         return self.normalize_sftp_settings(raw)[key]
     
+    # 接続先が無いときの表示
+    NO_TARGET_TEXT = "接続先: なし"
+
     # 未接続のときに出す案内。接続すると消す。
     HINT_TEXT = (
         "ターミナルで機器へ SSH 接続すると、このパネルが使えるようになります。\n"
@@ -108,6 +111,14 @@ class SFTPPanel(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(5, 5, 5, 5)
         
+        # 接続先の明示。ツールバーより上に置く。どの機器を相手にしているかは、
+        # ファイルを落とす前に必ず目に入るべき情報。
+        self.target_label = QLabel(self.NO_TARGET_TEXT)
+        self.target_label.setStyleSheet(
+            "background-color: #eef4fb; border: 1px solid #b8cfe6;"
+            " padding: 6px; font-weight: bold;")
+        layout.addWidget(self.target_label)
+
         # ツールバー
         toolbar = self._create_toolbar()
         layout.addWidget(toolbar)
@@ -199,7 +210,8 @@ class SFTPPanel(QWidget):
         
         return toolbar
     
-    def set_sftp_manager(self, sftp_manager: SFTPManager, device_name: str = ""):
+    def set_sftp_manager(self, sftp_manager: SFTPManager, device_name: str = "",
+                         target: str = ""):
         """
         SFTPマネージャーを設定
         
@@ -231,6 +243,12 @@ class SFTPPanel(QWidget):
         self.sftp_manager.error_occurred.connect(self._on_error)
         
         # どの機器を見ているかを出す。出さないと、送り先が違っても気づけない。
+        if target:
+            self.target_label.setText("接続先: %s (%s)" % (device_name, target))
+        elif device_name:
+            self.target_label.setText("接続先: %s" % device_name)
+        else:
+            self.target_label.setText(self.NO_TARGET_TEXT)
         self._update_path_label(self.sftp_manager.current_path)
 
         # 初期ディレクトリ一覧を取得
@@ -247,6 +265,7 @@ class SFTPPanel(QWidget):
         """パネルをクリア"""
         self.model.removeRows(0, self.model.rowCount())
         self.path_label.setText("接続されていません")
+        self.target_label.setText(self.NO_TARGET_TEXT)
         self.hint_label.setVisible(True)
         self.status_label.setText("")
         self.progress_bar.setVisible(False)
