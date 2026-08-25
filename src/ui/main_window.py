@@ -308,6 +308,8 @@ class MainWindow(QMainWindow):
         # 右側: ターミナル
         self.terminal_widget = TerminalWidget()
         self.terminal_widget.tab_closed.connect(self._on_tab_closed)
+        self.terminal_widget.font_size_change_requested.connect(
+            self._on_font_size_wheel)
         self.terminal_widget.macro_execute_requested.connect(self._on_macro_execute_requested)
         self.terminal_widget.macro_settings_requested.connect(self._on_macro_settings_from_context)
         self.terminal_widget.keepalive_start_requested.connect(self._on_keepalive_start_requested)
@@ -1144,6 +1146,14 @@ class MainWindow(QMainWindow):
         else:
             self.status_bar.showMessage(
                 f"フォントサイズ: {new_size}pt（設定ファイルへ保存できませんでした）")
+
+    def _on_font_size_wheel(self, delta: int):
+        """Ctrl+ホイールでのフォントサイズ変更
+
+        表示メニューの拡大/縮小と同じ経路を通す。QTextEdit の組込みズームは
+        config を通らず上下限も効かないため、こちらへ寄せている。
+        """
+        self._change_font_size(delta)
 
     def _on_font_size_increase(self):
         """フォントサイズを1pt大きくする"""

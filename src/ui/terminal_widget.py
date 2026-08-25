@@ -13,6 +13,8 @@ class InteractiveTerminal(QTextEdit):
     macro_settings_requested = pyqtSignal()  # マクロ設定画面要求シグナル
     keepalive_start_requested = pyqtSignal()  # キープアライブ開始要求シグナル
     keepalive_stop_requested = pyqtSignal()  # キープアライブ停止要求シグナル
+    # Ctrl+ホイールでのフォントサイズ変更要求（回した向き: +1 / -1）
+    font_size_change_requested = pyqtSignal(int)
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -62,21 +64,41 @@ class InteractiveTerminal(QTextEdit):
             cursor.movePosition(QTextCursor.MoveOperation.End)
             self.setTextCursor(cursor)
     
+    def send_text(self, text: str) -> bool:
+        """テキストを機器へ送る（画面へは直接書かない）
+
+        画面に出るのは機器が返してきたエコーだけにする。ここで直接
+        書いてしまうと、機器が受け取っていない文字が入力済みのように
+        見えてしまう。
+
+        Returns:
+            bool: 送ったなら True（送れる状態でない・空文字なら False）
+        """
+        if not text or not self.can_send_input():
+            return False
+        # 1文字ずつ送る。改行は端末と同じく CR で送る
+        for char in text:
+            if char == '\n' or char == '\r':
+                self.key_pressed.emit('\r')
+            else:
+                self.key_pressed.emit(char)
+        return True
+
     def custom_paste(self):
         """カスタムペースト機能 - ペーストされたテキストをSSHセッションに送信"""
         from PyQt6.QtWidgets import QApplication
-        
-        clipboard = QApplication.clipboard()
-        text = clipboard.text()
-        
-        if text and self.can_send_input():
-            # ペーストされたテキストを1文字ずつ送信
-            for char in text:
-                if char == '\n' or char == '\r':
-                    # 改行の場合は\rとして送信
-                    self.key_pressed.emit('\r')
-                else:
-                    self.key_pressed.emit(char)
+
+        self.send_text(QApplication.clipboard().text())
+
+    def insertFromMimeData(self, source):
+        """ドロップや挿入経路を機器送信へ振り替える
+
+        QTextEdit は編集可能なので、既定ではドロップされたテキストを
+        そのまま画面へ挿入する。機器は何も受け取っていないのに
+        入力済みに見えるため、送信へ回して画面へは書かない。
+        """
+        if source.hasText():
+            self.send_text(source.text())
     
     def set_macro_list(self, macros: list):
         """
@@ -205,6 +227,21 @@ class InteractiveTerminal(QTextEdit):
             if current_widget == self:
                 parent.stop_log_recording()
     
+    def wheelEvent(self, event):
+        """Ctrl+ホイールを設定経路へ回す
+
+        QTextEdit の組込みズームは config を通らず、6〜32pt の制限も
+        受けず、設定を再適用すると失われる。表示メニューの拡大/縮小と
+        同じ意味になるよう、要求として上へ投げる。
+        """
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            delta = event.angleDelta().y()
+            if delta:
+                self.font_size_change_requested.emit(1 if delta > 0 else -1)
+            event.accept()
+            return
+        super().wheelEvent(event)
+
     def keyPressEvent(self, event: QKeyEvent):
         """キーイベントを処理"""
         if not self._input_enabled:
@@ -266,6 +303,8 @@ class TerminalWidget(QWidget):
     tab_closed = pyqtSignal(str)
     # マクロ実行要求シグナル（機器名、マクロ名）
     macro_execute_requested = pyqtSignal(str, str)
+    # Ctrl+ホイールでのフォントサイズ変更要求（回した向き: +1 / -1）
+    font_size_change_requested = pyqtSignal(int)
     # マクロ設定画面要求シグナル（機器名）
     macro_settings_requested = pyqtSignal(str)
     # キープアライブ開始要求シグナル（機器名）
@@ -447,6 +486,8 @@ class TerminalWidget(QWidget):
         self._terminals[device_name] = terminal
         
         # マクロ実行要求シグナルを接続
+        terminal.font_size_change_requested.connect(
+            self.font_size_change_requested.emit)
         terminal.macro_execute_requested.connect(
             lambda macro_name: self.macro_execute_requested.emit(device_name, macro_name)
         )
