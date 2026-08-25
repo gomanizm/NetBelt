@@ -22,10 +22,13 @@ class DownloadThread(QThread):
     download_failed = pyqtSignal(str)  # エラーメッセージ
     
     def __init__(self, url: str, github_token: str = None, parent=None,
-                 sha256_url: str = None):
+                 sha256_url: str = None, version: str = None):
         super().__init__(parent)
         self.url = url
         self.sha256_url = sha256_url
+        # ダウンロードした ZIP の傍らへ控える版。次回起動時に
+        # 「これは今より新しいか」を判断するのに要る。
+        self.version = version
         self._cancelled = False
         self.version_mgr = VersionManager(github_token=github_token)
     
@@ -36,6 +39,7 @@ class DownloadThread(QThread):
                 self.url,
                 progress_callback=self._on_progress,
                 sha256_url=self.sha256_url,
+                version=self.version,
                 cancel_check=lambda: self._cancelled
             )
             
