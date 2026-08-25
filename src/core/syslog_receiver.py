@@ -253,13 +253,18 @@ class SyslogReceiver(QObject):
         if not entry:
             return
         entry["stop"].set()
-        try:
-            entry["socket"].close()
-        except Exception:
-            pass
+        # ソケットはループ自身に閉じさせる。recvfrom / accept でブロック中の
+        # スレッドが使っているハンドルを別スレッドから解放すると、Windows では
+        # そのブロック中の呼び出しがアクセス違反で落ちる。
+        # UDP・TCP どちらのソケットにも settimeout(1.0) があるので、
+        # stop_event を立てるだけで1秒以内にループを抜け、finally で
+        # 自分のソケットを閉じる。
         th = entry["thread"]
         if th and th.is_alive():
-            th.join(timeout=2)
+            th.join(timeout=3)   # ソケットのタイムアウト1秒に対する余裕
+            if th.is_alive():
+                print("[Syslog] %s の受信スレッドが終了しません"
+                      "（ポートが解放されない可能性があります）" % proto)
         print("[Syslog] %s Server stopped" % proto)
         if not self._servers:
             self.stopped.emit()
