@@ -50,6 +50,10 @@ class TFTPServer:
 
     def start(self):
         os.makedirs(self.root_dir, exist_ok=True)
+        # 進行中の転送スレッドを覚えておく。覚えないと stop() で止められず、
+        # 停止したはずの後にファイルが作られたり、終了時に書きかけが消える。
+        self._workers = []
+        self._workers_lock = threading.Lock()
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         set_exclusive_bind(self._sock)
         self._sock.bind(("0.0.0.0", self.port))
@@ -60,14 +64,32 @@ class TFTPServer:
         self._thread.start()
 
     def stop(self):
+        """待受と進行中の転送を止める。
+
+        待受ソケットは、待受スレッドが抜けたことを確かめてから閉じる。
+        recvfrom でブロック中のスレッドが使うハンドルを別スレッドから
+        解放するのは Windows では不正で、アクセス違反になる。
+        settimeout(1.0) があるので _running を落とせば1秒以内に抜ける。
+
+        転送スレッドも待つ。待たないと、停止したはずの後にファイルが
+        作られたり、終了時に書きかけのファイルが黙って切り詰められる。
+        """
         self._running = False
-        if self._sock:
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=3)   # 待受の1秒に対する余裕
+        with self._workers_lock:
+            workers = list(self._workers)
+        for worker in workers:
+            if worker.is_alive():
+                # 転送側は _timeout 秒で必ず戻ってくるので、その少し先まで待つ
+                worker.join(timeout=self._timeout + 2)
+        # 抜けきったと確認できたときだけ閉じる。まだ recvfrom の中に
+        # いるなら、閉じるより開いたままにしておく方が安全。
+        if self._sock and not (self._thread and self._thread.is_alive()):
             try:
                 self._sock.close()
             except Exception:
                 pass
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=2)
 
     def _serve(self):
         while self._running:
@@ -83,9 +105,24 @@ class TFTPServer:
             # RRQ/WRQ ごとにスレッドを起こす。重複要求（機器の再送。送信元ポートが毎回
             # 変わる個体もある）の敗者スレッドは、確立できなければ各ハンドラ内で黙って撤退する。
             if op == OP_WRQ:
-                threading.Thread(target=self._handle_wrq, args=(pkt, addr), daemon=True).start()
+                self._spawn(self._handle_wrq, pkt, addr)
             elif op == OP_RRQ:
-                threading.Thread(target=self._handle_rrq, args=(pkt, addr), daemon=True).start()
+                self._spawn(self._handle_rrq, pkt, addr)
+
+    def _spawn(self, handler, pkt, addr):
+        """転送スレッドを起こし、終わるまで覚えておく。"""
+        def run():
+            try:
+                handler(pkt, addr)
+            finally:
+                with self._workers_lock:
+                    if thread in self._workers:
+                        self._workers.remove(thread)
+
+        thread = threading.Thread(target=run, daemon=True)
+        with self._workers_lock:
+            self._workers.append(thread)
+        thread.start()
 
     @staticmethod
     def _parse_request(pkt):
@@ -152,6 +189,13 @@ class TFTPServer:
         try:
             retries = 0
             while True:
+                if not self._running:
+                    # 停止された。ここまでに ACK した分は finally で確実に
+                    # 書き出す（放置すると終了時に黙って消える）
+                    if established:
+                        self.on_event("error", addr[0],
+                                      "停止により中断: %s" % filename)
+                    return
                 try:
                     data, a = xs.recvfrom(blksize + 4)
                     # RFC1350: 確立後は相手の TID(IP:port) が一致するものだけ受理する。
@@ -270,6 +314,11 @@ class TFTPServer:
                     self.on_event("transfer_started", addr[0], (filename, total, "download"))
                 block = 1
                 while True:
+                    if not self._running:
+                        if established:
+                            self.on_event("error", addr[0],
+                                          "停止により中断: %s" % filename)
+                        return
                     chunk = f.read(blksize)
                     try:
                         self._send_and_wait_ack(xs, struct.pack("!HH", OP_DATA, block) + chunk, addr, block)
