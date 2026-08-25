@@ -116,6 +116,10 @@ class ConfigManager:
                 }
             }
     
+    # 機器のパスワードと同じく暗号化して保存する settings のセクション。
+    # 画面では伏字にしているのにディスクは平文、という状態を避ける。
+    _ENCRYPTED_SETTING_SECTIONS = ("ftp_server", "sftp_server")
+
     def _encrypt_passwords(self, config: Dict) -> None:
         """
         設定内の全パスワードを暗号化
@@ -133,6 +137,19 @@ class ConfigManager:
                 # 保存は起動時にも走るので、ここで弾かないと原本が失われる。
                 if password and not self.crypto.is_encrypted(password):
                     device["password"] = self.crypto.encrypt(password)
+
+        settings = config.get("settings")
+        if not isinstance(settings, dict):
+            return
+        for name in self._ENCRYPTED_SETTING_SECTIONS:
+            section = settings.get(name)
+            if not isinstance(section, dict):
+                continue
+            password = section.get("password", "")
+            # 機器側と同じ理由で、暗号化済みは触らない
+            if (isinstance(password, str) and password
+                    and not self.crypto.is_encrypted(password)):
+                section["password"] = self.crypto.encrypt(password)
     
     def _decrypt_passwords(self, config: Dict) -> None:
         self._undecryptable_count = 0
@@ -153,6 +170,21 @@ class ConfigManager:
                 if self.crypto.is_encrypted(decrypted):
                     self._undecryptable_count += 1
                 device["password"] = decrypted
+
+        settings = config.get("settings")
+        if not isinstance(settings, dict):
+            return
+        for name in self._ENCRYPTED_SETTING_SECTIONS:
+            section = settings.get(name)
+            if not isinstance(section, dict):
+                continue
+            encrypted = section.get("password", "")
+            if not isinstance(encrypted, str) or not encrypted:
+                continue
+            decrypted = self.crypto.decrypt(encrypted)
+            if self.crypto.is_encrypted(decrypted):
+                self._undecryptable_count += 1
+            section["password"] = decrypted
     
     def _notify_undecryptable(self) -> None:
         """復号できなかったパスワードがあれば知らせる。"""
