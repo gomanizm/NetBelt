@@ -1710,13 +1710,27 @@ for details.
             if file_age_hours > 24:
                 # 24時間以上前のファイルは削除済み（cleanup_old_updatesで）
                 continue
+
+            # いま動いているものより新しいときだけ勧める。版を見ないと、
+            # 手で入れ直したあとに残った古い ZIP でダウングレードさせてしまう。
+            pending_version = version_mgr.pending_version(zip_path)
+            if not pending_version:
+                print("[Main] 版が分からない更新ファイルのため無視します: "
+                      f"{zip_path}")
+                continue
+            if VersionManager.compare_versions(
+                    pending_version, version_mgr.CURRENT_VERSION) <= 0:
+                print("[Main] 現在のバージョン以下のため無視します: "
+                      f"{pending_version}")
+                continue
             
             # 適用確認ダイアログ
             reply = QMessageBox.question(
                 self,
                 "未適用の更新",
-                f"前回ダウンロードした更新（{file_age_hours:.0f}時間前）が\n"
-                "まだ適用されていません。\n\n"
+                f"前回ダウンロードした更新 v{pending_version}"
+                f"（{file_age_hours:.0f}時間前）がまだ適用されていません。\n"
+                f"現在のバージョンは v{version_mgr.CURRENT_VERSION} です。\n\n"
                 "今すぐ更新を適用しますか？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No

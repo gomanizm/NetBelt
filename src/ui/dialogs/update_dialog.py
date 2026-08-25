@@ -266,7 +266,8 @@ class UpdateDialog(QDialog):
         
         self.download_thread = DownloadThread(
             download_url, github_token, self,
-            sha256_url=self.update_info.get('sha256_url'))
+            sha256_url=self.update_info.get('sha256_url'),
+            version=self.update_info.get('version'))
         self.download_thread.progress_updated.connect(self._on_progress_updated)
         self.download_thread.download_completed.connect(self._on_download_completed)
         self.download_thread.download_failed.connect(self._on_download_failed)
