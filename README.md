@@ -30,7 +30,7 @@
 - **SNMP GET / WALK** — v1 / v2c / v3（USM）に対応。任意の OID の取得と巡回、結果の CSV / JSON / テキスト出力
 - **TFTP サーバ** — ネットワーク機器の config / イメージ授受（既定 69/UDP）
 - **FTP サーバ** — 同上。匿名・認証の両対応（既定 21/TCP）
-- **SFTP サーバ / クライアント** — 双方向のファイル転送、転送履歴（既定 2222/TCP）
+- **SFTP サーバ / クライアント** — 双方向のファイル転送、転送履歴（既定 2222/TCP）。クライアントはターミナルの SSH セッションを使うため、機器へ SSH 接続すると利用できます（機器が SFTP に対応していない場合は使えません）
 - **ツールエリアのタブ化・切り離し** — 各サーバのパネルを別ウィンドウへ分離可能
 
 #### SNMPv3 について
@@ -191,7 +191,9 @@ application and a set of daemons.
 - **Receivers** — Syslog (UDP/TCP 514) with level filtering; SNMP trap (UDP 162,
   v1/v2c/v3 with USM) with MIB name resolution, community filtering and CSV export
 - **File transfer** — TFTP (UDP 69), FTP (TCP 21) and SFTP (TCP 2222) servers,
-  plus an SFTP client, for moving configs and images to and from network devices
+  plus an SFTP client, for moving configs and images to and from network devices.
+  The client rides the terminal's SSH session, so it becomes available once you
+  connect to a device — provided that device supports SFTP.
 - **Auto commands** — commands registered per group are sent right after connecting (e.g. `terminal length 0`). Configure them by right-clicking a group in the tree and choosing 「グループを編集」 ("Edit group"). Applies to SSH and Telnet. They are stored in plain text in `config.json`, so do not put passwords there.
 - **Copy / paste** — `Ctrl+Shift+C` / `Ctrl+Shift+V`, following terminal-emulator convention: `Ctrl+C` in a terminal tab is left free to send an interrupt (0x03) to the device. Paste only works on a connected tab.
 - **SNMP GET / WALK** — v1/v2c/v3 with USM; fetch or walk arbitrary OIDs, export results as CSV / JSON / text

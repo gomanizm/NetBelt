@@ -97,6 +97,12 @@ class SFTPPanel(QWidget):
         raw = self.config_manager.get_server_settings("sftp") if self.config_manager else {}
         return self.normalize_sftp_settings(raw)[key]
     
+    # 未接続のときに出す案内。接続すると消す。
+    HINT_TEXT = (
+        "ターミナルで機器へ SSH 接続すると、このパネルが使えるようになります。\n"
+        "SSH で入れても、機器が SFTP に対応していない場合は使えません。"
+    )
+
     def _init_ui(self):
         """UIを初期化"""
         layout = QVBoxLayout(self)
@@ -139,6 +145,13 @@ class SFTPPanel(QWidget):
         # ステータスラベル
         self.status_label = QLabel("")
         layout.addWidget(self.status_label)
+
+        # 使い方の案内。このパネルはターミナルの SSH セッションに相乗りする
+        # 設計で、単独で接続する手段が無い。黙っていて分かるものではない。
+        self.hint_label = QLabel(self.HINT_TEXT)
+        self.hint_label.setWordWrap(True)
+        self.hint_label.setStyleSheet("color: #666; padding: 4px;")
+        layout.addWidget(self.hint_label)
     
     def _create_toolbar(self) -> QToolBar:
         """ツールバーを作成"""
@@ -205,6 +218,7 @@ class SFTPPanel(QWidget):
                 pass
         
         self.sftp_manager = sftp_manager
+        self.hint_label.setVisible(False)
         # 接続先が変わるので、前の接続で観測した一覧は使えない
         self._current_entries = {}
         self._pending_upload_names = set()
@@ -216,13 +230,24 @@ class SFTPPanel(QWidget):
         self.sftp_manager.transfer_complete.connect(self._on_transfer_complete)
         self.sftp_manager.error_occurred.connect(self._on_error)
         
+        # どの機器を見ているかを出す。出さないと、送り先が違っても気づけない。
+        self._update_path_label(self.sftp_manager.current_path)
+
         # 初期ディレクトリ一覧を取得
         self.sftp_manager.list_directory()
     
+    def _update_path_label(self, path: str) -> None:
+        """パスの表示に機器名を添える"""
+        if self.current_device:
+            self.path_label.setText("%s: %s" % (self.current_device, path))
+        else:
+            self.path_label.setText(path)
+
     def clear(self):
         """パネルをクリア"""
         self.model.removeRows(0, self.model.rowCount())
         self.path_label.setText("接続されていません")
+        self.hint_label.setVisible(True)
         self.status_label.setText("")
         self.progress_bar.setVisible(False)
         self.sftp_manager = None

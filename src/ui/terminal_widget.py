@@ -301,6 +301,9 @@ class TerminalWidget(QWidget):
 
     # タブが閉じられたときのシグナル（機器名を送信）
     tab_closed = pyqtSignal(str)
+    # 表示中のタブが変わったことを知らせる（機器名。タブが無ければ空文字）。
+    # SFTP パネルなど、機器に紐づく表示を追従させるために要る。
+    current_tab_changed = pyqtSignal(str)
     # マクロ実行要求シグナル（機器名、マクロ名）
     macro_execute_requested = pyqtSignal(str, str)
     # Ctrl+ホイールでのフォントサイズ変更要求（回した向き: +1 / -1）
@@ -330,6 +333,7 @@ class TerminalWidget(QWidget):
         self.tab_widget = QTabWidget()
         self.tab_widget.setTabsClosable(True)
         self.tab_widget.tabCloseRequested.connect(self._close_tab)
+        self.tab_widget.currentChanged.connect(self._on_current_tab_changed)
         
         # デフォルトのウェルカムタブを作成
         welcome_terminal = self._create_terminal()
@@ -956,6 +960,10 @@ class TerminalWidget(QWidget):
                     f"ログファイルを閉じる際にエラーが発生しました:\n{str(e)}"
                 )
     
+    def _on_current_tab_changed(self, index: int) -> None:
+        """表示中のタブが変わったことを知らせる"""
+        self.current_tab_changed.emit(self.get_current_tab_name())
+
     def get_current_tab_name(self) -> str:
         """
         現在アクティブなタブの名前を取得

@@ -308,6 +308,8 @@ class MainWindow(QMainWindow):
         # 右側: ターミナル
         self.terminal_widget = TerminalWidget()
         self.terminal_widget.tab_closed.connect(self._on_tab_closed)
+        self.terminal_widget.current_tab_changed.connect(
+            self._on_terminal_tab_changed)
         self.terminal_widget.font_size_change_requested.connect(
             self._on_font_size_wheel)
         self.terminal_widget.macro_execute_requested.connect(self._on_macro_execute_requested)
@@ -811,6 +813,21 @@ class MainWindow(QMainWindow):
                     print(f"  詳細:\n{traceback.format_exc()}")
                     # ステータスバーは通常の接続メッセージのまま
     
+    def _on_terminal_tab_changed(self, device_name: str) -> None:
+        """表示中のターミナルに合わせて SFTP パネルを切り替える
+
+        追従しないと、別の機器のターミナルを見ながら、その1つ前に
+        繋いだ機器へファイルを送ることになる。パネルに機器名が出ない
+        ため、送り先が違うことに気づけない。
+        """
+        manager = self.sftp_managers.get(device_name)
+        if manager is not None:
+            if self.sftp_panel.current_device != device_name:
+                self.sftp_panel.set_sftp_manager(manager, device_name)
+        elif self.sftp_panel.current_device:
+            # いま見ている機器に SFTP が無いなら、前の機器のものを残さない
+            self.sftp_panel.clear()
+
     def _find_group_of_device(self, device_name: str):
         """機器名から所属グループを返す(見つからなければNone)"""
         for group in self.config_manager.get_groups():
