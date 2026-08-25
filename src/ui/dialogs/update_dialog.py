@@ -123,7 +123,7 @@ class UpdateDialog(QDialog):
             from __version__ import __version__
             current_version = __version__
         except ImportError:
-            current_version = "1.1.0"
+            current_version = "1.1.1"
         new_version = self.update_info.get('version', '不明')
         
         self.version_label = QLabel(f"現在: v{current_version}  →  新規: v{new_version}")

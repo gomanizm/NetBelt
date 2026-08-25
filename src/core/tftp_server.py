@@ -30,6 +30,10 @@ def _err(sock, addr, code, msg):
     sock.sendto(struct.pack("!HH", OP_ERROR, code) + msg.encode() + b"\x00", addr)
 
 
+class _ServerStopped(Exception):
+    """停止要求により転送を打ち切った（タイムアウトとは区別する）"""
+
+
 class TFTPServer:
     """低レベル TFTP サーバー（Qt 非依存）。on_event(kind, ip, payload) で通知。
     payload は transfer_started/progress/complete では (filename, total_or_done, ..., direction) のタプル、
@@ -45,20 +49,23 @@ class TFTPServer:
         self._sock = None
         self._thread = None
         self._running = False
+        # 「まだ起動していない」と「停止された」は別物。_running だけで
+        # 表すと、起動前の呼び出しを停止と誤認する。
+        self._stopping = False
+        # 進行中の転送スレッド。覚えないと stop() で止められない。
+        self._workers = []
+        self._workers_lock = threading.Lock()
         self._retries = 5      # タイムアウト時の再送回数
         self._timeout = 2.0    # 送受信タイムアウト秒
 
     def start(self):
         os.makedirs(self.root_dir, exist_ok=True)
-        # 進行中の転送スレッドを覚えておく。覚えないと stop() で止められず、
-        # 停止したはずの後にファイルが作られたり、終了時に書きかけが消える。
-        self._workers = []
-        self._workers_lock = threading.Lock()
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         set_exclusive_bind(self._sock)
         self._sock.bind(("0.0.0.0", self.port))
         self.port = self._sock.getsockname()[1]  # port=0 のとき実ポートを反映
         self._sock.settimeout(1.0)
+        self._stopping = False
         self._running = True
         self._thread = threading.Thread(target=self._serve, daemon=True)
         self._thread.start()
@@ -74,6 +81,7 @@ class TFTPServer:
         転送スレッドも待つ。待たないと、停止したはずの後にファイルが
         作られたり、終了時に書きかけのファイルが黙って切り詰められる。
         """
+        self._stopping = True
         self._running = False
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=3)   # 待受の1秒に対する余裕
@@ -190,7 +198,7 @@ class TFTPServer:
         try:
             retries = 0
             while True:
-                if not self._running:
+                if self._stopping:
                     # 停止された。ここまでに ACK した分は finally で確実に
                     # 書き出す（放置すると終了時に黙って消える）
                     if established:
@@ -260,6 +268,10 @@ class TFTPServer:
         """packet を送り、block=expect_block の ACK を待つ。来なければ最大 _retries 回まで再送。
         古い/重複 ACK は無視。全再送失敗で socket.timeout を送出（呼び出し側が中断処理）。"""
         for attempt in range(self._retries + 1):
+            # ここで見ないと、再送を繰り返すあいだ（最大 12 秒）停止に
+            # 気づかず、止めたあとも DATA を送り続けることになる。
+            if self._stopping:
+                raise _ServerStopped()
             xs.sendto(packet, addr)
             deadline_tries = 0
             while True:
@@ -315,11 +327,13 @@ class TFTPServer:
                         self._send_and_wait_ack(xs, _oack(neg), addr, 0)  # OACKにACK(0)。再送付き
                     except socket.timeout:
                         return  # 未確立: 重複RRQの孤児。started/error とも出さない
+                    except _ServerStopped:
+                        return  # 未確立のまま停止。何も出さない
                     established = True
                     self.on_event("transfer_started", addr[0], (filename, total, "download"))
                 block = 1
                 while True:
-                    if not self._running:
+                    if self._stopping:
                         if established:
                             self.on_event("interrupted", addr[0],
                                           (filename, "download"))
@@ -331,6 +345,11 @@ class TFTPServer:
                         if not established:
                             return  # block1 の ACK すら来ない = 孤児。黙って撤退
                         raise      # 確立後の中断は本物のエラー
+                    except _ServerStopped:
+                        if established:
+                            self.on_event("interrupted", addr[0],
+                                          (filename, "download"))
+                        return
                     if not established:
                         established = True
                         self.on_event("transfer_started", addr[0], (filename, total, "download"))
@@ -433,7 +452,9 @@ class TFTPServerManager(QObject):
         # スレッド安全（クロススレッドはキュー化）なのでロック外で行う。
         if kind == "transfer_started":
             fn, total, d = payload
-            key = (ip, fn)
+            # 方向まで含める。同じ機器が同名ファイルを送受で同時に扱うと、
+            # 方向を落としたキーでは片方が他方を潰す。
+            key = (ip, fn, d)
             with self._tx_lock:
                 first = key not in self._tx
                 if first:
@@ -445,12 +466,12 @@ class TFTPServerManager(QObject):
         elif kind == "transfer_progress":
             fn, done, total, d = payload
             with self._tx_lock:
-                active = (ip, fn) in self._tx
+                active = (ip, fn, d) in self._tx
             if active:
                 self.transfer_progress.emit(ip, fn, int(done), int(total), d)
         elif kind == "transfer_complete":
             fn, done, total, d = payload
-            key = (ip, fn)
+            key = (ip, fn, d)
             with self._tx_lock:
                 st = self._tx.get(key)
                 if st is not None:
@@ -465,7 +486,7 @@ class TFTPServerManager(QObject):
             # 放置すると「進行中」の行が残る）。
             filename, direction = payload
             with self._tx_lock:
-                self._tx.pop((ip, filename), None)
+                self._tx.pop((ip, filename, direction), None)
             self.transfer_interrupted.emit(ip, filename, direction)
         elif kind == "protocol_error":
             # 重複RRQ/WRQ の敗者が出すタイムアウトは、その転送が成功済み or
@@ -474,14 +495,17 @@ class TFTPServerManager(QObject):
             filename, reason = payload
             suppress = False
             if filename and "タイムアウト" in reason:
-                key = (ip, filename)
+                # 失敗の通知は方向を持たないので、両方向を見る。
+                # 重複要求の敗者が出すタイムアウトを握り潰すのが目的。
                 with self._tx_lock:
-                    st = self._tx.get(key)
-                    if st is not None:
+                    for direction in ("upload", "download"):
+                        st = self._tx.get((ip, filename, direction))
+                        if st is None:
+                            continue
                         st["count"] -= 1
-                        suppress = st["done"] or st["count"] > 0
+                        suppress = suppress or st["done"] or st["count"] > 0
                         if st["count"] <= 0:
-                            self._tx.pop(key, None)
+                            self._tx.pop((ip, filename, direction), None)
             if not suppress:
                 self.protocol_event.emit(ip, filename, reason)
         else:

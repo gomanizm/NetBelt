@@ -210,6 +210,28 @@ class SFTPPanel(QWidget):
         
         return toolbar
     
+    def _detach_manager(self):
+        """いま繋いでいるマネージャから、自分の接続だけを外す
+
+        引数なしの disconnect() はそのシグナルの全接続を外してしまい、
+        MainWindow が張ったエラー監視まで消える。スロットを指定して外す。
+
+        外さずに参照だけ捨てると、旧マネージャの遅れた通知で
+        空にしたはずのパネルが埋め直される。
+        """
+        if not self.sftp_manager:
+            return
+        for signal, slot in (
+            (self.sftp_manager.file_list_ready, self._update_file_list),
+            (self.sftp_manager.transfer_progress, self._update_progress),
+            (self.sftp_manager.transfer_complete, self._on_transfer_complete),
+            (self.sftp_manager.error_occurred, self._on_error),
+        ):
+            try:
+                signal.disconnect(slot)
+            except (TypeError, RuntimeError):
+                pass    # 繋がっていなければそれでよい
+
     def set_sftp_manager(self, sftp_manager: SFTPManager, device_name: str = "",
                          target: str = ""):
         """
@@ -219,15 +241,8 @@ class SFTPPanel(QWidget):
             sftp_manager: SFTPマネージャー
             device_name: デバイス名
         """
-        # 既存の接続を解除
-        if self.sftp_manager:
-            try:
-                self.sftp_manager.file_list_ready.disconnect()
-                self.sftp_manager.transfer_progress.disconnect()
-                self.sftp_manager.transfer_complete.disconnect()
-                self.sftp_manager.error_occurred.disconnect()
-            except Exception:
-                pass
+        # 既存の接続を解除（自分の分だけ）
+        self._detach_manager()
         
         self.sftp_manager = sftp_manager
         self.hint_label.setVisible(False)
@@ -259,10 +274,15 @@ class SFTPPanel(QWidget):
         if self.current_device:
             self.path_label.setText("%s: %s" % (self.current_device, path))
         else:
-            self.path_label.setText(path)
+            self.path_label.setText("現在のパス: %s" % path)
 
     def clear(self):
-        """パネルをクリア"""
+        """パネルをクリア
+
+        旧マネージャの通知が遅れて届くと、空にしたはずのパネルが
+        旧機器の一覧で埋め直される。参照を捨てる前に接続を外す。
+        """
+        self._detach_manager()
         self.model.removeRows(0, self.model.rowCount())
         self.path_label.setText("接続されていません")
         self.target_label.setText(self.NO_TARGET_TEXT)
@@ -300,8 +320,8 @@ class SFTPPanel(QWidget):
         
         # 現在のパスを表示
         if self.sftp_manager:
-            current_path = self.sftp_manager.get_current_path()
-            self.path_label.setText(f"現在のパス: {current_path}")
+            # ここで直接書くと、機器名つきの表示を消してしまう
+            self._update_path_label(self.sftp_manager.get_current_path())
         
         # ファイル/ディレクトリを追加
         for file_info in file_list:

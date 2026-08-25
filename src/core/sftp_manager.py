@@ -37,6 +37,10 @@ class SFTPManager(QObject):
     # 長く待つと転送中ずっと画面が固まるので、短く切って諦める。
     _GUI_WAIT_SECONDS = 0.5
 
+    # 切断のときに、進行中の転送が手を離すのを待つ上限。GUI スレッドから
+    # 呼ばれるため、長く待つとアプリが終了できなくなる。
+    _DISCONNECT_WAIT_SECONDS = 3.0
+
     def _acquire_for_gui(self, what: str) -> bool:
         """GUI スレッドから使うためにロックを取る（取れなければ False）
 
@@ -83,17 +87,38 @@ class SFTPManager(QObject):
             return False
     
     def disconnect(self):
-        """SFTP接続を切断"""
+        """SFTP接続を切断
+
+        閉じるのはロックの中で行う。転送や一覧取得の最中に閉じると、
+        進行中のスレッドが閉じられたクライアントを触ることになる。
+        先に is_connected を落として新しい操作を止め、いま走っている
+        ものが手を離すまで待ってから閉じる。
+        """
+        # 新しい操作をここで止める（各メソッドが先頭で見ている）
         self.is_connected = False
-        
-        if self.sftp_client:
+
+        # 空くのを無期限には待たない。タブを閉じるときやアプリ終了時に
+        # GUI スレッドから呼ばれるので、応答しない機器への転送中だと
+        # 待った分だけアプリが固まる（終了できなくなる）。
+        acquired = self._sftp_lock.acquire(timeout=self._DISCONNECT_WAIT_SECONDS)
+        try:
+            client, self.sftp_client = self.sftp_client, None
+            self.ssh_client = None
+        finally:
+            if acquired:
+                self._sftp_lock.release()
+
+        if client and acquired:
             try:
-                self.sftp_client.close()
+                client.close()
             except Exception:
                 pass
-            self.sftp_client = None
-        
-        self.ssh_client = None
+        elif client:
+            # 転送が掴んだまま。ここで閉じると、その最中のスレッドが
+            # 閉じたハンドルを触ることになる。参照だけ手放し、後片付けは
+            # SSH 接続の終了に任せる。
+            print("[SFTP] 転送中のため接続を閉じきれませんでした"
+                  "（SSH の切断で解放されます）")
         self.disconnected.emit()
     
     def list_directory(self, path: str = None):

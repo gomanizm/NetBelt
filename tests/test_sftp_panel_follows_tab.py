@@ -90,13 +90,23 @@ class SftpPanelFollowsTabTest(unittest.TestCase):
     def test_the_path_names_the_device(self):
         """どの機器を見ているかが画面に出ること。
 
-        出ていないと、送り先が違っても気づけない。
+        出ていないと、送り先が違っても気づけない。一覧が届いたあとも
+        残ることを見る。以前は Mock のせいで一覧が来ず、_update_file_list
+        が上書きする経路を通っていなかった（偽のグリーン）。
         """
+        from PyQt6.QtWidgets import QApplication
         window = self._two_devices()
         self._switch(window, "router-A")
 
         self.assertIn("router-A", window.sftp_panel.path_label.text(),
                       "機器名が出ていない: %r"
+                      % window.sftp_panel.path_label.text())
+
+        # 実際の一覧到着を通す（本番ではここで上書きされていた）
+        window.sftp_panel._update_file_list([])
+        QApplication.processEvents()
+        self.assertIn("router-A", window.sftp_panel.path_label.text(),
+                      "一覧が届くと機器名が消える: %r"
                       % window.sftp_panel.path_label.text())
 
     def test_a_device_without_sftp_shows_nothing_stale(self):
@@ -156,6 +166,114 @@ class SftpPanelFollowsTabTest(unittest.TestCase):
         self.assertEqual(window.sftp_panel.target_label.text(),
                          window.sftp_panel.NO_TARGET_TEXT,
                          "前の機器の接続先が残っている")
+
+
+class SftpPanelStaleSignalTest(unittest.TestCase):
+    """切り替えたあと、前の機器の通知でパネルが汚れないことを検証する。
+
+    Mock では再現できないので、本物の SFTPManager のシグナルを使う。
+    引数なしの disconnect() は「そのシグナルの全接続」を外すため、
+    MainWindow が張ったエラー監視まで消えていた。逆に clear() は
+    接続を外さず参照だけ捨てていたので、旧機器の一覧が遅れて届くと
+    空にしたはずのパネルが埋め直された。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import os as _os
+        _os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PyQt6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        from unittest import mock
+        # 失敗経路がモーダルを出すと、offscreen では誰も閉じられない
+        for name in ("critical", "warning", "information"):
+            patcher = mock.patch("ui.sftp_panel.QMessageBox." + name)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _attached(self):
+        """本物のマネージャを繋いだパネルを返す。"""
+        from unittest import mock
+        from core.sftp_manager import SFTPManager
+        from ui.sftp_panel import SFTPPanel
+
+        panel = SFTPPanel()
+        manager = SFTPManager()
+        manager.is_connected = True
+        manager.sftp_client = mock.Mock()
+        manager.sftp_client.listdir_attr.return_value = []
+        panel.set_sftp_manager(manager, "old-device", "192.0.2.10")
+        return panel, manager
+
+    def _entry(self, name):
+        return {"name": name, "size": 1, "is_dir": False,
+                "permissions": "-rw-r--r--", "modified": "now"}
+
+    def test_a_late_listing_does_not_refill_a_cleared_panel(self):
+        """clear した後に旧機器の一覧が届いても、表示を戻さないこと。"""
+        from PyQt6.QtWidgets import QApplication
+        panel, manager = self._attached()
+
+        panel.clear()
+        manager.file_list_ready.emit([self._entry("OLD.cfg")])
+        QApplication.processEvents()
+
+        self.assertEqual(panel.model.rowCount(), 0,
+                         "旧機器の一覧でパネルが埋め直された")
+        self.assertEqual(panel.target_label.text(), panel.NO_TARGET_TEXT)
+
+    def test_a_late_listing_does_not_leak_into_the_next_device(self):
+        """次の機器へ切り替えた後も、旧機器の一覧が入り込まないこと。
+
+        これが起きると、別の機器の中身を見ながらファイルを落とすことになる。
+        """
+        from unittest import mock
+        from PyQt6.QtWidgets import QApplication
+        from core.sftp_manager import SFTPManager
+        panel, old = self._attached()
+
+        new = SFTPManager()
+        new.is_connected = True
+        new.sftp_client = mock.Mock()
+        new.sftp_client.listdir_attr.return_value = []
+        panel.set_sftp_manager(new, "new-device", "192.0.2.11")
+
+        old.file_list_ready.emit([self._entry("OLD.cfg")])
+        QApplication.processEvents()
+
+        names = [panel.model.item(r, 0).text()
+                 for r in range(panel.model.rowCount())]
+        self.assertNotIn("OLD.cfg", names,
+                         "旧機器の一覧が新しい機器の表示に混ざった")
+
+    def test_switching_keeps_someone_elses_error_watch(self):
+        """切り替えで、他が張ったエラー監視を外さないこと。
+
+        MainWindow は機器ごとに error_occurred を監視している。
+        引数なしの disconnect() はそれごと外すので、一度タブを移ると
+        以後その機器の SFTP エラーがどこにも出なくなる。
+        """
+        from unittest import mock
+        from PyQt6.QtWidgets import QApplication
+        from core.sftp_manager import SFTPManager
+        panel, manager = self._attached()
+
+        seen = []
+        manager.error_occurred.connect(seen.append)   # MainWindow の代わり
+
+        other = SFTPManager()
+        other.is_connected = True
+        other.sftp_client = mock.Mock()
+        other.sftp_client.listdir_attr.return_value = []
+        panel.set_sftp_manager(other, "new-device", "192.0.2.11")
+
+        manager.error_occurred.emit("転送に失敗しました")
+        QApplication.processEvents()
+
+        self.assertEqual(seen, ["転送に失敗しました"],
+                         "外部のエラー監視まで外している")
 
 
 if __name__ == "__main__":

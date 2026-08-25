@@ -22,6 +22,7 @@ import unittest
 
 sys.path.insert(0, "src")
 
+OP_RRQ = 1
 OP_WRQ = 2
 OP_DATA = 3
 OP_ACK = 4
@@ -74,9 +75,9 @@ class TftpShutdownTest(unittest.TestCase):
         server, _root = self._server()
         self._begin_upload(server, "inflight.bin")
 
-        before = [t for t in threading.enumerate() if t.is_alive()]
-        self.assertTrue(any("_handle_wrq" in t.name or "run" in t.name
-                            for t in before) or True)   # 名前は実装依存
+        # スレッド名は実装依存なので、サーバ自身が持つ台帳で数える
+        before = [w for w in server._workers if w.is_alive()]
+        self.assertTrue(before, "転送スレッドが動いていない（前提が崩れている）")
 
         server.stop()
 
@@ -127,6 +128,48 @@ class TftpShutdownTest(unittest.TestCase):
         self.assertTrue(os.path.exists(path), "ACK 済みなのにファイルが無い")
         self.assertEqual(os.path.getsize(path), len(payload),
                          "ACK 済みのバイトが書き出されていない")
+
+
+    def test_a_download_stops_too(self):
+        """ダウンロード（RRQ）も停止で止まること。
+
+        停止チェックをループ先頭にだけ置くと、その中で呼ぶ
+        _send_and_wait_ack が最大 (retries+1) x timeout まで
+        _running を見ないため、止めたあとも DATA を送り続ける。
+        停止のテストがアップロードしか通っていなかったので見逃していた。
+        """
+        server, root = self._server()
+        with open(os.path.join(root, "big.bin"), "wb") as f:
+            f.write(b"D" * (512 * 40))
+
+        client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        client.settimeout(5)
+        self.addCleanup(client.close)
+        client.sendto(struct.pack("!H", OP_RRQ) + b"big.bin\0octet\0",
+                      ("127.0.0.1", server.port))
+        _data, peer = client.recvfrom(4096)           # block 1
+        client.sendto(struct.pack("!HH", OP_ACK, 1), peer)   # 確立
+        client.recvfrom(4096)                        # block 2
+        # ここから ACK を返さない（応答しない機器を模す）
+
+        started = time.time()
+        server.stop()
+        elapsed = time.time() - started
+
+        alive = [w for w in server._workers if w.is_alive()]
+        self.assertEqual(alive, [],
+                         "停止後もダウンロードのスレッドが動いている")
+
+        client.settimeout(3)
+        extra = 0
+        try:
+            while True:
+                client.recvfrom(4096)
+                extra += 1
+        except OSError:
+            pass
+        self.assertEqual(extra, 0, "停止後も DATA を送っている（%d 発）" % extra)
+        self.assertLess(elapsed, 10.0, "停止に時間がかかりすぎる")
 
     def test_stop_returns_promptly(self):
         """停止が現実的な時間で返ること。

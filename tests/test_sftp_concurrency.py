@@ -100,11 +100,13 @@ class SftpConcurrencyTest(unittest.TestCase):
         manager = self._manager(port)
 
         local = tempfile.mkdtemp()
-        payload = b"x" * (256 * 1024)
+        # ファイルごとに中身を変える。同じバイト列だと、混線してもサイズが
+        # 合ってしまい「壊れていない」と誤判定する。
         names = ["a.cfg", "b.cfg", "c.cfg"]
+        payloads = {n: bytes([ord(n[0])]) * (256 * 1024) for n in names}
         for name in names:
             with open(os.path.join(local, name), "wb") as f:
-                f.write(payload)
+                f.write(payloads[name])
 
         errors = []
         manager.error_occurred.connect(errors.append)
@@ -119,7 +121,7 @@ class SftpConcurrencyTest(unittest.TestCase):
         while time.time() < deadline:
             QApplication.processEvents()
             if all(os.path.exists(os.path.join(root, n)) for n in names):
-                if all(os.path.getsize(os.path.join(root, n)) == len(payload)
+                if all(os.path.getsize(os.path.join(root, n)) == len(payloads[n])
                        for n in names):
                     break
             time.sleep(0.05)
@@ -129,8 +131,13 @@ class SftpConcurrencyTest(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertTrue(os.path.exists(path),
                                 "%s が届いていない (errors=%s)" % (name, errors))
-                self.assertEqual(os.path.getsize(path), len(payload),
+                with open(path, "rb") as f:
+                    got = f.read()
+                self.assertEqual(len(got), len(payloads[name]),
                                  "%s が途中で切れている" % name)
+                # 中身まで見る。チャンネルが混線すると別ファイルの内容が入る。
+                self.assertEqual(got, payloads[name],
+                                 "%s の中身が別のファイルと混ざっている" % name)
 
     def test_a_listing_during_an_upload_does_not_corrupt_it(self):
         """アップロード中に一覧を更新しても転送が壊れないこと。"""
