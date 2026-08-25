@@ -277,5 +277,81 @@ class TftpStopNoticeTest(unittest.TestCase):
                          "中断した転送が進行中のまま残っている")
 
 
+class TftpProtocolEventTest(unittest.TestCase):
+    """機器が投げてくる要求の失敗を、どう伝えるか。
+
+    最初に報告された症状は、社内セグメントに置いた Windows へ機器の
+    auto-install が RRQ を投げてきて、(1) どの機器か分からず、
+    (2) エラーダイアログが出続け、(3) 無関係な転送まで巻き添えで
+    エラーになる、というものだった。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import os as _os
+        _os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PyQt6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    def _panel(self):
+        from unittest import mock
+        from ui.tftp_server_panel import TFTPServerPanel
+        with mock.patch("core.firewall.ensure_inbound_allow",
+                        return_value=(True, "stub")):
+            return TFTPServerPanel()
+
+    def test_the_source_address_is_shown(self):
+        """どの機器から来たのかがログに出ること。
+
+        IP はハンドラまで来ているのに、マネージャが本文だけを流していた。
+        """
+        panel = self._panel()
+        panel._on_protocol_event(
+            "192.0.2.77", "network-confg", "要求されたファイルがありません")
+
+        text = panel.log_text.toPlainText()
+        self.assertIn("192.0.2.77", text, "送信元が出ていない")
+        self.assertIn("network-confg", text, "対象ファイルが出ていない")
+
+    def test_no_dialog_for_a_device_side_failure(self):
+        """機器都合の失敗でモーダルを出さないこと。
+
+        auto-install が繰り返し取りに来る環境では、出すとダイアログが
+        溢れて操作できなくなる。
+        """
+        from unittest import mock
+        panel = self._panel()
+        with mock.patch("ui.tftp_server_panel.QMessageBox.critical") as dialog:
+            for _ in range(5):
+                panel._on_protocol_event(
+                    "192.0.2.77", "network-confg", "要求されたファイルがありません")
+        dialog.assert_not_called()
+
+    def test_only_the_matching_transfer_is_marked(self):
+        """1件の失敗で、無関係な転送を巻き添えにしないこと。"""
+        panel = self._panel()
+        panel._on_tx_started("192.0.2.10", "a.bin", 100, "upload")
+        panel._on_tx_started("192.0.2.11", "b.bin", 100, "upload")
+        other = panel._active[("192.0.2.11", "b.bin", "upload")]["row"]
+
+        panel._on_protocol_event(
+            "192.0.2.10", "a.bin", "アップロードがタイムアウト")
+
+        self.assertNotEqual(panel.history.item(other, 5).text(), "エラー",
+                            "無関係な転送までエラーにしている")
+        self.assertIn(("192.0.2.11", "b.bin", "upload"), panel._active)
+
+    def test_a_server_fault_still_stops_the_user(self):
+        """サーバ自体の障害は、これまでどおりモーダルで知らせること。
+
+        起動失敗やポート使用中は、対処しないと先へ進めない。
+        """
+        from unittest import mock
+        panel = self._panel()
+        with mock.patch("ui.tftp_server_panel.QMessageBox.critical") as dialog:
+            panel._on_error("TFTP起動失敗: ポート 69 は使用中です")
+        dialog.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()
