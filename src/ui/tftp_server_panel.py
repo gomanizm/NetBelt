@@ -139,6 +139,7 @@ class TFTPServerPanel(QWidget):
         self.tftp_server.transfer_progress.connect(self._on_tx_progress)
         self.tftp_server.transfer_complete.connect(self._on_tx_complete)
         self.tftp_server.client_activity.connect(self._on_activity_event)
+        self.tftp_server.transfer_interrupted.connect(self._on_transfer_interrupted)
 
     def _restore_settings(self):
         """保存済み設定を復元"""
@@ -249,6 +250,16 @@ class TFTPServerPanel(QWidget):
             for c, v in enumerate(vals):
                 self.history.setItem(row, c, QTableWidgetItem(v))
         self._add_log("[%s] 転送完了: %s (%s)" % (ip, filename, self._fmt_bytes(done)))
+
+    def _on_transfer_interrupted(self, ip: str, filename: str, direction: str):
+        """利用者が止めたことによる中断。エラーではないので行だけ確定させる。
+
+        確定させないと「転送中」の表示が残り続ける。ダイアログは出さない。
+        """
+        st = self._active.pop((ip, filename, direction), None)
+        if st is not None:
+            self.history.setItem(st["row"], 5, QTableWidgetItem("中断"))
+        self._add_log("[%s] 停止により中断: %s" % (ip, filename))
 
     def _on_error(self, error_message: str):
         """エラー発生時の処理"""

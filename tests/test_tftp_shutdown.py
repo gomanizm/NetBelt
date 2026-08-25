@@ -103,7 +103,8 @@ class TftpShutdownTest(unittest.TestCase):
         client.sendto(struct.pack("!HH", OP_DATA, 1) + b"B" * 512, peer)
         try:
             client.recvfrom(4096)
-        except socket.timeout:
+        except OSError:
+            # 停止済みなので、タイムアウトでも ICMP 由来のリセットでもよい
             pass
         time.sleep(0.5)
 
@@ -141,6 +142,139 @@ class TftpShutdownTest(unittest.TestCase):
 
         self.assertLess(elapsed, 15.0,
                         "停止に時間がかかりすぎる: %.1f秒" % elapsed)
+
+
+class TftpStopNoticeTest(unittest.TestCase):
+    """停止による中断は、エラーではなく情報として伝えること。
+
+    利用者が意図して止めたのだから、エラー扱いは誤り。実機のログでも
+    「エラー: 停止により中断」と赤く出ていた。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import os as _os
+        _os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PyQt6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        import unittest.mock
+        fw = unittest.mock.patch("core.firewall.ensure_inbound_allow",
+                                 return_value=(True, "test stub"))
+        fw.start()
+        self.addCleanup(fw.stop)
+
+    def test_an_interrupted_transfer_is_not_reported_as_an_error(self):
+        from PyQt6.QtWidgets import QApplication
+        from core.tftp_server import TFTPServerManager
+
+        root = tempfile.mkdtemp(prefix="netbelt-tftp-notice-")
+        port = free_udp_port()
+        manager = TFTPServerManager()
+        self.addCleanup(manager.stop)
+        errors, notices = [], []
+        manager.error_occurred.connect(errors.append)
+        manager.transfer_interrupted.connect(
+            lambda ip, fn, d: notices.append("停止により中断: %s" % fn))
+        self.assertTrue(manager.start(port=port, root_dir=root))
+
+        client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        client.settimeout(5)
+        self.addCleanup(client.close)
+        client.sendto(wrq("notice.bin"), ("127.0.0.1", port))
+        _oack, peer = client.recvfrom(4096)
+        client.sendto(struct.pack("!HH", OP_DATA, 1) + b"A" * 512, peer)
+        client.recvfrom(4096)
+
+        manager.stop()
+        for _ in range(10):
+            QApplication.processEvents()
+            time.sleep(0.05)
+
+        interrupted = [m for m in notices if "中断" in m]
+        self.assertTrue(interrupted, "中断を伝えていない: %s" % notices)
+        self.assertIn("notice.bin", interrupted[0])
+        self.assertEqual(
+            [e for e in errors if "中断" in e], [],
+            "利用者が止めたのにエラーとして出している")
+
+
+    def test_the_history_row_shows_interrupted_not_error(self):
+        """履歴の状況列が「エラー」ではなく「中断」になること。
+
+        実機で試したところ、状況列も赤いエラー表示になっていた。
+        利用者が止めたのだからエラーではないし、「転送中」のまま
+        残るのも誤り。
+        """
+        from unittest import mock
+        from PyQt6.QtWidgets import QApplication, QTableWidgetItem
+        from ui.tftp_server_panel import TFTPServerPanel
+
+        with mock.patch("core.firewall.ensure_inbound_allow",
+                        return_value=(True, "stub")):
+            panel = TFTPServerPanel()
+
+        ip, filename, direction = "192.0.2.10", "conf.bin", "upload"
+        panel._on_tx_started(ip, filename, 4096, direction)
+        row = panel._active[(ip, filename, direction)]["row"]
+        self.assertNotEqual(panel.history.item(row, 5).text(), "中断")
+
+        panel._on_transfer_interrupted(ip, filename, direction)
+
+        self.assertEqual(panel.history.item(row, 5).text(), "中断",
+                         "状況列が中断になっていない")
+        self.assertNotIn((ip, filename, direction), panel._active,
+                         "中断した転送が進行中のまま残っている")
+
+    def test_an_interruption_does_not_touch_other_rows(self):
+        """他の転送の行まで巻き添えにしないこと。
+
+        既存の _on_error は進行中の行を全部エラーにする作りなので、
+        中断を同じ経路に載せると無関係な転送まで壊す。
+        """
+        from unittest import mock
+        from ui.tftp_server_panel import TFTPServerPanel
+
+        with mock.patch("core.firewall.ensure_inbound_allow",
+                        return_value=(True, "stub")):
+            panel = TFTPServerPanel()
+
+        panel._on_tx_started("192.0.2.10", "a.bin", 100, "upload")
+        panel._on_tx_started("192.0.2.11", "b.bin", 100, "upload")
+        other = panel._active[("192.0.2.11", "b.bin", "upload")]["row"]
+
+        panel._on_transfer_interrupted("192.0.2.10", "a.bin", "upload")
+
+        self.assertNotEqual(panel.history.item(other, 5).text(), "中断",
+                            "無関係な転送まで中断にしている")
+        self.assertIn(("192.0.2.11", "b.bin", "upload"), panel._active)
+    def test_an_interrupted_transfer_leaves_no_active_row(self):
+        """中断した転送を「進行中」のまま残さないこと。"""
+        from PyQt6.QtWidgets import QApplication
+        from core.tftp_server import TFTPServerManager
+
+        root = tempfile.mkdtemp(prefix="netbelt-tftp-notice-")
+        port = free_udp_port()
+        manager = TFTPServerManager()
+        self.addCleanup(manager.stop)
+        self.assertTrue(manager.start(port=port, root_dir=root))
+
+        client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        client.settimeout(5)
+        self.addCleanup(client.close)
+        client.sendto(wrq("row.bin"), ("127.0.0.1", port))
+        _oack, peer = client.recvfrom(4096)
+        client.sendto(struct.pack("!HH", OP_DATA, 1) + b"A" * 512, peer)
+        client.recvfrom(4096)
+
+        manager.stop()
+        for _ in range(10):
+            QApplication.processEvents()
+            time.sleep(0.05)
+
+        self.assertEqual(dict(manager._tx), {},
+                         "中断した転送が進行中のまま残っている")
 
 
 if __name__ == "__main__":

@@ -193,8 +193,8 @@ class TFTPServer:
                     # 停止された。ここまでに ACK した分は finally で確実に
                     # 書き出す（放置すると終了時に黙って消える）
                     if established:
-                        self.on_event("error", addr[0],
-                                      "停止により中断: %s" % filename)
+                        self.on_event("interrupted", addr[0],
+                                      (filename, "upload"))
                     return
                 try:
                     data, a = xs.recvfrom(blksize + 4)
@@ -316,8 +316,8 @@ class TFTPServer:
                 while True:
                     if not self._running:
                         if established:
-                            self.on_event("error", addr[0],
-                                          "停止により中断: %s" % filename)
+                            self.on_event("interrupted", addr[0],
+                                          (filename, "download"))
                         return
                     chunk = f.read(blksize)
                     try:
@@ -364,6 +364,8 @@ class TFTPServerManager(QObject):
     transfer_started = pyqtSignal(str, str, int, str)       # ip, filename, total, direction
     transfer_progress = pyqtSignal(str, str, int, int, str)  # ip, filename, done, total, direction
     transfer_complete = pyqtSignal(str, str, int, int, str)  # ip, filename, done, total, direction
+    # 利用者が止めたことによる中断。エラーではないので別の口にする
+    transfer_interrupted = pyqtSignal(str, str, str)         # ip, filename, direction
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -457,6 +459,14 @@ class TFTPServerManager(QObject):
                     if st["count"] <= 0:
                         self._tx.pop(key, None)
             self.transfer_complete.emit(ip, fn, int(done), int(total), d)
+        elif kind == "interrupted":
+            # 利用者が止めたことによる中断。エラーではないので別の口へ流す。
+            # 併せて台帳から降ろす（transfer_complete が来ないため、
+            # 放置すると「進行中」の行が残る）。
+            filename, direction = payload
+            with self._tx_lock:
+                self._tx.pop((ip, filename), None)
+            self.transfer_interrupted.emit(ip, filename, direction)
         elif kind == "error":
             # 重複RRQ/WRQ の敗者が出す "…timeout: <fn>" は、その転送が成功済み or まだ
             # 生存兄弟がいる間は握り潰す。全滅（兄弟ゼロ・未完了）なら本物の失敗として通す。
