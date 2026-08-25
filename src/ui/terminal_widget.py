@@ -515,6 +515,26 @@ class TerminalWidget(QWidget):
                 pass
             terminal.reconnect_requested.connect(lambda: reconnect_callback(device_name))
     
+    def _render_cursor_for(self, terminal: QTextEdit):
+        """機器出力の書き込み位置を返す（ユーザーの選択とは独立）
+
+        端末は行編集をカーソル移動と上書きで行い、カーソルを戻す指示と
+        上書きする文字が別々のパケットで届く。そのため書き込み位置は
+        append_output を跨いで保つ必要がある。一方で、この位置に
+        terminal.textCursor() を使うと、利用者が範囲選択している最中に
+        出力が届いたとき insertText が選択範囲を置き換えてしまう。
+        書き込み位置は選択とは別に持つ。
+        """
+        from PyQt6.QtGui import QTextCursor
+
+        cursor = getattr(terminal, "_render_cursor", None)
+        if cursor is None or cursor.document() is not terminal.document():
+            cursor = QTextCursor(terminal.document())
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            terminal._render_cursor = cursor
+        cursor.clearSelection()
+        return cursor
+
     def _process_control_codes(self, terminal: QTextEdit, text: str) -> str:
         """機器から届いた制御コードを解釈して画面へ反映する。
 
@@ -537,7 +557,7 @@ class TerminalWidget(QWidget):
         text = text.replace('\x00', '')   # NUL は捨てる（BEL は OSC 終端に使うため後段で処理）
 
         logged = []          # ログへ残す内容（画面に出した文字と改行）
-        cursor = terminal.textCursor()
+        cursor = self._render_cursor_for(terminal)
 
         def put(s):
             """カーソル位置へ書く。行末なら追記、途中なら上書き（端末と同じ挙動）。"""
@@ -669,7 +689,10 @@ class TerminalWidget(QWidget):
             logged.append(chunk)
             i = j
 
-        terminal.setTextCursor(cursor)
+        # 選択中に視覚カーソルを動かすと選択が外れる。コピーしようと
+        # している最中に機器がログを送ってくるだけで範囲が消えてしまう。
+        if not terminal.textCursor().hasSelection():
+            terminal.setTextCursor(cursor)
         terminal.ensureCursorVisible()
         return ''.join(logged)
 
