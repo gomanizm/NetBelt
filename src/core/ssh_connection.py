@@ -70,6 +70,23 @@ class SSHConnection(QObject):
                 pass
         client.set_missing_host_key_policy(_TofuHostKeyPolicy(known_hosts_path))
 
+    def _auth_failure_message(self) -> str:
+        """認証失敗の理由を、実際に使った手段に合わせて返す。
+
+        すべてを「ユーザー名またはパスワードが間違っています」と報告すると、
+        鍵で認証しているときに、存在しないパスワードを疑わせることになる。
+        ユーザー名が空のときは機器側ではなく設定の問題なので、そう名指しする。
+        """
+        if not self.username:
+            return ("認証失敗: ユーザー名が設定されていません。"
+                    "デバイスの設定でユーザー名を入力してください。")
+        if self.ssh_key:
+            return ("認証失敗: 指定した鍵がユーザー %s では受け付けられません"
+                    "でした。機器側の authorized_keys にこの鍵の公開鍵が"
+                    "登録されているか、ユーザー名が合っているかを"
+                    "確認してください。" % self.username)
+        return "認証失敗: ユーザー名またはパスワードが間違っています"
+
     def connect(self) -> bool:
         """
         SSH接続を開始
@@ -160,7 +177,7 @@ class SSHConnection(QObject):
             return True
             
         except paramiko.AuthenticationException:
-            self.error_occurred.emit("認証失敗: ユーザー名またはパスワードが間違っています")
+            self.error_occurred.emit(self._auth_failure_message())
             return False
         except paramiko.BadHostKeyException:
             self.error_occurred.emit(

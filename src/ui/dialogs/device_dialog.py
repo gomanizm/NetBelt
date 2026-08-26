@@ -186,6 +186,15 @@ class DeviceDialog(QDialog):
             QMessageBox.warning(self, "入力エラー", "ホストを入力してください。")
             return
         
+        # SSH はユーザー名が無いと必ず認証に失敗する。空のまま保存できると、
+        # その機器は二度と繋がらないうえ、失敗の理由も分からない。
+        # telnet は利用者名を送らない機器が多く、console では使わない。
+        if (self.protocol_combo.currentText() == "ssh"
+                and not self.username_edit.text().strip()):
+            QMessageBox.warning(self, "入力エラー",
+                                "SSH ではユーザー名が必要です。")
+            return
+
         # ポート番号チェック（console以外）
         if self.protocol_combo.currentText() != "console":
             try:
