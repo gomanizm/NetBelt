@@ -476,6 +476,11 @@ class TerminalWidget(QWidget):
             for i in range(self.tab_widget.count()):
                 if self.tab_widget.tabText(i) == device_name:
                     self.tab_widget.setCurrentIndex(i)
+                    # 全画面アプリを開いたまま切断されると ESC[?1049l が
+                    # 来ないので「代替画面の中」が残る。タブは機器名で
+                    # 使い回すため、そのままだと再接続後もその状態が続き、
+                    # このタブだけ clear が効かず案内も出なくなる。
+                    self._terminals[device_name]._alt_screen = False
                     return self._terminals[device_name]
         
         # 接続機器がなく、ホームタブが残っている場合は、ホームタブを再利用

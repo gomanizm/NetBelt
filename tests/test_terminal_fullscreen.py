@@ -100,6 +100,42 @@ class TerminalFullScreenTest(unittest.TestCase):
                         "案内と本文の間に空行が入り、案内が画面外へ流れる:\n%r"
                         % text)
 
+    def test_reconnecting_forgets_that_we_were_inside(self):
+        """全画面アプリを開いたまま切断されたあと、再接続で元に戻ること。
+
+        抜けるときの ESC[?1049l が来ないまま切れると、そのタブに
+        「代替画面の中」が残る。タブは機器名で使い回されるので、
+        再接続してもその状態が続き、このタブだけ clear が効かず、
+        次に nano を開いても案内が出なくなる。
+        """
+        from ui.terminal_widget import TerminalWidget
+        w = self._widget()
+
+        # nano を開いたところで切断された
+        w.append_output("dev", ESC + "[?1049h")
+        self.assertTrue(w._terminals["dev"]._alt_screen)
+
+        # 同じ機器名で再接続する（タブは使い回される）
+        w.create_terminal_tab("dev")
+
+        self.assertFalse(
+            getattr(w._terminals["dev"], "_alt_screen", False),
+            "切断前の代替画面の状態が残っている")
+
+        # clear が効くこと
+        w.append_output("dev", "output\r\n")
+        before = w._terminals["dev"].toPlainText()
+        w.append_output("dev", ESC + "[2J")
+        after = w._terminals["dev"].toPlainText()
+        self.assertGreater(after.count("\n"), before.count("\n") + 5,
+                           "clear が効かないままになっている")
+
+        # 案内がまた出ること
+        w.append_output("dev", ESC + "[?1049h")
+        self.assertIn(TerminalWidget.ALT_SCREEN_NOTICE,
+                      w._terminals["dev"].toPlainText(),
+                      "再接続後に案内が出なくなっている")
+
     # --- 画面消去で記録を失わない -----------------------------------
 
     def test_clear_does_not_throw_away_the_session(self):
