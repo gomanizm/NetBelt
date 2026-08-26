@@ -560,6 +560,54 @@ class TerminalWidget(QWidget):
                 pass
             terminal.reconnect_requested.connect(lambda: reconnect_callback(device_name))
     
+    # 全画面アプリが代替画面へ切り替えるときのモード番号
+    # （1049 が現行、1047 / 47 は古い実装）
+    ALT_SCREEN_MODES = ("1049", "1047", "47")
+
+    ALT_SCREEN_NOTICE = (
+        "[NetBelt] nano や vi のような全画面アプリの表示には対応していません。"
+        "画面が崩れますが、機器との接続は切れていません。"
+    )
+
+    # 端末が名乗っている画面の高さ。実際の表示から取れないときに使う
+    DEFAULT_SCREEN_LINES = 24
+
+    def _visible_lines(self, terminal: QTextEdit) -> int:
+        """画面に見えているおおよその行数を返す。"""
+        from PyQt6.QtGui import QFontMetrics
+        try:
+            spacing = QFontMetrics(terminal.font()).lineSpacing()
+            height = terminal.viewport().height()
+            if spacing > 0 and height > 0:
+                return max(1, min(200, height // spacing))
+        except Exception:
+            pass
+        return self.DEFAULT_SCREEN_LINES
+
+    def _note_alt_screen(self, terminal: QTextEdit, params_str: str,
+                         command: str, cursor) -> None:
+        """代替画面への出入りを見て、入るときだけ案内を出す。
+
+        このターミナルは行を追記していく作りで、行・桁を指定して
+        描く仕組みを持たない。全画面アプリは画面のどこにでも書くので、
+        すべてが同じ場所に重なって出る。黙って崩れた画面を見せるより、
+        崩れる理由を伝えるほうがよい。
+        """
+        from PyQt6.QtGui import QTextCursor
+
+        codes = params_str[1:].split(';') if len(params_str) > 1 else []
+        if not any(c in self.ALT_SCREEN_MODES for c in codes):
+            return
+        if command == 'h':
+            if getattr(terminal, "_alt_screen", False):
+                return          # すでに案内済み。何度も出さない
+            terminal._alt_screen = True
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            cursor.insertText('\n' + self.ALT_SCREEN_NOTICE
+                              + '\n')
+        elif command == 'l':
+            terminal._alt_screen = False
+
     def _render_cursor_for(self, terminal: QTextEdit):
         """機器出力の書き込み位置を返す（ユーザーの選択とは独立）
 
@@ -635,7 +683,9 @@ class TerminalWidget(QWidget):
                         # SGR の ':' 区切り副パラメータなど。移動・消去系では起きない
                         num, mode = 1, 0
                     if private:
-                        pass                    # 解釈しない（読み飛ばすだけ）
+                        # 解釈はしないが、全画面アプリへの出入りだけは見る
+                        self._note_alt_screen(terminal, params_str,
+                                              command, cursor)
                     elif command == 'D':        # カーソル左
                         for _ in range(num):
                             cursor.movePosition(QTextCursor.MoveOperation.Left)
@@ -655,17 +705,32 @@ class TerminalWidget(QWidget):
                                                 QTextCursor.MoveMode.KeepAnchor)
                         cursor.removeSelectedText()
                     elif command == 'J':        # 画面の消去（NX-OS が行編集で使う）
-                        if mode == 1:           # 先頭からカーソルまで
+                        if mode == 2:           # 画面全体
+                            # 端末では「今見えている画面」を消す指示だが、
+                            # ここは追記していく文書で、画面という区切りが
+                            # 無い。消すとセッションの記録ごと失われ、
+                            # Linux で clear を打っただけでそれまでの
+                            # show 出力が全部消える。端末と同じように、
+                            # 上へ送り出して見えなくするだけにする。
+                            # ただし代替画面にいる間は、消す対象がその画面で
+                            # あってこちらの記録ではない。持っていないので
+                            # 何もしない（送り出すと、直前に出した案内まで
+                            # 流れて読めなくなる）。
+                            if not getattr(terminal, "_alt_screen", False):
+                                cursor.movePosition(
+                                    QTextCursor.MoveOperation.End)
+                                cursor.insertText(
+                                    '\n' * self._visible_lines(terminal))
+                        elif mode == 3:         # スクロールバックの消去
+                            pass                # 記録は消さない
+                        elif mode == 1:         # 先頭からカーソルまで
                             cursor.movePosition(QTextCursor.MoveOperation.Start,
                                                 QTextCursor.MoveMode.KeepAnchor)
-                        elif mode == 2:         # 画面全体
-                            cursor.movePosition(QTextCursor.MoveOperation.Start)
-                            cursor.movePosition(QTextCursor.MoveOperation.End,
-                                                QTextCursor.MoveMode.KeepAnchor)
+                            cursor.removeSelectedText()
                         else:                   # 0: カーソルから末尾まで
                             cursor.movePosition(QTextCursor.MoveOperation.End,
                                                 QTextCursor.MoveMode.KeepAnchor)
-                        cursor.removeSelectedText()
+                            cursor.removeSelectedText()
                     i += len(match.group())
                     continue
                 # OSC: ESC ] ... 終端は BEL または ST(ESC \)。ウィンドウタイトル等
