@@ -169,6 +169,95 @@ class Screen(object):
             self._move(_param(p, 0, 1) - 1, self.cursor_col)
         elif f in "Hf":
             self._move(_param(p, 0, 1) - 1, _param(p, 1, 1) - 1)
+        elif f == "J":
+            self._erase_display(_param(p, 0, 0))
+        elif f == "K":
+            self._erase_line(_param(p, 0, 0))
+        elif f == "L":
+            self._shift_lines(n, insert=True)
+        elif f == "M":
+            self._shift_lines(n, insert=False)
+        elif f == "@":
+            self._shift_chars(n, insert=True)
+        elif f == "P":
+            self._shift_chars(n, insert=False)
+        elif f == "X":
+            self._erase_chars(n)
+        elif f == "S":
+            self._scroll_up(n)
+        elif f == "T":
+            self._scroll_down(n)
+        elif f == "r":
+            self._set_margins(p)
         elif f == "m":
             self.attr = apply_sgr(self.attr, p)
         # 知らない最終文字は黙って捨てる (画面を壊さないことが仕事)
+
+    def _set_margins(self, p):
+        top = _param(p, 0, 1) - 1
+        bottom = _param(p, 1, self.rows) - 1
+        if 0 <= top < bottom <= self.rows - 1:
+            self.scroll_top = top
+            self.scroll_bottom = bottom
+            self._move(0, 0)            # DECSTBM はカーソルも戻す
+
+    def _erase_display(self, mode):
+        if mode == 0:
+            self._erase_line(0)
+            rng = range(self.cursor_row + 1, self.rows)
+        elif mode == 1:
+            self._erase_line(1)
+            rng = range(0, self.cursor_row)
+        else:                           # 2 と 3。履歴は消さない
+            rng = range(0, self.rows)
+        for r in rng:
+            self.lines[r] = self._blank_line()
+        self.dirty.update(rng)
+        self._pending_wrap = False
+
+    def _erase_line(self, mode):
+        line = self.lines[self.cursor_row]
+        if mode == 0:
+            rng = range(self.cursor_col, self.cols)
+        elif mode == 1:
+            rng = range(0, self.cursor_col + 1)
+        else:
+            rng = range(0, self.cols)
+        for c in rng:
+            line[c] = BLANK
+        self.dirty.add(self.cursor_row)
+        self._pending_wrap = False
+
+    def _shift_lines(self, n, insert):
+        """IL / DL。スクロール範囲の中でだけ効く。"""
+        if not self.scroll_top <= self.cursor_row <= self.scroll_bottom:
+            return
+        for _ in range(n):
+            if insert:
+                self.lines.pop(self.scroll_bottom)
+                self.lines.insert(self.cursor_row, self._blank_line())
+            else:
+                self.lines.pop(self.cursor_row)
+                self.lines.insert(self.scroll_bottom, self._blank_line())
+        self.dirty.update(range(self.cursor_row, self.scroll_bottom + 1))
+        self._pending_wrap = False
+
+    def _shift_chars(self, n, insert):
+        """ICH / DCH。行の右端は詰まる・押し出される。"""
+        line = self.lines[self.cursor_row]
+        for _ in range(n):
+            if insert:
+                line.pop()
+                line.insert(self.cursor_col, BLANK)
+            else:
+                line.pop(self.cursor_col)
+                line.append(BLANK)
+        self.dirty.add(self.cursor_row)
+        self._pending_wrap = False
+
+    def _erase_chars(self, n):
+        line = self.lines[self.cursor_row]
+        for c in range(self.cursor_col, min(self.cols, self.cursor_col + n)):
+            line[c] = BLANK
+        self.dirty.add(self.cursor_row)
+        self._pending_wrap = False

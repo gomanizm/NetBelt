@@ -110,6 +110,85 @@ class CursorMovementTest(unittest.TestCase):
         self.assertEqual(s.text()[0], "ab_def")
 
 
+class ErasingTest(unittest.TestCase):
+    def test_erase_to_end_of_line(self):
+        s = feed(Screen(), "abcdef\x1b[4G\x1b[K")
+        self.assertEqual(s.text()[0], "abc")
+
+    def test_erase_to_start_of_line(self):
+        s = feed(Screen(), "abcdef\x1b[3G\x1b[1K")
+        self.assertEqual(s.text()[0], "   def")
+
+    def test_erase_whole_line_leaves_the_cursor(self):
+        s = feed(Screen(), "abcdef\x1b[2KX")
+        self.assertEqual(s.text()[0], "      X")
+
+    def test_erase_below(self):
+        s = feed(Screen(), "aaa\r\nbbb\r\nccc\x1b[2;2H\x1b[J")
+        self.assertEqual(s.text()[:3], ["aaa", "b", ""])
+
+    def test_erase_a_run_of_characters(self):
+        s = feed(Screen(), "abcdef\x1b[2G\x1b[3X")
+        self.assertEqual(s.text()[0], "a   ef")
+
+    def test_erasing_the_display_keeps_the_history(self):
+        s = feed(Screen(), "\r\n".join("l%d" % i for i in range(30)))
+        before = len(s.history)
+        feed(s, "\x1b[2J")
+        self.assertEqual(s.text(), [""] * 24)
+        self.assertEqual(len(s.history), before)
+
+    def test_erased_cells_are_undressed(self):
+        s = feed(Screen(), "\x1b[7mabc\x1b[2K")
+        self.assertEqual(s.lines[0][1], (" ", DEFAULT))
+
+
+class EditingTest(unittest.TestCase):
+    def test_inserted_lines_push_the_rest_down(self):
+        s = feed(Screen(), "aaa\r\nbbb\r\nccc\x1b[2;1H\x1b[L")
+        self.assertEqual(s.text()[:4], ["aaa", "", "bbb", "ccc"])
+
+    def test_deleted_lines_pull_the_rest_up(self):
+        s = feed(Screen(), "aaa\r\nbbb\r\nccc\x1b[2;1H\x1b[M")
+        self.assertEqual(s.text()[:3], ["aaa", "ccc", ""])
+
+    def test_inserted_chars_push_the_line_right(self):
+        s = feed(Screen(), "abcdef\x1b[3G\x1b[2@")
+        self.assertEqual(s.text()[0], "ab  cdef")
+
+    def test_deleted_chars_pull_the_line_left(self):
+        s = feed(Screen(), "abcdef\x1b[3G\x1b[2P")
+        self.assertEqual(s.text()[0], "abef")
+
+    def test_the_line_stays_exactly_as_wide(self):
+        s = feed(Screen(), "abc\x1b[1;1H\x1b[3@")
+        self.assertEqual(len(s.lines[0]), 80)
+        feed(s, "\x1b[3P")
+        self.assertEqual(len(s.lines[0]), 80)
+
+
+class ScrollRegionTest(unittest.TestCase):
+    def test_decstbm_confines_the_scroll(self):
+        s = Screen()
+        feed(s, "top\x1b[2;3r")         # 2..3 行目だけがスクロールする
+        feed(s, "\x1b[3;1Haaa\r\nbbb\r\nccc")
+        self.assertEqual(s.text()[:4], ["top", "bbb", "ccc", ""])
+
+    def test_a_partial_region_never_feeds_history(self):
+        s = Screen()
+        feed(s, "\x1b[2;3r\x1b[3;1H" + "\r\n".join("x%d" % i
+                                                   for i in range(10)))
+        self.assertEqual(len(s.history), 0)
+
+    def test_decstbm_homes_the_cursor(self):
+        s = feed(Screen(), "\x1b[5;5H\x1b[2;10rX")
+        self.assertEqual(s.text()[0], "X")
+
+    def test_nonsense_margins_are_refused(self):
+        s = feed(Screen(), "\x1b[7;3r")
+        self.assertEqual((s.scroll_top, s.scroll_bottom), (0, 23))
+
+
 class AttributeTest(unittest.TestCase):
     def test_sgr_travels_with_the_characters(self):
         s = feed(Screen(), "a\x1b[7mb\x1b[mc")
