@@ -30,6 +30,7 @@ Dcs = collections.namedtuple("Dcs", "private params intermediate final text")
 
 MAX_PARAMS = 256      # 暴走した列でメモリを食わないための上限
 MAX_STRING = 4096
+MAX_INTERMEDIATE = 32
 
 
 class Parser(object):
@@ -107,7 +108,8 @@ class Parser(object):
                 if code < 0x20:
                     out.append(Ctrl(ch))
                 elif code <= 0x2F:
-                    self._intermediate += ch
+                    if len(self._intermediate) < MAX_INTERMEDIATE:
+                        self._intermediate += ch
                     self.state = ESCAPE_INTERMEDIATE
                 elif ch == "[":
                     self._clear()
@@ -132,7 +134,8 @@ class Parser(object):
                 if code < 0x20:
                     out.append(Ctrl(ch))
                 elif code <= 0x2F:
-                    self._intermediate += ch
+                    if len(self._intermediate) < MAX_INTERMEDIATE:
+                        self._intermediate += ch
                 elif code <= 0x7E:
                     out.append(Esc(self._intermediate, ch))
                     self.state = GROUND
@@ -145,7 +148,8 @@ class Parser(object):
                 if code < 0x20:
                     out.append(Ctrl(ch))
                 elif code <= 0x2F:
-                    self._intermediate += ch
+                    if len(self._intermediate) < MAX_INTERMEDIATE:
+                        self._intermediate += ch
                     self.state = CSI_INTERMEDIATE
                 elif ch == ":":
                     self.state = CSI_IGNORE
@@ -168,7 +172,8 @@ class Parser(object):
                 if code < 0x20:
                     out.append(Ctrl(ch))
                 elif code <= 0x2F:
-                    self._intermediate += ch
+                    if len(self._intermediate) < MAX_INTERMEDIATE:
+                        self._intermediate += ch
                     self.state = CSI_INTERMEDIATE
                 elif (0x30 <= code <= 0x39 or ch == ";") and \
                         len(self._params) < MAX_PARAMS:
@@ -188,7 +193,8 @@ class Parser(object):
                 if code < 0x20:
                     out.append(Ctrl(ch))
                 elif code <= 0x2F:
-                    self._intermediate += ch
+                    if len(self._intermediate) < MAX_INTERMEDIATE:
+                        self._intermediate += ch
                 elif code <= 0x3F:
                     self.state = CSI_IGNORE
                 elif code <= 0x7E:
@@ -226,7 +232,8 @@ class Parser(object):
                 if code < 0x20:
                     pass
                 elif code <= 0x2F:
-                    self._intermediate += ch
+                    if len(self._intermediate) < MAX_INTERMEDIATE:
+                        self._intermediate += ch
                     self.state = DCS_INTERMEDIATE
                 elif ch == ":":
                     self.state = DCS_IGNORE
@@ -250,7 +257,8 @@ class Parser(object):
                 if code < 0x20:
                     pass
                 elif code <= 0x2F:
-                    self._intermediate += ch
+                    if len(self._intermediate) < MAX_INTERMEDIATE:
+                        self._intermediate += ch
                     self.state = DCS_INTERMEDIATE
                 elif (0x30 <= code <= 0x39 or ch == ";") and \
                         len(self._params) < MAX_PARAMS:
@@ -271,7 +279,8 @@ class Parser(object):
                 if code < 0x20:
                     pass
                 elif code <= 0x2F:
-                    self._intermediate += ch
+                    if len(self._intermediate) < MAX_INTERMEDIATE:
+                        self._intermediate += ch
                 elif code <= 0x3F:
                     self.state = DCS_IGNORE
                 elif code <= 0x7E:

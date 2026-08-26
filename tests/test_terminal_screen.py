@@ -7,6 +7,7 @@
 import io
 import os
 import sys
+import time
 import unittest
 
 sys.path.insert(0, "src")
@@ -192,6 +193,49 @@ class ScrollRegionTest(unittest.TestCase):
         self.assertEqual((s.scroll_top, s.scroll_bottom), (0, 23))
 
 
+class RunawayParameterTest(unittest.TestCase):
+    """暴走したパラメータで画面処理が止まらなくならないこと。
+
+    パラメータは 256 桁まで書けるので、頭打ちにしないと 10^250 回の
+    ループになる。apply は GUI スレッドから呼ばれるので、そうなると
+    強制終了以外に戻る手立てが無い。
+    """
+    HUGE = "9" * 200
+
+    def test_every_repeating_command_finishes_at_once(self):
+        for final in "STLM@PX":
+            with self.subTest(command=final):
+                s = Screen()
+                start = time.time()
+                feed(s, "\x1b[" + self.HUGE + final)
+                self.assertLess(time.time() - start, 1.0,
+                                "ESC[<巨大数>%s が終わらない" % final)
+
+    def test_a_huge_scroll_does_not_flood_the_history(self):
+        s = Screen()
+        feed(s, "\x1b[" + self.HUGE + "S")
+        self.assertLessEqual(len(s.take_new_history()), s.rows)
+
+    def test_the_result_still_matches_a_full_screen_operation(self):
+        # 頭打ちにしても、意味は「画面全部」のままであること
+        huge = feed(Screen(), "a\r\nb\r\nc\x1b[" + self.HUGE + "S")
+        full = feed(Screen(), "a\r\nb\r\nc\x1b[24S")
+        self.assertEqual(huge.text(), full.text())
+
+
+class ScrollbackEraseTest(unittest.TestCase):
+    def test_ed3_leaves_the_visible_screen_alone(self):
+        """ESC[3J は履歴を消す命令で、見えている画面には触らない。
+
+        NetBelt は記録を消さない方針なので何もしない。画面まで消すと
+        clear -x を打っただけで表示が飛ぶ。
+        """
+        s = feed(Screen(), "visible text")
+        feed(s, "\x1b[3J")
+        self.assertEqual(s.text()[0], "visible text")
+        self.assertEqual(len(s.history), 0)
+
+
 class AttributeTest(unittest.TestCase):
     def test_sgr_travels_with_the_characters(self):
         s = feed(Screen(), "a\x1b[7mb\x1b[mc")
@@ -292,10 +336,25 @@ class ResizeTest(unittest.TestCase):
         self.assertEqual(s.text()[0], "show version")
         self.assertEqual(len(s.lines[0]), 132)
 
-    def test_narrower_lines_are_cut_not_rewrapped(self):
+    def test_narrowing_wraps_instead_of_cutting(self):
+        """桁が狭くなっても一文字も捨てないこと。
+
+        以前は del line[cols:] で切り捨てており、窓を縮めるだけで
+        出力の末尾が永久に失われていた (実機試験で報告された)。
+        長い鍵や show 出力を読んでいる最中に窓を縮めると消える。
+        """
         s = feed(Screen(), "0123456789")
         s.set_size(24, 8)
-        self.assertEqual(s.text()[0], "01234567")
+        self.assertEqual(s.text()[:2], ["01234567", "89"])
+
+    def test_repeated_narrowing_still_keeps_everything(self):
+        key = "ssh-ed25519 " + "A" * 68 + " user@example.com"
+        s = Screen(24, 120)
+        feed(s, key)
+        for cols in (100, 80, 60, 40, 30):
+            s.set_size(24, cols)
+        self.assertEqual("".join(s.text()).replace(" ", ""),
+                         key.replace(" ", ""))
 
     def test_shrinking_rows_prefers_dropping_blank_bottom_lines(self):
         s = feed(Screen(), "keep me")
@@ -309,6 +368,16 @@ class ResizeTest(unittest.TestCase):
         self.assertEqual(len(s.history), 14)
         self.assertEqual(s.text()[0], "l14")
         self.assertEqual((s.cursor_row, s.cursor_col), (9, 3))
+
+    def test_the_screen_behind_an_alternate_screen_is_not_lost(self):
+        """vi を開いている間に窓を縮めても、裏のシェル画面を捨てないこと。"""
+        s = feed(Screen(), "\r\n".join("shell-%02d" % i for i in range(24)))
+        feed(s, "\x1b[?1049h")
+        s.set_size(10, 80)
+        feed(s, "\x1b[?1049l")
+        seen = everything(s)
+        for i in range(24):
+            self.assertIn("shell-%02d" % i, seen)
 
     def test_the_scroll_region_snaps_back_to_full(self):
         s = feed(Screen(), "\x1b[5;10r")

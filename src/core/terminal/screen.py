@@ -104,37 +104,88 @@ class Screen(object):
         return responses
 
     def set_size(self, rows, cols):
-        """端末の大きさを変える。内容は再折返ししない (実端末と同じ)。
+        """端末の大きさを変える。書かれた内容は一文字も捨てない。
 
-        行が縮むときは、まず下の空行を削り、足りなければ上の行を
-        履歴へ送る (書かれた行を黙って消さないため)。
+        桁が狭くなったら、はみ出す分は切らずに次の行へ送る (組み直し)。
+        切り捨てると、窓を縮めただけで出力の末尾が永久に失われる。
+        行が足りなくなった分は上から履歴へ送る。
+
+        代替画面 (vi 等) の中身だけは組み直さない。アプリはサイズ変更を
+        受けて描き直すので、組み直しても上書きされるだけ。ただし裏へ
+        退避しているメイン画面は、見えていなくても記録なので守る。
         """
         if (rows, cols) == (self.rows, self.cols) or rows < 1 or cols < 1:
             return
-        for line in self.lines + self._other:
+        main = self._other if self.alt_active else self.lines
+        alt = self.lines if self.alt_active else self._other
+
+        if self.alt_active:
+            cursor = self._saved_main[:2] if self._saved_main else (0, 0)
+        else:
+            cursor = (self.cursor_row, self.cursor_col)
+        reflowed, cursor = self._reflow(main, cols, cursor)
+
+        # 入りきらない分は、まず下の空行から捨てる。中身が無いので
+        # 捨てても記録は減らない。それでも余るときだけ上を履歴へ送る
+        while (len(reflowed) > rows and cursor[0] < len(reflowed) - 1
+               and all(c == BLANK for c in reflowed[-1])):
+            reflowed.pop()
+        while len(reflowed) > rows:
+            removed = reflowed.pop(0)
+            self.history.append(removed)
+            self._new_history.append(removed)
+            cursor = (max(0, cursor[0] - 1), cursor[1])
+        while len(reflowed) < rows:
+            reflowed.append([BLANK] * cols)
+
+        del alt[rows:]
+        for line in alt:
             del line[cols:]
             line.extend([BLANK] * (cols - len(line)))
-        while len(self.lines) > rows:
-            if (self.cursor_row < len(self.lines) - 1
-                    and all(c == BLANK for c in self.lines[-1])):
-                self.lines.pop()
-            else:
-                removed = self.lines.pop(0)
-                if not self.alt_active:
-                    self.history.append(removed)
-                    self._new_history.append(removed)
-                self.cursor_row = max(0, self.cursor_row - 1)
-        del self._other[rows:]
-        while len(self.lines) < rows:
-            self.lines.append([BLANK] * cols)
-        while len(self._other) < rows:
-            self._other.append([BLANK] * cols)
+        while len(alt) < rows:
+            alt.append([BLANK] * cols)
+
+        if self.alt_active:
+            self._other[:] = reflowed
+            if self._saved_main:
+                self._saved_main = (min(cursor[0], rows - 1),
+                                    min(cursor[1], cols - 1),
+                                    self._saved_main[2])
+        else:
+            self.lines[:] = reflowed
+            self.cursor_row = min(cursor[0], rows - 1)
+            self.cursor_col = min(cursor[1], cols - 1)
         self.rows, self.cols = rows, cols
         self.scroll_top, self.scroll_bottom = 0, rows - 1
         self.cursor_row = min(self.cursor_row, rows - 1)
         self.cursor_col = min(self.cursor_col, cols - 1)
         self._pending_wrap = False
         self.dirty = set(range(rows))
+
+    def _reflow(self, lines, cols, cursor):
+        """行の並びを cols 幅で組み直す。(新しい行, 新しいカーソル) を返す。"""
+        cursor_row, cursor_col = cursor
+        out = []
+        new_cursor = (0, 0)
+        for r, line in enumerate(lines):
+            cells = list(line)
+            end = len(cells)
+            while end and cells[end - 1] == BLANK:
+                end -= 1
+            if r == cursor_row:
+                end = max(end, cursor_col)      # カーソル手前の空白は残す
+            cells = cells[:end]
+            first = len(out)
+            if not cells:
+                out.append([BLANK] * cols)
+            else:
+                for i in range(0, len(cells), cols):
+                    chunk = cells[i:i + cols]
+                    chunk.extend([BLANK] * (cols - len(chunk)))
+                    out.append(chunk)
+            if r == cursor_row:
+                new_cursor = (first + cursor_col // cols, cursor_col % cols)
+        return out, new_cursor
 
     # ---- 印字と C0 -------------------------------------------------
 
@@ -215,6 +266,12 @@ class Screen(object):
         p = seq.params
         f = seq.final
         n = max(1, _param(p, 0, 1))
+        # 繰り返す命令の回数は、画面より大きくても意味を持たない。
+        # 頭打ちにしないと ESC[999999999S だけで画面処理が何十分も
+        # 回り、その間 GUI が固まる (パラメータは 256 桁まで書ける)。
+        # カーソル移動は _move が行桁で丸めるので、ここでは触らない
+        rows_n = min(n, self.rows)
+        cols_n = min(n, self.cols)
         if f == "A":
             limit = (self.scroll_top
                      if self.cursor_row >= self.scroll_top else 0)
@@ -243,19 +300,19 @@ class Screen(object):
         elif f == "K":
             self._erase_line(_param(p, 0, 0))
         elif f == "L":
-            self._shift_lines(n, insert=True)
+            self._shift_lines(rows_n, insert=True)
         elif f == "M":
-            self._shift_lines(n, insert=False)
+            self._shift_lines(rows_n, insert=False)
         elif f == "@":
-            self._shift_chars(n, insert=True)
+            self._shift_chars(cols_n, insert=True)
         elif f == "P":
-            self._shift_chars(n, insert=False)
+            self._shift_chars(cols_n, insert=False)
         elif f == "X":
-            self._erase_chars(n)
+            self._erase_chars(cols_n)
         elif f == "S":
-            self._scroll_up(n)
+            self._scroll_up(rows_n)
         elif f == "T":
-            self._scroll_down(n)
+            self._scroll_down(rows_n)
         elif f == "r":
             self._set_margins(p)
         elif f == "m":
@@ -306,6 +363,11 @@ class Screen(object):
                 self._switch_screen(on, with_cursor=(mode == 1049))
             elif mode == 7:
                 self.autowrap = on
+                if not on:
+                    # 右端で保留していた折り返しも一緒に捨てる。
+                    # 残すと、折り返しを切った直後の 1 文字だけが
+                    # 次の行へ流れる
+                    self._pending_wrap = False
             elif mode == 25:
                 self.cursor_visible = on
             elif mode == 1:
@@ -341,6 +403,11 @@ class Screen(object):
             self._move(0, 0)            # DECSTBM はカーソルも戻す
 
     def _erase_display(self, mode):
+        if mode == 3:
+            # ED 3 は履歴 (スクロールバック) を消す命令で、可視画面には
+            # 触らない。NetBelt はセッションの記録を消さない方針なので
+            # 何もしない。画面まで消すと clear -x で表示が飛ぶ
+            return
         # 画面全体が消えるとき (clear は ESC[H ESC[J、つまり home からの
         # mode 0 で来る) は、消す前に見えていた中身を履歴へ送る。
         # clear でセッションの記録を失わない、という v1.1.1 の方針
