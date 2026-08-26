@@ -70,6 +70,27 @@ class SSHConnection(QObject):
                 pass
         client.set_missing_host_key_policy(_TofuHostKeyPolicy(known_hosts_path))
 
+    def _auth_failure_message(self) -> str:
+        """認証失敗の理由を、実際に使った手段に合わせて返す。
+
+        すべてを「ユーザー名またはパスワードが間違っています」と報告すると、
+        鍵で認証しているときに、存在しないパスワードを疑わせることになる。
+        ユーザー名が空のときは機器側ではなく設定の問題なので、そう名指しする。
+        """
+        if not self.username:
+            return ("認証失敗: ユーザー名が設定されていません。"
+                    "デバイスの設定でユーザー名を入力してください。")
+        if self.ssh_key:
+            # 鍵を指定したときはパスワードを一切使わない。入力されて
+            # いると「パスワードも試された」と誤解されるので、そう書く。
+            note = ("なお、鍵を指定しているためパスワードは使っていません。"
+                    if self.password else "")
+            return ("認証失敗: 指定した鍵がユーザー %s では受け付けられません"
+                    "でした。機器側の authorized_keys にこの鍵の公開鍵が"
+                    "登録されているか、ユーザー名が合っているかを"
+                    "確認してください。%s" % (self.username, note))
+        return "認証失敗: ユーザー名またはパスワードが間違っています"
+
     def connect(self) -> bool:
         """
         SSH接続を開始
@@ -96,22 +117,43 @@ class SSHConnection(QObject):
             # パスワードまたは秘密鍵で認証
             if self.ssh_key:
                 try:
-                    # 鍵タイプを自動判別（RSA, Ed25519, ECDSA, DSA に対応）
+                    # 鍵タイプを自動判別。paramiko 4.0.0 で DSA(DSSKey) は
+                    # 削除されているので並べない。存在しない属性を並べると
+                    # リストを組む時点で AttributeError になり、正常な鍵でも
+                    # 「読み込みエラー」で接続できなくなる。
                     key = None
                     key_errors = []
-                    for key_class in [paramiko.RSAKey, paramiko.Ed25519Key, paramiko.ECDSAKey, paramiko.DSSKey]:
+                    needs_passphrase = False
+                    for key_class in (paramiko.RSAKey, paramiko.Ed25519Key,
+                                      paramiko.ECDSAKey):
                         try:
                             key = key_class.from_private_key_file(self.ssh_key)
                             break
+                        except paramiko.PasswordRequiredException as e:
+                            # 例外の文言に password の語が無いので型で覚えておく
+                            needs_passphrase = True
+                            key_errors.append(f"{key_class.__name__}: {e}")
                         except Exception as e:
                             key_errors.append(f"{key_class.__name__}: {e}")
 
                     if key is None:
-                        self.error_occurred.emit(f"秘密鍵の読み込みエラー: 対応する鍵タイプが見つかりません")
+                        # 集めた理由を捨てない。特にパスフレーズ付きの鍵は
+                        # 「対応する鍵タイプが無い」と出ると原因が分からない。
+                        if needs_passphrase:
+                            self.error_occurred.emit(
+                                "秘密鍵の読み込みエラー: この鍵はパスフレーズで保護されています。"
+                                "パスフレーズ無しの鍵を指定してください。")
+                        else:
+                            self.error_occurred.emit(
+                                "秘密鍵の読み込みエラー: 対応する鍵タイプが見つかりません。\n"
+                                + "\n".join(key_errors))
                         return False
 
                     connect_kwargs['pkey'] = key
-                    connect_kwargs['look_for_keys'] = True
+                    # 指定された鍵だけを使う。True にすると、その鍵が拒否された
+                    # ときに ~/.ssh の別の鍵で認証が通ってしまい、利用者が
+                    # 意図したのと違う身元で接続することになる。
+                    connect_kwargs['look_for_keys'] = False
                 except Exception as e:
                     self.error_occurred.emit(f"秘密鍵の読み込みエラー: {str(e)}")
                     return False
@@ -139,7 +181,7 @@ class SSHConnection(QObject):
             return True
             
         except paramiko.AuthenticationException:
-            self.error_occurred.emit("認証失敗: ユーザー名またはパスワードが間違っています")
+            self.error_occurred.emit(self._auth_failure_message())
             return False
         except paramiko.BadHostKeyException:
             self.error_occurred.emit(

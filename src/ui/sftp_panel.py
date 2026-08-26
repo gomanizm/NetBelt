@@ -10,6 +10,7 @@ from PyQt6.QtCore import Qt, QModelIndex, pyqtSignal
 from PyQt6.QtGui import QStandardItemModel, QStandardItem, QIcon, QAction, QDragEnterEvent, QDropEvent
 from typing import Optional
 from core.sftp_manager import SFTPManager
+from ui import theme
 
 
 class SFTPPanel(QWidget):
@@ -97,18 +98,39 @@ class SFTPPanel(QWidget):
         raw = self.config_manager.get_server_settings("sftp") if self.config_manager else {}
         return self.normalize_sftp_settings(raw)[key]
     
+    # 接続先が無いときの表示
+    def _band_style(self, bold: bool = False) -> str:
+        return theme.band_style(self, bold=bold)
+
+    def _hint_style(self) -> str:
+        return theme.dim_style(self, padding="4px")
+
+    NO_TARGET_TEXT = "接続先: なし"
+
+    # 未接続のときに出す案内。接続すると消す。
+    HINT_TEXT = (
+        "ターミナルで機器へ SSH 接続すると、このパネルが使えるようになります。\n"
+        "SSH で入れても、機器が SFTP に対応していない場合は使えません。"
+    )
+
     def _init_ui(self):
         """UIを初期化"""
         layout = QVBoxLayout(self)
         layout.setContentsMargins(5, 5, 5, 5)
         
+        # 接続先の明示。ツールバーより上に置く。どの機器を相手にしているかは、
+        # ファイルを落とす前に必ず目に入るべき情報。
+        self.target_label = QLabel(self.NO_TARGET_TEXT)
+        self.target_label.setStyleSheet(self._band_style(bold=True))
+        layout.addWidget(self.target_label)
+
         # ツールバー
         toolbar = self._create_toolbar()
         layout.addWidget(toolbar)
         
         # 現在のパス表示
         self.path_label = QLabel("接続されていません")
-        self.path_label.setStyleSheet("background-color: #f0f0f0; padding: 5px; border: 1px solid #ccc;")
+        self.path_label.setStyleSheet(self._band_style())
         layout.addWidget(self.path_label)
         
         # ファイルリストビュー
@@ -139,6 +161,13 @@ class SFTPPanel(QWidget):
         # ステータスラベル
         self.status_label = QLabel("")
         layout.addWidget(self.status_label)
+
+        # 使い方の案内。このパネルはターミナルの SSH セッションに相乗りする
+        # 設計で、単独で接続する手段が無い。黙っていて分かるものではない。
+        self.hint_label = QLabel(self.HINT_TEXT)
+        self.hint_label.setWordWrap(True)
+        self.hint_label.setStyleSheet(self._hint_style())
+        layout.addWidget(self.hint_label)
     
     def _create_toolbar(self) -> QToolBar:
         """ツールバーを作成"""
@@ -186,7 +215,30 @@ class SFTPPanel(QWidget):
         
         return toolbar
     
-    def set_sftp_manager(self, sftp_manager: SFTPManager, device_name: str = ""):
+    def _detach_manager(self):
+        """いま繋いでいるマネージャから、自分の接続だけを外す
+
+        引数なしの disconnect() はそのシグナルの全接続を外してしまい、
+        MainWindow が張ったエラー監視まで消える。スロットを指定して外す。
+
+        外さずに参照だけ捨てると、旧マネージャの遅れた通知で
+        空にしたはずのパネルが埋め直される。
+        """
+        if not self.sftp_manager:
+            return
+        for signal, slot in (
+            (self.sftp_manager.file_list_ready, self._update_file_list),
+            (self.sftp_manager.transfer_progress, self._update_progress),
+            (self.sftp_manager.transfer_complete, self._on_transfer_complete),
+            (self.sftp_manager.error_occurred, self._on_error),
+        ):
+            try:
+                signal.disconnect(slot)
+            except (TypeError, RuntimeError):
+                pass    # 繋がっていなければそれでよい
+
+    def set_sftp_manager(self, sftp_manager: SFTPManager, device_name: str = "",
+                         target: str = ""):
         """
         SFTPマネージャーを設定
         
@@ -194,17 +246,11 @@ class SFTPPanel(QWidget):
             sftp_manager: SFTPマネージャー
             device_name: デバイス名
         """
-        # 既存の接続を解除
-        if self.sftp_manager:
-            try:
-                self.sftp_manager.file_list_ready.disconnect()
-                self.sftp_manager.transfer_progress.disconnect()
-                self.sftp_manager.transfer_complete.disconnect()
-                self.sftp_manager.error_occurred.disconnect()
-            except Exception:
-                pass
+        # 既存の接続を解除（自分の分だけ）
+        self._detach_manager()
         
         self.sftp_manager = sftp_manager
+        self.hint_label.setVisible(False)
         # 接続先が変わるので、前の接続で観測した一覧は使えない
         self._current_entries = {}
         self._pending_upload_names = set()
@@ -216,13 +262,36 @@ class SFTPPanel(QWidget):
         self.sftp_manager.transfer_complete.connect(self._on_transfer_complete)
         self.sftp_manager.error_occurred.connect(self._on_error)
         
+        # どの機器を見ているかを出す。出さないと、送り先が違っても気づけない。
+        if target:
+            self.target_label.setText("接続先: %s (%s)" % (device_name, target))
+        elif device_name:
+            self.target_label.setText("接続先: %s" % device_name)
+        else:
+            self.target_label.setText(self.NO_TARGET_TEXT)
+        self._update_path_label(self.sftp_manager.current_path)
+
         # 初期ディレクトリ一覧を取得
         self.sftp_manager.list_directory()
     
+    def _update_path_label(self, path: str) -> None:
+        """パスの表示に機器名を添える"""
+        if self.current_device:
+            self.path_label.setText("%s: %s" % (self.current_device, path))
+        else:
+            self.path_label.setText("現在のパス: %s" % path)
+
     def clear(self):
-        """パネルをクリア"""
+        """パネルをクリア
+
+        旧マネージャの通知が遅れて届くと、空にしたはずのパネルが
+        旧機器の一覧で埋め直される。参照を捨てる前に接続を外す。
+        """
+        self._detach_manager()
         self.model.removeRows(0, self.model.rowCount())
         self.path_label.setText("接続されていません")
+        self.target_label.setText(self.NO_TARGET_TEXT)
+        self.hint_label.setVisible(True)
         self.status_label.setText("")
         self.progress_bar.setVisible(False)
         self.sftp_manager = None
@@ -256,8 +325,8 @@ class SFTPPanel(QWidget):
         
         # 現在のパスを表示
         if self.sftp_manager:
-            current_path = self.sftp_manager.get_current_path()
-            self.path_label.setText(f"現在のパス: {current_path}")
+            # ここで直接書くと、機器名つきの表示を消してしまう
+            self._update_path_label(self.sftp_manager.get_current_path())
         
         # ファイル/ディレクトリを追加
         for file_info in file_list:

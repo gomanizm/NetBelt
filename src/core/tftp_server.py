@@ -30,6 +30,10 @@ def _err(sock, addr, code, msg):
     sock.sendto(struct.pack("!HH", OP_ERROR, code) + msg.encode() + b"\x00", addr)
 
 
+class _ServerStopped(Exception):
+    """停止要求により転送を打ち切った（タイムアウトとは区別する）"""
+
+
 class TFTPServer:
     """低レベル TFTP サーバー（Qt 非依存）。on_event(kind, ip, payload) で通知。
     payload は transfer_started/progress/complete では (filename, total_or_done, ..., direction) のタプル、
@@ -45,6 +49,12 @@ class TFTPServer:
         self._sock = None
         self._thread = None
         self._running = False
+        # 「まだ起動していない」と「停止された」は別物。_running だけで
+        # 表すと、起動前の呼び出しを停止と誤認する。
+        self._stopping = False
+        # 進行中の転送スレッド。覚えないと stop() で止められない。
+        self._workers = []
+        self._workers_lock = threading.Lock()
         self._retries = 5      # タイムアウト時の再送回数
         self._timeout = 2.0    # 送受信タイムアウト秒
 
@@ -55,19 +65,39 @@ class TFTPServer:
         self._sock.bind(("0.0.0.0", self.port))
         self.port = self._sock.getsockname()[1]  # port=0 のとき実ポートを反映
         self._sock.settimeout(1.0)
+        self._stopping = False
         self._running = True
         self._thread = threading.Thread(target=self._serve, daemon=True)
         self._thread.start()
 
     def stop(self):
+        """待受と進行中の転送を止める。
+
+        待受ソケットは、待受スレッドが抜けたことを確かめてから閉じる。
+        recvfrom でブロック中のスレッドが使うハンドルを別スレッドから
+        解放するのは Windows では不正で、アクセス違反になる。
+        settimeout(1.0) があるので _running を落とせば1秒以内に抜ける。
+
+        転送スレッドも待つ。待たないと、停止したはずの後にファイルが
+        作られたり、終了時に書きかけのファイルが黙って切り詰められる。
+        """
+        self._stopping = True
         self._running = False
-        if self._sock:
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=3)   # 待受の1秒に対する余裕
+        with self._workers_lock:
+            workers = list(self._workers)
+        for worker in workers:
+            if worker.is_alive():
+                # 転送側は _timeout 秒で必ず戻ってくるので、その少し先まで待つ
+                worker.join(timeout=self._timeout + 2)
+        # 抜けきったと確認できたときだけ閉じる。まだ recvfrom の中に
+        # いるなら、閉じるより開いたままにしておく方が安全。
+        if self._sock and not (self._thread and self._thread.is_alive()):
             try:
                 self._sock.close()
             except Exception:
                 pass
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=2)
 
     def _serve(self):
         while self._running:
@@ -83,9 +113,24 @@ class TFTPServer:
             # RRQ/WRQ ごとにスレッドを起こす。重複要求（機器の再送。送信元ポートが毎回
             # 変わる個体もある）の敗者スレッドは、確立できなければ各ハンドラ内で黙って撤退する。
             if op == OP_WRQ:
-                threading.Thread(target=self._handle_wrq, args=(pkt, addr), daemon=True).start()
+                self._spawn(self._handle_wrq, pkt, addr)
             elif op == OP_RRQ:
-                threading.Thread(target=self._handle_rrq, args=(pkt, addr), daemon=True).start()
+                self._spawn(self._handle_rrq, pkt, addr)
+
+    def _spawn(self, handler, pkt, addr):
+        """転送スレッドを起こし、終わるまで覚えておく。"""
+        def run():
+            try:
+                handler(pkt, addr)
+            finally:
+                with self._workers_lock:
+                    if thread in self._workers:
+                        self._workers.remove(thread)
+
+        thread = threading.Thread(target=run, daemon=True)
+        with self._workers_lock:
+            self._workers.append(thread)
+        thread.start()
 
     @staticmethod
     def _parse_request(pkt):
@@ -125,7 +170,8 @@ class TFTPServer:
         except ValueError:
             _err(xs, addr, 2, "Access violation")
             xs.close()
-            self.on_event("error", addr[0], "path traversal blocked: %s" % filename)
+            self.on_event("protocol_error", addr[0],
+                          (filename, "パス外への書き込みを拒否", "upload"))
             return
         if not self.allow_upload:
             _err(xs, addr, 2, "Upload disabled")
@@ -152,6 +198,13 @@ class TFTPServer:
         try:
             retries = 0
             while True:
+                if self._stopping:
+                    # 停止された。ここまでに ACK した分は finally で確実に
+                    # 書き出す（放置すると終了時に黙って消える）
+                    if established:
+                        self.on_event("interrupted", addr[0],
+                                      (filename, "upload"))
+                    return
                 try:
                     data, a = xs.recvfrom(blksize + 4)
                     # RFC1350: 確立後は相手の TID(IP:port) が一致するものだけ受理する。
@@ -197,13 +250,15 @@ class TFTPServer:
                     xs.sendto(struct.pack("!HH", OP_ACK, block), addr)  # 重複 DATA へ再 ACK
             self.on_event("transfer_complete", addr[0], (filename, received, total, "upload"))
         except socket.timeout:
-            self.on_event("error", addr[0], "WRQ timeout: %s" % filename)
+            self.on_event("protocol_error", addr[0],
+                          (filename, "アップロードがタイムアウト", "upload"))
         except (OSError, struct.error) as e:
             try:
                 _err(xs, addr, 0, str(e))   # 可能ならクライアントへ ERROR 応答（未定義エラーコード0）
             except Exception:
                 pass                         # xs 自体が原因のエラーなら送信も失敗しうる。二次例外は無視
-            self.on_event("error", addr[0], "WRQ error: %s: %s" % (filename, e))
+            self.on_event("protocol_error", addr[0],
+                          (filename, "アップロード失敗: %s" % e, "upload"))
         finally:
             if f:
                 f.close()
@@ -213,6 +268,10 @@ class TFTPServer:
         """packet を送り、block=expect_block の ACK を待つ。来なければ最大 _retries 回まで再送。
         古い/重複 ACK は無視。全再送失敗で socket.timeout を送出（呼び出し側が中断処理）。"""
         for attempt in range(self._retries + 1):
+            # ここで見ないと、再送を繰り返すあいだ（最大 12 秒）停止に
+            # 気づかず、止めたあとも DATA を送り続けることになる。
+            if self._stopping:
+                raise _ServerStopped()
             xs.sendto(packet, addr)
             deadline_tries = 0
             while True:
@@ -244,11 +303,13 @@ class TFTPServer:
             target = _safe_join(self.root_dir, filename)
         except ValueError:
             _err(xs, addr, 2, "Access violation"); xs.close()
-            self.on_event("error", addr[0], "path traversal blocked: %s" % filename)
+            self.on_event("protocol_error", addr[0],
+                          (filename, "パス外への書き込みを拒否", "download"))
             return
         if not self.allow_download or not os.path.isfile(target):
             _err(xs, addr, 1, "File not found"); xs.close()
-            self.on_event("error", addr[0], "RRQ not found: %s" % filename); return
+            self.on_event("protocol_error", addr[0],
+                          (filename, "要求されたファイルがありません", "download")); return
         neg = self._neg_options(opts)
         if "tsize" in neg:
             neg["tsize"] = str(os.path.getsize(target))  # 実サイズを返す
@@ -266,10 +327,17 @@ class TFTPServer:
                         self._send_and_wait_ack(xs, _oack(neg), addr, 0)  # OACKにACK(0)。再送付き
                     except socket.timeout:
                         return  # 未確立: 重複RRQの孤児。started/error とも出さない
+                    except _ServerStopped:
+                        return  # 未確立のまま停止。何も出さない
                     established = True
                     self.on_event("transfer_started", addr[0], (filename, total, "download"))
                 block = 1
                 while True:
+                    if self._stopping:
+                        if established:
+                            self.on_event("interrupted", addr[0],
+                                          (filename, "download"))
+                        return
                     chunk = f.read(blksize)
                     try:
                         self._send_and_wait_ack(xs, struct.pack("!HH", OP_DATA, block) + chunk, addr, block)
@@ -277,6 +345,11 @@ class TFTPServer:
                         if not established:
                             return  # block1 の ACK すら来ない = 孤児。黙って撤退
                         raise      # 確立後の中断は本物のエラー
+                    except _ServerStopped:
+                        if established:
+                            self.on_event("interrupted", addr[0],
+                                          (filename, "download"))
+                        return
                     if not established:
                         established = True
                         self.on_event("transfer_started", addr[0], (filename, total, "download"))
@@ -290,11 +363,13 @@ class TFTPServer:
                         break
             self.on_event("transfer_complete", addr[0], (filename, sent, total, "download"))
         except socket.timeout:
-            self.on_event("error", addr[0], "RRQ timeout: %s" % filename)
+            self.on_event("protocol_error", addr[0],
+                          (filename, "ダウンロードがタイムアウト", "download"))
         except (OSError, struct.error) as e:
             try: _err(xs, addr, 0, str(e))
             except Exception: pass
-            self.on_event("error", addr[0], "RRQ error: %s: %s" % (filename, e))
+            self.on_event("protocol_error", addr[0],
+                          (filename, "ダウンロード失敗: %s" % e, "download"))
         finally:
             xs.close()
 
@@ -315,6 +390,10 @@ class TFTPServerManager(QObject):
     transfer_started = pyqtSignal(str, str, int, str)       # ip, filename, total, direction
     transfer_progress = pyqtSignal(str, str, int, int, str)  # ip, filename, done, total, direction
     transfer_complete = pyqtSignal(str, str, int, int, str)  # ip, filename, done, total, direction
+    # 利用者が止めたことによる中断。エラーではないので別の口にする
+    transfer_interrupted = pyqtSignal(str, str, str)         # ip, filename, direction
+    # 転送ごとのプロトコル事象。サーバ障害ではないのでモーダルにはしない
+    protocol_event = pyqtSignal(str, str, str, str)          # ip, filename, reason, direction
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -368,21 +447,14 @@ class TFTPServerManager(QObject):
             self.error_occurred.emit("ファイアウォール設定エラー: %s" % e)
             return False, str(e)
 
-    @staticmethod
-    def _parse_timeout_filename(payload):
-        """"RRQ timeout: <fn>" / "WRQ timeout: <fn>" から <fn> を取り出す。非該当は None。"""
-        if isinstance(payload, str):
-            for prefix in ("RRQ timeout: ", "WRQ timeout: "):
-                if payload.startswith(prefix):
-                    return payload[len(prefix):]
-        return None
-
     def _on_event(self, kind, ip, payload):
         # 複数の handler スレッドから呼ばれるため _tx は _tx_lock で保護。emit は Qt が
         # スレッド安全（クロススレッドはキュー化）なのでロック外で行う。
         if kind == "transfer_started":
             fn, total, d = payload
-            key = (ip, fn)
+            # 方向まで含める。同じ機器が同名ファイルを送受で同時に扱うと、
+            # 方向を落としたキーでは片方が他方を潰す。
+            key = (ip, fn, d)
             with self._tx_lock:
                 first = key not in self._tx
                 if first:
@@ -394,12 +466,12 @@ class TFTPServerManager(QObject):
         elif kind == "transfer_progress":
             fn, done, total, d = payload
             with self._tx_lock:
-                active = (ip, fn) in self._tx
+                active = (ip, fn, d) in self._tx
             if active:
                 self.transfer_progress.emit(ip, fn, int(done), int(total), d)
         elif kind == "transfer_complete":
             fn, done, total, d = payload
-            key = (ip, fn)
+            key = (ip, fn, d)
             with self._tx_lock:
                 st = self._tx.get(key)
                 if st is not None:
@@ -408,21 +480,32 @@ class TFTPServerManager(QObject):
                     if st["count"] <= 0:
                         self._tx.pop(key, None)
             self.transfer_complete.emit(ip, fn, int(done), int(total), d)
-        elif kind == "error":
-            # 重複RRQ/WRQ の敗者が出す "…timeout: <fn>" は、その転送が成功済み or まだ
-            # 生存兄弟がいる間は握り潰す。全滅（兄弟ゼロ・未完了）なら本物の失敗として通す。
-            fn = self._parse_timeout_filename(payload)
+        elif kind == "interrupted":
+            # 利用者が止めたことによる中断。エラーではないので別の口へ流す。
+            # 併せて台帳から降ろす（transfer_complete が来ないため、
+            # 放置すると「進行中」の行が残る）。
+            filename, direction = payload
+            with self._tx_lock:
+                self._tx.pop((ip, filename, direction), None)
+            self.transfer_interrupted.emit(ip, filename, direction)
+        elif kind == "protocol_error":
+            # 重複RRQ/WRQ の敗者が出すタイムアウトは、その転送が成功済み or
+            # まだ生存兄弟がいる間は握り潰す。全滅（兄弟ゼロ・未完了）なら
+            # 本物の失敗として通す。
+            filename, reason, direction = payload
             suppress = False
-            if fn is not None:
-                key = (ip, fn)
+            if filename and "タイムアウト" in reason:
+                # 重複要求の敗者が出すタイムアウトを握り潰す。方向を見ないと、
+                # 同じ機器が同名ファイルを送受で同時に扱ったときに、
+                # 片方の失敗で反対方向まで巻き添えにする。
                 with self._tx_lock:
-                    st = self._tx.get(key)
+                    st = self._tx.get((ip, filename, direction))
                     if st is not None:
                         st["count"] -= 1
                         suppress = st["done"] or st["count"] > 0
                         if st["count"] <= 0:
-                            self._tx.pop(key, None)
+                            self._tx.pop((ip, filename, direction), None)
             if not suppress:
-                self.error_occurred.emit(payload)
+                self.protocol_event.emit(ip, filename, reason, direction)
         else:
             self.client_activity.emit(ip, payload)

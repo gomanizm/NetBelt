@@ -25,6 +25,7 @@ from core.sftp_manager import SFTPManager
 from core.syslog_receiver import SyslogReceiver
 from core.snmp_manager import SNMPManager
 from core.version_manager import VersionManager
+from ui import theme
 from typing import Dict, Union, Optional
 from datetime import datetime
 import os
@@ -308,6 +309,10 @@ class MainWindow(QMainWindow):
         # 右側: ターミナル
         self.terminal_widget = TerminalWidget()
         self.terminal_widget.tab_closed.connect(self._on_tab_closed)
+        self.terminal_widget.current_tab_changed.connect(
+            self._on_terminal_tab_changed)
+        self.terminal_widget.font_size_change_requested.connect(
+            self._on_font_size_wheel)
         self.terminal_widget.macro_execute_requested.connect(self._on_macro_execute_requested)
         self.terminal_widget.macro_settings_requested.connect(self._on_macro_settings_from_context)
         self.terminal_widget.keepalive_start_requested.connect(self._on_keepalive_start_requested)
@@ -444,6 +449,13 @@ class MainWindow(QMainWindow):
             
             # 新しい機器を追加
             if self.config_manager.add_device(new_group_name, new_device_data):
+                # 開いているタブの再接続は device_info の写しを見る。
+                # ここを更新しないと編集内容が届かず、古い接続情報のまま
+                # 繋がり続ける（存在しない鍵を指定しても、以前の鍵で
+                # 繋がってしまう）。名前を変えたときは古い写しを残さない。
+                if old_device_name in self.device_info:
+                    del self.device_info[old_device_name]
+                    self.device_info[new_device_data["name"]] = new_device_data
                 # ツリーを再読み込み
                 self._load_devices()
                 self.status_bar.showMessage(f"機器 '{new_device_data['name']}' を更新しました")
@@ -471,6 +483,9 @@ class MainWindow(QMainWindow):
         
         if reply == QMessageBox.StandardButton.Yes:
             if self.config_manager.remove_device(group_name, device_name):
+                # 消した機器の接続情報を残さない（残すと、開いたままの
+                # タブで Enter を押したときに消したはずの機器へ繋がる）
+                self.device_info.pop(device_name, None)
                 # ツリーを再読み込み
                 self._load_devices()
                 self.status_bar.showMessage(f"機器 '{device_name}' を削除しました")
@@ -793,7 +808,9 @@ class MainWindow(QMainWindow):
                         self.sftp_managers[device_name] = sftp_manager
                         # 現在アクティブなタブの場合はSFTPパネルに表示
                         if self.terminal_widget.get_current_tab_name() == device_name:
-                            self.sftp_panel.set_sftp_manager(sftp_manager, device_name)
+                            self.sftp_panel.set_sftp_manager(
+                                sftp_manager, device_name,
+                                self._describe_target(device_name))
                             # SFTPパネルを表示
                             self._select_tool_tab("sftp")
                         self.status_bar.showMessage(f"{device_name} に接続しました（SFTP有効）")
@@ -809,6 +826,34 @@ class MainWindow(QMainWindow):
                     print(f"  詳細:\n{traceback.format_exc()}")
                     # ステータスバーは通常の接続メッセージのまま
     
+    def _describe_target(self, device_name: str) -> str:
+        """機器の接続先（host:port）を返す。分からなければ空文字。
+
+        SFTP パネルに出して、送り先の取り違えに気づけるようにする。
+        """
+        conn = self.connections.get(device_name)
+        host = getattr(conn, "host", "")
+        if not host:
+            return ""
+        port = getattr(conn, "port", 22)
+        return host if port == 22 else "%s:%s" % (host, port)
+
+    def _on_terminal_tab_changed(self, device_name: str) -> None:
+        """表示中のターミナルに合わせて SFTP パネルを切り替える
+
+        追従しないと、別の機器のターミナルを見ながら、その1つ前に
+        繋いだ機器へファイルを送ることになる。パネルに機器名が出ない
+        ため、送り先が違うことに気づけない。
+        """
+        manager = self.sftp_managers.get(device_name)
+        if manager is not None:
+            if self.sftp_panel.current_device != device_name:
+                self.sftp_panel.set_sftp_manager(
+                    manager, device_name, self._describe_target(device_name))
+        elif self.sftp_panel.current_device:
+            # いま見ている機器に SFTP が無いなら、前の機器のものを残さない
+            self.sftp_panel.clear()
+
     def _find_group_of_device(self, device_name: str):
         """機器名から所属グループを返す(見つからなければNone)"""
         for group in self.config_manager.get_groups():
@@ -1144,6 +1189,14 @@ class MainWindow(QMainWindow):
         else:
             self.status_bar.showMessage(
                 f"フォントサイズ: {new_size}pt（設定ファイルへ保存できませんでした）")
+
+    def _on_font_size_wheel(self, delta: int):
+        """Ctrl+ホイールでのフォントサイズ変更
+
+        表示メニューの拡大/縮小と同じ経路を通す。QTextEdit の組込みズームは
+        config を通らず上下限も効かないため、こちらへ寄せている。
+        """
+        self._change_font_size(delta)
 
     def _on_font_size_increase(self):
         """フォントサイズを1pt大きくする"""
@@ -1538,11 +1591,13 @@ class MainWindow(QMainWindow):
             app_name = "NetBelt"
             repo = "gomanizm/NetBelt"
         
+        # 決め打ちの色は暗い配色で沈む。地に追従させる。
+        dim_colour = theme.dim(theme.surface(self)).name()
         info_text = f"""<h2>{app_name}</h2>
 <p><b>バージョン:</b> {version}</p>
 <p><b>リポジトリ:</b> <a href="https://github.com/{repo}">github.com/{repo}</a></p>
 <br>
-<p style="font-size: 10pt; color: #666;">
+<p style="font-size: 10pt; color: {dim_colour};">
 Copyright (C) 2026 NetBelt Contributors<br>
 <br>
 This program comes with ABSOLUTELY NO WARRANTY.<br>
@@ -1700,13 +1755,27 @@ for details.
             if file_age_hours > 24:
                 # 24時間以上前のファイルは削除済み（cleanup_old_updatesで）
                 continue
+
+            # いま動いているものより新しいときだけ勧める。版を見ないと、
+            # 手で入れ直したあとに残った古い ZIP でダウングレードさせてしまう。
+            pending_version = version_mgr.pending_version(zip_path)
+            if not pending_version:
+                print("[Main] 版が分からない更新ファイルのため無視します: "
+                      f"{zip_path}")
+                continue
+            if VersionManager.compare_versions(
+                    pending_version, version_mgr.CURRENT_VERSION) <= 0:
+                print("[Main] 現在のバージョン以下のため無視します: "
+                      f"{pending_version}")
+                continue
             
             # 適用確認ダイアログ
             reply = QMessageBox.question(
                 self,
                 "未適用の更新",
-                f"前回ダウンロードした更新（{file_age_hours:.0f}時間前）が\n"
-                "まだ適用されていません。\n\n"
+                f"前回ダウンロードした更新 v{pending_version}"
+                f"（{file_age_hours:.0f}時間前）がまだ適用されていません。\n"
+                f"現在のバージョンは v{version_mgr.CURRENT_VERSION} です。\n\n"
                 "今すぐ更新を適用しますか？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No
@@ -1741,8 +1810,14 @@ for details.
         
         try:
             import subprocess
+            # cmd はコンマと等号も引数の区切りとして扱うが、Python の
+            # リスト渡しは空白を含む引数しか引用符で包まない。インストール
+            # 先に , や = があると updater 側で %1 が途中で切れ、更新が
+            # 当たらないまま終わる。自分で包んでコマンド行として渡す。
+            command = '"{}" "{}" "{}"'.format(
+                updater_path, zip_path, app_path)
             subprocess.Popen(
-                [updater_path, zip_path, app_path],
+                command,
                 creationflags=subprocess.CREATE_NEW_CONSOLE
             )
             

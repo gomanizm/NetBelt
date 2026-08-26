@@ -1,6 +1,7 @@
 from PyQt6.QtWidgets import QDialog, QVBoxLayout, QLabel, QPushButton, QHBoxLayout
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer
 from datetime import datetime
+from ui import theme
 
 
 class LogRecordingDialog(QDialog):
@@ -37,7 +38,7 @@ class LogRecordingDialog(QDialog):
         # ファイルパスラベル
         path_label = QLabel(f"保存先: {self.file_path}")
         path_label.setWordWrap(True)
-        path_label.setStyleSheet("color: gray; font-size: 9pt;")
+        path_label.setStyleSheet(theme.dim_style(self, font_size="9pt"))
         layout.addWidget(path_label)
         
         # 経過時間ラベル
@@ -50,7 +51,8 @@ class LogRecordingDialog(QDialog):
             "※ ログは受信したデータがリアルタイムで保存されます。\n"
             "※ 記録を停止するには、下のボタンをクリックしてください。"
         )
-        note_label.setStyleSheet("color: #666; font-size: 9pt; margin-top: 10px;")
+        note_label.setStyleSheet(
+            theme.dim_style(self, font_size="9pt") + " margin-top: 10px;")
         note_label.setWordWrap(True)
         layout.addWidget(note_label)
         

@@ -15,7 +15,7 @@ try:
     from __version__ import __version__, GITHUB_REPO, APP_NAME
 except ImportError:
     # フォールバック
-    __version__ = "1.1.0"
+    __version__ = "1.1.1"
     GITHUB_REPO = "gomanizm/NetBelt"
     APP_NAME = "NetBelt"
 
@@ -118,27 +118,30 @@ class VersionManager:
             
             # ダウンロードURLを取得（Windows 64bit用のZIPを探す）
             download_url = None
+            download_name = None
             assets = data.get('assets', [])
             
             for asset in assets:
                 name = asset.get('name', '').lower()
                 if 'windows' in name and name.endswith('.zip'):
                     download_url = asset.get('url')  # APIのURLを使用（プライベートリポジトリ対応）
+                    download_name = asset.get('name', '')
                     break
             
-            # assetsが見つからない場合は、最初のZIPファイルを使用
-            if not download_url and assets:
-                for asset in assets:
-                    if asset.get('name', '').endswith('.zip'):
-                        download_url = asset.get('url')  # APIのURLを使用
-                        break
+            # Windows 向けの ZIP が無ければ何も選ばない。以前は「最初の ZIP」へ
+            # 落ちていたが、実行可能物でない ZIP を掴む余地を残すだけで、
+            # 見つからないことは呼び出し側が扱える。
             
-            # 併せて置かれるチェックサムファイルを探す
+            # 選んだ ZIP に対応する控えを探す。「最初の .sha256」を取ると、
+            # asset が1つ増えただけで別物を掴み、照合が必ず外れて自動更新が
+            # 黙って止まる。
             sha256_url = None
-            for asset in assets:
-                if asset.get('name', '').lower().endswith('.sha256'):
-                    sha256_url = asset.get('url')
-                    break
+            if download_name:
+                wanted = (download_name + '.sha256').lower()
+                for asset in assets:
+                    if asset.get('name', '').lower() == wanted:
+                        sha256_url = asset.get('url')
+                        break
 
             return {
                 'available': is_newer,
@@ -204,6 +207,7 @@ class VersionManager:
         url: str,
         progress_callback: Optional[Callable[[int, int, int], None]] = None,
         sha256_url: Optional[str] = None,
+        version: Optional[str] = None,
         cancel_check: Optional[Callable[[], bool]] = None
     ) -> Optional[str]:
         """
@@ -293,6 +297,14 @@ class VersionManager:
             self._discard(zip_path)
             os.replace(part_path, zip_path)
             try:
+                # 版も控える。控えないと、次回起動時に「これは今より新しいか」を
+                # 判断できず、古い ZIP の適用を勧めてしまう。
+                if version:
+                    try:
+                        with open(zip_path + '.version', 'w', encoding='ascii') as vf:
+                            vf.write(str(version))
+                    except Exception:
+                        pass
                 with open(zip_path + '.sha256', 'w', encoding='ascii') as f:
                     f.write(actual.lower())
             except Exception as e:
@@ -304,6 +316,15 @@ class VersionManager:
             print(f"[VersionManager] ダウンロードエラー: {e}")
             return None
     
+    @staticmethod
+    def pending_version(zip_path: str) -> Optional[str]:
+        """ダウンロード時に控えた版を返す（無ければ None）"""
+        try:
+            with open(zip_path + '.version', encoding='ascii') as f:
+                return f.read().strip() or None
+        except Exception:
+            return None
+
     def is_verified_update(self, zip_path: str) -> bool:
         """適用前に、ダウンロード時の検証を通ったファイルかを確かめる。
 

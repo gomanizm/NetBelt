@@ -39,7 +39,10 @@ class TerminalEscapeTest(unittest.TestCase):
         self.assertEqual(self._screen(ESC + "[?2004lDONE"), "DONE")
 
     def test_other_private_modes_are_not_printed(self):
-        for seq in ("[?25l", "[?25h", "[?1049h", "[?1h"):
+        # 代替画面（?1049 / ?1047 / ?47）は読み飛ばさず、全画面アプリに
+        # 入ったことを案内するようになったので、ここでは扱わない。
+        # そちらは test_terminal_fullscreen.py が見る。
+        for seq in ("[?25l", "[?25h", "[?1h"):
             with self.subTest(seq=seq):
                 self.assertEqual(self._screen(ESC + seq + "X"), "X")
 

@@ -22,10 +22,13 @@ class DownloadThread(QThread):
     download_failed = pyqtSignal(str)  # エラーメッセージ
     
     def __init__(self, url: str, github_token: str = None, parent=None,
-                 sha256_url: str = None):
+                 sha256_url: str = None, version: str = None):
         super().__init__(parent)
         self.url = url
         self.sha256_url = sha256_url
+        # ダウンロードした ZIP の傍らへ控える版。次回起動時に
+        # 「これは今より新しいか」を判断するのに要る。
+        self.version = version
         self._cancelled = False
         self.version_mgr = VersionManager(github_token=github_token)
     
@@ -36,6 +39,7 @@ class DownloadThread(QThread):
                 self.url,
                 progress_callback=self._on_progress,
                 sha256_url=self.sha256_url,
+                version=self.version,
                 cancel_check=lambda: self._cancelled
             )
             
@@ -119,7 +123,7 @@ class UpdateDialog(QDialog):
             from __version__ import __version__
             current_version = __version__
         except ImportError:
-            current_version = "1.1.0"
+            current_version = "1.1.1"
         new_version = self.update_info.get('version', '不明')
         
         self.version_label = QLabel(f"現在: v{current_version}  →  新規: v{new_version}")
@@ -266,7 +270,8 @@ class UpdateDialog(QDialog):
         
         self.download_thread = DownloadThread(
             download_url, github_token, self,
-            sha256_url=self.update_info.get('sha256_url'))
+            sha256_url=self.update_info.get('sha256_url'),
+            version=self.update_info.get('version'))
         self.download_thread.progress_updated.connect(self._on_progress_updated)
         self.download_thread.download_completed.connect(self._on_download_completed)
         self.download_thread.download_failed.connect(self._on_download_failed)

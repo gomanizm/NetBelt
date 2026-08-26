@@ -8,6 +8,7 @@ from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QFont
 from core.sftp_server import SFTPServerManager
 from datetime import datetime
+from ui import theme
 
 
 class SFTPServerPanel(QWidget):
@@ -140,7 +141,7 @@ class SFTPServerPanel(QWidget):
             "💡 Cisco Routerからファイルをコピーする場合:\n"
             "Router# copy running-config sftp://[ユーザー名]@[WindowsのIP]:[ポート]/[ファイル名]"
         )
-        info_label.setStyleSheet("color: #666; font-size: 9pt; padding: 5px; background-color: #f9f9f9; border: 1px solid #ddd;")
+        info_label.setStyleSheet(theme.note_style(self))
         info_label.setWordWrap(True)
         layout.addWidget(info_label)
         
