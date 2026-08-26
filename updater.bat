@@ -5,8 +5,25 @@ rem Keep these on separate lines, not in a ( ) block: %errorlevel% inside
 rem a block is expanded when the block is parsed, i.e. before the child
 rem has run, so the real exit code would always be lost.
 rem ------------------------------------------------------------------
+rem Detect '!' before delayed expansion is on. Afterwards %~f0 has
+rem already lost it, so the check would never fire.
+set "BANG="
+echo."%~f0" "%~1" "%~2"| findstr /C:"!" >nul && set "BANG=1"
+
 setlocal enabledelayedexpansion
 if "%~3"=="--utf8" goto :run
+rem Stop here, not after :run. With '!' in the path the re-entry itself
+rem fails (!SELF! has already lost it), so nothing past this point runs.
+rem The message stays ASCII: this is before the codepage is settled, and
+rem printing Japanese here is the very fault this file was fixed for.
+if defined BANG (
+    echo ERROR: the path contains an exclamation mark.
+    echo   NetBelt cannot update itself from a folder whose path
+    echo   contains that character. Rename the folder, or extract
+    echo   the new ZIP over this one by hand.
+    pause
+    exit /b 1
+)
 chcp 65001 >nul
 set "SELF=%~f0"
 set "A1=%~1"

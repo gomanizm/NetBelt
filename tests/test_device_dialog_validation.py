@@ -117,6 +117,27 @@ class AuthFailureMessageTest(unittest.TestCase):
         self.assertIn("authorized_keys", message, "確かめる場所を示していない")
         self.assertIn("cisco", message, "どのユーザーで試したか出ていない")
 
+    def test_a_key_says_the_password_was_not_used(self):
+        """鍵とパスワードの両方を入れていたら、使っていないと伝えること。
+
+        鍵を指定するとパスワードは一切試さない。入力欄が埋まっていると
+        「パスワードも試された」と誤解される。
+        """
+        message = self._connection(
+            username="cisco", ssh_key=r"C:\keys\id_ed25519",
+            password="secret")._auth_failure_message()
+
+        self.assertIn("パスワードは使っていません", message,
+                      "使っていないことを伝えていない: %s" % message)
+
+    def test_a_key_alone_does_not_mention_the_password(self):
+        """パスワードを入れていないなら、その話は出さないこと。"""
+        message = self._connection(
+            username="cisco",
+            ssh_key=r"C:\keys\id_ed25519")._auth_failure_message()
+
+        self.assertNotIn("パスワード", message)
+
     def test_a_password_failure_still_says_so(self):
         message = self._connection(
             username="cisco", password="secret")._auth_failure_message()

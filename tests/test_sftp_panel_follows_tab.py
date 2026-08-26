@@ -224,6 +224,44 @@ class SftpPanelStaleSignalTest(unittest.TestCase):
                          "旧機器の一覧でパネルが埋め直された")
         self.assertEqual(panel.target_label.text(), panel.NO_TARGET_TEXT)
 
+    def test_a_notification_already_in_flight_does_not_leak(self):
+        """切り替える前に別スレッドが emit した分も、届かないこと。
+
+        disconnect は接続を外すが、既に emit されてキューに積まれた分が
+        配送されるかは Qt の実装次第。この版では配送されないことを
+        測って確かめたので、変わったら気づけるように固定しておく。
+        """
+        import threading
+        from PyQt6.QtWidgets import QApplication
+        from unittest import mock
+        from core.sftp_manager import SFTPManager
+        panel, old = self._attached()
+
+        gate = threading.Event()
+
+        def emit_from_worker():
+            gate.wait()
+            old.file_list_ready.emit([self._entry("OLD.cfg")])
+
+        worker = threading.Thread(target=emit_from_worker)
+        worker.start()
+        gate.set()
+        worker.join()
+
+        # 配送される前に切り替える
+        new = SFTPManager()
+        new.is_connected = True
+        new.sftp_client = mock.Mock()
+        new.sftp_client.listdir_attr.return_value = []
+        panel.set_sftp_manager(new, "new-device", "192.0.2.11")
+        QApplication.processEvents()
+        QApplication.processEvents()
+
+        names = [panel.model.item(r, 0).text()
+                 for r in range(panel.model.rowCount())]
+        self.assertNotIn("OLD.cfg", names,
+                         "配送前の通知が新しい機器へ混ざった")
+
     def test_a_late_listing_does_not_leak_into_the_next_device(self):
         """次の機器へ切り替えた後も、旧機器の一覧が入り込まないこと。
 

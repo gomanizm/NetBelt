@@ -165,6 +165,27 @@ class TerminalFullScreenTest(unittest.TestCase):
                            raw[max(0, cut - 8):cut], raw[cut:cut + 8],
                            len(split) - len(whole)))
 
+    def test_a_window_title_never_leaks_at_a_split(self):
+        """ウィンドウタイトルが、どこで切れても画面へ漏れないこと。
+
+        終端は BEL の場合と ESC + backslash の場合がある。後者が
+        ちょうど ESC と backslash の間で割れると、持ち越しの対象から
+        外れてタイトル本文が画面に出ていた。採取データに OSC が
+        含まれていなかったため、実データのテストでは踏めなかった。
+        """
+        bel = ESC + "]0;user@lab: ~" + "\x07"
+        st = ESC + "]0;user@lab: ~" + ESC + "\\"
+        for label, payload in (("BEL 終端", bel), ("ST 終端", st)):
+            whole = self._screen("A" + payload + "B")
+            for cut in range(1, len(payload) + 2):
+                with self.subTest(terminator=label, cut=cut):
+                    text = "A" + payload + "B"
+                    split = self._screen(text[:cut], text[cut:])
+                    self.assertEqual(
+                        split, whole,
+                        "%s を %d バイト目で分けるとタイトルが漏れる: %r"
+                        % (label, cut, split))
+
     def test_the_notice_survives_a_split_marker(self):
         """目印がちょうど切れても、案内が出ること。"""
         raw = capture("nano_vt100.bin")

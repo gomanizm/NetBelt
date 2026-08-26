@@ -244,6 +244,33 @@ class UpdaterScriptTest(unittest.TestCase):
                     encoding="ascii").read(), "new",
             "%r で更新が当たらない:\n%s" % (dirname, out))
 
+    def test_an_exclamation_mark_in_the_path_says_why(self):
+        """! を含むパスでは、黙って失敗せずに理由を言うこと。
+
+        遅延展開がこの文字を食べるため更新できない。CHANGELOG には
+        書いたが、実行時は「The system cannot find the path specified」
+        で終わり、原因が分からなかった。
+        """
+        nested = os.path.join(self.base, "hello!world")
+        app_dir = os.path.join(nested, "app")
+        os.makedirs(app_dir)
+        updater = os.path.join(app_dir, "updater.bat")
+        shutil.copyfile(UPDATER, updater)
+        app_path = self._make_dummy_app(app_dir)
+        self._write(os.path.join(app_dir, "NetBelt.exe"), "old")
+        zip_path = self._make_zip({"NetBelt.exe": "new"})
+
+        code, out = self._run(zip_path, updater=updater,
+                              app_path=app_path)
+
+        self.assertNotEqual(code, 0, "失敗として返していない\n" + out)
+        self.assertIn("exclamation mark", out,
+                      "理由を言っていない:\n" + out)
+        self.assertEqual(
+            io.open(os.path.join(app_dir, "NetBelt.exe"),
+                    encoding="ascii").read(), "old",
+            "中途半端に書き換えている")
+
     def test_a_zip_without_the_app_is_reported_as_a_failure(self):
         """実行ファイルが入っていない zip を、成功と報告しないこと。
 

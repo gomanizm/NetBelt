@@ -587,8 +587,10 @@ class TerminalWidget(QWidget):
 
     # 「まだ伸びうる」形。終端の文字がまだ来ていないもの。
     #   ESC 単体 / ESC[ とパラメータ / ESC] と本文 / ESC と中間文字
+    # OSC の本文のあとに ESC を 1 つ許すのは、終端が ESC + backslash の
+    # 形のときに、ちょうどその間で切れるとタイトルが画面へ漏れるため。
     _INCOMPLETE_ESCAPE = re.compile(
-        "\x1b(?:\\[[0-9:;<=>?]*[ -/]*|][^\x07\x1b]*|[ -/]*)?$")
+        "\x1b(?:\\[[0-9:;<=>?]*[ -/]*|][^\x07\x1b]*\x1b?|[ -/]*)?$")
 
     def _visible_lines(self, terminal: QTextEdit) -> int:
         """画面に見えているおおよその行数を返す。"""

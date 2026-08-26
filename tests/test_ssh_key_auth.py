@@ -42,11 +42,31 @@ class SshKeyLoadingTest(unittest.TestCase):
         ok = conn.connect()
         return ok, (errors[0] if errors else "")
 
-    def test_supported_key_types_load(self):
-        """対応を謳う鍵タイプが実際に読み込めること。
+    def _attempt_without_network(self, key_path):
+        """接続の直前で止めて、(渡された引数, 最初のエラー) を返す。"""
+        from unittest import mock
+        import paramiko
+        from core.ssh_connection import SSHConnection
 
-        読み込めれば接続へ進み、到達しないアドレスなので通信エラーになる。
-        「秘密鍵の読み込みエラー」で止まるなら、鍵を読めていない。
+        conn = SSHConnection(host=HOST, port=22, username="admin",
+                             ssh_key=key_path)
+        errors = []
+        conn.error_occurred.connect(errors.append)
+        with mock.patch("core.ssh_connection.paramiko.SSHClient") as client:
+            client.return_value.connect.side_effect = \
+                paramiko.AuthenticationException()
+            conn.connect()
+            calls = client.return_value.connect.call_args
+        kwargs = calls.kwargs if calls else {}
+        return kwargs, (errors[0] if errors else "")
+
+    def test_supported_key_types_load(self):
+        """対応を謳う鍵タイプが実際に読み込めて、接続へ渡ること。
+
+        以前は到達しないアドレスへ本当に接続を試み、鍵タイプごとに
+        タイムアウトを待って 40 秒かかっていた。待ち時間の長さは
+        検証の役に立たないうえ、環境で挙動が変わる。接続の直前で
+        止めて、鍵が pkey として渡ったことを直接見る。
         """
         import paramiko
         cases = (
@@ -60,9 +80,14 @@ class SshKeyLoadingTest(unittest.TestCase):
                     path = self._write_key(name, gen)
                 except Exception as e:      # 生成できない型は検証対象外
                     self.skipTest("%s を生成できない: %s" % (name, e))
-                _ok, message = self._attempt(path)
+                kwargs, message = self._attempt_without_network(path)
                 self.assertNotIn("秘密鍵の読み込みエラー", message,
                                  "%s を読み込めていない: %s" % (name, message))
+                self.assertIn("pkey", kwargs,
+                              "%s が接続へ渡っていない" % name)
+                self.assertIsInstance(
+                    kwargs["pkey"], gen().__class__,
+                    "%s とは違う型が渡っている" % name)
 
     def test_a_missing_paramiko_attribute_cannot_break_key_loading(self):
         """候補の鍵タイプがすべて実在すること。

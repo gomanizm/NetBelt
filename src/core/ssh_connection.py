@@ -81,10 +81,14 @@ class SSHConnection(QObject):
             return ("認証失敗: ユーザー名が設定されていません。"
                     "デバイスの設定でユーザー名を入力してください。")
         if self.ssh_key:
+            # 鍵を指定したときはパスワードを一切使わない。入力されて
+            # いると「パスワードも試された」と誤解されるので、そう書く。
+            note = ("なお、鍵を指定しているためパスワードは使っていません。"
+                    if self.password else "")
             return ("認証失敗: 指定した鍵がユーザー %s では受け付けられません"
                     "でした。機器側の authorized_keys にこの鍵の公開鍵が"
                     "登録されているか、ユーザー名が合っているかを"
-                    "確認してください。" % self.username)
+                    "確認してください。%s" % (self.username, note))
         return "認証失敗: ユーザー名またはパスワードが間違っています"
 
     def connect(self) -> bool:
