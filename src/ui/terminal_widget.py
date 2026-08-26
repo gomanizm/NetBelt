@@ -581,7 +581,9 @@ class TerminalWidget(QWidget):
 
     # 途中で切れたエスケープを次の受信まで持ち越す上限。これを超えたら
     # 完成する見込みが無いとみなして、今までどおり読み飛ばす。
-    MAX_PENDING_ESCAPE = 64
+    # ウィンドウタイトル(OSC)は長い。パスまで含めると 64 では足りない
+    # （`ESC]0;user@host: /home/user/configs/2026` で 75 バイト）。
+    MAX_PENDING_ESCAPE = 128
 
     # 「まだ伸びうる」形。終端の文字がまだ来ていないもの。
     #   ESC 単体 / ESC[ とパラメータ / ESC] と本文 / ESC と中間文字

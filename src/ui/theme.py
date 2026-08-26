@@ -69,8 +69,11 @@ def readable_ink(background: QColor) -> QColor:
     高いほうを採る。輝度 0.5 で切ると、中間輝度で不利な側を選ぶ
     （#808080 では白 3.9:1 に対して黒 4.8:1）。
     """
-    return (WHITE if contrast(WHITE, background) >= contrast(BLACK, background)
+    # 写しを返す。定数そのものを渡すと、呼び出し側が書き換えたときに
+    # モジュールの定数ごと壊れる。
+    best = (WHITE if contrast(WHITE, background) >= contrast(BLACK, background)
             else BLACK)
+    return QColor(best)
 
 
 def blend(a: QColor, b: QColor, amount: int) -> QColor:

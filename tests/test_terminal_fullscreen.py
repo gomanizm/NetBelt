@@ -321,19 +321,23 @@ class FixtureIntegrityTest(unittest.TestCase):
         """公開できる状態であること。
 
         最初は IPv4 しか見ておらず、`ip -br addr` の出力に混じった
-        IPv6 リンクローカルを見落としていた。fe80::5054:ff:fe13:f6e0 は
-        EUI-64 なので、MAC(52:54:00:13:f6:e0) がそのまま復元できる。
-        アドレスの形をしたものは、文書用に割り当てられた範囲かどうかで
-        判定する。禁止パターンを並べる方式では、次に別の形が来たときに
-        また抜ける。
+        IPv6 リンクローカルを見落としていた。リンクローカルは EUI-64 で
+        作られるため、機器の MAC アドレスがそのまま復元できてしまう。
+
+        判定は「禁止する形を並べる」ではなく「文書用に割り当てられた
+        範囲か」で行う。並べる方式は、次に別の形が来たときにまた抜ける
+        し、実環境の値を禁止リストとして書き残すことになる。
         """
         import re
 
         forbidden = (
             (re.compile(r"\b[0-9a-f]{2}(?::[0-9a-f]{2}){5}\b",
                         re.I), "MAC アドレス"),
-            (re.compile(r"inserthostname", re.I), "実ホスト名"),
         )
+        # RFC 2606 の予約名か、採取時に置き換えた架空名だけ許す
+        allowed_hosts = re.compile(
+            r"^[\w.-]+@(?:lab|localhost|[\w.-]+\.(?:example|test|invalid))$",
+            re.I)
         # RFC 5737 / RFC 6890 の文書用・ループバックのみ許す
         allowed_v4 = re.compile(
             r"^(?:192\.0\.2\.|198\.51\.100\.|203\.0\.113\.|127\.)")
@@ -350,6 +354,10 @@ class FixtureIntegrityTest(unittest.TestCase):
                         found,
                         "%s が残っている: %s"
                         % (label, found.group(0) if found else ""))
+                for prompt in re.findall(r"[\w.-]+@[\w.-]+", text):
+                    self.assertRegex(
+                        prompt, allowed_hosts,
+                        "実環境のホスト名が残っている: %s" % prompt)
                 for ip in re.findall(
                         r"\b\d{1,3}(?:\.\d{1,3}){3}\b",
                         text):
