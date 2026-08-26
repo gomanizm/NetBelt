@@ -25,6 +25,7 @@ from core.sftp_manager import SFTPManager
 from core.syslog_receiver import SyslogReceiver
 from core.snmp_manager import SNMPManager
 from core.version_manager import VersionManager
+from ui import theme
 from typing import Dict, Union, Optional
 from datetime import datetime
 import os
@@ -1590,11 +1591,13 @@ class MainWindow(QMainWindow):
             app_name = "NetBelt"
             repo = "gomanizm/NetBelt"
         
+        # 決め打ちの色は暗い配色で沈む。地に追従させる。
+        dim_colour = theme.dim(theme.surface(self)).name()
         info_text = f"""<h2>{app_name}</h2>
 <p><b>バージョン:</b> {version}</p>
 <p><b>リポジトリ:</b> <a href="https://github.com/{repo}">github.com/{repo}</a></p>
 <br>
-<p style="font-size: 10pt; color: #666;">
+<p style="font-size: 10pt; color: {dim_colour};">
 Copyright (C) 2026 NetBelt Contributors<br>
 <br>
 This program comes with ABSOLUTELY NO WARRANTY.<br>

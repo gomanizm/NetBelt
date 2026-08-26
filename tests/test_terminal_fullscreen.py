@@ -259,15 +259,53 @@ class FixtureIntegrityTest(unittest.TestCase):
                 self.assertIsNone(re.search(r"\x1b\[\d+;\d+H", text))
 
     def test_the_captures_name_no_real_environment(self):
-        """公開できる状態であること。"""
+        """公開できる状態であること。
+
+        最初は IPv4 しか見ておらず、`ip -br addr` の出力に混じった
+        IPv6 リンクローカルを見落としていた。fe80::5054:ff:fe13:f6e0 は
+        EUI-64 なので、MAC(52:54:00:13:f6:e0) がそのまま復元できる。
+        アドレスの形をしたものは、文書用に割り当てられた範囲かどうかで
+        判定する。禁止パターンを並べる方式では、次に別の形が来たときに
+        また抜ける。
+        """
         import re
-        for name in ("nano_vt100.bin", "shell_vt100.bin", "clear_vt100.bin"):
+
+        forbidden = (
+            (re.compile(r"\b[0-9a-f]{2}(?::[0-9a-f]{2}){5}\b",
+                        re.I), "MAC アドレス"),
+            (re.compile(r"inserthostname", re.I), "実ホスト名"),
+        )
+        # RFC 5737 / RFC 6890 の文書用・ループバックのみ許す
+        allowed_v4 = re.compile(
+            r"^(?:192\.0\.2\.|198\.51\.100\.|203\.0\.113\.|127\.)")
+        # RFC 3849 の文書用のみ許す
+        allowed_v6 = re.compile(r"^(?:2001:db8:|::1$)", re.I)
+
+        for name in ("nano_vt100.bin", "shell_vt100.bin",
+                     "clear_vt100.bin"):
             with self.subTest(capture=name):
                 text = capture(name)
-                for ip in re.findall(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", text):
-                    self.assertTrue(
-                        ip.startswith("192.0.2.") or ip.startswith("127."),
-                        "実環境のアドレスが残っている: %s" % ip)
+                for pattern, label in forbidden:
+                    found = pattern.search(text)
+                    self.assertIsNone(
+                        found,
+                        "%s が残っている: %s"
+                        % (label, found.group(0) if found else ""))
+                for ip in re.findall(
+                        r"\b\d{1,3}(?:\.\d{1,3}){3}\b",
+                        text):
+                    self.assertRegex(
+                        ip, allowed_v4,
+                        "文書用に割り当てられていないアドレス: %s" % ip)
+                # コロン区切りの塊を拾ってから振り分ける。時刻表記
+                # (20:28:23) は :: を含まずコロンも 2 個なので外れる。
+                for token in re.findall(r"[0-9a-f]*(?::[0-9a-f]*)+",
+                                        text, re.I):
+                    if "::" not in token and token.count(":") < 7:
+                        continue
+                    self.assertRegex(
+                        token.rstrip(":"), allowed_v6,
+                        "文書用に割り当てられていないアドレス: %s" % token)
 
 
 if __name__ == "__main__":

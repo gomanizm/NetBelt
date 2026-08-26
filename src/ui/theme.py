@@ -21,6 +21,9 @@ from PyQt6.QtGui import QColor, QPalette
 # WCAG の本文基準。これを下回る組み合わせは作らない
 MIN_CONTRAST = 4.5
 
+# 帯を地から離す割合(%)。基準を満たす最初のものを使う
+_BAND_SHIFTS = (12, 22, 32, 42, 52)
+
 
 def relative_luminance(color: QColor) -> float:
     """sRGB の相対輝度（0=黒, 1=白）。"""
@@ -41,8 +44,8 @@ def contrast(a: QColor, b: QColor) -> float:
 
 
 def is_dark(color: QColor) -> bool:
+    """暗い側の色か。配色が明暗どちらに寄っているかの判定に使う。"""
     return relative_luminance(color) < 0.5
-
 
 def surface(widget) -> QColor:
     """そのウィジェットが乗っている地の色。
@@ -53,20 +56,54 @@ def surface(widget) -> QColor:
     return widget.palette().color(QPalette.ColorRole.Window)
 
 
-def readable_ink(background: QColor) -> QColor:
-    """その背景の上で確実に読める文字色。
+WHITE = QColor("#ffffff")
+# 純黒にする。#101010 では中間輝度の地(#777777 付近)で 4.25:1 にしか
+# ならず、白の 4.48:1 と合わせて基準に届く色が無くなる。
+BLACK = QColor("#000000")
 
-    パレットからは採らない。背景の明暗だけで決める。
+
+def readable_ink(background: QColor) -> QColor:
+    """その背景の上で最も読める文字色。
+
+    パレットからは採らない。白と黒の両方でコントラストを計算して、
+    高いほうを採る。輝度 0.5 で切ると、中間輝度で不利な側を選ぶ
+    （#808080 では白 3.9:1 に対して黒 4.8:1）。
     """
-    return QColor("#ffffff") if is_dark(background) else QColor("#101010")
+    return (WHITE if contrast(WHITE, background) >= contrast(BLACK, background)
+            else BLACK)
+
+
+def blend(a: QColor, b: QColor, amount: int) -> QColor:
+    """a を b の側へ amount%% 寄せた色。
+
+    lighter()/darker() は HSV の明度を掛けるので、真っ黒は何倍しても
+    黒のまま。地が #000000 のときに帯が出なくなる。ブレンドなら動く。
+    """
+    amount = max(0, min(100, amount))
+    return QColor(
+        (a.red() * (100 - amount) + b.red() * amount) // 100,
+        (a.green() * (100 - amount) + b.green() * amount) // 100,
+        (a.blue() * (100 - amount) + b.blue() * amount) // 100)
 
 
 def band_colours(widget):
-    """帯の (背景, 文字, 枠) を返す。地から少し離して帯だと分かるようにする。"""
+    """帯の (背景, 文字, 枠) を返す。
+
+    地を文字色の側へ少しだけ寄せて帯にする。地が真っ黒でも真っ白でも
+    必ず動く。文字色は帯そのものから決め直す。
+    """
     base = surface(widget)
-    dark = is_dark(base)
-    band = base.lighter(160) if dark else base.darker(108)
-    edge = band.lighter(150) if dark else band.darker(118)
+    ink = readable_ink(base)
+    # 中間輝度の地は白からも黒からも遠い。少し寄せただけでは、帯の上に
+    # 白を置いても黒を置いても基準に届かない（地 #888888 なら
+    # 白 4.3:1 / 黒 4.4:1）。届くまで文字色の側へ寄せる。
+    band = blend(base, ink, _BAND_SHIFTS[-1])
+    for amount in _BAND_SHIFTS:
+        candidate = blend(base, ink, amount)
+        if contrast(candidate, readable_ink(candidate)) >= MIN_CONTRAST:
+            band = candidate
+            break
+    edge = blend(band, ink, 28)
     return band, readable_ink(band), edge
 
 
@@ -90,11 +127,7 @@ def dim(background: QColor, amount: int = 30) -> QColor:
     コントラストが基準を割ったら寄せるのをやめる。
     """
     ink = readable_ink(background)
-    amount = max(0, min(60, amount))
-    blended = QColor(
-        (ink.red() * (100 - amount) + background.red() * amount) // 100,
-        (ink.green() * (100 - amount) + background.green() * amount) // 100,
-        (ink.blue() * (100 - amount) + background.blue() * amount) // 100)
+    blended = blend(ink, background, max(0, min(60, amount)))
     return blended if contrast(blended, background) >= MIN_CONTRAST else ink
 
 

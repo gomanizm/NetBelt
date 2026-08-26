@@ -18,6 +18,7 @@ import os
 import re
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, "src")
 
@@ -176,6 +177,67 @@ class ThemeContrastTest(unittest.TestCase):
                         "%d%% 寄せたら読めなくなった（%.1f:1）"
                         % (amount, ratio))
 
+    def test_every_shade_of_surface_stays_readable(self):
+        """地が真っ黒から真っ白まで、どこでも読めること。
+
+        2 つのテーマを試すだけでは端に届かない。#000000 では明度の
+        掛け算が効かず帯が出ず、#808080 付近では白より黒のほうが
+        読みやすいのに白が選ばれていた。
+        """
+        from ui import theme
+        for level in range(0, 256, 17):
+            shade = "#%02x%02x%02x" % (level, level, level)
+            with self.subTest(surface=shade):
+                colours = dict(PLAIN_LIGHT)
+                colours["Window"] = shade
+                widget = self._widget(colours)
+
+                bg, fg = colours_of(theme.band_style(widget), shade)
+                ratio = contrast(bg, fg)
+                self.assertGreaterEqual(
+                    ratio, MIN,
+                    "帯が読めない（地 %s / %s on %s = %.1f:1）"
+                    % (shade, fg, bg, ratio))
+
+                _bg, dim_fg = colours_of(theme.dim_style(widget), shade)
+                dim_ratio = contrast(shade, dim_fg)
+                self.assertGreaterEqual(
+                    dim_ratio, MIN,
+                    "説明文が読めない（地 %s / %s = %.1f:1）"
+                    % (shade, dim_fg, dim_ratio))
+
+    def test_a_band_appears_even_on_pure_black_or_white(self):
+        """真っ黒・真っ白の地でも、帯が地と別の色になること。
+
+        QColor.lighter() は HSV の明度を掛けるので、#000000 は
+        何倍しても黒のまま。帯が消える。
+        """
+        from ui import theme
+        for shade in ("#000000", "#ffffff"):
+            with self.subTest(surface=shade):
+                colours = dict(PLAIN_LIGHT)
+                colours["Window"] = shade
+                band, _ink, _edge = theme.band_colours(self._widget(colours))
+                self.assertNotEqual(
+                    band.name().lower(), shade,
+                    "地 %s で帯が出ない" % shade)
+
+    def test_the_ink_is_the_better_of_black_and_white(self):
+        """白と黒のうち、コントラストが高いほうを選ぶこと。"""
+        from PyQt6.QtGui import QColor
+        from ui import theme
+        for level in range(0, 256, 17):
+            shade = "#%02x%02x%02x" % (level, level, level)
+            with self.subTest(background=shade):
+                background = QColor(shade)
+                ink = theme.readable_ink(background)
+                other = (theme.BLACK if ink.name() == theme.WHITE.name()
+                         else theme.WHITE)
+                self.assertGreaterEqual(
+                    theme.contrast(ink, background),
+                    theme.contrast(other, background),
+                    "%s の上で不利なほうを選んでいる" % shade)
+
     def test_a_missing_palette_does_not_produce_an_unreadable_pair(self):
         """パレットが空でも、読める組み合わせを返すこと。"""
         from PyQt6.QtWidgets import QWidget
@@ -187,6 +249,10 @@ class ThemeContrastTest(unittest.TestCase):
 
 class PanelStyleTest(unittest.TestCase):
     """実際のパネルが、実測の配色で読めること。"""
+
+    # 破棄済みウィジェットへのシグナル配送で落ちるため保持する
+    _windows = []
+
 
     @classmethod
     def setUpClass(cls):
@@ -251,6 +317,38 @@ class PanelStyleTest(unittest.TestCase):
             if "background-color" in style and "font-size" in style:
                 return style
         return None
+
+    def test_the_version_dialog_builds_and_is_readable(self):
+        """バージョン情報が組み立てられ、文字が読めること。
+
+        この画面を通るテストが無く、色の差し込みを書き損じても
+        気づけなかった。開いた瞬間に落ちる類の間違いだった。
+        """
+        import re
+        from ui.main_window import MainWindow
+
+        for name, colours in THEMES:
+            with self.subTest(theme=name):
+                self._with_theme(colours)
+                with mock.patch.object(MainWindow,
+                                       "_check_for_updates_on_startup"):
+                    window = MainWindow()
+                type(self)._windows.append(window)
+                with mock.patch("ui.main_window.QMessageBox") as box:
+                    window._on_version_info()
+
+                self.assertTrue(box.return_value.setText.called,
+                                "本文を組み立てていない")
+                text = box.return_value.setText.call_args[0][0]
+                self.assertNotIn("{", text, "差し込みが残っている: %r" % text)
+                found = re.findall(r"color:\s*(#[0-9a-fA-F]{6})", text)
+                self.assertTrue(found, "色を指定していない")
+                for colour in found:
+                    ratio = contrast(colours["Window"], colour)
+                    self.assertGreaterEqual(
+                        ratio, MIN,
+                        "バージョン情報が読めない（%s / %s = %.1f:1）"
+                        % (colour, colours["Window"], ratio))
 
     def test_no_hard_coded_light_background_is_left(self):
         """地に依存する色を、決め打ちで残していないこと。
