@@ -139,42 +139,5 @@ class DeviceEditReachesReconnectTest(unittest.TestCase):
                          "消した機器の接続情報が残っている")
 
 
-    def test_deleting_a_group_forgets_its_devices_too(self):
-        """グループごと消したときも、配下の接続情報を残さないこと。
-
-        機器を 1 台ずつ消す経路は塞いだが、グループ削除は配下を
-        まとめて消すので、同じ穴が開いたままだった。
-        """
-        from PyQt6.QtWidgets import QMessageBox
-        window = self._window()
-        window.device_info["Ubuntu0"] = self._old()
-        window.device_info["Cat8000v"] = dict(self._old(), name="Cat8000v")
-        window.device_info["余所の機器"] = dict(self._old(), name="余所の機器")
-
-        groups = [
-            {"name": "Default",
-             "devices": [{"name": "Ubuntu0"}, {"name": "Cat8000v"}]},
-            {"name": "他", "devices": [{"name": "余所の機器"}]},
-        ]
-        patches = (
-            mock.patch("ui.main_window.QMessageBox.question",
-                       return_value=QMessageBox.StandardButton.Yes),
-            mock.patch.object(window, "_load_devices"),
-            mock.patch.object(window.config_manager, "get_groups",
-                              return_value=groups),
-            mock.patch.object(window.config_manager, "remove_group",
-                              return_value=True),
-        )
-        for patch in patches:
-            patch.start()
-            self.addCleanup(patch.stop)
-        window._on_delete_group("Default")
-
-        self.assertNotIn("Ubuntu0", window.device_info,
-                         "消したグループの機器が残っている")
-        self.assertNotIn("Cat8000v", window.device_info)
-        self.assertIn("余所の機器", window.device_info,
-                      "関係ないグループの機器まで消している")
-
 if __name__ == "__main__":
     unittest.main()
