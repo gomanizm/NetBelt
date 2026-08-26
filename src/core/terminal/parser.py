@@ -18,10 +18,12 @@ import collections
 Print = collections.namedtuple("Print", "text")
 Ctrl = collections.namedtuple("Ctrl", "char")
 Esc = collections.namedtuple("Esc", "intermediate final")
+Csi = collections.namedtuple("Csi", "private params intermediate final")
 Osc = collections.namedtuple("Osc", "text")
 
 (GROUND, ESCAPE, ESCAPE_INTERMEDIATE,
- OSC_STRING, SOS_PM_APC) = range(5)
+ CSI_ENTRY, CSI_PARAM, CSI_INTERMEDIATE, CSI_IGNORE,
+ OSC_STRING, SOS_PM_APC) = range(9)
 
 MAX_PARAMS = 256      # 暴走した列でメモリを食わないための上限
 MAX_STRING = 4096
@@ -37,6 +39,11 @@ class Parser(object):
         self._private = ""
         self._params = ""
         self._intermediate = ""
+
+    def _split_params(self):
+        if not self._params:
+            return ()
+        return tuple(int(p) if p else None for p in self._params.split(";"))
 
     def _end_string(self, out):
         """ESC / ST で文字列列 (OSC) を閉じ、確定した命令を出す。"""
@@ -92,6 +99,9 @@ class Parser(object):
                 elif code <= 0x2F:
                     self._intermediate += ch
                     self.state = ESCAPE_INTERMEDIATE
+                elif ch == "[":
+                    self._clear()
+                    self.state = CSI_ENTRY
                 elif ch == "]":
                     self._string = []
                     self.state = OSC_STRING
@@ -114,6 +124,75 @@ class Parser(object):
                     out.append(Esc(self._intermediate, ch))
                     self.state = GROUND
                 elif code == 0x7F:
+                    pass
+                else:
+                    abort_and_print(ch)
+
+            elif state == CSI_ENTRY:
+                if code < 0x20:
+                    out.append(Ctrl(ch))
+                elif code <= 0x2F:
+                    self._intermediate += ch
+                    self.state = CSI_INTERMEDIATE
+                elif ch == ":":
+                    self.state = CSI_IGNORE
+                elif code <= 0x39 or ch == ";":
+                    self._params += ch
+                    self.state = CSI_PARAM
+                elif code <= 0x3F:              # < = > ?
+                    self._private += ch
+                    self.state = CSI_PARAM
+                elif code <= 0x7E:
+                    out.append(Csi(self._private, self._split_params(),
+                                   self._intermediate, ch))
+                    self.state = GROUND
+                elif code == 0x7F:
+                    pass
+                else:
+                    abort_and_print(ch)
+
+            elif state == CSI_PARAM:
+                if code < 0x20:
+                    out.append(Ctrl(ch))
+                elif code <= 0x2F:
+                    self._intermediate += ch
+                    self.state = CSI_INTERMEDIATE
+                elif (0x30 <= code <= 0x39 or ch == ";") and \
+                        len(self._params) < MAX_PARAMS:
+                    self._params += ch
+                elif code <= 0x3F:              # : < = > ? と長すぎる列
+                    self.state = CSI_IGNORE
+                elif code <= 0x7E:
+                    out.append(Csi(self._private, self._split_params(),
+                                   self._intermediate, ch))
+                    self.state = GROUND
+                elif code == 0x7F:
+                    pass
+                else:
+                    abort_and_print(ch)
+
+            elif state == CSI_INTERMEDIATE:
+                if code < 0x20:
+                    out.append(Ctrl(ch))
+                elif code <= 0x2F:
+                    self._intermediate += ch
+                elif code <= 0x3F:
+                    self.state = CSI_IGNORE
+                elif code <= 0x7E:
+                    out.append(Csi(self._private, self._split_params(),
+                                   self._intermediate, ch))
+                    self.state = GROUND
+                elif code == 0x7F:
+                    pass
+                else:
+                    abort_and_print(ch)
+
+            elif state == CSI_IGNORE:
+                if code < 0x20:
+                    out.append(Ctrl(ch))
+                elif 0x40 <= code <= 0x7E:
+                    self.state = GROUND
+                elif code <= 0x7F:
                     pass
                 else:
                     abort_and_print(ch)

@@ -16,7 +16,7 @@ import unittest
 sys.path.insert(0, "src")
 
 from core.terminal.parser import (      # noqa: E402
-    Parser, Print, Ctrl, Esc, Osc, MAX_STRING)
+    Parser, Print, Ctrl, Esc, Csi, Osc, MAX_STRING)
 
 FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         "fixtures")
@@ -82,6 +82,42 @@ class EscapeStateTest(unittest.TestCase):
 
     def test_a_character_outside_the_diagram_aborts_and_prints(self):
         self.assertEqual(parse("\x1b日X"), [Print("日X")])
+
+
+class CsiSequenceTest(unittest.TestCase):
+    def test_no_params_at_all(self):
+        self.assertEqual(parse("\x1b[m"), [Csi("", (), "", "m")])
+
+    def test_params_are_numbers(self):
+        self.assertEqual(parse("\x1b[1;24r"), [Csi("", (1, 24), "", "r")])
+
+    def test_an_omitted_param_stays_visible_as_none(self):
+        self.assertEqual(parse("\x1b[;5H"), [Csi("", (None, 5), "", "H")])
+
+    def test_private_markers_are_kept_apart(self):
+        self.assertEqual(parse("\x1b[?1049h"), [Csi("?", (1049,), "", "h")])
+
+    def test_an_intermediate_is_collected(self):
+        self.assertEqual(parse("\x1b[4 q"), [Csi("", (4,), " ", "q")])
+
+    def test_an_unknown_final_still_comes_through(self):
+        # 何を捨てるかを決めるのはパーサでなく画面
+        self.assertEqual(parse("\x1b[999X"), [Csi("", (999,), "", "X")])
+
+    def test_a_control_executes_without_leaving_the_sequence(self):
+        self.assertEqual(parse("\x1b[1;\r24r"),
+                         [Ctrl("\r"), Csi("", (1, 24), "", "r")])
+
+    def test_a_colon_poisons_the_whole_sequence(self):
+        # 図の通り。サブパラメータ (38:5:1 形式) は列ごと無視する
+        self.assertEqual(parse("\x1b[38:5:1mX"), [Print("X")])
+
+    def test_runaway_params_poison_the_whole_sequence(self):
+        self.assertEqual(parse("\x1b[" + "1" * 300 + "mX"), [Print("X")])
+
+    def test_cancel_aborts_midway(self):
+        self.assertEqual(parse("\x1b[12\x18mX"),
+                         [Ctrl("\x18"), Print("mX")])
 
 
 class OscStringTest(unittest.TestCase):
@@ -155,6 +191,54 @@ class RealDeviceCaptureTest(unittest.TestCase):
             split = merged(p.feed(raw[:cut]) + p.feed(raw[cut:]))
             self.assertEqual(split, whole,
                              "%d バイト目で切ると命令列が変わる" % cut)
+
+
+class RealLinuxCaptureTest(unittest.TestCase):
+    """Ubuntu の実データ (nano / 普通のシェル / clear)。
+
+    値はどれも実測。nano は TERM=vt100 では代替画面 (?1049) を使わず、
+    DECSTBM (ESC[1;24r) と CUP で全画面を組む。clear は ESC[H ESC[J。
+    どのシェル操作にも OSC は 1 度も現れない。
+    """
+    LINUX = ("nano_vt100.bin", "shell_vt100.bin", "clear_vt100.bin")
+
+    def test_nano_reaches_the_full_screen_markers(self):
+        events = parse(fixture("nano_vt100.bin"))
+        csi = [(e.private, e.params, e.final)
+               for e in events if isinstance(e, Csi)]
+        self.assertIn(("", (1, 24), "r"), csi)      # DECSTBM
+        self.assertIn(("", (22, 16), "H"), csi)     # CUP 行桁指定
+
+    def test_bash_toggles_bracketed_paste(self):
+        events = parse(fixture("shell_vt100.bin"))
+        csi = [(e.private, e.params, e.final)
+               for e in events if isinstance(e, Csi)]
+        self.assertIn(("?", (2004,), "h"), csi)
+        self.assertIn(("?", (2004,), "l"), csi)
+
+    def test_clear_erases_instead_of_scrolling(self):
+        events = parse(fixture("clear_vt100.bin"))
+        csi = [(e.private, e.params, e.final)
+               for e in events if isinstance(e, Csi)]
+        self.assertIn(("", (), "H"), csi)
+        self.assertIn(("", (), "J"), csi)
+
+    def test_no_escape_ever_leaks_into_printed_text(self):
+        for name in self.LINUX:
+            for event in parse(fixture(name)):
+                if isinstance(event, Print):
+                    self.assertNotIn("\x1b", event.text, name)
+
+    def test_every_split_point_gives_the_same_commands(self):
+        for name in self.LINUX:
+            raw = fixture(name)
+            whole = merged(parse(raw))
+            for cut in range(1, len(raw)):
+                p = Parser()
+                split = merged(p.feed(raw[:cut]) + p.feed(raw[cut:]))
+                self.assertEqual(
+                    split, whole,
+                    "%s: %d バイト目で切ると命令列が変わる" % (name, cut))
 
 
 if __name__ == "__main__":
