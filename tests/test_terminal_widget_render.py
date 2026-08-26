@@ -198,6 +198,44 @@ class ColourTest(WidgetRenderTest):
         self.assertEqual(fmt.background().color().name(), "#ffffff")
 
 
+class GridResizeTest(WidgetRenderTest):
+    """ウィンドウの大きさに格子が追従し、機器へ知らせること。"""
+
+    def test_a_new_size_reaches_screen_and_signal(self):
+        w = self.widget()
+        recorded = []
+        w.terminal_resized.connect(
+            lambda d, c, r: recorded.append((d, c, r)))
+        w._grid_size = lambda terminal: (30, 100)
+        w._apply_grid_size("dev")
+        screen = w._terminals["dev"]._screen
+        self.assertEqual((screen.rows, screen.cols), (30, 100))
+        self.assertEqual(recorded, [("dev", 100, 30)])
+
+    def test_the_same_size_is_not_re_announced(self):
+        w = self.widget()
+        recorded = []
+        w.terminal_resized.connect(
+            lambda d, c, r: recorded.append((d, c, r)))
+        w._grid_size = lambda terminal: (30, 100)
+        w._apply_grid_size("dev")
+        w._apply_grid_size("dev")
+        self.assertEqual(len(recorded), 1)
+
+    def test_what_was_written_survives_the_resize(self):
+        w = self.widget()
+        w.append_output("dev", "show run\r\nhostname lab-rtr\r\n")
+        w._grid_size = lambda terminal: (10, 40)
+        w._apply_grid_size("dev")
+        self.assertIn("hostname lab-rtr", self.screen_text(w))
+
+    def test_grid_size_stays_within_sane_bounds(self):
+        w = self.widget()
+        rows, cols = w._grid_size(w._terminals["dev"])
+        self.assertTrue(5 <= rows <= 200, rows)
+        self.assertTrue(20 <= cols <= 500, cols)
+
+
 class DeviceQueryTest(WidgetRenderTest):
     def test_a_cursor_position_query_is_answered(self):
         w = self.widget()

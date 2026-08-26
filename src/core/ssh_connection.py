@@ -54,6 +54,9 @@ class SSHConnection(QObject):
         self.client: Optional[paramiko.SSHClient] = None
         self.channel: Optional[paramiko.Channel] = None
         self.is_connected = False
+        # 端末の大きさ。接続前に set_terminal_size で上書きされる
+        self.term_cols = 80
+        self.term_rows = 24
         self._read_thread: Optional[threading.Thread] = None
         self._stop_reading = False
     
@@ -166,8 +169,9 @@ class SSHConnection(QObject):
             # SSH接続を実行
             self.client.connect(**connect_kwargs)
             
-            # インタラクティブシェルを開始
-            self.channel = self.client.invoke_shell(term='vt100', width=80, height=24)
+            # インタラクティブシェルを開始 (RFC 4254 6.2 pty-req)
+            self.channel = self.client.invoke_shell(
+                term='vt100', width=self.term_cols, height=self.term_rows)
             self.channel.settimeout(0.1)
             
             self.is_connected = True
@@ -230,7 +234,22 @@ class SSHConnection(QObject):
             self.channel.send(command.encode('utf-8'))
         except Exception as e:
             self.error_occurred.emit(f"送信エラー: {str(e)}")
-    
+
+    def set_terminal_size(self, cols: int, rows: int):
+        """端末の大きさを機器へ伝える (RFC 4254 6.7 window-change)。
+
+        接続前に呼ばれたら、接続時の pty 要求 (6.2) に使う。
+        通知に失敗しても接続はそのまま続ける。
+        """
+        self.term_cols = cols
+        self.term_rows = rows
+        if not self.is_connected or not self.channel:
+            return
+        try:
+            self.channel.resize_pty(width=cols, height=rows)
+        except Exception:
+            pass
+
     def _read_output(self):
         """バックグラウンドで出力を読み取る"""
         while not self._stop_reading and self.is_connected:

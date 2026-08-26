@@ -27,7 +27,13 @@ class InteractiveTerminal(QTextEdit):
     keepalive_stop_requested = pyqtSignal()  # キープアライブ停止要求シグナル
     # Ctrl+ホイールでのフォントサイズ変更要求（回した向き: +1 / -1）
     font_size_change_requested = pyqtSignal(int)
-    
+    # ウィジェットの大きさが変わった（行数・桁数の再計算が要る）
+    resized = pyqtSignal()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.resized.emit()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setReadOnly(False)
@@ -326,7 +332,9 @@ class TerminalWidget(QWidget):
     keepalive_start_requested = pyqtSignal(str)
     # キープアライブ停止要求シグナル（機器名）
     keepalive_stop_requested = pyqtSignal(str)
-    
+    # 端末の行数・桁数が変わった（機器名, 桁, 行）。機器への通知に使う
+    terminal_resized = pyqtSignal(str, int, int)
+
     def __init__(self):
         super().__init__()
         self._terminals: Dict[str, InteractiveTerminal] = {}  # 機器名 -> ターミナル
@@ -334,6 +342,13 @@ class TerminalWidget(QWidget):
         self._log_dialogs: Dict[str, object] = {}  # 機器名 -> ログ記録ダイアログ
         # ターミナルの外観設定。_create_terminal が参照するので _create_ui より先に持つ
         self._terminal_settings = dict(self.DEFAULT_TERMINAL_SETTINGS)
+        # ウィンドウをドラッグ中のリサイズ連打を 1 回にまとめる
+        from PyQt6.QtCore import QTimer
+        self._pending_resizes = set()
+        self._resize_timer = QTimer(self)
+        self._resize_timer.setSingleShot(True)
+        self._resize_timer.setInterval(200)
+        self._resize_timer.timeout.connect(self._apply_pending_resizes)
         self._create_ui()
     
     def _create_ui(self):
@@ -457,6 +472,10 @@ class TerminalWidget(QWidget):
             palette.setColor(QPalette.ColorRole.Text, text_color)
             terminal.setPalette(palette)
 
+        # 文字の大きさが変われば収まる行数・桁数も変わる
+        for device_name in self._terminals:
+            self._schedule_grid_update(device_name)
+
     def current_terminal_settings(self) -> dict:
         """
         いま実際に適用されている外観設定を返す
@@ -523,6 +542,10 @@ class TerminalWidget(QWidget):
         terminal.keepalive_stop_requested.connect(
             lambda: self.keepalive_stop_requested.emit(device_name)
         )
+
+        # ウィンドウの大きさに画面の格子を追従させる
+        terminal.resized.connect(
+            lambda: self._schedule_grid_update(device_name))
         
         # タブとして追加
         index = self.tab_widget.addTab(terminal, device_name)
@@ -541,11 +564,55 @@ class TerminalWidget(QWidget):
         文書のいまの末尾から後ろを「今の画面」の領域とする。それより
         前は確定した記録で、二度と書き換えない。
         """
+        rows, cols = self._grid_size(terminal)
         terminal._parser = vt.Parser()
-        terminal._screen = Screen(self.SCREEN_ROWS, self.SCREEN_COLS)
+        terminal._screen = Screen(rows, cols)
         region = QTextCursor(terminal.document())
         region.movePosition(QTextCursor.MoveOperation.End)
         terminal._region = region
+
+    def _grid_size(self, terminal: QTextEdit):
+        """いまの表示領域に収まる (行数, 桁数)。測れないときは 24x80。"""
+        from PyQt6.QtGui import QFontMetrics
+        metrics = QFontMetrics(terminal.font())
+        char_w = metrics.horizontalAdvance("0")
+        line_h = metrics.lineSpacing()
+        width = terminal.viewport().width()
+        height = terminal.viewport().height()
+        if char_w <= 0 or line_h <= 0 or width < 2 * char_w or height < line_h:
+            return self.SCREEN_ROWS, self.SCREEN_COLS
+        return (max(5, min(200, height // line_h)),
+                max(20, min(500, width // char_w)))
+
+    def grid_size_for(self, device_name: str):
+        """接続時の pty 要求 (RFC 4254 6.2) に使う (桁, 行)。"""
+        terminal = self._terminals.get(device_name)
+        if terminal is None:
+            return self.SCREEN_COLS, self.SCREEN_ROWS
+        rows, cols = self._grid_size(terminal)
+        return cols, rows
+
+    def _schedule_grid_update(self, device_name: str) -> None:
+        self._pending_resizes.add(device_name)
+        self._resize_timer.start()
+
+    def _apply_pending_resizes(self) -> None:
+        pending, self._pending_resizes = self._pending_resizes, set()
+        for device_name in sorted(pending):
+            self._apply_grid_size(device_name)
+
+    def _apply_grid_size(self, device_name: str) -> None:
+        """画面の格子を表示領域に合わせ、変わったら機器へ知らせる。"""
+        terminal = self._terminals.get(device_name)
+        if terminal is None:
+            return
+        screen = terminal._screen
+        rows, cols = self._grid_size(terminal)
+        if (rows, cols) == (screen.rows, screen.cols):
+            return
+        screen.set_size(rows, cols)
+        self._render_screen(terminal)
+        self.terminal_resized.emit(device_name, cols, rows)
 
     @staticmethod
     def _visible_cells(line):

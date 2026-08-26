@@ -317,6 +317,7 @@ class MainWindow(QMainWindow):
         self.terminal_widget.macro_settings_requested.connect(self._on_macro_settings_from_context)
         self.terminal_widget.keepalive_start_requested.connect(self._on_keepalive_start_requested)
         self.terminal_widget.keepalive_stop_requested.connect(self._on_keepalive_stop_requested)
+        self.terminal_widget.terminal_resized.connect(self._on_terminal_resized)
         splitter.addWidget(self.terminal_widget)
         
         # デフォルトの分割比率を設定（30% : 70%）
@@ -598,6 +599,9 @@ class MainWindow(QMainWindow):
         
         # SSH接続を作成
         ssh = SSHConnection(host, port, username, password, ssh_key, self)
+        # pty 要求 (RFC 4254 6.2) に、いまの表示領域の行数・桁数を使う
+        cols, rows = self.terminal_widget.grid_size_for(device_name)
+        ssh.set_terminal_size(cols, rows)
         
         # シグナル接続
         ssh.output_received.connect(lambda text: self.terminal_widget.append_output(device_name, text))
@@ -961,6 +965,16 @@ class MainWindow(QMainWindow):
         # 接続処理を実行（ダブルクリックと同じ処理）
         self._on_connect_requested(device_data)
     
+    def _on_terminal_resized(self, device_name: str, cols: int, rows: int):
+        """端末の行数・桁数の変化を機器へ伝える (RFC 4254 6.7)。
+
+        SSH だけが対応している。Telnet (RFC 1073) と シリアルは未対応
+        なので、伝えられない接続では黙って何もしない。
+        """
+        conn = self.connections.get(device_name)
+        if conn is not None and hasattr(conn, "set_terminal_size"):
+            conn.set_terminal_size(cols, rows)
+
     def _on_tab_closed(self, device_name: str):
         """
         タブが閉じられたときの処理
