@@ -94,12 +94,21 @@ class InteractiveTerminal(QTextEdit):
         """
         if not text or not self.can_send_input():
             return False
+        # アプリが ESC[?2004h を送ってきていたら、貼り付けを目印で
+        # 包む (xterm のブラケットペースト)。bash はこれで貼り付けを
+        # 即実行せず 1 かたまりの編集として扱える
+        screen = getattr(self, "_screen", None)
+        bracketed = screen is not None and screen.bracketed_paste
+        if bracketed:
+            self.key_pressed.emit("\x1b[200~")
         # 1文字ずつ送る。改行は端末と同じく CR で送る
         for char in text:
             if char == '\n' or char == '\r':
                 self.key_pressed.emit('\r')
             else:
                 self.key_pressed.emit(char)
+        if bracketed:
+            self.key_pressed.emit("\x1b[201~")
         return True
 
     def custom_paste(self):
@@ -260,6 +269,17 @@ class InteractiveTerminal(QTextEdit):
             return
         super().wheelEvent(event)
 
+    def _cursor_key(self, letter: str) -> str:
+        """カーソルキーの送り方。
+
+        アプリが ESC[?1h (DECCKM) を立てている間は SS3 形式
+        (ESC O A) で送る。nano は矢印キーをこの形で待っている。
+        """
+        screen = getattr(self, "_screen", None)
+        if screen is not None and screen.application_cursor_keys:
+            return "\x1bO" + letter
+        return "\x1b[" + letter
+
     def keyPressEvent(self, event: QKeyEvent):
         """キーイベントを処理"""
         if not self._input_enabled:
@@ -287,13 +307,13 @@ class InteractiveTerminal(QTextEdit):
         elif key == Qt.Key.Key_Escape:
             self.key_pressed.emit('\x1b')
         elif key == Qt.Key.Key_Up:
-            self.key_pressed.emit('\x1b[A')
+            self.key_pressed.emit(self._cursor_key('A'))
         elif key == Qt.Key.Key_Down:
-            self.key_pressed.emit('\x1b[B')
+            self.key_pressed.emit(self._cursor_key('B'))
         elif key == Qt.Key.Key_Right:
-            self.key_pressed.emit('\x1b[C')
+            self.key_pressed.emit(self._cursor_key('C'))
         elif key == Qt.Key.Key_Left:
-            self.key_pressed.emit('\x1b[D')
+            self.key_pressed.emit(self._cursor_key('D'))
         else:
             # 通常の文字入力
             text = event.text()

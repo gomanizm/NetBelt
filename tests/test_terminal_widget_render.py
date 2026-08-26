@@ -236,6 +236,36 @@ class GridResizeTest(WidgetRenderTest):
         self.assertTrue(20 <= cols <= 500, cols)
 
 
+class InputModeTest(WidgetRenderTest):
+    """機器が立てた入力モードに、送る側が合わせること。"""
+
+    def sendable(self, w):
+        terminal = w._terminals["dev"]
+        terminal.set_input_enabled(True)
+        return terminal
+
+    def test_arrow_keys_follow_decckm(self):
+        w = self.widget()
+        terminal = self.sendable(w)
+        self.assertEqual(terminal._cursor_key("A"), "\x1b[A")
+        w.append_output("dev", "\x1b[?1h")      # nano が立てる
+        self.assertEqual(terminal._cursor_key("A"), "\x1bOA")
+        w.append_output("dev", "\x1b[?1l")
+        self.assertEqual(terminal._cursor_key("A"), "\x1b[A")
+
+    def test_a_paste_is_bracketed_only_when_asked(self):
+        w = self.widget()
+        terminal = self.sendable(w)
+        sent = []
+        terminal.key_pressed.connect(sent.append)
+        terminal.send_text("conf t\n")
+        self.assertEqual("".join(sent), "conf t\r")     # 機器相手は素のまま
+        del sent[:]
+        w.append_output("dev", "\x1b[?2004h")           # bash が立てる
+        terminal.send_text("echo hi\n")
+        self.assertEqual("".join(sent), "\x1b[200~echo hi\r\x1b[201~")
+
+
 class DeviceQueryTest(WidgetRenderTest):
     def test_a_cursor_position_query_is_answered(self):
         w = self.widget()
