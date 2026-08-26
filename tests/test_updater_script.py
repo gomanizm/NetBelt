@@ -51,9 +51,20 @@ class UpdaterScriptTest(unittest.TestCase):
         # 書き込むことになる。必ず写しを作業用ディレクトリで動かす。
         self.updater = os.path.join(self.app_dir, "updater.bat")
         shutil.copyfile(UPDATER, self.updater)
-        # 起動先。exe は動かせないので、すぐ終わるバッチで代用する
-        self.app_path = os.path.join(self.app_dir, "dummy_app.bat")
-        self._write(self.app_path, "@echo off\r\nexit " + chr(47) + "b 0\r\n")
+        self.app_path = self._make_dummy_app(self.app_dir)
+
+    def _make_dummy_app(self, directory):
+        """再起動先の代わり。すぐ終わり、窓を残さないものを置く。
+
+        バッチを置くと start が cmd /K で開くため、コンソールが開いた
+        まま残る。全体テストを一度回すと十数個たまって画面が埋まるので、
+        引数なしで即終了する exe を借りてくる。
+        """
+        target = os.path.join(directory, "dummy_app.exe")
+        shutil.copyfile(
+            os.path.join(os.environ["SystemRoot"], "System32",
+                         "rundll32.exe"), target)
+        return target
 
     def _write(self, path, text):
         io.open(path, "w", encoding="ascii", newline="").write(text)
@@ -162,8 +173,7 @@ class UpdaterScriptTest(unittest.TestCase):
         os.makedirs(app_dir)
         updater = os.path.join(app_dir, "updater.bat")
         shutil.copyfile(UPDATER, updater)
-        app_path = os.path.join(app_dir, "dummy_app.bat")
-        self._write(app_path, "@echo off\r\nexit " + chr(47) + "b 0\r\n")
+        app_path = self._make_dummy_app(app_dir)
         self._write(os.path.join(app_dir, "NetBelt.exe"), "old")
         zip_path = self._make_zip({"NetBelt.exe": "new"})
 
@@ -217,8 +227,7 @@ class UpdaterScriptTest(unittest.TestCase):
         os.makedirs(app_dir)
         updater = os.path.join(app_dir, "updater.bat")
         shutil.copyfile(UPDATER, updater)
-        app_path = os.path.join(app_dir, "dummy_app.bat")
-        self._write(app_path, "@echo off\r\nexit " + chr(47) + "b 0\r\n")
+        app_path = self._make_dummy_app(app_dir)
         self._write(os.path.join(app_dir, "NetBelt.exe"), "old")
 
         zip_dir = nested if zip_in_folder else self.base
