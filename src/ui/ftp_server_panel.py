@@ -7,6 +7,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtGui import QFont
 from core.ftp_server import FTPServerManager
+from ui import theme
 from datetime import datetime
 
 class FTPServerPanel(QWidget):
@@ -132,7 +133,6 @@ class FTPServerPanel(QWidget):
         layout.addWidget(log_group)
         # 説明文
         info_label = QLabel("💡 Ciscoからconfigをコピー: copy running-config ftp://user:pass@[WindowsのIP]/[ファイル名]（機器側は ip ftp passive 推奨）")
-        from ui import theme
         info_label.setStyleSheet(theme.note_style(self))
         info_label.setWordWrap(True)
         layout.addWidget(info_label)

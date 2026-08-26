@@ -1,6 +1,7 @@
 from PyQt6.QtWidgets import QDialog, QVBoxLayout, QLabel, QPushButton, QHBoxLayout
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer
 from datetime import datetime
+from ui import theme
 
 
 class LogRecordingDialog(QDialog):
@@ -37,7 +38,6 @@ class LogRecordingDialog(QDialog):
         # ファイルパスラベル
         path_label = QLabel(f"保存先: {self.file_path}")
         path_label.setWordWrap(True)
-        from ui import theme
         path_label.setStyleSheet(theme.dim_style(self, font_size="9pt"))
         layout.addWidget(path_label)
         

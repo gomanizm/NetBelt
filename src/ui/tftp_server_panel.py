@@ -8,6 +8,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtGui import QFont
 from core.tftp_server import TFTPServerManager
 from datetime import datetime
+from ui import theme
 
 class TFTPServerPanel(QWidget):
     """TFTPサーバー制御パネル"""
@@ -125,7 +126,6 @@ class TFTPServerPanel(QWidget):
         layout.addWidget(log_group)
         # 説明文
         info_label = QLabel("💡 Ciscoからconfigをコピー: copy running-config tftp://[WindowsのIP]/[ファイル名]")
-        from ui import theme
         info_label.setStyleSheet(theme.note_style(self))
         info_label.setWordWrap(True)
         layout.addWidget(info_label)

@@ -21,8 +21,6 @@ from PyQt6.QtGui import QColor, QPalette
 # WCAG の本文基準。これを下回る組み合わせは作らない
 MIN_CONTRAST = 4.5
 
-_FALLBACK_SURFACE = "#f0f0f0"
-
 
 def relative_luminance(color: QColor) -> float:
     """sRGB の相対輝度（0=黒, 1=白）。"""
@@ -50,9 +48,9 @@ def surface(widget) -> QColor:
     """そのウィジェットが乗っている地の色。
 
     Window だけを見る。他の役割は、スタイルによっては配色と食い違う。
+    パレットの役割から取った色は常に有効なので、既定値は用意しない。
     """
-    color = widget.palette().color(QPalette.ColorRole.Window)
-    return color if color.isValid() else QColor(_FALLBACK_SURFACE)
+    return widget.palette().color(QPalette.ColorRole.Window)
 
 
 def readable_ink(background: QColor) -> QColor:

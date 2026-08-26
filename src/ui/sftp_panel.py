@@ -10,6 +10,7 @@ from PyQt6.QtCore import Qt, QModelIndex, pyqtSignal
 from PyQt6.QtGui import QStandardItemModel, QStandardItem, QIcon, QAction, QDragEnterEvent, QDropEvent
 from typing import Optional
 from core.sftp_manager import SFTPManager
+from ui import theme
 
 
 class SFTPPanel(QWidget):
@@ -99,11 +100,9 @@ class SFTPPanel(QWidget):
     
     # 接続先が無いときの表示
     def _band_style(self, bold: bool = False) -> str:
-        from ui import theme
         return theme.band_style(self, bold=bold)
 
     def _hint_style(self) -> str:
-        from ui import theme
         return theme.dim_style(self, padding="4px")
 
     NO_TARGET_TEXT = "接続先: なし"
