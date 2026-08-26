@@ -132,7 +132,8 @@ class FTPServerPanel(QWidget):
         layout.addWidget(log_group)
         # 説明文
         info_label = QLabel("💡 Ciscoからconfigをコピー: copy running-config ftp://user:pass@[WindowsのIP]/[ファイル名]（機器側は ip ftp passive 推奨）")
-        info_label.setStyleSheet("color: #666; font-size: 9pt; padding: 5px; background-color: #f9f9f9; border: 1px solid #ddd;")
+        from ui import theme
+        info_label.setStyleSheet(theme.note_style(self))
         info_label.setWordWrap(True)
         layout.addWidget(info_label)
         layout.addStretch()

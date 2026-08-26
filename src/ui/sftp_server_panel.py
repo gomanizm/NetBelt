@@ -140,7 +140,8 @@ class SFTPServerPanel(QWidget):
             "💡 Cisco Routerからファイルをコピーする場合:\n"
             "Router# copy running-config sftp://[ユーザー名]@[WindowsのIP]:[ポート]/[ファイル名]"
         )
-        info_label.setStyleSheet("color: #666; font-size: 9pt; padding: 5px; background-color: #f9f9f9; border: 1px solid #ddd;")
+        from ui import theme
+        info_label.setStyleSheet(theme.note_style(self))
         info_label.setWordWrap(True)
         layout.addWidget(info_label)
         

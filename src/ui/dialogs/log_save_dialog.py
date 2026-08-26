@@ -72,7 +72,9 @@ class LogSaveProgressDialog(QDialog):
         # ファイルパスラベル
         self.path_label = QLabel(self.file_path)
         self.path_label.setWordWrap(True)
-        self.path_label.setStyleSheet("color: gray; font-size: 9pt;")
+        from ui import theme
+        self.path_label.setStyleSheet(
+            theme.dim_style(self, font_size="9pt"))
         layout.addWidget(self.path_label)
         
         # プログレスバー
