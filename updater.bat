@@ -1,13 +1,32 @@
 @echo off
+rem ------------------------------------------------------------------
+rem ASCII ONLY above :run. See the note after setlocal.
+rem Keep these on separate lines, not in a ( ) block: %errorlevel% inside
+rem a block is expanded when the block is parsed, i.e. before the child
+rem has run, so the real exit code would always be lost.
+rem ------------------------------------------------------------------
+if "%~3"=="--utf8" goto :run
 chcp 65001 >nul
+cmd /d /c ""%~f0" "%~1" "%~2" --utf8"
+exit /b %errorlevel%
+
+:run
 setlocal enabledelayedexpansion
 
 REM ================================================================
 REM NetBelt 自動更新スクリプト
 REM ================================================================
+REM 冒頭でコードページを決めてから、同じファイルへ入り直している。
+REM cmd.exe はバッチファイルをバイト位置で読み直すため、ファイルの
+REM 途中で chcp すると位置がずれ、日本語の行が二重に読まれたり途中で
+REM 切れて、余りがコマンドとして実行される。実際 v1.1.0 の更新で
+REM 「'ションを再起動中...' is not recognized」が出た。
+REM そのため、入り直すまでの行は ASCII だけで書くこと。
+REM ================================================================
 REM 引数:
 REM   %1 = ダウンロードしたZIPファイルのパス
 REM   %2 = アプリケーション実行ファイルのパス
+REM   %3 = --utf8（コードページ設定後の再入を示す内部用）
 REM ================================================================
 
 echo ================================================
@@ -28,10 +47,10 @@ if "%~2"=="" (
     exit /b 1
 )
 
-set ZIP_FILE=%~1
-set APP_PATH=%~2
-set APP_DIR=%~dp0
-set TEMP_DIR=%TEMP%\NetBeltUpdate_%RANDOM%
+set "ZIP_FILE=%~1"
+set "APP_PATH=%~2"
+set "APP_DIR=%~dp0"
+set "TEMP_DIR=%TEMP%\NetBeltUpdate_%RANDOM%"
 
 echo [1/6] 更新情報
 echo   ZIPファイル: %ZIP_FILE%
@@ -48,8 +67,10 @@ if not exist "%ZIP_FILE%" (
 )
 
 REM アプリケーションの終了を待機
+REM timeout は標準入力がリダイレクトされていると失敗し、errorlevel を
+REM 残す。待つだけなので ping を使う（どの Windows にもある）。
 echo [2/6] アプリケーションの終了を待機中...
-timeout /t 3 /nobreak >nul
+ping -n 4 127.0.0.1 >nul 2>&1
 echo   完了
 echo.
 
@@ -76,20 +97,15 @@ if errorlevel 1 (
 echo   展開完了
 echo.
 
-REM バックアップディレクトリ作成（オプション）
-echo [5/6] ファイルを更新中...
 REM 古いバックアップを削除（7日以上前のもの）
+echo [5/6] ファイルを更新中...
 for /d %%d in ("%APP_DIR%backup_*") do (
-    set "BACKUP_DIR=%%d"
-    set "DIR_NAME=%%~nd"
-    REM 7日以上前のバックアップを削除
     forfiles /p "%%d" /d -7 >nul 2>&1
     if not errorlevel 1 (
         rd /s /q "%%d" 2>nul
     )
 )
 
-REM 新しいファイルでアップデート
 REM 展開されたファイルを確認（ルートに直接あるか、サブフォルダか）
 if exist "%TEMP_DIR%\NetBelt.exe" (
     set "SOURCE_DIR=%TEMP_DIR%"
@@ -111,36 +127,54 @@ echo   コピー先: %APP_DIR%
 REM ファイルをコピー（上書き）
 xcopy "!SOURCE_DIR!\*" "%APP_DIR%" /E /I /Y /Q >nul 2>&1
 if errorlevel 1 (
-    echo 警告: 一部のファイルのコピーに失敗しました
-) else (
-    echo   更新完了
+    echo エラー: ファイルのコピーに失敗しました
+    echo   アプリがまだ起動したままだと、上書きできません
+    rd /s /q "%TEMP_DIR%" 2>nul
+    pause
+    exit /b 1
 )
+
+REM コピーできたことを確認する。xcopy の戻り値だけでは、
+REM 肝心の実行ファイルが置かれたかどうかは分からない。
+if not exist "%APP_DIR%NetBelt.exe" (
+    echo エラー: 更新後の NetBelt.exe が見つかりません
+    echo   場所: %APP_DIR%
+    rd /s /q "%TEMP_DIR%" 2>nul
+    pause
+    exit /b 1
+)
+echo   更新完了
 echo.
 
 REM アプリケーションを再起動
+REM start は成功しても errorlevel を 0 に戻さない。直前の失敗が残って
+REM いると、起動できていても失敗と誤判定する。start の戻り値では判定せず、
+REM 起動する前に実行ファイルの存在を確かめる。
 echo [6/6] アプリケーションを再起動中...
-start "" "%APP_PATH%"
-if errorlevel 1 (
-    echo エラー: アプリケーションの起動に失敗しました
+if not exist "%APP_PATH%" (
+    echo エラー: 実行ファイルが見つかりません
     echo   パス: %APP_PATH%
-    pause
     rd /s /q "%TEMP_DIR%" 2>nul
+    pause
     exit /b 1
 )
-echo   起動完了
+start "" "%APP_PATH%"
+echo   起動しました
 echo.
 
 REM クリーンアップ
 echo クリーンアップ中...
-timeout /t 1 /nobreak >nul
+ping -n 2 127.0.0.1 >nul 2>&1
 rd /s /q "%TEMP_DIR%" 2>nul
 del "%ZIP_FILE%" 2>nul
+del "%ZIP_FILE%.sha256" 2>nul
+del "%ZIP_FILE%.version" 2>nul
 echo   完了
 echo.
 
 echo ================================================
 echo  更新が完了しました！
 echo ================================================
-timeout /t 3 /nobreak >nul
+ping -n 4 127.0.0.1 >nul 2>&1
 
 exit /b 0
