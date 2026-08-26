@@ -642,7 +642,7 @@ class MainWindow(QMainWindow):
                 if not success:
                     # GUIスレッド外からウィジェットを直接触らない。
                     # 既に append_output へ接続済みのシグナルへ流す。
-                    ssh.output_received.emit("\n接続失敗\n")
+                    ssh.output_received.emit("\r\n接続失敗\r\n")
             except Exception as e:
                 ssh.error_occurred.emit(f"接続スレッドエラー: {str(e)}")
         
@@ -713,7 +713,7 @@ class MainWindow(QMainWindow):
                 if not success:
                     # GUIスレッド外からウィジェットを直接触らない。
                     # 既に append_output へ接続済みのシグナルへ流す。
-                    serial_conn.output_received.emit("\n接続失敗\n")
+                    serial_conn.output_received.emit("\r\n接続失敗\r\n")
             except Exception as e:
                 serial_conn.error_occurred.emit(f"接続スレッドエラー: {str(e)}")
         
@@ -782,7 +782,7 @@ class MainWindow(QMainWindow):
                 if not success:
                     # GUIスレッド外からウィジェットを直接触らない。
                     # 既に append_output へ接続済みのシグナルへ流す。
-                    telnet.output_received.emit("\n接続失敗\n")
+                    telnet.output_received.emit("\r\n接続失敗\r\n")
             except Exception as e:
                 telnet.error_occurred.emit(f"接続スレッドエラー: {str(e)}")
         
@@ -905,7 +905,7 @@ class MainWindow(QMainWindow):
             del self.connections[device_name]
         
         # 切断メッセージと再接続方法を表示
-        self.terminal_widget.append_output(
+        self.terminal_widget.show_notice(
             device_name, 
             "\n\n========================================\n"
             "セッションが切断されました\n"
@@ -926,7 +926,7 @@ class MainWindow(QMainWindow):
             self._on_connection_closed(device_name)
         else:
             # その他のエラー
-            self.terminal_widget.append_output(device_name, f"\nエラー: {error}\n")
+            self.terminal_widget.show_notice(device_name, f"\nエラー: {error}\n")
             if device_name in self.connections:
                 del self.connections[device_name]
     
@@ -939,11 +939,11 @@ class MainWindow(QMainWindow):
         """
         # 機器情報を取得
         if device_name not in self.device_info:
-            self.terminal_widget.append_output(device_name, "\n再接続情報が見つかりません\n")
+            self.terminal_widget.show_notice(device_name, "\n再接続情報が見つかりません\n")
             return
         
         # 再接続メッセージ
-        self.terminal_widget.append_output(device_name, "再接続中...\n\n")
+        self.terminal_widget.show_notice(device_name, "再接続中...\n\n")
         
         # 接続処理を実行
         device_data = self.device_info[device_name]

@@ -713,8 +713,21 @@ class TerminalWidget(QWidget):
         region = terminal._region
 
         for line in screen.take_new_history():
-            for text, attr in self._runs(self._visible_cells(line)):
-                region.insertText(text, self._char_format(attr))
+            # 押し出された行は、画面領域の先頭として文書にもう書いて
+            # ある。同じ内容なら書き直さず、記録との境目を進めるだけに
+            # する。書き直すと画面領域が丸ごと入れ替わり、そこにある
+            # 範囲選択が消える (機器がログを 1 行吐くだけで起きる)
+            text = "".join(cell[0] for cell in self._visible_cells(line))
+            probe = QTextCursor(terminal.document())
+            probe.setPosition(region.position())
+            probe.movePosition(QTextCursor.MoveOperation.EndOfBlock,
+                               QTextCursor.MoveMode.KeepAnchor)
+            if (probe.selectedText() == text
+                    and not probe.atEnd()):
+                region.setPosition(probe.position() + 1)
+                continue
+            for run, attr in self._runs(self._visible_cells(line)):
+                region.insertText(run, self._char_format(attr))
             region.insertText("\n", QTextCharFormat())
 
         cell_rows = [self._visible_cells(line) for line in screen.lines]
@@ -725,11 +738,10 @@ class TerminalWidget(QWidget):
             cell_rows[screen.cursor_row] = (
                 cell_rows[screen.cursor_row] + [BLANK] * pad)
         rows = ["".join(cell[0] for cell in cells) for cells in cell_rows]
-        last = screen.cursor_row
-        for r, line in enumerate(rows):
-            if line and r > last:
-                last = r
-        new_text = "\n".join(rows[:last + 1])
+        # 画面は必ず行数ぶんの高さで描く。末尾の空行を詰めると、clear の
+        # あとに履歴が下端へせり上がり「消えていない」ように見える。
+        # 全画面アプリも、画面の一部しか窓に入らなくなる
+        new_text = "\n".join(rows)
         start = region.position()
 
         # 変わった範囲だけ置き換える。全部消して入れ直すと、機器が
@@ -739,6 +751,7 @@ class TerminalWidget(QWidget):
         probe.movePosition(QTextCursor.MoveOperation.End,
                            QTextCursor.MoveMode.KeepAnchor)
         old_text = probe.selectedText().replace("\u2029", "\n")
+        touched = (0, -1)
         if old_text != new_text:
             prefix = 0
             limit = min(len(old_text), len(new_text))
@@ -751,14 +764,25 @@ class TerminalWidget(QWidget):
             probe.setPosition(start + prefix)
             probe.setPosition(start + len(old_text) - suffix,
                               QTextCursor.MoveMode.KeepAnchor)
-            probe.insertText(new_text[prefix:len(new_text) - suffix])
+            # 書式は空で入れる。insertText は挿入位置の書式を引き継ぐので、
+            # 指定しないと直前の色や反転が新しい文字へ伝染する
+            probe.insertText(new_text[prefix:len(new_text) - suffix],
+                             QTextCharFormat())
+            touched = (prefix, len(new_text) - suffix)
         region.setPosition(start)
 
         # 変わった行に色・太字・反転を塗り直す
         dirty = screen.take_dirty()
         dirty.add(screen.cursor_row)    # カーソル桁の空白の伸縮ぶん
+        # 書き換わった範囲の行も塗り直す。画面側が「変わっていない」と
+        # 思っていても、入れ直した文字は書式を失っている
+        at = 0
+        for r, line in enumerate(rows):
+            if at <= touched[1] and at + len(line) >= touched[0]:
+                dirty.add(r)
+            at += len(line) + 1
         offset = start
-        for r in range(last + 1):
+        for r in range(len(rows)):
             if r in dirty:
                 self._paint_row(terminal, offset, cell_rows[r])
             offset += len(rows[r]) + 1
@@ -773,7 +797,23 @@ class TerminalWidget(QWidget):
             caret = QTextCursor(terminal.document())
             caret.setPosition(pos)
             terminal.setTextCursor(caret)
-            terminal.ensureCursorVisible()
+        # 端末と同じく、常に下端へ寄せる。画面は文書の末尾 rows 行
+        # なので、ここを見せることが「いま端末に映っているもの」を
+        # 見せることになる。カーソルへ寄せると、全画面アプリでは
+        # 画面の上半分しか窓に入らない
+        bar = terminal.verticalScrollBar()
+        bar.setValue(bar.maximum())
+
+    def show_notice(self, device_name: str, text: str) -> None:
+        """アプリ自身の案内 (切断バナー・エラー文) を画面へ出す。
+
+        端末では LF は「1 行下へ」であって行頭へは戻らない (戻すのは
+        CR)。アプリの文言は普通の改行で書かれているので、ここで
+        CRLF へ直す。直さないと案内が階段状にずれて出る。
+        """
+        self.append_output(device_name,
+                           text.replace("\r\n", "\n")
+                               .replace("\n", "\r\n"))
 
     def append_output(self, device_name: str, text: str) -> None:
         """
@@ -797,11 +837,12 @@ class TerminalWidget(QWidget):
             terminal.key_pressed.emit(response)
 
         if device_name in self._log_files:
+            # タブは桁を作る文字なので落とすと表が潰れる
             logged = "".join(
-                e.text if isinstance(e, vt.Print) else "\n"
+                e.text if isinstance(e, vt.Print) else e.char
                 for e in events
                 if isinstance(e, vt.Print)
-                or (isinstance(e, vt.Ctrl) and e.char == "\n"))
+                or (isinstance(e, vt.Ctrl) and e.char in "\n\t"))
             if logged:
                 try:
                     self._log_files[device_name].write(logged)

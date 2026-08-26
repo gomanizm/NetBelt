@@ -30,11 +30,20 @@ class WidgetRenderTest(unittest.TestCase):
         from PyQt6.QtWidgets import QApplication
         cls.app = QApplication.instance() or QApplication([])
 
-    def widget(self):
+    def widget(self, rows=None, cols=None):
         from ui.terminal_widget import TerminalWidget
         w = TerminalWidget()
+        if rows is not None:
+            w._grid_size = lambda t, r=rows, c=cols: (r, c)
         w.create_terminal_tab("dev")
+        if rows is not None:
+            w._apply_grid_size("dev")
         return w
+
+    def visible_screen(self, w):
+        """いま端末に映っている行 (文書の末尾 rows 行)。"""
+        terminal = w._terminals["dev"]
+        return terminal.toPlainText().split("\n")[-terminal._screen.rows:]
 
     def screen_text(self, w):
         return w._terminals["dev"].toPlainText()
@@ -44,7 +53,9 @@ class NanoRendersForRealTest(WidgetRenderTest):
     """実機の nano (527 バイト)。旧実装では 1 行に潰れていた。"""
 
     def setUp(self):
-        self.w = self.widget()
+        # 採取したときと同じ 24x80 で描く。nano は端末の大きさに合わせて
+        # 組むので、違う大きさで流すと下端の位置が合わない
+        self.w = self.widget(24, 80)
         self.w.append_output("dev", "user@lab:~$ ")
         self.w.append_output("dev", fixture("nano_vt100.bin"))
         self.lines = self.screen_text(self.w).split("\n")
@@ -71,6 +82,104 @@ class ClearKeepsTheSessionTest(WidgetRenderTest):
         text = self.screen_text(w)
         self.assertIn("file1  file2", text)
         self.assertTrue(text.rstrip().endswith("user@lab:~$"))
+
+
+class ScreenOccupiesTheViewportTest(WidgetRenderTest):
+    """画面は必ず行数ぶんの高さを占めること。
+
+    実機試験で「clear が効かない」「nano の表示がおかしい」と報告された。
+    どちらも原因は同じで、末尾の空行を詰めていたために履歴が下端へ
+    せり上がり、画面が窓の一部しか占めていなかった。
+    """
+
+    def test_clear_leaves_an_empty_screen(self):
+        w = self.widget(24, 80)
+        w.append_output("dev", "\r\n".join("out-%02d" % i for i in range(20))
+                        + "\r\n$ clear\r\n")
+        w.append_output("dev", fixture("clear_vt100.bin"))
+        screen = self.visible_screen(w)
+        self.assertEqual(len(screen), 24)
+        self.assertFalse([l for l in screen if "out-" in l],
+                         "clear のあとも直前の出力が画面に残っている")
+        self.assertIn("user@lab:~$", "".join(screen))
+        self.assertIn("out-19", self.screen_text(w))    # 記録には残る
+
+    def test_a_full_screen_app_fills_the_screen(self):
+        w = self.widget(24, 80)
+        w.append_output("dev", "\r\n".join("shell-%02d" % i for i in range(20))
+                        + "\r\n$ nano\r\n")
+        w.append_output("dev", fixture("nano_vt100.bin"))
+        screen = self.visible_screen(w)
+        self.assertEqual(len(screen), 24)
+        self.assertIn("GNU nano", screen[0])
+        self.assertTrue(screen[-1].startswith("^X Exit"))
+        self.assertFalse([l for l in screen if l.startswith("shell-")],
+                         "画面にシェルの履歴が混ざっている")
+
+    def test_the_view_stays_at_the_bottom(self):
+        w = self.widget(24, 80)
+        w.append_output("dev", "\r\n".join("l%02d" % i for i in range(60)))
+        bar = w._terminals["dev"].verticalScrollBar()
+        self.assertEqual(bar.value(), bar.maximum())
+
+
+class ResizeKeepsContentTest(WidgetRenderTest):
+    """窓を縮めても一文字も失わないこと (実機試験で報告)。"""
+
+    KEY = "ssh-ed25519 " + "A" * 68 + " user@example.com"
+
+    def test_a_long_line_survives_repeated_shrinking(self):
+        w = self.widget(24, 120)
+        w.append_output("dev", "$ cat ~/.ssh/authorized_keys\r\n"
+                        + self.KEY + "\r\n$ ")
+        for cols in (100, 80, 60, 40, 30):
+            w._grid_size = lambda t, c=cols: (24, c)
+            w._apply_grid_size("dev")
+            joined = "".join(self.screen_text(w).split("\n"))
+            self.assertIn(self.KEY.replace(" ", ""),
+                          joined.replace(" ", ""),
+                          "%d 桁へ縮めたときに欠けた" % cols)
+
+
+class NoticeTest(WidgetRenderTest):
+    """アプリ自身の案内が階段状にならないこと。
+
+    端末の LF は「1 行下へ」で行頭には戻らない。アプリの文言は普通の
+    改行で書かれているので、そのまま流すと切断バナーが桁ずれする。
+    """
+
+    def test_a_banner_stays_left_aligned(self):
+        w = self.widget(24, 80)
+        w.append_output("dev", "lab-rtr#")       # プロンプト表示中
+        w.show_notice("dev",
+                      "\n\n====\nセッションが切断されました\n====\n")
+        printed = [l for l in self.screen_text(w).split("\n") if l.strip()]
+        for line in printed[1:]:
+            self.assertFalse(line.startswith(" "),
+                             "案内が字下げされている: %r" % line)
+
+    def test_device_output_is_untouched(self):
+        # 機器からの LF は端末の意味のまま扱う (show の桁揃えが崩れる)
+        w = self.widget(24, 80)
+        w.append_output("dev", "abc\ndef")
+        self.assertEqual(self.screen_text(w).split("\n")[1], "   def")
+
+
+class LogRecordingTest(WidgetRenderTest):
+    def test_tabs_are_kept_in_the_log(self):
+        """タブは桁を作る文字なので、落とすと表が潰れる。"""
+        import io as _io
+        import tempfile
+        w = self.widget(24, 80)
+        path = os.path.join(tempfile.gettempdir(), "netbelt_tab_log.txt")
+        w._log_files["dev"] = _io.open(path, "w", encoding="utf-8")
+        try:
+            w.append_output("dev", "Interface\tStatus\r\nGi0/0\tup\r\n")
+            w._log_files["dev"].close()
+            self.assertEqual(_io.open(path, encoding="utf-8").read(),
+                             "Interface\tStatus\nGi0/0\tup\n")
+        finally:
+            os.remove(path)
 
 
 class SplitInvarianceTest(WidgetRenderTest):
@@ -114,6 +223,33 @@ class ReconnectTest(WidgetRenderTest):
 
 
 class SelectionSurvivesOutputTest(WidgetRenderTest):
+    def test_a_selection_survives_the_screen_scrolling(self):
+        """画面がスクロールしても範囲選択が消えないこと。
+
+        v1.1.0 で直した性質。画面が 1 行上がると全行がずれるので、
+        素朴に描き直すと選択が Qt に潰される。show run をコピーしよう
+        としている最中に機器が syslog を 1 行吐くだけで起きる。
+        """
+        from PyQt6.QtGui import QTextCursor
+        w = self.widget()
+        terminal = w._terminals["dev"]
+        rows = terminal._screen.rows
+        w.append_output("dev",
+                        "\r\n".join("line %02d" % i for i in range(rows + 8)))
+        self.assertGreater(len(terminal._screen.history), 0,
+                           "スクロールが起きていない (前提が崩れている)")
+
+        for word in ("line 05", "line 12", "line %02d" % (rows + 5)):
+            text = terminal.toPlainText()
+            cursor = terminal.textCursor()
+            cursor.setPosition(text.index(word))
+            cursor.movePosition(QTextCursor.MoveOperation.Right,
+                                QTextCursor.MoveMode.KeepAnchor, len(word))
+            terminal.setTextCursor(cursor)
+            w.append_output("dev", "\r\nsyslog message")
+            self.assertEqual(terminal.textCursor().selectedText(), word,
+                             "%s の選択が消えた" % word)
+
     def test_incoming_output_does_not_break_a_selection(self):
         # コピーしようと選択している最中に機器がログを吐いても、
         # 選択が消えたり置き換わったりしないこと (旧実装から守る性質)
