@@ -26,6 +26,40 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
         
+    - name: Install test tools
+      run: |
+        pip install pytest==9.1.1
+
+    # タグを打てば中身に関わらず公開されていた。ここを門番にする。
+    - name: Run tests
+      env:
+        QT_QPA_PLATFORM: offscreen
+      run: |
+        python -m pytest -q
+
+    # 版がずれると、更新の判定と表示がずれた配布物が出る。
+    - name: Check version consistency
+      id: version
+      shell: pwsh
+      run: |
+        $line = Select-String -Path src/__version__.py `
+                              -Pattern '__version__\s*=\s*"([^"]+)"'
+        if (-not $line) { throw '__version__ を読めません' }
+        $version = $line.Matches[0].Groups[1].Value
+        Write-Host "__version__ = $version"
+
+        if (-not (Select-String -Path CHANGELOG.md -SimpleMatch "## [$version]")) {
+          throw "CHANGELOG.md に [$version] の節がありません"
+        }
+
+        if ($env:GITHUB_REF -like 'refs/tags/*') {
+          $tag = $env:GITHUB_REF_NAME
+          if ($tag -ne "v$version") {
+            throw "タグ $tag と __version__ $version が食い違っています"
+          }
+        }
+        "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
     - name: Generate third-party notices
       run: |
         python tools/gen_third_party_notices.py > THIRD-PARTY-NOTICES.txt
@@ -42,6 +76,7 @@ jobs:
         copy LICENSE portable\LICENSE.txt
         copy THIRD-PARTY-NOTICES.txt portable\
         copy updater.bat portable\
+        copy CHANGELOG.md portable\CHANGELOG.txt
         
         REM MIBファイルもコピー
         xcopy /E /I mibs portable\mibs
@@ -49,8 +84,9 @@ jobs:
         
     - name: Create ZIP archive
       run: |
-        $tag = "${{ github.ref_name }}"
-        $version = $tag -replace '^v', ''
+        # タグではなく __version__ を使う。タグ以外で手動実行すると
+        # ブランチ名が入り、スラッシュでファイル名が壊れていた。
+        $version = "${{ steps.version.outputs.version }}"
         $zipName = "NetBelt-v${version}-Windows-Portable.zip"
         Compress-Archive -Path portable\* -DestinationPath $zipName
         # 自動更新がダウンロード後に照合するチェックサム
@@ -94,6 +130,7 @@ jobs:
           - `README.txt` - 使い方ガイド
           - `LICENSE.txt` - NetBelt のライセンス（GPL-3.0）
           - `THIRD-PARTY-NOTICES.txt` - 同梱した第三者パッケージのライセンス表示
+          - `CHANGELOG.txt` - この版で変わったこと
           - `.sha256` - ZIP のチェックサム。自動更新がダウンロード後に照合し、
             一致しなければ更新を中止します（破損の検知が目的で、GitHub 自体が
             侵害された場合の改ざんは検知できません）
