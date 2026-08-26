@@ -1,8 +1,12 @@
 import re
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QTextEdit, QTabWidget, QMenu
-from PyQt6.QtGui import QFont, QColor, QPalette, QKeyEvent, QAction
+from PyQt6.QtGui import (QFont, QColor, QPalette, QKeyEvent, QAction,
+                         QTextCursor)
 from PyQt6.QtCore import Qt, pyqtSignal
 from typing import Dict, Optional
+
+from core.terminal import parser as vt
+from core.terminal.screen import Screen
 
 
 class InteractiveTerminal(QTextEdit):
@@ -477,10 +481,9 @@ class TerminalWidget(QWidget):
             for i in range(self.tab_widget.count()):
                 if self.tab_widget.tabText(i) == device_name:
                     self.tab_widget.setCurrentIndex(i)
-                    # 案内は 1 接続につき一度。タブは機器名で使い回す
-                    # ため、ここで戻さないと再接続後に出なくなる。
-                    self._terminals[device_name]._fullscreen_warned = False
-                    self._terminals[device_name]._pending_escape = ""
+                    # 再接続は新しいセッション。前の画面はそのまま記録と
+                    # して文書に残し、端末状態 (パーサ・画面) は作り直す
+                    self._attach_screen(self._terminals[device_name])
                     return self._terminals[device_name]
         
         # 接続機器がなく、ホームタブが残っている場合は、ホームタブを再利用
@@ -517,35 +520,123 @@ class TerminalWidget(QWidget):
         # タブとして追加
         index = self.tab_widget.addTab(terminal, device_name)
         self.tab_widget.setCurrentIndex(index)
-        
+
+        self._attach_screen(terminal)
         return terminal
-    
+
+    # 端末の格子の大きさ。pty 要求 (vt100, 80x24) と合わせてある
+    SCREEN_ROWS = 24
+    SCREEN_COLS = 80
+
+    def _attach_screen(self, terminal: QTextEdit) -> None:
+        """端末状態 (パーサと画面) をこのタブへ付け直す。
+
+        文書のいまの末尾から後ろを「今の画面」の領域とする。それより
+        前は確定した記録で、二度と書き換えない。
+        """
+        terminal._parser = vt.Parser()
+        terminal._screen = Screen(self.SCREEN_ROWS, self.SCREEN_COLS)
+        region = QTextCursor(terminal.document())
+        region.movePosition(QTextCursor.MoveOperation.End)
+        terminal._region = region
+
+    def _render_screen(self, terminal: QTextEdit) -> None:
+        """画面の中身を文書へ写す。
+
+        文書 = [確定した記録 (履歴)] + [今の画面]。上から押し出された
+        行を記録側へ差し込み、画面領域は毎回まるごと描き直す。
+        """
+        screen = terminal._screen
+        region = terminal._region
+
+        new_history = screen.take_new_history()
+        if new_history:
+            region.insertText("".join(
+                "".join(cell[0] for cell in line).rstrip() + "\n"
+                for line in new_history))
+
+        rows = screen.text()
+        # カーソルの行は、カーソルの桁まで空白を残す。プロンプト末尾の
+        # 空白 ("Router# ") を落とすとキャレットが $ に張り付いて見える
+        if len(rows[screen.cursor_row]) < screen.cursor_col:
+            rows[screen.cursor_row] = (
+                rows[screen.cursor_row].ljust(screen.cursor_col))
+        last = screen.cursor_row
+        for r, line in enumerate(rows):
+            if line and r > last:
+                last = r
+        new_text = "\n".join(rows[:last + 1])
+        start = region.position()
+
+        # 変わった範囲だけ置き換える。全部消して入れ直すと、機器が
+        # ログを吐くたびに画面内の範囲選択が消えてしまう
+        probe = QTextCursor(terminal.document())
+        probe.setPosition(start)
+        probe.movePosition(QTextCursor.MoveOperation.End,
+                           QTextCursor.MoveMode.KeepAnchor)
+        old_text = probe.selectedText().replace("\u2029", "\n")
+        if old_text != new_text:
+            prefix = 0
+            limit = min(len(old_text), len(new_text))
+            while prefix < limit and old_text[prefix] == new_text[prefix]:
+                prefix += 1
+            suffix = 0
+            while (suffix < limit - prefix
+                   and old_text[-1 - suffix] == new_text[-1 - suffix]):
+                suffix += 1
+            probe.setPosition(start + prefix)
+            probe.setPosition(start + len(old_text) - suffix,
+                              QTextCursor.MoveMode.KeepAnchor)
+            probe.insertText(new_text[prefix:len(new_text) - suffix])
+        region.setPosition(start)
+        screen.take_dirty()             # 差分は文字列比較で取るので不使用
+
+        # キャレット (点滅カーソル) を画面カーソルの位置へ。範囲選択の
+        # 最中に動かすと選択が消えるので、そのときは触らない
+        if not terminal.textCursor().hasSelection():
+            pos = start
+            for r in range(screen.cursor_row):
+                pos += len(rows[r]) + 1
+            pos += min(screen.cursor_col, len(rows[screen.cursor_row]))
+            caret = QTextCursor(terminal.document())
+            caret.setPosition(pos)
+            terminal.setTextCursor(caret)
+            terminal.ensureCursorVisible()
+
     def append_output(self, device_name: str, text: str) -> None:
         """
         指定した機器のターミナルにテキストを追加
-        
+
         Args:
             device_name: 機器名
             text: 追加するテキスト
         """
-        if device_name in self._terminals:
-            terminal = self._terminals[device_name]
-            from PyQt6.QtGui import QTextCursor
-            
-            # 制御コードを処理（カーソル位置も変更される可能性がある）
-            processed_text = self._process_control_codes(terminal, text)
-            
-            # テキストがある場合のみ挿入
-            # 描画は _process_control_codes 内で完了している（戻り値はログ用）
-            if processed_text:
-                # ログ記録中の場合はファイルに書き込み
-                if device_name in self._log_files:
-                    try:
-                        self._log_files[device_name].write(processed_text)
-                        self._log_files[device_name].flush()  # 即座にディスクに書き込む
-                    except Exception as e:
-                        import sys
-                        print(f"[ERROR] ログ書き込みエラー: {str(e)}", file=sys.stderr)
+        if device_name not in self._terminals:
+            return
+        terminal = self._terminals[device_name]
+
+        events = terminal._parser.feed(text)
+        terminal._screen.apply(events)
+        self._render_screen(terminal)
+
+        # 機器からの問い合わせ (カーソル位置・装置識別) に答える。
+        # key_pressed はキー入力と同じ「機器へ送る文字」の経路
+        for response in terminal._screen.take_responses():
+            terminal.key_pressed.emit(response)
+
+        if device_name in self._log_files:
+            logged = "".join(
+                e.text if isinstance(e, vt.Print) else "\n"
+                for e in events
+                if isinstance(e, vt.Print)
+                or (isinstance(e, vt.Ctrl) and e.char == "\n"))
+            if logged:
+                try:
+                    self._log_files[device_name].write(logged)
+                    self._log_files[device_name].flush()
+                except Exception as e:
+                    import sys
+                    print(f"[ERROR] ログ書き込みエラー: {str(e)}", file=sys.stderr)
     
     def enable_reconnect(self, device_name: str, reconnect_callback):
         """
