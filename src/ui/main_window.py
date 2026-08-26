@@ -448,6 +448,13 @@ class MainWindow(QMainWindow):
             
             # 新しい機器を追加
             if self.config_manager.add_device(new_group_name, new_device_data):
+                # 開いているタブの再接続は device_info の写しを見る。
+                # ここを更新しないと編集内容が届かず、古い接続情報のまま
+                # 繋がり続ける（存在しない鍵を指定しても、以前の鍵で
+                # 繋がってしまう）。名前を変えたときは古い写しを残さない。
+                if old_device_name in self.device_info:
+                    del self.device_info[old_device_name]
+                    self.device_info[new_device_data["name"]] = new_device_data
                 # ツリーを再読み込み
                 self._load_devices()
                 self.status_bar.showMessage(f"機器 '{new_device_data['name']}' を更新しました")
@@ -475,6 +482,9 @@ class MainWindow(QMainWindow):
         
         if reply == QMessageBox.StandardButton.Yes:
             if self.config_manager.remove_device(group_name, device_name):
+                # 消した機器の接続情報を残さない（残すと、開いたままの
+                # タブで Enter を押したときに消したはずの機器へ繋がる）
+                self.device_info.pop(device_name, None)
                 # ツリーを再読み込み
                 self._load_devices()
                 self.status_bar.showMessage(f"機器 '{device_name}' を削除しました")
