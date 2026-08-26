@@ -1,11 +1,19 @@
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QTextEdit, QTabWidget, QMenu
 from PyQt6.QtGui import (QFont, QColor, QPalette, QKeyEvent, QAction,
-                         QTextCursor)
+                         QTextCursor, QTextCharFormat)
 from PyQt6.QtCore import Qt, pyqtSignal
 from typing import Dict, Optional
 
 from core.terminal import parser as vt
-from core.terminal.screen import Screen
+from core.terminal.attrs import DEFAULT
+from core.terminal.screen import Screen, BLANK
+
+# SGR の基本 16 色 (xterm の既定値)。0-7 が基本、8-15 が明色
+ANSI_COLOURS = (
+    "#000000", "#cd0000", "#00cd00", "#cdcd00",
+    "#0000ee", "#cd00cd", "#00cdcd", "#e5e5e5",
+    "#7f7f7f", "#ff0000", "#00ff00", "#ffff00",
+    "#5c5cff", "#ff00ff", "#00ffff", "#ffffff")
 
 
 class InteractiveTerminal(QTextEdit):
@@ -539,27 +547,97 @@ class TerminalWidget(QWidget):
         region.movePosition(QTextCursor.MoveOperation.End)
         terminal._region = region
 
+    @staticmethod
+    def _visible_cells(line):
+        """行のセル列から、既定属性の末尾空白だけを落とす。
+
+        色や反転の付いた空白 (nano のタイトルバーの帯) は表示に
+        意味があるので残す。
+        """
+        n = len(line)
+        while n and line[n - 1] == BLANK:
+            n -= 1
+        return line[:n]
+
+    @staticmethod
+    def _runs(cells):
+        """同じ属性が続く区間ごとに (文字列, 属性) を返す。"""
+        runs = []
+        for ch, attr in cells:
+            if runs and runs[-1][1] == attr:
+                runs[-1][0].append(ch)
+            else:
+                runs.append(([ch], attr))
+        return [("".join(chars), attr) for chars, attr in runs]
+
+    def _colour(self, value, default):
+        """セルの色番号を実際の色にする。"""
+        if value is None:
+            return default
+        if isinstance(value, tuple):
+            return QColor(*value)
+        if value < 16:
+            return QColor(ANSI_COLOURS[value])
+        if value < 232:                     # 6x6x6 の色立方体
+            value -= 16
+            parts = (value // 36, value // 6 % 6, value % 6)
+            return QColor(*(0 if p == 0 else 55 + p * 40 for p in parts))
+        gray = 8 + (value - 232) * 10       # グレースケール
+        return QColor(gray, gray, gray)
+
+    def _char_format(self, attr) -> QTextCharFormat:
+        fmt = QTextCharFormat()
+        if attr == DEFAULT:
+            return fmt                      # 空の書式 = パレットに従う
+        settings = self._terminal_settings
+        fg = self._colour(attr.fg, QColor(settings["text_color"]))
+        bg = self._colour(attr.bg, QColor(settings["background_color"]))
+        if attr.reverse:
+            fg, bg = bg, fg
+        fmt.setForeground(fg)
+        if attr.bg is not None or attr.reverse:
+            fmt.setBackground(bg)
+        if attr.bold:
+            fmt.setFontWeight(QFont.Weight.Bold)
+        if attr.underline:
+            fmt.setFontUnderline(True)
+        return fmt
+
+    def _paint_row(self, terminal: QTextEdit, offset: int, cells) -> None:
+        """1 行ぶんのセル属性を、文書のその範囲へ塗る。
+
+        書式だけを変えるので文字位置は動かず、範囲選択も壊れない。
+        """
+        painter = QTextCursor(terminal.document())
+        for text, attr in self._runs(cells):
+            painter.setPosition(offset)
+            painter.setPosition(offset + len(text),
+                                QTextCursor.MoveMode.KeepAnchor)
+            painter.setCharFormat(self._char_format(attr))
+            offset += len(text)
+
     def _render_screen(self, terminal: QTextEdit) -> None:
         """画面の中身を文書へ写す。
 
         文書 = [確定した記録 (履歴)] + [今の画面]。上から押し出された
-        行を記録側へ差し込み、画面領域は毎回まるごと描き直す。
+        行を記録側へ差し込み、画面領域は変わった範囲だけ描き直す。
         """
         screen = terminal._screen
         region = terminal._region
 
-        new_history = screen.take_new_history()
-        if new_history:
-            region.insertText("".join(
-                "".join(cell[0] for cell in line).rstrip() + "\n"
-                for line in new_history))
+        for line in screen.take_new_history():
+            for text, attr in self._runs(self._visible_cells(line)):
+                region.insertText(text, self._char_format(attr))
+            region.insertText("\n", QTextCharFormat())
 
-        rows = screen.text()
+        cell_rows = [self._visible_cells(line) for line in screen.lines]
         # カーソルの行は、カーソルの桁まで空白を残す。プロンプト末尾の
         # 空白 ("Router# ") を落とすとキャレットが $ に張り付いて見える
-        if len(rows[screen.cursor_row]) < screen.cursor_col:
-            rows[screen.cursor_row] = (
-                rows[screen.cursor_row].ljust(screen.cursor_col))
+        pad = screen.cursor_col - len(cell_rows[screen.cursor_row])
+        if pad > 0:
+            cell_rows[screen.cursor_row] = (
+                cell_rows[screen.cursor_row] + [BLANK] * pad)
+        rows = ["".join(cell[0] for cell in cells) for cells in cell_rows]
         last = screen.cursor_row
         for r, line in enumerate(rows):
             if line and r > last:
@@ -588,7 +666,15 @@ class TerminalWidget(QWidget):
                               QTextCursor.MoveMode.KeepAnchor)
             probe.insertText(new_text[prefix:len(new_text) - suffix])
         region.setPosition(start)
-        screen.take_dirty()             # 差分は文字列比較で取るので不使用
+
+        # 変わった行に色・太字・反転を塗り直す
+        dirty = screen.take_dirty()
+        dirty.add(screen.cursor_row)    # カーソル桁の空白の伸縮ぶん
+        offset = start
+        for r in range(last + 1):
+            if r in dirty:
+                self._paint_row(terminal, offset, cell_rows[r])
+            offset += len(rows[r]) + 1
 
         # キャレット (点滅カーソル) を画面カーソルの位置へ。範囲選択の
         # 最中に動かすと選択が消えるので、そのときは触らない

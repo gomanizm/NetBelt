@@ -131,6 +131,73 @@ class SelectionSurvivesOutputTest(WidgetRenderTest):
         self.assertIn("more output", self.screen_text(w))
 
 
+class ColourTest(WidgetRenderTest):
+    """SGR が実際の色になること。番号→実色の対応は xterm の既定値。"""
+
+    def format_at(self, w, needle):
+        from PyQt6.QtGui import QTextCursor
+        terminal = w._terminals["dev"]
+        pos = terminal.toPlainText().index(needle)
+        cursor = QTextCursor(terminal.document())
+        cursor.setPosition(pos + 1)         # charFormat は直前の文字の書式
+        return cursor.charFormat()
+
+    def test_basic_colours_reach_the_glyphs(self):
+        w = self.widget()
+        w.append_output("dev", "\x1b[31mRED\x1b[m plain")
+        self.assertEqual(self.format_at(w, "RED").foreground().color().name(),
+                         "#cd0000")
+
+    def test_default_text_carries_no_explicit_colour(self):
+        # 書式を空に戻しておかないと、設定でパレットを変えたとき
+        # 過去の文字だけ古い色で残ってしまう
+        from PyQt6.QtGui import QTextFormat
+        w = self.widget()
+        w.append_output("dev", "\x1b[31mRED\x1b[m plain")
+        self.assertFalse(self.format_at(w, "plain").hasProperty(
+            QTextFormat.Property.ForegroundBrush))
+
+    def test_reverse_video_swaps_the_palette(self):
+        w = self.widget()
+        w.append_output("dev", "\x1b[7m--More--\x1b[m")
+        fmt = self.format_at(w, "--More--")
+        settings = w._terminal_settings
+        self.assertEqual(fmt.foreground().color().name(),
+                         settings["background_color"].lower())
+        self.assertEqual(fmt.background().color().name(),
+                         settings["text_color"].lower())
+
+    def test_bold_is_bold(self):
+        from PyQt6.QtGui import QFont
+        w = self.widget()
+        w.append_output("dev", "\x1b[1mboot system\x1b[m")
+        self.assertEqual(self.format_at(w, "boot").fontWeight(),
+                         QFont.Weight.Bold)
+
+    def test_the_256_colour_cube(self):
+        w = self.widget()
+        w.append_output("dev", "\x1b[38;5;196mX")
+        self.assertEqual(self.format_at(w, "X").foreground().color().name(),
+                         "#ff0000")
+
+    def test_colour_survives_scrolling_into_the_record(self):
+        w = self.widget()
+        w.append_output("dev", "\x1b[32mUP\x1b[m\r\n" + "\r\n" * 30)
+        self.assertEqual(self.format_at(w, "UP").foreground().color().name(),
+                         "#00cd00")
+
+    def test_nano_title_bar_keeps_its_band(self):
+        # 反転属性の付いた空白は帯として意味があるので、行末でも
+        # 削らずに描く
+        w = self.widget()
+        w.append_output("dev", fixture("nano_vt100.bin"))
+        title = [l for l in w._terminals["dev"].toPlainText().split("\n")
+                 if "GNU nano" in l][0]
+        self.assertEqual(len(title), 80)
+        fmt = self.format_at(w, "GNU nano")
+        self.assertEqual(fmt.background().color().name(), "#ffffff")
+
+
 class DeviceQueryTest(WidgetRenderTest):
     def test_a_cursor_position_query_is_answered(self):
         w = self.widget()
