@@ -1119,7 +1119,17 @@ class MainWindow(QMainWindow):
         )
         
         if reply == QMessageBox.StandardButton.Yes:
+            # 消える機器を先に控える。削除後には辿れない。
+            doomed = [device.get("name")
+                      for group in self.config_manager.get_groups()
+                      if group.get("name") == group_name
+                      for device in group.get("devices", [])]
             if self.config_manager.remove_group(group_name):
+                # 機器を個別に消したときと同じ理由で、接続情報を残さない。
+                # 残すと、開いたままのタブで Enter を押しただけで、
+                # 消したはずの機器へ繋がる。
+                for name in doomed:
+                    self.device_info.pop(name, None)
                 # ツリーを再読み込み
                 self._load_devices()
                 self.status_bar.showMessage(f"グループ '{group_name}' を削除しました")
