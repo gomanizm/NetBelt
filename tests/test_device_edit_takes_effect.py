@@ -140,13 +140,38 @@ class DeviceEditReachesReconnectTest(unittest.TestCase):
 
 
 class PanelBandContrastTest(unittest.TestCase):
-    """帯の文字が、暗い配色でも読めることを検証する。
+    """帯の文字が、実際の配色で読めることを検証する。
 
-    1.1.1 で足した接続先の表示は背景色だけを決め打ちしており、
-    ダークモードでは明るい文字色と同系色になって消えていた。
-    どの機器へ送るのかを確かめるための表示が読めないのでは、
-    付けた意味がない。
+    1.1.1 で足した接続先の表示は、ダークモードで背景に溶けて消えた。
+    一度目の修正はパレットの AlternateBase を背景に、Text を文字色に
+    採ったが、それでも消えたままだった。このマシンで測ると理由が出た:
+
+        colorScheme      Dark
+        Window           #1e1e1e
+        AlternateBase    #ffffff   ← ダークなのに白
+        Text             #ffffff
+
+    役割ごとの値が互いに整合している保証は無い。下の WINDOWS11_DARK は
+    その実測値そのもので、一度目の修正はこれで落ちる。
     """
+
+    # Windows 11 / Qt6 / windows11 スタイル / システムはダーク の実測値
+    WINDOWS11_DARK = {
+        "Window": "#1e1e1e", "WindowText": "#ffffff",
+        "Base": "#2d2d2d", "AlternateBase": "#ffffff",
+        "Text": "#ffffff", "Button": "#3c3c3c",
+        "ButtonText": "#ffffff", "Mid": "#282828",
+        "PlaceholderText": "#ffffff",
+    }
+
+    # 比較用。素直な明るい配色
+    PLAIN_LIGHT = {
+        "Window": "#f0f0f0", "WindowText": "#000000",
+        "Base": "#ffffff", "AlternateBase": "#f7f7f7",
+        "Text": "#000000", "Button": "#e1e1e1",
+        "ButtonText": "#000000", "Mid": "#a0a0a0",
+        "PlaceholderText": "#7f7f7f",
+    }
 
     @classmethod
     def setUpClass(cls):
@@ -169,24 +194,26 @@ class PanelBandContrastTest(unittest.TestCase):
         hi, lo = max(la, lb), min(la, lb)
         return (hi + 0.05) / (lo + 0.05)
 
-    def _panel(self, dark):
+    def _panel(self, colours):
+        """その配色をアプリへ適用した状態でパネルを作る。
+
+        スタイルは __init__ で組み立てられるので、あとから
+        パレットを差し替えても実際の表示は変わらない。本番と
+        同じ順で作る。
+        """
         from PyQt6.QtGui import QColor, QPalette
         from ui.sftp_panel import SFTPPanel
 
-        panel = SFTPPanel()
         palette = QPalette()
-        if dark:
-            palette.setColor(QPalette.ColorRole.AlternateBase, QColor("#2b2b2b"))
-            palette.setColor(QPalette.ColorRole.Text, QColor("#f0f0f0"))
-            palette.setColor(QPalette.ColorRole.Mid, QColor("#555555"))
-        else:
-            palette.setColor(QPalette.ColorRole.AlternateBase, QColor("#f0f0f0"))
-            palette.setColor(QPalette.ColorRole.Text, QColor("#101010"))
-            palette.setColor(QPalette.ColorRole.Mid, QColor("#b0b0b0"))
-        panel.setPalette(palette)
-        return panel
+        for role, value in colours.items():
+            palette.setColor(getattr(QPalette.ColorRole, role),
+                             QColor(value))
+        previous = self.app.palette()
+        self.app.setPalette(palette)
+        self.addCleanup(self.app.setPalette, previous)
+        return SFTPPanel()
 
-    def _colors(self, style):
+    def _colours(self, style):
         import re
         bg = re.search(r"background-color:\s*(#[0-9a-fA-F]{6})", style)
         fg = re.search(r"(?<!-)\bcolor:\s*(#[0-9a-fA-F]{6})", style)
@@ -194,22 +221,56 @@ class PanelBandContrastTest(unittest.TestCase):
         self.assertIsNotNone(fg, "文字色が無い: %r" % style)
         return bg.group(1), fg.group(1)
 
-    def test_the_band_is_readable_in_both_themes(self):
-        for dark in (True, False):
-            with self.subTest(dark=dark):
-                panel = self._panel(dark)
-                bg, fg = self._colors(panel._band_style())
+    def test_the_band_is_readable_on_this_machines_dark_theme(self):
+        """実測した配色で読めること。
+
+        AlternateBase と Text をそのまま使うと、ここが
+        白地に白（コントラスト 1.0:1）になる。
+        """
+        panel = self._panel(self.WINDOWS11_DARK)
+
+        for name, label in (("接続先", panel.target_label),
+                            ("パス", panel.path_label)):
+            with self.subTest(label=name):
+                bg, fg = self._colours(label.styleSheet())
                 ratio = self._contrast(bg, fg)
                 self.assertGreater(
                     ratio, 4.5,
-                    "帯の文字が読めない（%s / %s = %.1f:1）" % (fg, bg, ratio))
+                    "%s の文字が読めない（%s / %s = %.1f:1）"
+                    % (name, fg, bg, ratio))
 
-    def test_the_band_always_sets_both_colors(self):
-        """背景だけを決めない。片方だけだと配色次第で溶ける。"""
-        panel = self._panel(dark=True)
-        for style in (panel._band_style(), panel._band_style(bold=True)):
-            self.assertIn("background-color:", style)
-            self.assertIn("color:", style.replace("background-color:", ""))
+    def test_the_band_is_readable_on_a_light_theme(self):
+        panel = self._panel(self.PLAIN_LIGHT)
+
+        bg, fg = self._colours(panel.target_label.styleSheet())
+        ratio = self._contrast(bg, fg)
+        self.assertGreater(ratio, 4.5,
+                           "明るい配色で読めない（%s / %s = %.1f:1）"
+                           % (fg, bg, ratio))
+
+    def test_the_band_stands_out_from_the_panel(self):
+        """帯だと分かること。地と同じ色では帯の意味がない。"""
+        for name, colours in (("ダーク", self.WINDOWS11_DARK),
+                              ("ライト", self.PLAIN_LIGHT)):
+            with self.subTest(theme=name):
+                panel = self._panel(colours)
+                bg, _fg = self._colours(panel.target_label.styleSheet())
+                self.assertNotEqual(bg.lower(), colours["Window"].lower(),
+                                    "帯が地と同じ色")
+
+    def test_the_hint_is_readable_too(self):
+        """未接続のときの案内文も読めること。"""
+        import re
+        panel = self._panel(self.WINDOWS11_DARK)
+
+        style = panel.hint_label.styleSheet()
+        fg = re.search(r"color:\s*(#[0-9a-fA-F]{6})", style)
+        self.assertIsNotNone(fg, "文字色が無い: %r" % style)
+        ratio = self._contrast(self.WINDOWS11_DARK["Window"], fg.group(1))
+        self.assertGreater(ratio, 4.5,
+                           "案内文が読めない（%s / %s = %.1f:1）"
+                           % (fg.group(1), self.WINDOWS11_DARK["Window"],
+                              ratio))
 
     def test_no_hard_coded_background_is_left_in_the_panel(self):
         """パネルの中に、決め打ちの背景色を残さないこと。"""

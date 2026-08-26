@@ -98,33 +98,64 @@ class SFTPPanel(QWidget):
         return self.normalize_sftp_settings(raw)[key]
     
     # 接続先が無いときの表示
-    def _band_style(self, bold: bool = False) -> str:
-        """帯のスタイルを、いまの配色から組み立てる。
+    @staticmethod
+    def _luminance(color) -> float:
+        """sRGB の相対輝度（0=黒, 1=白）。"""
+        def channel(v):
+            v = v / 255.0
+            return v / 12.92 if v <= 0.04045 else ((v + 0.055) / 1.055) ** 2.4
 
-        背景だけを決め打ちすると、暗い配色のときに文字色（パレット
-        由来の明るい色）と同系色になって読めなくなる。実際 1.1.1 の
-        ダークモードで、接続先の表示が背景に溶けて消えていた。
-        背景と文字色は必ず対で決める。
+        return (0.2126 * channel(color.red())
+                + 0.7152 * channel(color.green())
+                + 0.0722 * channel(color.blue()))
+
+    def _band_colours(self):
+        """帯の (背景, 文字, 枠) を返す。
+
+        パレットの役割どうしが整合している保証は無い。実測では、
+        Windows 11 のダークテーマで配色は Dark と判定されているのに
+        AlternateBase も Text も #ffffff を返し、白地に白の帯になった。
+        信用できる地の色（Window）だけを取り、明暗はそこから計算する。
         """
-        from PyQt6.QtGui import QPalette
+        from PyQt6.QtGui import QColor, QPalette
 
-        palette = self.palette()
+        base = self.palette().color(QPalette.ColorRole.Window)
+        if not base.isValid():
+            base = QColor("#f0f0f0")
+        dark = self._luminance(base) < 0.5
+        # 地から少し離して、帯だと分かるようにする
+        band = base.lighter(160) if dark else base.darker(108)
+        # 文字色はパレットから採らない。帯の明暗だけで決める。
+        ink = QColor("#ffffff") if self._luminance(band) < 0.5 \
+            else QColor("#101010")
+        edge = band.lighter(150) if dark else band.darker(118)
+        return band, ink, edge
+
+    def _band_style(self, bold: bool = False) -> str:
+        """帯のスタイル。背景と文字色は必ず対で決める。"""
+        band, ink, edge = self._band_colours()
         return (
             "background-color: %s; color: %s; border: 1px solid %s;"
             " padding: 6px;%s" % (
-                palette.color(QPalette.ColorRole.AlternateBase).name(),
-                palette.color(QPalette.ColorRole.Text).name(),
-                palette.color(QPalette.ColorRole.Mid).name(),
+                band.name(), ink.name(), edge.name(),
                 " font-weight: bold;" if bold else "",
             ))
 
     def _hint_style(self) -> str:
-        """案内文のスタイル。こちらも配色に追従させる。"""
-        from PyQt6.QtGui import QPalette
+        """案内文のスタイル。地の上で読める範囲で控えめにする。"""
+        from PyQt6.QtGui import QColor, QPalette
 
-        palette = self.palette()
-        return "color: %s; padding: 4px;" % (
-            palette.color(QPalette.ColorRole.PlaceholderText).name(),)
+        base = self.palette().color(QPalette.ColorRole.Window)
+        if not base.isValid():
+            base = QColor("#f0f0f0")
+        ink = QColor("#ffffff") if self._luminance(base) < 0.5 \
+            else QColor("#101010")
+        # 地の側へ 3 割寄せて、本文より一段落とす
+        hint = QColor(
+            (ink.red() * 7 + base.red() * 3) // 10,
+            (ink.green() * 7 + base.green() * 3) // 10,
+            (ink.blue() * 7 + base.blue() * 3) // 10)
+        return "color: %s; padding: 4px;" % hint.name()
 
     NO_TARGET_TEXT = "接続先: なし"
 
