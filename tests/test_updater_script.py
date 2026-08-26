@@ -28,6 +28,14 @@ import zipfile
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 UPDATER = os.path.join(REPO_ROOT, "updater.bat")
 
+def _start_line(text):
+    """アプリを起動している行を返す。変数の書き方に依存しない。"""
+    for line in text.splitlines():
+        if line.startswith('start "" '):
+            return line
+    raise AssertionError("起動している行が見つからない")
+
+
 
 class UpdaterScriptTest(unittest.TestCase):
     """実際に cmd.exe で走らせて確かめる。"""
@@ -117,7 +125,7 @@ class UpdaterScriptTest(unittest.TestCase):
 
         # updater.bat の写しに、再起動の直前で必ず失敗する行を入れる
         original = io.open(UPDATER, encoding="utf-8", newline="").read()
-        anchor = 'start "" "%APP_PATH%"'
+        anchor = _start_line(original)
         self.assertIn(anchor, original, "起動行の形が変わっている")
         injected = original.replace(
             anchor,
@@ -132,6 +140,33 @@ class UpdaterScriptTest(unittest.TestCase):
                          "直前の失敗を start の失敗として報告している")
         self.assertEqual(code, 0, out)
         self.assertEqual(self._installed(), "new", out)
+
+    def test_a_folder_with_parentheses_still_updates(self):
+        """括弧を含むフォルダでも更新できること。
+
+        `Program Files (x86)` も、同じ zip を 2 回ダウンロードしたときの
+        `... (1)` も、現実によくあるフォルダ名。%VAR% は解析の段階で
+        展開されるため、その `)` が if / for の括弧を閉じてしまい
+        「\\app\\ was unexpected at this time」で途中停止していた。
+        v1.1.0 でも同じで、更新が当たらないまま終わっていた。
+        """
+        nested = os.path.join(self.base, "NetBelt-v9.9.9-Portable (1)")
+        app_dir = os.path.join(nested, "app")
+        os.makedirs(app_dir)
+        updater = os.path.join(app_dir, "updater.bat")
+        shutil.copyfile(UPDATER, updater)
+        app_path = os.path.join(app_dir, "dummy_app.bat")
+        self._write(app_path, "@echo off\r\nexit " + chr(47) + "b 0\r\n")
+        self._write(os.path.join(app_dir, "NetBelt.exe"), "old")
+        zip_path = self._make_zip({"NetBelt.exe": "new"})
+
+        code, out = self._run(zip_path, updater=updater, app_path=app_path)
+
+        self.assertEqual(code, 0, out)
+        self.assertEqual(
+            io.open(os.path.join(app_dir, "NetBelt.exe"),
+                    encoding="ascii").read(), "new", out)
+        self.assertNotIn("was unexpected at this time", out)
 
     def test_a_zip_without_the_app_is_reported_as_a_failure(self):
         """実行ファイルが入っていない zip を、成功と報告しないこと。
@@ -187,7 +222,7 @@ class UpdaterEncodingTest(unittest.TestCase):
 
         start は成功しても errorlevel を 0 に戻さない。実測で確認済み。
         """
-        after = self.text[self.text.index('start "" "%APP_PATH%"'):]
+        after = self.text[self.text.index(_start_line(self.text)):]
         head = after.split("\r\n")[1:4]
         self.assertNotIn("errorlevel", "\n".join(head),
                          "start の直後で errorlevel を見ている: %r" % head)
