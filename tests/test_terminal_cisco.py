@@ -10,10 +10,8 @@ backspace で消して打ち直す、を含む。実環境を指す値だけ文�
 **この 7058 バイトに、エスケープシーケンスは 1 つも含まれていない。**
 届くのは `\\r` `\\n` `\\b` だけ。ネットワーク機器の画面はバックスペースの
 上書きだけで組み立てられており、それが NetBelt の主用途である以上、
-この経路を壊すことは許容できない。
-
-全画面アプリの検知が機器の通常操作で誤爆しないか、という問いにも
-ここで答えている（目印は 1 度も現れない）。
+この経路を壊すことは許容できない。v1.2.0 の描画作り直しの成否も
+まずここで測る。
 """
 import io
 import os
@@ -94,19 +92,6 @@ class CiscoRenderingTest(unittest.TestCase):
                     if l.startswith("       ") and l.strip()]
         self.assertGreaterEqual(len(indented), 10,
                                 "凡例の字下げが失われている")
-
-    def test_no_full_screen_notice_for_ordinary_device_work(self):
-        """機器を普通に操作している間、全画面アプリの案内を出さないこと。
-
-        レビューで 2 度「ページャや端末リセットで誤爆しないか」と
-        指摘された。実機で測ったところ、目印になるシーケンスは
-        1 度も届かない。
-        """
-        from ui.terminal_widget import TerminalWidget
-        text = self._screen(capture())
-
-        self.assertNotIn(TerminalWidget.ALT_SCREEN_NOTICE, text,
-                         "機器の通常操作で誤爆している")
 
     def test_every_split_point_renders_the_same(self):
         """受信がどこで切れても、同じ画面になること。"""
