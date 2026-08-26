@@ -20,10 +20,13 @@ Ctrl = collections.namedtuple("Ctrl", "char")
 Esc = collections.namedtuple("Esc", "intermediate final")
 Csi = collections.namedtuple("Csi", "private params intermediate final")
 Osc = collections.namedtuple("Osc", "text")
+Dcs = collections.namedtuple("Dcs", "private params intermediate final text")
 
 (GROUND, ESCAPE, ESCAPE_INTERMEDIATE,
  CSI_ENTRY, CSI_PARAM, CSI_INTERMEDIATE, CSI_IGNORE,
- OSC_STRING, SOS_PM_APC) = range(9)
+ OSC_STRING, SOS_PM_APC,
+ DCS_ENTRY, DCS_PARAM, DCS_INTERMEDIATE, DCS_PASSTHROUGH,
+ DCS_IGNORE) = range(14)
 
 MAX_PARAMS = 256      # 暴走した列でメモリを食わないための上限
 MAX_STRING = 4096
@@ -34,6 +37,7 @@ class Parser(object):
         self.state = GROUND
         self._clear()
         self._string = []
+        self._hook = None
 
     def _clear(self):
         self._private = ""
@@ -46,10 +50,15 @@ class Parser(object):
         return tuple(int(p) if p else None for p in self._params.split(";"))
 
     def _end_string(self, out):
-        """ESC / ST で文字列列 (OSC) を閉じ、確定した命令を出す。"""
+        """ESC / ST で文字列列 (OSC/DCS) を閉じ、確定した命令を出す。"""
         if self.state == OSC_STRING:
             out.append(Osc("".join(self._string)))
+        elif self.state == DCS_PASSTHROUGH:
+            private, params, intermediate, final = self._hook
+            out.append(Dcs(private, params, intermediate, final,
+                           "".join(self._string)))
         self._string = []
+        self._hook = None
 
     def feed(self, text):
         """デコード済み文字列を食わせ、確定した命令のリストを返す。"""
@@ -79,6 +88,7 @@ class Parser(object):
             if code in (0x18, 0x1A):            # CAN / SUB は列を捨てる
                 flush()
                 self._string = []
+                self._hook = None
                 out.append(Ctrl(ch))
                 self.state = GROUND
                 continue
@@ -105,7 +115,10 @@ class Parser(object):
                 elif ch == "]":
                     self._string = []
                     self.state = OSC_STRING
-                elif ch in "PX^_":              # DCS はまだ中身を読まず捨てる
+                elif ch == "P":
+                    self._clear()
+                    self.state = DCS_ENTRY
+                elif ch in "X^_":
                     self.state = SOS_PM_APC
                 elif code <= 0x7E:
                     out.append(Esc(self._intermediate, ch))
@@ -207,6 +220,77 @@ class Parser(object):
                     self._string.append(ch)
 
             elif state == SOS_PM_APC:
+                pass                            # ST/ESC/CAN/SUB まで無視
+
+            elif state == DCS_ENTRY:
+                if code < 0x20:
+                    pass
+                elif code <= 0x2F:
+                    self._intermediate += ch
+                    self.state = DCS_INTERMEDIATE
+                elif ch == ":":
+                    self.state = DCS_IGNORE
+                elif code <= 0x39 or ch == ";":
+                    self._params += ch
+                    self.state = DCS_PARAM
+                elif code <= 0x3F:
+                    self._private += ch
+                    self.state = DCS_PARAM
+                elif code <= 0x7E:
+                    self._hook = (self._private, self._split_params(),
+                                  self._intermediate, ch)
+                    self._string = []
+                    self.state = DCS_PASSTHROUGH
+                elif code == 0x7F:
+                    pass
+                else:
+                    abort_and_print(ch)
+
+            elif state == DCS_PARAM:
+                if code < 0x20:
+                    pass
+                elif code <= 0x2F:
+                    self._intermediate += ch
+                    self.state = DCS_INTERMEDIATE
+                elif (0x30 <= code <= 0x39 or ch == ";") and \
+                        len(self._params) < MAX_PARAMS:
+                    self._params += ch
+                elif code <= 0x3F:
+                    self.state = DCS_IGNORE
+                elif code <= 0x7E:
+                    self._hook = (self._private, self._split_params(),
+                                  self._intermediate, ch)
+                    self._string = []
+                    self.state = DCS_PASSTHROUGH
+                elif code == 0x7F:
+                    pass
+                else:
+                    abort_and_print(ch)
+
+            elif state == DCS_INTERMEDIATE:
+                if code < 0x20:
+                    pass
+                elif code <= 0x2F:
+                    self._intermediate += ch
+                elif code <= 0x3F:
+                    self.state = DCS_IGNORE
+                elif code <= 0x7E:
+                    self._hook = (self._private, self._split_params(),
+                                  self._intermediate, ch)
+                    self._string = []
+                    self.state = DCS_PASSTHROUGH
+                elif code == 0x7F:
+                    pass
+                else:
+                    abort_and_print(ch)
+
+            elif state == DCS_PASSTHROUGH:
+                if code == 0x7F:
+                    pass
+                elif len(self._string) < MAX_STRING:
+                    self._string.append(ch)
+
+            elif state == DCS_IGNORE:
                 pass                            # ST/ESC/CAN/SUB まで無視
 
         flush()

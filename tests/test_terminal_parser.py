@@ -16,7 +16,7 @@ import unittest
 sys.path.insert(0, "src")
 
 from core.terminal.parser import (      # noqa: E402
-    Parser, Print, Ctrl, Esc, Csi, Osc, MAX_STRING)
+    Parser, Print, Ctrl, Esc, Csi, Osc, Dcs, MAX_STRING)
 
 FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         "fixtures")
@@ -136,6 +136,23 @@ class OscStringTest(unittest.TestCase):
         events = parse("\x1b]" + "a" * (MAX_STRING + 100) + "\x07")
         self.assertEqual(len(events), 1)
         self.assertEqual(len(events[0].text), MAX_STRING)
+
+
+class DcsStringTest(unittest.TestCase):
+    def test_the_whole_sequence_arrives_on_st(self):
+        # DECRQSS の形。頭 (パラメータ・最終文字) と中身が揃って届く
+        self.assertEqual(parse("\x1bP1$qm\x1b\\"),
+                         [Dcs("", (1,), "$", "q", "m"), Esc("", "\\")])
+
+    def test_the_head_and_body_survive_a_feed_boundary(self):
+        p = Parser()
+        self.assertEqual(p.feed("\x1bP+q54"), [])
+        self.assertEqual(p.feed("4e\x1b\\"),
+                         [Dcs("", (), "+", "q", "544e"), Esc("", "\\")])
+
+    def test_cancel_discards_head_and_body(self):
+        self.assertEqual(parse("\x1bP0;1|17/ab\x18X"),
+                         [Ctrl("\x18"), Print("X")])
 
 
 class SosPmApcTest(unittest.TestCase):
