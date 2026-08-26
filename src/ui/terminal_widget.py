@@ -476,11 +476,9 @@ class TerminalWidget(QWidget):
             for i in range(self.tab_widget.count()):
                 if self.tab_widget.tabText(i) == device_name:
                     self.tab_widget.setCurrentIndex(i)
-                    # 全画面アプリを開いたまま切断されると ESC[?1049l が
-                    # 来ないので「代替画面の中」が残る。タブは機器名で
-                    # 使い回すため、そのままだと再接続後もその状態が続き、
-                    # このタブだけ clear が効かず案内も出なくなる。
-                    self._terminals[device_name]._alt_screen = False
+                    # 案内は 1 接続につき一度。タブは機器名で使い回す
+                    # ため、ここで戻さないと再接続後に出なくなる。
+                    self._terminals[device_name]._fullscreen_warned = False
                     return self._terminals[device_name]
         
         # 接続機器がなく、ホームタブが残っている場合は、ホームタブを再利用
@@ -566,7 +564,9 @@ class TerminalWidget(QWidget):
             terminal.reconnect_requested.connect(lambda: reconnect_callback(device_name))
     
     # 全画面アプリが代替画面へ切り替えるときのモード番号
-    # （1049 が現行、1047 / 47 は古い実装）
+    # （1049 が現行、1047 / 47 は古い実装）。ただし端末種別を vt100 と
+    # 名乗っているため、nano や vi はこれを送ってこない。実機で採った
+    # 限り、目印になるのは下の 2 つだった。
     ALT_SCREEN_MODES = ("1049", "1047", "47")
 
     ALT_SCREEN_NOTICE = (
@@ -589,29 +589,47 @@ class TerminalWidget(QWidget):
             pass
         return self.DEFAULT_SCREEN_LINES
 
-    def _note_alt_screen(self, terminal: QTextEdit, params_str: str,
-                         command: str, cursor) -> None:
-        """代替画面への出入りを見て、入るときだけ案内を出す。
+    def _is_full_screen_draw(self, private: bool, params_str: str,
+                             command: str) -> bool:
+        """全画面アプリが画面を組み立て始めた合図かを判定する。
+
+        代替画面への切り替え（ESC[?1049h など）が本来の合図だが、
+        こちらは端末種別を vt100 と名乗っており、その terminfo には
+        代替画面が無い。そのため nano も vi も送ってこない。
+
+        実機で採った限り、代わりに届くのは次の 2 つ。
+          ESC[<上>;<下>r   スクロール範囲の設定。描画より前に届く
+          ESC[<行>;<桁>H   行と桁を指定したカーソル移動
+        同じ条件で採った普通のシェル操作には、どちらも現れなかった。
+        """
+        if private:
+            codes = params_str[1:].split(';') if len(params_str) > 1 else []
+            return (command == 'h'
+                    and any(c in self.ALT_SCREEN_MODES for c in codes))
+        if not params_str:
+            return False        # 引数なしの ESC[H / ESC[r は画面の初期化
+        if command == 'r':
+            return True         # スクロール範囲を切るのは全画面アプリだけ
+        return command in ('H', 'f') and ';' in params_str
+
+    def _note_full_screen_app(self, terminal: QTextEdit, cursor) -> None:
+        """崩れる理由を、一度だけ画面に出す。
 
         このターミナルは行を追記していく作りで、行・桁を指定して
         描く仕組みを持たない。全画面アプリは画面のどこにでも書くので、
         すべてが同じ場所に重なって出る。黙って崩れた画面を見せるより、
         崩れる理由を伝えるほうがよい。
+
+        抜けたことを知る手立てが無い（代替画面を使っていないので
+        戻りの合図も来ない）ため、1 接続につき一度だけにする。
         """
         from PyQt6.QtGui import QTextCursor
 
-        codes = params_str[1:].split(';') if len(params_str) > 1 else []
-        if not any(c in self.ALT_SCREEN_MODES for c in codes):
+        if getattr(terminal, "_fullscreen_warned", False):
             return
-        if command == 'h':
-            if getattr(terminal, "_alt_screen", False):
-                return          # すでに案内済み。何度も出さない
-            terminal._alt_screen = True
-            cursor.movePosition(QTextCursor.MoveOperation.End)
-            cursor.insertText('\n' + self.ALT_SCREEN_NOTICE
-                              + '\n')
-        elif command == 'l':
-            terminal._alt_screen = False
+        terminal._fullscreen_warned = True
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        cursor.insertText('\n' + self.ALT_SCREEN_NOTICE + '\n')
 
     def _render_cursor_for(self, terminal: QTextEdit):
         """機器出力の書き込み位置を返す（ユーザーの選択とは独立）
@@ -687,10 +705,12 @@ class TerminalWidget(QWidget):
                     except ValueError:
                         # SGR の ':' 区切り副パラメータなど。移動・消去系では起きない
                         num, mode = 1, 0
+                    if self._is_full_screen_draw(private, params_str,
+                                                 command):
+                        self._note_full_screen_app(terminal, cursor)
+
                     if private:
-                        # 解釈はしないが、全画面アプリへの出入りだけは見る
-                        self._note_alt_screen(terminal, params_str,
-                                              command, cursor)
+                        pass                # 私用パラメータは解釈しない
                     elif command == 'D':        # カーソル左
                         for _ in range(num):
                             cursor.movePosition(QTextCursor.MoveOperation.Left)
@@ -717,15 +737,13 @@ class TerminalWidget(QWidget):
                             # Linux で clear を打っただけでそれまでの
                             # show 出力が全部消える。端末と同じように、
                             # 上へ送り出して見えなくするだけにする。
-                            # ただし代替画面にいる間は、消す対象がその画面で
-                            # あってこちらの記録ではない。持っていないので
-                            # 何もしない（送り出すと、直前に出した案内まで
-                            # 流れて読めなくなる）。
-                            if not getattr(terminal, "_alt_screen", False):
-                                cursor.movePosition(
-                                    QTextCursor.MoveOperation.End)
-                                cursor.insertText(
-                                    '\n' * self._visible_lines(terminal))
+                            # なお端末種別を vt100 と名乗っているため、
+                            # Linux の clear は ESC[2J ではなく ESC[H ESC[J
+                            # を送る。ここへは届かない。備えとして残す。
+                            cursor.movePosition(
+                                QTextCursor.MoveOperation.End)
+                            cursor.insertText(
+                                '\n' * self._visible_lines(terminal))
                         elif mode == 3:         # スクロールバックの消去
                             pass                # 記録は消さない
                         elif mode == 1:         # 先頭からカーソルまで

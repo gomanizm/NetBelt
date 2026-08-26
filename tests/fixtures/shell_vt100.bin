@@ -1,0 +1,42 @@
+ls --color=always -la /etc | head -30
+[?2004lip -br addr
+uname -a
+echo abcdefg | rev
+total 1200
+drwxr-xr-x 146 root   root      12288 Aug 25 12:41 [0m[01;34m.[0m
+drwxr-xr-x  21 root   root       4096 Aug 26 02:03 [01;34m..[0m
+-rw-------   1 root   root          0 Aug 14 12:55 .pwd.lock
+-rw-r--r--   1 root   root        862 Aug 14 12:55 [00;90m.resolv.conf.systemd-resolved.bak[0m
+-rw-r--r--   1 root   root        208 Aug 14 12:55 .updated
+drwxr-xr-x   4 root   root       4096 Aug 14 12:58 [01;34mModemManager[0m
+drwxr-xr-x   8 root   root       4096 Aug 15 12:15 [01;34mNetworkManager[0m
+drwxr-xr-x   2 root   root       4096 Aug 14 12:58 [01;34mPackageKit[0m
+drwxr-xr-x   2 root   root       4096 Aug 15 12:15 [01;34mUPower[0m
+drwxr-xr-x  12 root   root       4096 Aug 15 12:16 [01;34mX11[0m
+-rw-r--r--   1 root   root       3444 Jul  5  2023 adduser.conf
+drwxr-xr-x   3 root   root       4096 Aug 15 12:15 [01;34malsa[0m
+drwxr-xr-x   2 root   root       4096 Aug 15 12:16 [01;34malternatives[0m
+-rw-r--r--   1 root   root        433 Apr  8  2024 apg.conf
+drwxr-xr-x   2 root   root       4096 Aug 14 12:58 [01;34mapparmor[0m
+drwxr-xr-x   9 root   root       4096 Aug 15 12:16 [01;34mapparmor.d[0m
+drwxr-xr-x   4 root   root       4096 Aug 15 12:15 [01;34mapport[0m
+drwxr-xr-x   8 root   root       4096 Aug 14 13:00 [01;34mapt[0m
+drwxr-xr-x   3 root   root       4096 Aug 15 12:16 [01;34mavahi[0m
+-rw-r--r--   1 root   root       2319 Mar 31  2024 bash.bashrc
+-rw-r--r--   1 root   root         45 Jan 24  2020 bash_completion
+drwxr-xr-x   2 root   root       4096 Aug 14 12:58 [01;34mbash_completion.d[0m
+-rw-r--r--   1 root   root        367 Aug  2  2022 bindresvport.blacklist
+drwxr-xr-x   2 root   root       4096 Apr 19  2024 [01;34mbinfmt.d[0m
+drwxr-xr-x   2 root   root       4096 Aug 15 12:16 [01;34mbluetooth[0m
+drwxr-xr-x   2 root   root       4096 Aug 14 12:58 [01;34mbyobu[0m
+drwxr-xr-x   3 root   root       4096 Aug 14 12:55 [01;34mca-certificates[0m
+-rw-r--r--   1 root   root       6862 Aug 14 12:56 ca-certificates.conf
+-rw-r--r--   1 root   root       6288 Aug 14 12:55 [00;90mca-certificates.conf.dpkg-old[0m
+[?2004huser@lab:~$ ip -br addr
+[?2004llo               UNKNOWN        127.0.0.1/8 ::1/128 
+ens3             UP             192.0.2.10/24 metric 100 fe80::5054:ff:fe13:f6e0/64 
+[?2004huser@lab:~$ uname -a
+[?2004lLinux lab 6.8.0-137-generic #137-Ubuntu SMP PREEMPT_DYNAMIC Fri Jul 17 20:28:23 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
+[?2004huser@lab:~$ echo abcdefg | rev
+[?2004lgfedcba
+[?2004huser@lab:~$ 
