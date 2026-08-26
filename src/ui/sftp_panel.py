@@ -98,6 +98,34 @@ class SFTPPanel(QWidget):
         return self.normalize_sftp_settings(raw)[key]
     
     # 接続先が無いときの表示
+    def _band_style(self, bold: bool = False) -> str:
+        """帯のスタイルを、いまの配色から組み立てる。
+
+        背景だけを決め打ちすると、暗い配色のときに文字色（パレット
+        由来の明るい色）と同系色になって読めなくなる。実際 1.1.1 の
+        ダークモードで、接続先の表示が背景に溶けて消えていた。
+        背景と文字色は必ず対で決める。
+        """
+        from PyQt6.QtGui import QPalette
+
+        palette = self.palette()
+        return (
+            "background-color: %s; color: %s; border: 1px solid %s;"
+            " padding: 6px;%s" % (
+                palette.color(QPalette.ColorRole.AlternateBase).name(),
+                palette.color(QPalette.ColorRole.Text).name(),
+                palette.color(QPalette.ColorRole.Mid).name(),
+                " font-weight: bold;" if bold else "",
+            ))
+
+    def _hint_style(self) -> str:
+        """案内文のスタイル。こちらも配色に追従させる。"""
+        from PyQt6.QtGui import QPalette
+
+        palette = self.palette()
+        return "color: %s; padding: 4px;" % (
+            palette.color(QPalette.ColorRole.PlaceholderText).name(),)
+
     NO_TARGET_TEXT = "接続先: なし"
 
     # 未接続のときに出す案内。接続すると消す。
@@ -114,9 +142,7 @@ class SFTPPanel(QWidget):
         # 接続先の明示。ツールバーより上に置く。どの機器を相手にしているかは、
         # ファイルを落とす前に必ず目に入るべき情報。
         self.target_label = QLabel(self.NO_TARGET_TEXT)
-        self.target_label.setStyleSheet(
-            "background-color: #eef4fb; border: 1px solid #b8cfe6;"
-            " padding: 6px; font-weight: bold;")
+        self.target_label.setStyleSheet(self._band_style(bold=True))
         layout.addWidget(self.target_label)
 
         # ツールバー
@@ -125,7 +151,7 @@ class SFTPPanel(QWidget):
         
         # 現在のパス表示
         self.path_label = QLabel("接続されていません")
-        self.path_label.setStyleSheet("background-color: #f0f0f0; padding: 5px; border: 1px solid #ccc;")
+        self.path_label.setStyleSheet(self._band_style())
         layout.addWidget(self.path_label)
         
         # ファイルリストビュー
@@ -161,7 +187,7 @@ class SFTPPanel(QWidget):
         # 設計で、単独で接続する手段が無い。黙っていて分かるものではない。
         self.hint_label = QLabel(self.HINT_TEXT)
         self.hint_label.setWordWrap(True)
-        self.hint_label.setStyleSheet("color: #666; padding: 4px;")
+        self.hint_label.setStyleSheet(self._hint_style())
         layout.addWidget(self.hint_label)
     
     def _create_toolbar(self) -> QToolBar:
