@@ -14,6 +14,11 @@ from core.terminal.attrs import DEFAULT, apply_sgr
 
 BLANK = (" ", DEFAULT)
 
+# DEC Special Graphics (ESC ( 0 で指示される罫線用文字集合)
+DEC_GRAPHICS = dict(zip(
+    "`abcdefghijklmnopqrstuvwxyz{|}~",
+    "◆▒␉␌␍␊°±␤␋┘┐┌└┼⎺⎻─⎼⎽├┤┴┬│≤≥π≠£·"))
+
 
 def _param(params, i, default):
     if i < len(params) and params[i] is not None:
@@ -28,17 +33,28 @@ class Screen(object):
         self.history = collections.deque(maxlen=max_history)
         self._new_history = []
         self.title = ""
+        self.responses = []             # 機器へ送り返す応答 (DSR/DA)
         self.reset()
 
     def reset(self):
         """RIS 相当。履歴とタイトルだけは残す (セッションの記録なので)。"""
         self.lines = self._blank_lines()
+        self._other = self._blank_lines()   # 裏画面 (代替画面用)
+        self.alt_active = False
         self.cursor_row = 0
         self.cursor_col = 0
         self.attr = DEFAULT
         self.scroll_top = 0
         self.scroll_bottom = self.rows - 1
         self._pending_wrap = False
+        self._saved = (0, 0, DEFAULT)       # ESC 7 / ESC 8
+        self._saved_main = None             # ?1049 用
+        self.autowrap = True
+        self.cursor_visible = True
+        self.application_cursor_keys = False    # ?1 DECCKM (入力側が見る)
+        self.bracketed_paste = False            # ?2004 (入力側が見る)
+        self._g = {"(": "B", ")": "B"}          # G0/G1 の指示文字
+        self._charset = "("                     # SI/SO でどちらを使うか
         self.dirty = set(range(self.rows))
 
     def _blank_lines(self):
@@ -58,7 +74,11 @@ class Screen(object):
                 self._ctrl(event.char)
             elif isinstance(event, parser.Csi):
                 self._csi(event)
-            # Esc / Osc / Dcs は後段のコミットで
+            elif isinstance(event, parser.Esc):
+                self._esc(event)
+            elif isinstance(event, parser.Osc):
+                self._osc(event.text)
+            # Dcs は画面に出るものではないので捨てる
 
     def text(self):
         """画面の見た目を行のリストで返す (検証と描画の共通口)。"""
@@ -77,6 +97,45 @@ class Screen(object):
         self.dirty = set()
         return dirty
 
+    def take_responses(self):
+        """機器へ送り返すべき応答 (DSR/DA) を返して忘れる。"""
+        responses = self.responses
+        self.responses = []
+        return responses
+
+    def set_size(self, rows, cols):
+        """端末の大きさを変える。内容は再折返ししない (実端末と同じ)。
+
+        行が縮むときは、まず下の空行を削り、足りなければ上の行を
+        履歴へ送る (書かれた行を黙って消さないため)。
+        """
+        if (rows, cols) == (self.rows, self.cols) or rows < 1 or cols < 1:
+            return
+        for line in self.lines + self._other:
+            del line[cols:]
+            line.extend([BLANK] * (cols - len(line)))
+        while len(self.lines) > rows:
+            if (self.cursor_row < len(self.lines) - 1
+                    and all(c == BLANK for c in self.lines[-1])):
+                self.lines.pop()
+            else:
+                removed = self.lines.pop(0)
+                if not self.alt_active:
+                    self.history.append(removed)
+                    self._new_history.append(removed)
+                self.cursor_row = max(0, self.cursor_row - 1)
+        del self._other[rows:]
+        while len(self.lines) < rows:
+            self.lines.append([BLANK] * cols)
+        while len(self._other) < rows:
+            self._other.append([BLANK] * cols)
+        self.rows, self.cols = rows, cols
+        self.scroll_top, self.scroll_bottom = 0, rows - 1
+        self.cursor_row = min(self.cursor_row, rows - 1)
+        self.cursor_col = min(self.cursor_col, cols - 1)
+        self._pending_wrap = False
+        self.dirty = set(range(rows))
+
     # ---- 印字と C0 -------------------------------------------------
 
     def _print(self, text):
@@ -86,13 +145,16 @@ class Screen(object):
             if self._pending_wrap:      # 右端の 1 文字あとの折り返し
                 self.cursor_col = 0
                 self._linefeed()
+            if self._g[self._charset] == "0":
+                ch = DEC_GRAPHICS.get(ch, ch)
             line = self.lines[self.cursor_row]
             line[self.cursor_col] = (ch, self.attr)
             self.dirty.add(self.cursor_row)
             if self.cursor_col + 1 < self.cols:
                 self.cursor_col += 1
-            else:
+            elif self.autowrap:
                 self._pending_wrap = True
+            # autowrap 無効なら右端で上書きを続ける
 
     def _ctrl(self, ch):
         if ch == "\r":
@@ -108,7 +170,11 @@ class Screen(object):
             self.cursor_col = min(self.cols - 1,
                                   (self.cursor_col // 8 + 1) * 8)
             self._pending_wrap = False
-        # BEL・NUL・SI/SO などは (今は) 何もしない
+        elif ch == "\x0e":              # SO: G1 へ
+            self._charset = ")"
+        elif ch == "\x0f":              # SI: G0 へ
+            self._charset = "("
+        # BEL・NUL などは何もしない
 
     def _linefeed(self):
         self._pending_wrap = False
@@ -121,7 +187,8 @@ class Screen(object):
         for _ in range(n):
             removed = self.lines.pop(self.scroll_top)
             self.lines.insert(self.scroll_bottom, self._blank_line())
-            if self.scroll_top == 0 and self.scroll_bottom == self.rows - 1:
+            if (not self.alt_active and self.scroll_top == 0
+                    and self.scroll_bottom == self.rows - 1):
                 self.history.append(removed)
                 self._new_history.append(removed)
         self.dirty.update(range(self.scroll_top, self.scroll_bottom + 1))
@@ -141,8 +208,10 @@ class Screen(object):
         self.dirty.add(self.cursor_row)
 
     def _csi(self, seq):
+        if seq.private == "?" and seq.final in "hl":
+            return self._private_mode(seq)
         if seq.private or seq.intermediate:
-            return                      # 私用モードは後段のコミットで
+            return                      # DECSCUSR 等、表示に関わらない
         p = seq.params
         f = seq.final
         n = max(1, _param(p, 0, 1))
@@ -191,7 +260,77 @@ class Screen(object):
             self._set_margins(p)
         elif f == "m":
             self.attr = apply_sgr(self.attr, p)
+        elif f == "n":
+            if _param(p, 0, 0) == 6:    # DSR: カーソル位置を答える
+                self.responses.append("\x1b[%d;%dR" % (
+                    self.cursor_row + 1, self.cursor_col + 1))
+            elif _param(p, 0, 0) == 5:
+                self.responses.append("\x1b[0n")
+        elif f == "c":                  # DA: VT100 with AVO と名乗る
+            self.responses.append("\x1b[?1;2c")
         # 知らない最終文字は黙って捨てる (画面を壊さないことが仕事)
+
+    def _esc(self, seq):
+        if seq.intermediate in ("(", ")"):      # 文字集合の指示
+            self._g[seq.intermediate] = seq.final
+        elif seq.final == "7":
+            self._saved = (self.cursor_row, self.cursor_col, self.attr)
+        elif seq.final == "8":
+            row, col, attr = self._saved
+            self.attr = attr
+            self._move(row, col)
+        elif seq.final == "D":          # IND
+            self._linefeed()
+        elif seq.final == "M":          # RI: 上端では下へスクロール
+            if self.cursor_row == self.scroll_top:
+                self._scroll_down(1)
+            elif self.cursor_row:
+                self.cursor_row -= 1
+            self._pending_wrap = False
+        elif seq.final == "E":          # NEL
+            self.cursor_col = 0
+            self._linefeed()
+        elif seq.final == "c":          # RIS。履歴は reset が残す
+            self.reset()
+        # = > \ H などは表示を変えない
+
+    def _osc(self, text):
+        num, _, rest = text.partition(";")
+        if num in ("0", "2"):
+            self.title = rest
+
+    def _private_mode(self, seq):
+        on = seq.final == "h"
+        for mode in seq.params:
+            if mode in (1049, 1047, 47):
+                self._switch_screen(on, with_cursor=(mode == 1049))
+            elif mode == 7:
+                self.autowrap = on
+            elif mode == 25:
+                self.cursor_visible = on
+            elif mode == 1:
+                self.application_cursor_keys = on
+            elif mode == 2004:
+                self.bracketed_paste = on
+            # ほかの私用モードは表示に効かないので無視
+
+    def _switch_screen(self, to_alt, with_cursor):
+        if to_alt == self.alt_active:
+            return
+        if to_alt and with_cursor:
+            self._saved_main = (self.cursor_row, self.cursor_col, self.attr)
+        self.lines, self._other = self._other, self.lines
+        self.alt_active = to_alt
+        if to_alt:                      # 代替画面は白紙で始まる
+            for r in range(self.rows):
+                self.lines[r] = self._blank_line()
+            self._move(0, 0)
+        elif with_cursor and self._saved_main:
+            row, col, attr = self._saved_main
+            self.attr = attr
+            self._move(row, col)
+        self.dirty.update(range(self.rows))
+        self._pending_wrap = False
 
     def _set_margins(self, p):
         top = _param(p, 0, 1) - 1
@@ -202,14 +341,28 @@ class Screen(object):
             self._move(0, 0)            # DECSTBM はカーソルも戻す
 
     def _erase_display(self, mode):
-        if mode == 0:
+        # 画面全体が消えるとき (clear は ESC[H ESC[J、つまり home からの
+        # mode 0 で来る) は、消す前に見えていた中身を履歴へ送る。
+        # clear でセッションの記録を失わない、という v1.1.1 の方針
+        wipes_all = (mode >= 2 or
+                     (mode == 0 and (self.cursor_row, self.cursor_col)
+                      == (0, 0)))
+        if wipes_all and not self.alt_active:
+            last = -1
+            for r in range(self.rows):
+                if any(c != BLANK for c in self.lines[r]):
+                    last = r
+            for line in self.lines[:last + 1]:
+                self.history.append(line)
+                self._new_history.append(line)
+        if wipes_all:
+            rng = range(0, self.rows)
+        elif mode == 0:
             self._erase_line(0)
             rng = range(self.cursor_row + 1, self.rows)
-        elif mode == 1:
+        else:
             self._erase_line(1)
             rng = range(0, self.cursor_row)
-        else:                           # 2 と 3。履歴は消さない
-            rng = range(0, self.rows)
         for r in rng:
             self.lines[r] = self._blank_line()
         self.dirty.update(rng)
