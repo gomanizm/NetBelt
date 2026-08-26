@@ -1,3 +1,4 @@
+import re
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QTextEdit, QTabWidget, QMenu
 from PyQt6.QtGui import QFont, QColor, QPalette, QKeyEvent, QAction
 from PyQt6.QtCore import Qt, pyqtSignal
@@ -479,6 +480,7 @@ class TerminalWidget(QWidget):
                     # 案内は 1 接続につき一度。タブは機器名で使い回す
                     # ため、ここで戻さないと再接続後に出なくなる。
                     self._terminals[device_name]._fullscreen_warned = False
+                    self._terminals[device_name]._pending_escape = ""
                     return self._terminals[device_name]
         
         # 接続機器がなく、ホームタブが残っている場合は、ホームタブを再利用
@@ -577,6 +579,15 @@ class TerminalWidget(QWidget):
     # 端末が名乗っている画面の高さ。実際の表示から取れないときに使う
     DEFAULT_SCREEN_LINES = 24
 
+    # 途中で切れたエスケープを次の受信まで持ち越す上限。これを超えたら
+    # 完成する見込みが無いとみなして、今までどおり読み飛ばす。
+    MAX_PENDING_ESCAPE = 64
+
+    # 「まだ伸びうる」形。終端の文字がまだ来ていないもの。
+    #   ESC 単体 / ESC[ とパラメータ / ESC] と本文 / ESC と中間文字
+    _INCOMPLETE_ESCAPE = re.compile(
+        "\x1b(?:\\[[0-9:;<=>?]*[ -/]*|][^\x07\x1b]*|[ -/]*)?$")
+
     def _visible_lines(self, terminal: QTextEdit) -> int:
         """画面に見えているおおよその行数を返す。"""
         from PyQt6.QtGui import QFontMetrics
@@ -672,6 +683,12 @@ class TerminalWidget(QWidget):
 
         text = text.replace('\x00', '')   # NUL は捨てる（BEL は OSC 終端に使うため後段で処理）
 
+        # 前回の受信が途中で切れていたら、その続きとして繋ぐ
+        pending = getattr(terminal, "_pending_escape", "")
+        if pending:
+            terminal._pending_escape = ""
+            text = pending + text
+
         logged = []          # ログへ残す内容（画面に出した文字と改行）
         cursor = self._render_cursor_for(terminal)
 
@@ -761,12 +778,23 @@ class TerminalWidget(QWidget):
                 if match:
                     i += len(match.group())
                     continue
+                # 受信の切れ目にかかっただけかもしれない。次と繋げれば
+                # 完成する形なら、捨てずに持ち越す。捨てると残りが文字と
+                # して画面へ漏れる。
+                # 2バイト系より前に見ること。あちらは終端に 0x30-0x7E を
+                # 許すので、ESC[ や ESC] で切れていると「2バイトの命令」
+                # として食べてしまう（実測で 161 箇所中 45 箇所しか減らず）。
+                if (n - i <= self.MAX_PENDING_ESCAPE
+                        and self._INCOMPLETE_ESCAPE.match(text, i)):
+                    terminal._pending_escape = text[i:]
+                    i = n
+                    continue
                 # 2バイト系: ESC ( B（文字集合指定）, ESC = / ESC >（キーパッドモード）等
                 match = re.match(r'\x1b[ -/]*[0-~]', text[i:])
                 if match:
                     i += len(match.group())
                     continue
-                # 未知、または途中で切れたシーケンス。ESC 1文字だけ捨てて必ず前進する
+                # 本当に未知のシーケンス。ESC 1文字だけ捨てて必ず前進する
                 # （ここで前進しないと無限ループになり、アプリが固まる）
                 i += 1
                 continue

@@ -140,6 +140,65 @@ class TerminalFullScreenTest(unittest.TestCase):
                 TerminalWidget.ALT_SCREEN_NOTICE), 2,
             "再接続後に案内が出なくなっている")
 
+    # --- 受信が途中で切れても同じ画面になること -------------------------
+
+    def test_every_split_point_renders_the_same(self):
+        """どこで切れても、切れなかったときと同じ画面になること。
+
+        本番は recv が返した分だけを渡すので、1 つのエスケープが 2 回の
+        呼び出しにまたがる。以前は ESC を捨てて先へ進んでいたため、
+        残りが文字として画面へ漏れていた。採取データを全ての位置で
+        2 分割して測ると、527 バイト中 161 箇所で画面が変わっていた。
+        """
+        for name in ("nano_vt100.bin", "shell_vt100.bin",
+                     "clear_vt100.bin"):
+            raw = capture(name)
+            whole = self._screen(raw)
+            for cut in range(1, len(raw)):
+                split = self._screen(raw[:cut], raw[cut:])
+                if split != whole:
+                    self.fail(
+                        "%s を %d バイト目で分けると画面が変わる\n"
+                        "  切れ目: ...%r | %r...\n"
+                        "  差分: %+d 文字"
+                        % (name, cut,
+                           raw[max(0, cut - 8):cut], raw[cut:cut + 8],
+                           len(split) - len(whole)))
+
+    def test_the_notice_survives_a_split_marker(self):
+        """目印がちょうど切れても、案内が出ること。"""
+        raw = capture("nano_vt100.bin")
+        marker = raw.index(ESC + "[1;24r")
+        for cut in range(marker, marker + 7):
+            with self.subTest(cut=cut):
+                text = self._screen(raw[:cut], raw[cut:])
+                self.assertIn(self._notice(), text,
+                              "%d バイト目で切れると案内が出ない" % cut)
+
+    def test_a_dangling_escape_is_not_held_for_ever(self):
+        """完成しない断片を、いつまでも抱え込まないこと。
+
+        機器が ESC のあと何も送らなくなることはある。上限を超えたら
+        今までどおり読み飛ばして、後続の表示を止めない。
+        """
+        from ui.terminal_widget import TerminalWidget
+        w = self._widget()
+        long_fragment = ESC + "[" + "1;" * TerminalWidget.MAX_PENDING_ESCAPE
+        w.append_output("dev", long_fragment)
+        w.append_output("dev", "prompt$ ")
+
+        self.assertIn("prompt$ ", w._terminals["dev"].toPlainText(),
+                      "断片を抱えたまま後続を出していない")
+
+    def test_a_carried_fragment_is_dropped_on_reconnect(self):
+        """再接続したら、前のセッションの断片を持ち越さないこと。"""
+        w = self._widget()
+        w.append_output("dev", "text" + ESC + "[1;2")
+        w.create_terminal_tab("dev")
+        self.assertEqual(
+            getattr(w._terminals["dev"], "_pending_escape", ""), "",
+            "切断前の断片が残っている")
+
     # --- 誤爆しないこと -------------------------------------------------
 
     def test_ordinary_shell_work_says_nothing(self):
