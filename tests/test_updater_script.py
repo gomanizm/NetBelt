@@ -21,6 +21,7 @@ import io
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 import zipfile
@@ -70,8 +71,14 @@ class UpdaterScriptTest(unittest.TestCase):
         # 閉じるまで戻らないことがある。ファイルへ流して親だけを待つ。
         out_path = os.path.join(self.base, "out.txt")
         with io.open(out_path, "wb") as out:
+            # 本番と同じ渡し方にする。リストで渡すと Python は空白を
+            # 含む引数しか包まず、cmd が , や = で切ってしまうため、
+            # テストだけ本番と違う経路を通ることになる。
+            command = '"{}" "{}" "{}"'.format(
+                updater or self.updater, zip_path,
+                app_path or self.app_path)
             proc = subprocess.Popen(
-                [updater or self.updater, zip_path, app_path or self.app_path],
+                command,
                 stdout=out, stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
             )
@@ -168,6 +175,66 @@ class UpdaterScriptTest(unittest.TestCase):
                     encoding="ascii").read(), "new", out)
         self.assertNotIn("was unexpected at this time", out)
 
+    def test_a_folder_with_an_apostrophe_still_updates(self):
+        """アポストロフィを含むパスでも更新できること。
+
+        展開は PowerShell に任せているが、パスを '...' の中へ直接
+        埋めていたため、パスに ' が入ると文字列がそこで閉じて壊れた。
+        O'Brien のような姓はユーザープロファイル名に普通に出てくる。
+        """
+        # ZIP 側も同じフォルダに置くこと。展開を任せている
+        # PowerShell の行を通らないと、この不具合を見られない。
+        self._in_folder("it's here", zip_in_folder=True)
+
+    def test_a_folder_with_an_ampersand_still_updates(self):
+        """& を含むパスでも更新できること。
+
+        入り直しの行で %~f0 を展開すると、その & が解析され
+        コマンドの区切りとして扱われていた。
+        """
+        self._in_folder("a & b", zip_in_folder=True)
+
+    def test_a_folder_with_a_comma_still_updates(self):
+        """コンマを含むパスでも更新できること。
+
+        cmd はコンマも引数の区切りとして扱う。起動側が引用符で
+        包まないと、updater 側の %1 が途中で切れる。
+        """
+        self._in_folder("a,b", zip_in_folder=True)
+
+    def test_a_folder_with_an_equals_sign_still_updates(self):
+        """等号も同じく引数の区切りとして扱われる。"""
+        self._in_folder("a=b", zip_in_folder=True)
+
+    def test_the_zip_may_also_sit_in_a_folder_with_parentheses(self):
+        """括弧はインストール先だけでなく ZIP 側にもあり得ること。"""
+        self._in_folder("dl (2)", zip_in_folder=True)
+
+    def _in_folder(self, dirname, zip_in_folder=False):
+        """厄介な名前のフォルダに一式を置いて、更新できるか見る。"""
+        nested = os.path.join(self.base, dirname)
+        app_dir = os.path.join(nested, "app")
+        os.makedirs(app_dir)
+        updater = os.path.join(app_dir, "updater.bat")
+        shutil.copyfile(UPDATER, updater)
+        app_path = os.path.join(app_dir, "dummy_app.bat")
+        self._write(app_path, "@echo off\r\nexit " + chr(47) + "b 0\r\n")
+        self._write(os.path.join(app_dir, "NetBelt.exe"), "old")
+
+        zip_dir = nested if zip_in_folder else self.base
+        zip_path = os.path.join(zip_dir, "update.zip")
+        with zipfile.ZipFile(zip_path, "w") as z:
+            z.writestr("NetBelt.exe", "new")
+
+        code, out = self._run(zip_path, updater=updater,
+                              app_path=app_path)
+
+        self.assertEqual(code, 0, out)
+        self.assertEqual(
+            io.open(os.path.join(app_dir, "NetBelt.exe"),
+                    encoding="ascii").read(), "new",
+            "%r で更新が当たらない:\n%s" % (dirname, out))
+
     def test_a_zip_without_the_app_is_reported_as_a_failure(self):
         """実行ファイルが入っていない zip を、成功と報告しないこと。
 
@@ -226,6 +293,46 @@ class UpdaterEncodingTest(unittest.TestCase):
         head = after.split("\r\n")[1:4]
         self.assertNotIn("errorlevel", "\n".join(head),
                          "start の直後で errorlevel を見ている: %r" % head)
+
+
+class UpdaterLaunchTest(unittest.TestCase):
+    """起動側が、区切り文字を含むパスを引用符で包むことを検証する。
+
+    cmd はコンマと等号も引数の区切りとして扱う。Python の
+    subprocess.list2cmdline は空白かタブを含む引数しか包まないので、
+    リストのまま渡すと updater 側の %1 が途中で切れ、更新が
+    当たらないまま終わる。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        sys.path.insert(0, "src")
+        from PyQt6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_the_paths_are_quoted_for_cmd(self):
+        from unittest import mock
+        from ui.main_window import MainWindow
+
+        zip_path = r"C:\lab\a,b\NetBelt-update.zip"
+        with mock.patch.object(MainWindow,
+                               "_check_for_updates_on_startup"):
+            window = MainWindow()
+        self.addCleanup(lambda: None)
+
+        with mock.patch("subprocess.Popen") as popen:
+            window._apply_pending_update(zip_path)
+
+        self.assertTrue(popen.called, "updater を起動していない")
+        sent = popen.call_args[0][0]
+        self.assertIsInstance(
+            sent, str,
+            "リストのまま渡している。コンマや等号で %1 が切れる")
+        self.assertIn('"%s"' % zip_path, sent,
+                      "ZIP のパスが引用符で包まれていない: %r" % sent)
+        self.assertEqual(sent.count('"'), 6,
+                         "3 つの引数それぞれを包むこと: %r" % sent)
 
 
 if __name__ == "__main__":

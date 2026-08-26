@@ -5,10 +5,14 @@ rem Keep these on separate lines, not in a ( ) block: %errorlevel% inside
 rem a block is expanded when the block is parsed, i.e. before the child
 rem has run, so the real exit code would always be lost.
 rem ------------------------------------------------------------------
+setlocal enabledelayedexpansion
 if "%~3"=="--utf8" goto :run
 chcp 65001 >nul
-cmd /d /c ""%~f0" "%~1" "%~2" --utf8"
-exit /b %errorlevel%
+set "SELF=%~f0"
+set "A1=%~1"
+set "A2=%~2"
+cmd /d /c ""!SELF!" "!A1!" "!A2!" --utf8"
+exit /b !errorlevel!
 
 :run
 setlocal enabledelayedexpansion
@@ -87,7 +91,11 @@ echo.
 
 REM ZIPファイルを展開
 echo [4/6] ZIPファイルを展開中...
-powershell -NoProfile -ExecutionPolicy Bypass -Command "try { Expand-Archive -Path '!ZIP_FILE!' -DestinationPath '!TEMP_DIR!' -Force; exit 0 } catch { Write-Host 'エラー:' $_.Exception.Message; exit 1 }"
+REM PowerShell の '...' に生のパスを埋めると、パスに ' が入っただけで
+REM 文字列が閉じて壊れる。環境変数で渡せば引用符の問題が起きない。
+set "PS_ZIP=!ZIP_FILE!"
+set "PS_DEST=!TEMP_DIR!"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "try { Expand-Archive -LiteralPath $env:PS_ZIP -DestinationPath $env:PS_DEST -Force; exit 0 } catch { Write-Host 'エラー:' $_.Exception.Message; exit 1 }"
 if errorlevel 1 (
     echo エラー: ZIPファイルの展開に失敗しました
     rd /s /q "!TEMP_DIR!" 2>nul

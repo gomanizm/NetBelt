@@ -1797,8 +1797,14 @@ for details.
         
         try:
             import subprocess
+            # cmd はコンマと等号も引数の区切りとして扱うが、Python の
+            # リスト渡しは空白を含む引数しか引用符で包まない。インストール
+            # 先に , や = があると updater 側で %1 が途中で切れ、更新が
+            # 当たらないまま終わる。自分で包んでコマンド行として渡す。
+            command = '"{}" "{}" "{}"'.format(
+                updater_path, zip_path, app_path)
             subprocess.Popen(
-                [updater_path, zip_path, app_path],
+                command,
                 creationflags=subprocess.CREATE_NEW_CONSOLE
             )
             
