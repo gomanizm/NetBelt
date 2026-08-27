@@ -1988,5 +1988,16 @@ for details.
         
         self.connections.clear()
         
+        # 別ウィンドウにしたツールを閉じる。開いたままだと可視のトップ
+        # レベルが残り、quitOnLastWindowClosed が既定 True のためイベント
+        # ループが終わらず、NetBelt.exe がプロセスとして居座る。サーバ類は
+        # 上で停止済みなので、残るのは何も動かない抜け殻の窓になる。
+        for win in list(getattr(self, "_detached", {}).values()):
+            # 「タブへ戻す」処理を予約させない。終了処理の最中に
+            # singleShot で reparent が走ると、破棄と競合する
+            win._closing = True
+            win.close()
+        self._detached = {}
+
         # イベントを受け入れて終了
         event.accept()
