@@ -104,8 +104,9 @@ jobs:
     # 更新の通知はリリース本文をそのまま出す。案内文だけだと、利用者は
     # 何が変わったのか分からない。CHANGELOG のこの版の節を先頭へ置き、
     # 案内文 (.github/release-body.md) をその下へ続ける。
+    # タグのときだけに絞らない。公開はしないので手動実行でも走らせ、
+    # 本文の組み立てが壊れていないことをタグを打つ前に確かめられるようにする
     - name: Build release notes
-      if: startsWith(github.ref, 'refs/tags/')
       shell: pwsh
       run: |
         $version = '${{ steps.version.outputs.version }}'
@@ -128,6 +129,9 @@ jobs:
         $body = "## v$version で変わったこと`n`n$section`n`n---`n`n$template"
         Set-Content -Path release_notes.md -Value $body -Encoding utf8
         Write-Host "本文 $($body.Length) 文字 (うち変更点 $($section.Length) 文字)"
+        Write-Host "--- 先頭 8 行 ---"
+        Get-Content release_notes.md -Encoding utf8 -TotalCount 8 | Write-Host
+        if ($body -match '\{\{TAG\}\}') { throw 'テンプレートの置換が残っています' }
 
     - name: Create Release
       if: startsWith(github.ref, 'refs/tags/')
