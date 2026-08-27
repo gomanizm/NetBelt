@@ -288,6 +288,8 @@ class VersionManager:
         Returns:
             ダウンロードしたZIPファイルのパス、またはNone（エラー時）
         """
+        # 受信中に例外が出ても書きかけを残さないよう、外側でも掴んでおく
+        part_path = None
         try:
             # ファイル名を生成
             filename = os.path.basename(url)
@@ -381,6 +383,11 @@ class VersionManager:
         
         except Exception as e:
             print(f"[VersionManager] ダウンロードエラー: {e}")
+            # 受信中に切れた場合、ここまでは書きかけが残ったままだった。
+            # get_pending_update_files は .zip しか拾わないので掃除にも
+            # かからず、利用者が再試行しない限り temp に居座り続ける。
+            if part_path:
+                self._discard(part_path)
             return None
     
     @staticmethod
@@ -458,7 +465,27 @@ class VersionManager:
                     deleted_count += 1
             except Exception as e:
                 print(f"[VersionManager] ファイル削除エラー: {e}")
-        
+
+        # 書きかけ (.part) も片付ける。get_pending_update_files は
+        # 「適用できる更新」を返す口なので、未検証の断片をそこへ混ぜる
+        # わけにはいかない（検証を通っていないものを適用してしまう）。
+        # 掃除だけはここで面倒を見る。まだ書いている最中かもしれないので、
+        # ZIP と同じく古くなったものだけを対象にする。
+        try:
+            for filename in os.listdir(self.UPDATE_DIR):
+                if not filename.endswith('.part'):
+                    continue
+                part_path = os.path.join(self.UPDATE_DIR, filename)
+                try:
+                    if current_time - os.path.getmtime(part_path) > max_age_seconds:
+                        os.remove(part_path)
+                        print(f"[VersionManager] 書きかけの更新ファイルを削除: {part_path}")
+                        deleted_count += 1
+                except Exception as e:
+                    print(f"[VersionManager] ファイル削除エラー: {e}")
+        except Exception as e:
+            print(f"[VersionManager] 書きかけの確認エラー: {e}")
+
         return deleted_count
     
     @staticmethod
