@@ -107,6 +107,10 @@ class SFTPPanel(QWidget):
 
     NO_TARGET_TEXT = "接続先: なし"
 
+    # サーバが属性を返さなかったときの表示。0 や 1970-01-01 に丸めると
+    # 「空のファイル」「1970年更新」という別の嘘になり、転送の判断を誤らせる。
+    UNKNOWN_TEXT = "不明"
+
     # 未接続のときに出す案内。接続すると消す。
     HINT_TEXT = (
         "ターミナルで機器へ SSH 接続すると、このパネルが使えるようになります。\n"
@@ -347,9 +351,11 @@ class SFTPPanel(QWidget):
             # パーミッション
             perm_item = QStandardItem(file_info['permissions'])
             
-            # 更新日時
-            mtime = datetime.fromtimestamp(file_info['mtime'])
-            time_item = QStandardItem(mtime.strftime("%Y-%m-%d %H:%M:%S"))
+            # 更新日時。サーバが ATTR_ACMODTIME を返さなければ None、
+            # paramiko が符号付き 32bit で読むので負値にもなり得る。
+            # ここは file_list_ready のスロット（キュー接続）なので、
+            # 例外を漏らすと PyQt がプロセスごと落とす。
+            time_item = QStandardItem(self._format_mtime(file_info['mtime']))
             
             # データとして元のファイル情報を保持
             name_item.setData(file_info, Qt.ItemDataRole.UserRole)
@@ -742,8 +748,29 @@ class SFTPPanel(QWidget):
         Returns:
             str: フォーマットされたサイズ文字列
         """
+        if size is None:
+            return SFTPPanel.UNKNOWN_TEXT
         for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
             if size < 1024.0:
                 return f"{size:.1f} {unit}"
             size /= 1024.0
         return f"{size:.1f} PB"
+
+    @staticmethod
+    def _format_mtime(mtime) -> str:
+        """
+        更新日時を読みやすい形式にフォーマット
+
+        Args:
+            mtime: エポック秒。サーバが返さなければ None
+
+        Returns:
+            str: フォーマットされた日時文字列。読めない値なら「不明」
+        """
+        if mtime is None:
+            return SFTPPanel.UNKNOWN_TEXT
+        try:
+            return datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
+        except (OSError, OverflowError, ValueError, TypeError):
+            # Windows の fromtimestamp は負のタイムスタンプで OSError を投げる
+            return SFTPPanel.UNKNOWN_TEXT
