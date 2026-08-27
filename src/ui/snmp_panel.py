@@ -624,6 +624,32 @@ class SNMPPanel(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "エラー", "エクスポート中にエラーが発生しました:\n" + str(e))
 
+    @staticmethod
+    def _csv_safe(value):
+        """表計算ソフトが数式として解釈しうる値を、文字列として書き出す
+
+        csv モジュールは区切り文字と引用符しかエスケープしない。先頭が
+        = + - @ の値はそのまま残り、Excel / LibreOffice で開いた瞬間に
+        数式（DDE を含む）として評価される。
+
+        値は攻撃者が選べる。v1/v2c ならコミュニティ名を知っている者が
+        UDP パケット1発で任意の VarBind を入れられるし、GET/WALK 側も
+        sysName / sysLocation / sysContact など機器側で自由に書ける
+        文字列が入る。エクスポートは障害チケットや報告書へ回る前提なので、
+        受け取った側の端末で発火する。
+
+        負の数まで文字列にすると表として読みにくくなるので、数として
+        読める値はそのまま通す。
+        """
+        text = "" if value is None else str(value)
+        if not text or text[0] not in "=+-@\t\r":
+            return text
+        try:
+            float(text)
+        except ValueError:
+            return "'" + text
+        return text
+
     def _export_results_to_csv(self, file_path: str, results):
         """CSV形式で GET/WALK 結果を書き出す"""
         import csv
@@ -631,7 +657,7 @@ class SNMPPanel(QWidget):
             writer = csv.writer(f)
             writer.writerow(["OID", "Type", "Value"])
             for row in results:
-                writer.writerow(list(row))
+                writer.writerow([self._csv_safe(cell) for cell in row])
 
     def _export_results_to_json(self, file_path: str, results):
         """JSON形式で GET/WALK 結果を書き出す"""
@@ -825,10 +851,12 @@ class SNMPPanel(QWidget):
                 # VarBindsがある場合は各VarBindを1行として出力
                 if varbinds:
                     for vb in varbinds:
-                        writer.writerow(head + [vb['oid'], vb['value']])
+                        writer.writerow(
+                            [self._csv_safe(c)
+                             for c in head + [vb['oid'], vb['value']]])
                 else:
                     # VarBindsがない場合は1行だけ出力
-                    writer.writerow(head + ['', ''])
+                    writer.writerow([self._csv_safe(c) for c in head + ['', '']])
     
     def _export_to_json(self, file_path: str):
         """JSON形式でエクスポート"""
