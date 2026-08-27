@@ -7,7 +7,10 @@ from ui import theme
 class LogRecordingDialog(QDialog):
     """ログ記録中に表示するダイアログ"""
     
-    stop_requested = pyqtSignal()  # 停止要求シグナル
+    # 停止要求シグナル（どの機器のダイアログかを必ず伝える）。
+    # 機器名を載せないと、受け手は「表示中のタブ」を止めるしかなく、
+    # 2台を同時に記録しているときに別の機器の記録を打ち切ってしまう。
+    stop_requested = pyqtSignal(str)
     
     def __init__(self, device_name: str, file_path: str, parent=None):
         super().__init__(parent)
@@ -79,7 +82,7 @@ class LogRecordingDialog(QDialog):
     def _on_stop(self):
         """停止ボタンクリック時の処理"""
         self.timer.stop()
-        self.stop_requested.emit()
+        self.stop_requested.emit(self.device_name)
         self.close()
     
     def closeEvent(self, event):

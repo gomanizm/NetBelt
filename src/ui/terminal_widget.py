@@ -925,10 +925,15 @@ class TerminalWidget(QWidget):
         if tab_name in self._terminals:
             self.tab_closed.emit(tab_name)
         
+        # 記録中なら止めてから閉じる。放っておくとファイルハンドルが
+        # 開いたまま残り（Windows ではファイルがロックされたままになる）、
+        # 宙に浮いたダイアログの停止ボタンが以後は別の機器を止めてしまう
+        self._stop_log_recording_for(tab_name, notify=False)
+
         # 辞書から削除
         if tab_name in self._terminals:
             del self._terminals[tab_name]
-        
+
         # タブを削除
         self.tab_widget.removeTab(index)
         
@@ -1084,18 +1089,34 @@ class TerminalWidget(QWidget):
                     f"ログファイルを開けませんでした:\n{str(e)}"
                 )
     
-    def stop_log_recording(self):
-        """現在アクティブなターミナルのログ記録を停止"""
+    def stop_log_recording(self, device_name: str = None):
+        """ログ記録を停止する
+
+        Args:
+            device_name: 止める機器。省略時は表示中のタブ（メニューや
+                右クリックからの操作）。記録中ダイアログの停止ボタンは
+                必ず自分の機器名を渡す。表示中のタブから引き直すと、
+                2台を同時に記録しているときに別の機器を止めてしまう。
+        """
+        if device_name is None:
+            current_index = self.tab_widget.currentIndex()
+            if current_index < 0:
+                return
+            device_name = self.tab_widget.tabText(current_index)
+        self._stop_log_recording_for(device_name)
+
+    def _stop_log_recording_for(self, tab_name: str, notify: bool = True):
+        """指定した機器のログ記録を止めて後始末する
+
+        Args:
+            tab_name: 止める機器
+            notify: 完了の通知を出すか。タブを閉じたときの後始末では
+                出さない（閉じる操作のたびにダイアログが出てしまう）
+        """
         from PyQt6.QtWidgets import QMessageBox
-        
-        # 現在のタブを取得
-        current_index = self.tab_widget.currentIndex()
-        if current_index < 0:
-            return
-        
-        current_widget = self.tab_widget.widget(current_index)
-        tab_name = self.tab_widget.tabText(current_index)
-        
+
+        current_widget = self._terminals.get(tab_name)
+
         # ログファイルを閉じる
         if tab_name in self._log_files:
             try:
@@ -1106,17 +1127,18 @@ class TerminalWidget(QWidget):
                 if isinstance(current_widget, InteractiveTerminal):
                     current_widget._is_recording = False
                 
-                # ダイアログを閉じる
-                if tab_name in self._log_dialogs:
-                    dialog = self._log_dialogs[tab_name]
+                # ダイアログを閉じる。停止ボタン経由だと相手は自分でも
+                # close() を呼んでいるので、二度閉じても平気にしておく
+                dialog = self._log_dialogs.pop(tab_name, None)
+                if dialog is not None:
                     dialog.close()
-                    del self._log_dialogs[tab_name]
-                
-                QMessageBox.information(
-                    self,
-                    "ログ記録停止",
-                    "ログ記録を停止しました。"
-                )
+
+                if notify:
+                    QMessageBox.information(
+                        self,
+                        "ログ記録停止",
+                        "ログ記録を停止しました。"
+                    )
                 
             except Exception as e:
                 QMessageBox.warning(
