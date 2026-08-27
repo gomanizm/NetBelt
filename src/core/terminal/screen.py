@@ -452,12 +452,14 @@ class Screen(object):
 
     def _erase_line(self, mode):
         line = self.lines[self.cursor_row]
-        # 行は桁より長いことがある (窓を縮めても切らないため)。
-        # 消すときは行の実際の長さで見る
+        # 行の長さは桁数と一致しない。窓を縮めても切らないので長いことが
+        # あり、折り返しで続く行は広げても埋めないので短いこともある。
+        # カーソルは桁数まで動けるので、必ず行の実際の長さで抑える
+        end = min(self.cursor_col + 1, len(line))
         if mode == 0:
-            rng = range(self.cursor_col, len(line))
+            rng = range(min(self.cursor_col, len(line)), len(line))
         elif mode == 1:
-            rng = range(0, self.cursor_col + 1)
+            rng = range(0, end)
         else:
             rng = range(0, len(line))
         for c in rng:
@@ -488,6 +490,10 @@ class Screen(object):
     def _shift_chars(self, n, insert):
         """ICH / DCH。行の右端は詰まる・押し出される。"""
         line = self.lines[self.cursor_row]
+        # カーソルが行の実際の長さより右にあることがある (折り返しで
+        # 続く行は広げても埋めないため)。そこで詰めても意味が無い
+        if self.cursor_col >= len(line):
+            return
         for _ in range(n):
             if insert:
                 line.pop()

@@ -423,6 +423,32 @@ class ResizeTest(unittest.TestCase):
         s.set_size(24, 100)
         self.assertEqual(len(s.lines[0]), 100)
 
+    def test_no_command_crashes_when_the_line_is_not_as_wide_as_the_screen(self):
+        """行の長さと桁数が食い違っても、どの命令でも落ちないこと。
+
+        窓を縮めても行を切らず、折り返しで続く行は広げても埋めないので、
+        行は桁数より長いことも短いこともある。カーソルは桁数まで動ける
+        ので、行の実際の長さを見ずに触ると IndexError でアプリごと落ちる。
+        実際 ESC[1K と ESC[P で落ちていた。
+        """
+        finals = "@ABCDEFGHIJKLMPSTXZdfghlmnrst`"
+        params = ("", "0", "1", "2", "5", "99", "1;99", "99;99")
+        for label, setup, size in (
+                ("短い行", "y" * 60, (24, 120)),      # 折り返し行を広げた
+                ("長い行", "z" * 120, (24, 20))):     # 長い行を縮めた
+            for col in (1, 40, 100, 120):
+                for final in finals:
+                    for param in params:
+                        with self.subTest(kind=label, col=col,
+                                          seq=param + final):
+                            s = Screen(24, 40)
+                            p = Parser()
+                            s.apply(p.feed(setup))
+                            s.set_size(*size)
+                            s.apply(p.feed("\x1b[1;%dH" % col))
+                            s.apply(p.feed("\x1b[" + param + final))
+                            s.apply(p.feed("X"))    # 続けて書けること
+
     def test_writing_past_the_end_of_a_wrapped_line_still_works(self):
         """埋めていない行の先へ書いても落ちないこと。"""
         s = Screen(24, 40)
