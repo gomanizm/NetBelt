@@ -57,6 +57,14 @@ class TFTPServer:
         self._workers_lock = threading.Lock()
         self._retries = 5      # タイムアウト時の再送回数
         self._timeout = 2.0    # 送受信タイムアウト秒
+        # 同時に走らせる転送の上限。TFTP は無認証で 0.0.0.0 で待ち受け、
+        # 各ワーカーが専用ソケットを bind したまま十数秒 (timeout x retries)
+        # 生きるので、上限が無いと到達可能な任意のホストがスレッドと
+        # エフェメラルポートを積み上げられる。
+        # 超えたぶんは待たせずにその場で断る。TFTP のクライアントは待って
+        # くれないので、キューに滞留させても再送とタイムアウトを増やすだけ。
+        # 機器を数台まとめて扱う実運用なら 16 で足りる。
+        self.max_workers = 16
 
     def start(self):
         os.makedirs(self.root_dir, exist_ok=True)
@@ -118,7 +126,13 @@ class TFTPServer:
                 self._spawn(self._handle_rrq, pkt, addr)
 
     def _spawn(self, handler, pkt, addr):
-        """転送スレッドを起こし、終わるまで覚えておく。"""
+        """転送スレッドを起こし、終わるまで覚えておく。
+
+        上限に達していたら起こさずに断る。起こせなかったときも、
+        呼び出し元の待受ループを巻き添えにしない。例外がそこまで届くと
+        待受スレッドだけが終わり、is_running は True のままなので、UI は
+        「起動中」を出し続けるのに何も受け付けない状態になる。
+        """
         def run():
             try:
                 handler(pkt, addr)
@@ -127,10 +141,35 @@ class TFTPServer:
                     if thread in self._workers:
                         self._workers.remove(thread)
 
-        thread = threading.Thread(target=run, daemon=True)
+        thread = None
         with self._workers_lock:
-            self._workers.append(thread)
-        thread.start()
+            if len(self._workers) < self.max_workers:
+                thread = threading.Thread(target=run, daemon=True)
+                self._workers.append(thread)
+
+        if thread is None:
+            self._refuse(addr, "server busy")
+            return
+
+        try:
+            thread.start()
+        except Exception as e:
+            with self._workers_lock:
+                if thread in self._workers:
+                    self._workers.remove(thread)
+            print(f"[TFTP] 転送スレッドを起こせませんでした: {e}")
+            self._refuse(addr, "server busy")
+
+    def _refuse(self, addr, message):
+        """要求を断ったことを相手へ伝える（黙って捨てない）。
+
+        黙って捨てるとクライアントは再送を繰り返し、タイムアウトまで
+        待たされる。断られたと分かればすぐ次の手を打てる。
+        """
+        try:
+            _err(self._sock, addr, 0, message)
+        except Exception:
+            pass
 
     @staticmethod
     def _parse_request(pkt):
