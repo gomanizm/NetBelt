@@ -473,6 +473,48 @@ class UpdaterLaunchTest(unittest.TestCase):
         self.assertEqual(sent.count('"'), 6,
                          "3 つの引数それぞれを包むこと: %r" % sent)
 
+    def _dialog_with_a_downloaded_zip(self, zip_path):
+        from ui.dialogs.update_dialog import UpdateDialog
+        dialog = UpdateDialog(None, {
+            "version": "9.9.9",
+            "release_notes": "test",
+            "download_url": "https://example.com/x.zip",
+            "published_at": "2026-08-27T00:00:00Z",
+        })
+        dialog.downloaded_zip_path = zip_path
+        return dialog
+
+    def test_the_dialog_quotes_its_paths_too(self):
+        """「更新を適用」からの経路も、同じように包むこと。
+
+        cmd の引数分割対策は起動時の未適用更新の経路にだけ入っていて、
+        「今すぐダウンロード → 更新を適用」というダイアログ側の経路は
+        リスト渡しのままだった。インストール先や ZIP のパスに , や =
+        があると updater.bat 自身のパスが途中で切れ、一度も起動しない
+        まま（アプリだけ終了して）更新が永久に当たらない。
+        """
+        from unittest import mock
+
+        base = tempfile.mkdtemp(prefix="netbelt_dlg_")
+        self.addCleanup(shutil.rmtree, base, True)
+        zip_path = os.path.join(base, "Net,Belt-update.zip")
+        io.open(zip_path, "wb").write(b"PK\x03\x04")
+
+        dialog = self._dialog_with_a_downloaded_zip(zip_path)
+        with mock.patch("subprocess.Popen") as popen, \
+             mock.patch("PyQt6.QtWidgets.QApplication.quit"):
+            dialog._on_apply_clicked()
+
+        self.assertTrue(popen.called, "updater を起動していない")
+        sent = popen.call_args[0][0]
+        self.assertIsInstance(
+            sent, str,
+            "リストのまま渡している。コンマや等号で引数が切れる")
+        self.assertIn('"%s"' % zip_path, sent,
+                      "ZIP のパスが引用符で包まれていない: %r" % sent)
+        self.assertEqual(sent.count('"'), 6,
+                         "3 つの引数それぞれを包むこと: %r" % sent)
+
 
 if __name__ == "__main__":
     unittest.main()

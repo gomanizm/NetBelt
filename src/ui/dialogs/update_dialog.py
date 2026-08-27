@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QFont
-from core.version_manager import VersionManager
+from core.version_manager import VersionManager, updater_command
 
 
 class DownloadThread(QThread):
@@ -349,8 +349,10 @@ class UpdateDialog(QDialog):
         # updater.batを起動
         try:
             # updater.bat <ZIPパス> <実行ファイルパス>
+            # リストで渡すと、パスの , や = で引数が途中で切れる
+            # （updater_command の説明を参照）
             subprocess.Popen(
-                [updater_path, self.downloaded_zip_path, app_path],
+                updater_command(updater_path, self.downloaded_zip_path, app_path),
                 creationflags=subprocess.CREATE_NEW_CONSOLE
             )
             

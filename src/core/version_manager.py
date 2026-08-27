@@ -20,6 +20,24 @@ except ImportError:
     APP_NAME = "NetBelt"
 
 
+def updater_command(updater_path: str, zip_path: str, app_path: str) -> str:
+    """updater.bat を起動するコマンド行を組み立てる
+
+    subprocess にリストで渡すと、Windows の list2cmdline は空白かタブを
+    含む引数しか引用符で包まない。ところが cmd はコンマと等号も引数の
+    区切りとして扱うので、パスに , や = が入っていて空白が無いと引数が
+    途中で切れる。updater.bat 自身のパスが切れた場合は一度も起動せず、
+    アプリだけ終了して更新が永久に当たらない。
+
+    起動元が2箇所（起動時の未適用更新と、更新ダイアログの「適用」）に
+    分かれていて、片方だけ直した状態で再発した。組み立てはここへ寄せる。
+
+    注意: パスに & が含まれる場合は、この形でも cmd の解釈で壊れる。
+    未解決。
+    """
+    return '"{}" "{}" "{}"'.format(updater_path, zip_path, app_path)
+
+
 class VersionManager:
     """バージョン管理とアップデート機能を提供するクラス"""
     
