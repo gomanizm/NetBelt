@@ -304,6 +304,26 @@ class SFTPPanel(QWidget):
         self._current_entries = {}
         self._pending_upload_names = set()
     
+    def _still_on(self, manager) -> bool:
+        """操作を始めた時点の機器のままかを返す。
+
+        モーダルダイアログの間も Qt のイベントループは回るので、開いている
+        間に (1) 接続が切れて clear() が走る（sftp_manager が None になる）、
+        (2) 利用者が別タブへ移り、パネルが別機器のマネージャへ差し替わる、
+        のどちらも起こり得る。(1) は AttributeError でプロセスごと落ち、
+        (2) は落ちない代わりに別の機器へ送ってしまう。
+        None 判定だけでは (2) を防げないので、同一性まで見る。
+        """
+        return manager is not None and self.sftp_manager is manager
+
+    def _abandon(self, what: str):
+        """接続が変わったので操作を取りやめたことを伝える。
+
+        ここでモーダルを出すと、ドロップした件数ぶん出てしまう。
+        ステータス欄に出すだけにする。
+        """
+        self.status_label.setText("接続先が変わったため、%sを取りやめました" % what)
+
     def _update_file_list(self, file_list: list):
         """
         ファイル一覧を更新
@@ -500,9 +520,10 @@ class SFTPPanel(QWidget):
     
     def _on_upload(self):
         """アップロードボタンがクリックされた"""
-        if not self.sftp_manager:
+        manager = self.sftp_manager
+        if not manager:
             return
-        
+
         # ファイル選択ダイアログ
         file_path, _ = QFileDialog.getOpenFileName(
             self,
@@ -512,15 +533,18 @@ class SFTPPanel(QWidget):
         )
         
         if file_path:
-            self._upload_with_confirmation(file_path)
-    
-    def _upload_with_confirmation(self, file_path: str):
+            self._upload_with_confirmation(file_path, manager)
+
+    def _upload_with_confirmation(self, file_path: str, manager=None):
         """
         上書き確認を挟んでアップロードする
-        
+
         Args:
             file_path: ローカルのファイルパス
+            manager: 操作を始めた時点のマネージャ。省略時はいまの接続
         """
+        if manager is None:
+            manager = self.sftp_manager
         name = os.path.basename(file_path)
         confirm = self._get_sftp_setting(
             "confirm_overwrite", self.SFTP_SETTING_DEFAULTS["confirm_overwrite"])
@@ -548,8 +572,11 @@ class SFTPPanel(QWidget):
         # 複数送る間は間に合わない。送信中の名前を別に覚えておき、同じドロップ内の
         # 同名2件目以降にも確認が出るようにする。_current_entries は
         # 「最後に観測したリモートの一覧」のまま保つ（種別を汚さないため）
+        if not self._still_on(manager):
+            self._abandon("アップロード")
+            return
         self._pending_upload_names.add(name)
-        self.sftp_manager.upload_file(file_path)
+        manager.upload_file(file_path)
     
     def _on_download(self):
         """ダウンロードボタンがクリックされた"""
@@ -576,9 +603,10 @@ class SFTPPanel(QWidget):
         Args:
             file_info: ファイル情報
         """
-        if not self.sftp_manager:
+        manager = self.sftp_manager
+        if not manager:
             return
-        
+
         # 保存先を選択（settings.sftp.default_download_path を初期位置に使う）
         download_dir = self._get_sftp_setting(
             "default_download_path",
@@ -593,15 +621,19 @@ class SFTPPanel(QWidget):
         )
         
         if local_path:
-            current_path = self.sftp_manager.get_current_path()
+            if not self._still_on(manager):
+                self._abandon("ダウンロード")
+                return
+            current_path = manager.get_current_path()
             remote_path = f"{current_path}/{file_info['name']}" if current_path != "/" else f"/{file_info['name']}"
-            self.sftp_manager.download_file(remote_path, local_path)
+            manager.download_file(remote_path, local_path)
     
     def _on_create_directory(self):
         """新規ディレクトリ作成"""
-        if not self.sftp_manager:
+        manager = self.sftp_manager
+        if not manager:
             return
-        
+
         # ディレクトリ名を入力
         dir_name, ok = QInputDialog.getText(
             self,
@@ -610,9 +642,12 @@ class SFTPPanel(QWidget):
         )
         
         if ok and dir_name:
-            current_path = self.sftp_manager.get_current_path()
+            if not self._still_on(manager):
+                self._abandon("フォルダの作成")
+                return
+            current_path = manager.get_current_path()
             new_path = f"{current_path}/{dir_name}" if current_path != "/" else f"/{dir_name}"
-            self.sftp_manager.create_directory(new_path)
+            manager.create_directory(new_path)
     
     def _on_delete(self):
         """削除ボタンがクリックされた"""
@@ -635,9 +670,10 @@ class SFTPPanel(QWidget):
         Args:
             file_info: ファイル情報
         """
-        if not self.sftp_manager:
+        manager = self.sftp_manager
+        if not manager:
             return
-        
+
         # 確認ダイアログ（settings.sftp.confirm_delete）
         if self._get_sftp_setting(
                 "confirm_delete", self.SFTP_SETTING_DEFAULTS["confirm_delete"]):
@@ -651,9 +687,12 @@ class SFTPPanel(QWidget):
             if reply != QMessageBox.StandardButton.Yes:
                 return
         
-        current_path = self.sftp_manager.get_current_path()
+        if not self._still_on(manager):
+            self._abandon("削除")
+            return
+        current_path = manager.get_current_path()
         item_path = f"{current_path}/{file_info['name']}" if current_path != "/" else f"/{file_info['name']}"
-        self.sftp_manager.delete_item(item_path, file_info['is_dir'])
+        manager.delete_item(item_path, file_info['is_dir'])
     
     def _on_rename_selected(self, file_info: dict):
         """
@@ -662,9 +701,10 @@ class SFTPPanel(QWidget):
         Args:
             file_info: ファイル情報
         """
-        if not self.sftp_manager:
+        manager = self.sftp_manager
+        if not manager:
             return
-        
+
         # 新しい名前を入力
         new_name, ok = QInputDialog.getText(
             self,
@@ -674,10 +714,13 @@ class SFTPPanel(QWidget):
         )
         
         if ok and new_name and new_name != file_info['name']:
-            current_path = self.sftp_manager.get_current_path()
+            if not self._still_on(manager):
+                self._abandon("名前の変更")
+                return
+            current_path = manager.get_current_path()
             old_path = f"{current_path}/{file_info['name']}" if current_path != "/" else f"/{file_info['name']}"
             new_path = f"{current_path}/{new_name}" if current_path != "/" else f"/{new_name}"
-            self.sftp_manager.rename_item(old_path, new_path)
+            manager.rename_item(old_path, new_path)
     
     def _on_chmod_selected(self, file_info: dict):
         """
@@ -686,9 +729,10 @@ class SFTPPanel(QWidget):
         Args:
             file_info: ファイル情報
         """
-        if not self.sftp_manager:
+        manager = self.sftp_manager
+        if not manager:
             return
-        
+
         # 現在のパーミッションを8進数で表示
         current_mode = file_info['mode'] & 0o777
         current_mode_str = oct(current_mode)[2:]  # '0o755' -> '755'
@@ -705,9 +749,12 @@ class SFTPPanel(QWidget):
             try:
                 # 8進数として解釈
                 new_mode = int(new_mode_str, 8)
-                current_path = self.sftp_manager.get_current_path()
+                if not self._still_on(manager):
+                    self._abandon("パーミッションの変更")
+                    return
+                current_path = manager.get_current_path()
                 item_path = f"{current_path}/{file_info['name']}" if current_path != "/" else f"/{file_info['name']}"
-                self.sftp_manager.change_permissions(item_path, new_mode)
+                manager.change_permissions(item_path, new_mode)
             except ValueError:
                 QMessageBox.warning(self, "入力エラー", "パーミッションは8進数で入力してください（例: 755）")
     
@@ -728,14 +775,17 @@ class SFTPPanel(QWidget):
         Args:
             event: ドロップイベント
         """
-        if not self.sftp_manager:
+        manager = self.sftp_manager
+        if not manager:
             return
-        
+
+        # 複数まとめてドロップされると、送っている途中で切れたり
+        # 別タブへ移ったりし得る。1件ごとに相手を確かめ直す。
         urls = event.mimeData().urls()
         for url in urls:
             file_path = url.toLocalFile()
             if os.path.isfile(file_path):
-                self._upload_with_confirmation(file_path)
+                self._upload_with_confirmation(file_path, manager)
     
     @staticmethod
     def _format_size(size: int) -> str:

@@ -195,7 +195,11 @@ class SftpClientSettingsTest(unittest.TestCase):
         with mock.patch("ui.sftp_panel.os.path.isfile", return_value=True), \
              mock.patch.object(panel, "_upload_with_confirmation") as upload:
             panel.dropEvent(event)
-        upload.assert_called_once_with("C:/tmp/既存.cfg")
+        # 引数の個数はここで見ない。操作を始めた時点のマネージャを渡すように
+        # なったため（test_sftp_panel_stale_manager.py）。ここで見たいのは
+        # 「ドロップしたファイルが確認経路へ入ること」だけ。
+        upload.assert_called_once()
+        self.assertEqual(upload.call_args.args[0], "C:/tmp/既存.cfg")
 
     def test_broken_boolean_settings_fall_back_to_defaults(self):
         """config.json は手で編集できるので型違いが来る。"""
