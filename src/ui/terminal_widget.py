@@ -1,8 +1,19 @@
-import re
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QTextEdit, QTabWidget, QMenu
-from PyQt6.QtGui import QFont, QColor, QPalette, QKeyEvent, QAction
+from PyQt6.QtGui import (QFont, QColor, QPalette, QKeyEvent, QAction,
+                         QTextCursor, QTextCharFormat)
 from PyQt6.QtCore import Qt, pyqtSignal
 from typing import Dict, Optional
+
+from core.terminal import parser as vt
+from core.terminal.attrs import DEFAULT
+from core.terminal.screen import Screen, BLANK
+
+# SGR の基本 16 色 (xterm の既定値)。0-7 が基本、8-15 が明色
+ANSI_COLOURS = (
+    "#000000", "#cd0000", "#00cd00", "#cdcd00",
+    "#0000ee", "#cd00cd", "#00cdcd", "#e5e5e5",
+    "#7f7f7f", "#ff0000", "#00ff00", "#ffff00",
+    "#5c5cff", "#ff00ff", "#00ffff", "#ffffff")
 
 
 class InteractiveTerminal(QTextEdit):
@@ -16,7 +27,13 @@ class InteractiveTerminal(QTextEdit):
     keepalive_stop_requested = pyqtSignal()  # キープアライブ停止要求シグナル
     # Ctrl+ホイールでのフォントサイズ変更要求（回した向き: +1 / -1）
     font_size_change_requested = pyqtSignal(int)
-    
+    # ウィジェットの大きさが変わった（行数・桁数の再計算が要る）
+    resized = pyqtSignal()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.resized.emit()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setReadOnly(False)
@@ -77,12 +94,21 @@ class InteractiveTerminal(QTextEdit):
         """
         if not text or not self.can_send_input():
             return False
+        # アプリが ESC[?2004h を送ってきていたら、貼り付けを目印で
+        # 包む (xterm のブラケットペースト)。bash はこれで貼り付けを
+        # 即実行せず 1 かたまりの編集として扱える
+        screen = getattr(self, "_screen", None)
+        bracketed = screen is not None and screen.bracketed_paste
+        if bracketed:
+            self.key_pressed.emit("\x1b[200~")
         # 1文字ずつ送る。改行は端末と同じく CR で送る
         for char in text:
             if char == '\n' or char == '\r':
                 self.key_pressed.emit('\r')
             else:
                 self.key_pressed.emit(char)
+        if bracketed:
+            self.key_pressed.emit("\x1b[201~")
         return True
 
     def custom_paste(self):
@@ -243,6 +269,17 @@ class InteractiveTerminal(QTextEdit):
             return
         super().wheelEvent(event)
 
+    def _cursor_key(self, letter: str) -> str:
+        """カーソルキーの送り方。
+
+        アプリが ESC[?1h (DECCKM) を立てている間は SS3 形式
+        (ESC O A) で送る。nano は矢印キーをこの形で待っている。
+        """
+        screen = getattr(self, "_screen", None)
+        if screen is not None and screen.application_cursor_keys:
+            return "\x1bO" + letter
+        return "\x1b[" + letter
+
     def keyPressEvent(self, event: QKeyEvent):
         """キーイベントを処理"""
         if not self._input_enabled:
@@ -270,13 +307,13 @@ class InteractiveTerminal(QTextEdit):
         elif key == Qt.Key.Key_Escape:
             self.key_pressed.emit('\x1b')
         elif key == Qt.Key.Key_Up:
-            self.key_pressed.emit('\x1b[A')
+            self.key_pressed.emit(self._cursor_key('A'))
         elif key == Qt.Key.Key_Down:
-            self.key_pressed.emit('\x1b[B')
+            self.key_pressed.emit(self._cursor_key('B'))
         elif key == Qt.Key.Key_Right:
-            self.key_pressed.emit('\x1b[C')
+            self.key_pressed.emit(self._cursor_key('C'))
         elif key == Qt.Key.Key_Left:
-            self.key_pressed.emit('\x1b[D')
+            self.key_pressed.emit(self._cursor_key('D'))
         else:
             # 通常の文字入力
             text = event.text()
@@ -315,7 +352,9 @@ class TerminalWidget(QWidget):
     keepalive_start_requested = pyqtSignal(str)
     # キープアライブ停止要求シグナル（機器名）
     keepalive_stop_requested = pyqtSignal(str)
-    
+    # 端末の行数・桁数が変わった（機器名, 桁, 行）。機器への通知に使う
+    terminal_resized = pyqtSignal(str, int, int)
+
     def __init__(self):
         super().__init__()
         self._terminals: Dict[str, InteractiveTerminal] = {}  # 機器名 -> ターミナル
@@ -323,6 +362,13 @@ class TerminalWidget(QWidget):
         self._log_dialogs: Dict[str, object] = {}  # 機器名 -> ログ記録ダイアログ
         # ターミナルの外観設定。_create_terminal が参照するので _create_ui より先に持つ
         self._terminal_settings = dict(self.DEFAULT_TERMINAL_SETTINGS)
+        # ウィンドウをドラッグ中のリサイズ連打を 1 回にまとめる
+        from PyQt6.QtCore import QTimer
+        self._pending_resizes = set()
+        self._resize_timer = QTimer(self)
+        self._resize_timer.setSingleShot(True)
+        self._resize_timer.setInterval(200)
+        self._resize_timer.timeout.connect(self._apply_pending_resizes)
         self._create_ui()
     
     def _create_ui(self):
@@ -333,6 +379,9 @@ class TerminalWidget(QWidget):
         # タブウィジェット
         self.tab_widget = QTabWidget()
         self.tab_widget.setTabsClosable(True)
+        # 横ドラッグで並べ替えられる。機器の対応付けはタブ名と
+        # ウィジェットで持っていて、位置には依存しない
+        self.tab_widget.setMovable(True)
         self.tab_widget.tabCloseRequested.connect(self._close_tab)
         self.tab_widget.currentChanged.connect(self._on_current_tab_changed)
         
@@ -446,6 +495,10 @@ class TerminalWidget(QWidget):
             palette.setColor(QPalette.ColorRole.Text, text_color)
             terminal.setPalette(palette)
 
+        # 文字の大きさが変われば収まる行数・桁数も変わる
+        for device_name in self._terminals:
+            self._schedule_grid_update(device_name)
+
     def current_terminal_settings(self) -> dict:
         """
         いま実際に適用されている外観設定を返す
@@ -477,10 +530,9 @@ class TerminalWidget(QWidget):
             for i in range(self.tab_widget.count()):
                 if self.tab_widget.tabText(i) == device_name:
                     self.tab_widget.setCurrentIndex(i)
-                    # 案内は 1 接続につき一度。タブは機器名で使い回す
-                    # ため、ここで戻さないと再接続後に出なくなる。
-                    self._terminals[device_name]._fullscreen_warned = False
-                    self._terminals[device_name]._pending_escape = ""
+                    # 再接続は新しいセッション。前の画面はそのまま記録と
+                    # して文書に残し、端末状態 (パーサ・画面) は作り直す
+                    self._attach_screen(self._terminals[device_name])
                     return self._terminals[device_name]
         
         # 接続機器がなく、ホームタブが残っている場合は、ホームタブを再利用
@@ -513,39 +565,305 @@ class TerminalWidget(QWidget):
         terminal.keepalive_stop_requested.connect(
             lambda: self.keepalive_stop_requested.emit(device_name)
         )
+
+        # ウィンドウの大きさに画面の格子を追従させる
+        terminal.resized.connect(
+            lambda: self._schedule_grid_update(device_name))
         
         # タブとして追加
         index = self.tab_widget.addTab(terminal, device_name)
         self.tab_widget.setCurrentIndex(index)
-        
+
+        self._attach_screen(terminal)
         return terminal
-    
+
+    # 端末の格子の大きさ。pty 要求 (vt100, 80x24) と合わせてある
+    SCREEN_ROWS = 24
+    SCREEN_COLS = 80
+
+    def _attach_screen(self, terminal: QTextEdit) -> None:
+        """端末状態 (パーサと画面) をこのタブへ付け直す。
+
+        文書のいまの末尾から後ろを「今の画面」の領域とする。それより
+        前は確定した記録で、二度と書き換えない。
+        """
+        rows, cols = self._grid_size(terminal)
+        terminal._parser = vt.Parser()
+        terminal._screen = Screen(rows, cols)
+        region = QTextCursor(terminal.document())
+        region.movePosition(QTextCursor.MoveOperation.End)
+        terminal._region = region
+
+    def _grid_size(self, terminal: QTextEdit):
+        """いまの表示領域に収まる (行数, 桁数)。測れないときは 24x80。"""
+        from PyQt6.QtGui import QFontMetrics
+        metrics = QFontMetrics(terminal.font())
+        char_w = metrics.horizontalAdvance("0")
+        line_h = metrics.lineSpacing()
+        width = terminal.viewport().width()
+        height = terminal.viewport().height()
+        if char_w <= 0 or line_h <= 0 or width < 2 * char_w or height < line_h:
+            return self.SCREEN_ROWS, self.SCREEN_COLS
+        return (max(5, min(200, height // line_h)),
+                max(20, min(500, width // char_w)))
+
+    def grid_size_for(self, device_name: str):
+        """接続時の pty 要求 (RFC 4254 6.2) に使う (桁, 行)。"""
+        terminal = self._terminals.get(device_name)
+        if terminal is None:
+            return self.SCREEN_COLS, self.SCREEN_ROWS
+        rows, cols = self._grid_size(terminal)
+        return cols, rows
+
+    def _schedule_grid_update(self, device_name: str) -> None:
+        self._pending_resizes.add(device_name)
+        self._resize_timer.start()
+
+    def _apply_pending_resizes(self) -> None:
+        pending, self._pending_resizes = self._pending_resizes, set()
+        for device_name in sorted(pending):
+            self._apply_grid_size(device_name)
+
+    def _apply_grid_size(self, device_name: str) -> None:
+        """画面の格子を表示領域に合わせ、変わったら機器へ知らせる。"""
+        terminal = self._terminals.get(device_name)
+        if terminal is None:
+            return
+        screen = terminal._screen
+        rows, cols = self._grid_size(terminal)
+        if (rows, cols) == (screen.rows, screen.cols):
+            return
+        screen.set_size(rows, cols)
+        self._render_screen(terminal)
+        self.terminal_resized.emit(device_name, cols, rows)
+
+    @staticmethod
+    def _visible_cells(line):
+        """行のセル列から、既定属性の末尾空白だけを落とす。
+
+        色や反転の付いた空白 (nano のタイトルバーの帯) は表示に
+        意味があるので残す。
+        """
+        n = len(line)
+        while n and line[n - 1] == BLANK:
+            n -= 1
+        return line[:n]
+
+    @staticmethod
+    def _runs(cells):
+        """同じ属性が続く区間ごとに (文字列, 属性) を返す。"""
+        runs = []
+        for ch, attr in cells:
+            if runs and runs[-1][1] == attr:
+                runs[-1][0].append(ch)
+            else:
+                runs.append(([ch], attr))
+        return [("".join(chars), attr) for chars, attr in runs]
+
+    def _colour(self, value, default):
+        """セルの色番号を実際の色にする。"""
+        if value is None:
+            return default
+        if isinstance(value, tuple):
+            return QColor(*value)
+        if value < 16:
+            return QColor(ANSI_COLOURS[value])
+        if value < 232:                     # 6x6x6 の色立方体
+            value -= 16
+            parts = (value // 36, value // 6 % 6, value % 6)
+            return QColor(*(0 if p == 0 else 55 + p * 40 for p in parts))
+        gray = 8 + (value - 232) * 10       # グレースケール
+        return QColor(gray, gray, gray)
+
+    def _char_format(self, attr) -> QTextCharFormat:
+        fmt = QTextCharFormat()
+        if attr == DEFAULT:
+            return fmt                      # 空の書式 = パレットに従う
+        settings = self._terminal_settings
+        fg = self._colour(attr.fg, QColor(settings["text_color"]))
+        bg = self._colour(attr.bg, QColor(settings["background_color"]))
+        if attr.reverse:
+            fg, bg = bg, fg
+        fmt.setForeground(fg)
+        if attr.bg is not None or attr.reverse:
+            fmt.setBackground(bg)
+        if attr.bold:
+            fmt.setFontWeight(QFont.Weight.Bold)
+        if attr.underline:
+            fmt.setFontUnderline(True)
+        return fmt
+
+    def _paint_row(self, terminal: QTextEdit, offset: int, cells) -> None:
+        """1 行ぶんのセル属性を、文書のその範囲へ塗る。
+
+        書式だけを変えるので文字位置は動かず、範囲選択も壊れない。
+        """
+        painter = QTextCursor(terminal.document())
+        for text, attr in self._runs(cells):
+            painter.setPosition(offset)
+            painter.setPosition(offset + len(text),
+                                QTextCursor.MoveMode.KeepAnchor)
+            painter.setCharFormat(self._char_format(attr))
+            offset += len(text)
+
+    def _render_screen(self, terminal: QTextEdit) -> None:
+        """画面の中身を文書へ写す。
+
+        文書 = [確定した記録 (履歴)] + [今の画面]。上から押し出された
+        行を記録側へ差し込み、画面領域は変わった範囲だけ描き直す。
+        """
+        screen = terminal._screen
+        region = terminal._region
+
+        # 組み直しの直後は、文書に残っている「今の画面」が組み直し前の
+        # ものなので、内容が一致しても同じ行とは限らない。境目を進める
+        # 近道は使えない (使うと押し出された行が書かれずに消える)
+        reflowed = screen.take_reflowed()
+
+        for line, wrapped in screen.take_new_history():
+            # 折り返しで続いている行は、改行で切らずに次の行と繋げる。
+            # 切ると、窓を縮めている間に流れた出力が刻まれたまま記録に
+            # 残り、窓を戻しても直らない
+            cells = list(line) if wrapped else self._visible_cells(line)
+            text = "".join(cell[0] for cell in cells)
+            # 押し出された行は、画面領域の先頭として文書にもう書いて
+            # ある。同じ内容なら書き直さず、記録との境目を進めるだけに
+            # する。書き直すと画面領域が丸ごと入れ替わり、そこにある
+            # 範囲選択が消える (機器がログを 1 行吐くだけで起きる)
+            probe = QTextCursor(terminal.document())
+            probe.setPosition(region.position())
+            probe.movePosition(QTextCursor.MoveOperation.EndOfBlock,
+                               QTextCursor.MoveMode.KeepAnchor)
+            if (not reflowed and not wrapped
+                    and probe.selectedText() == text
+                    and not probe.atEnd()):
+                region.setPosition(probe.position() + 1)
+                continue
+            for run, attr in self._runs(cells):
+                region.insertText(run, self._char_format(attr))
+            if not wrapped:
+                region.insertText("\n", QTextCharFormat())
+
+        cell_rows = [self._visible_cells(line) for line in screen.lines]
+        # カーソルの行は、カーソルの桁まで空白を残す。プロンプト末尾の
+        # 空白 ("Router# ") を落とすとキャレットが $ に張り付いて見える
+        pad = screen.cursor_col - len(cell_rows[screen.cursor_row])
+        if pad > 0:
+            cell_rows[screen.cursor_row] = (
+                cell_rows[screen.cursor_row] + [BLANK] * pad)
+        rows = ["".join(cell[0] for cell in cells) for cells in cell_rows]
+        # 画面は必ず行数ぶんの高さで描く。末尾の空行を詰めると、clear の
+        # あとに履歴が下端へせり上がり「消えていない」ように見える。
+        # 全画面アプリも、画面の一部しか窓に入らなくなる
+        new_text = "\n".join(rows)
+        start = region.position()
+
+        # 変わった範囲だけ置き換える。全部消して入れ直すと、機器が
+        # ログを吐くたびに画面内の範囲選択が消えてしまう
+        probe = QTextCursor(terminal.document())
+        probe.setPosition(start)
+        probe.movePosition(QTextCursor.MoveOperation.End,
+                           QTextCursor.MoveMode.KeepAnchor)
+        old_text = probe.selectedText().replace("\u2029", "\n")
+        touched = (0, -1)
+        if old_text != new_text:
+            prefix = 0
+            limit = min(len(old_text), len(new_text))
+            while prefix < limit and old_text[prefix] == new_text[prefix]:
+                prefix += 1
+            suffix = 0
+            while (suffix < limit - prefix
+                   and old_text[-1 - suffix] == new_text[-1 - suffix]):
+                suffix += 1
+            probe.setPosition(start + prefix)
+            probe.setPosition(start + len(old_text) - suffix,
+                              QTextCursor.MoveMode.KeepAnchor)
+            # 書式は空で入れる。insertText は挿入位置の書式を引き継ぐので、
+            # 指定しないと直前の色や反転が新しい文字へ伝染する
+            probe.insertText(new_text[prefix:len(new_text) - suffix],
+                             QTextCharFormat())
+            touched = (prefix, len(new_text) - suffix)
+        region.setPosition(start)
+
+        # 変わった行に色・太字・反転を塗り直す
+        dirty = screen.take_dirty()
+        dirty.add(screen.cursor_row)    # カーソル桁の空白の伸縮ぶん
+        # 書き換わった範囲の行も塗り直す。画面側が「変わっていない」と
+        # 思っていても、入れ直した文字は書式を失っている
+        at = 0
+        for r, line in enumerate(rows):
+            if at <= touched[1] and at + len(line) >= touched[0]:
+                dirty.add(r)
+            at += len(line) + 1
+        offset = start
+        for r in range(len(rows)):
+            if r in dirty:
+                self._paint_row(terminal, offset, cell_rows[r])
+            offset += len(rows[r]) + 1
+
+        # キャレット (点滅カーソル) を画面カーソルの位置へ。範囲選択の
+        # 最中に動かすと選択が消えるので、そのときは触らない
+        if not terminal.textCursor().hasSelection():
+            pos = start
+            for r in range(screen.cursor_row):
+                pos += len(rows[r]) + 1
+            pos += min(screen.cursor_col, len(rows[screen.cursor_row]))
+            caret = QTextCursor(terminal.document())
+            caret.setPosition(pos)
+            terminal.setTextCursor(caret)
+        # 端末と同じく、常に下端へ寄せる。画面は文書の末尾 rows 行
+        # なので、ここを見せることが「いま端末に映っているもの」を
+        # 見せることになる。カーソルへ寄せると、全画面アプリでは
+        # 画面の上半分しか窓に入らない
+        bar = terminal.verticalScrollBar()
+        bar.setValue(bar.maximum())
+
+    def show_notice(self, device_name: str, text: str) -> None:
+        """アプリ自身の案内 (切断バナー・エラー文) を画面へ出す。
+
+        端末では LF は「1 行下へ」であって行頭へは戻らない (戻すのは
+        CR)。アプリの文言は普通の改行で書かれているので、ここで
+        CRLF へ直す。直さないと案内が階段状にずれて出る。
+        """
+        self.append_output(device_name,
+                           text.replace("\r\n", "\n")
+                               .replace("\n", "\r\n"))
+
     def append_output(self, device_name: str, text: str) -> None:
         """
         指定した機器のターミナルにテキストを追加
-        
+
         Args:
             device_name: 機器名
             text: 追加するテキスト
         """
-        if device_name in self._terminals:
-            terminal = self._terminals[device_name]
-            from PyQt6.QtGui import QTextCursor
-            
-            # 制御コードを処理（カーソル位置も変更される可能性がある）
-            processed_text = self._process_control_codes(terminal, text)
-            
-            # テキストがある場合のみ挿入
-            # 描画は _process_control_codes 内で完了している（戻り値はログ用）
-            if processed_text:
-                # ログ記録中の場合はファイルに書き込み
-                if device_name in self._log_files:
-                    try:
-                        self._log_files[device_name].write(processed_text)
-                        self._log_files[device_name].flush()  # 即座にディスクに書き込む
-                    except Exception as e:
-                        import sys
-                        print(f"[ERROR] ログ書き込みエラー: {str(e)}", file=sys.stderr)
+        if device_name not in self._terminals:
+            return
+        terminal = self._terminals[device_name]
+
+        events = terminal._parser.feed(text)
+        terminal._screen.apply(events)
+        self._render_screen(terminal)
+
+        # 機器からの問い合わせ (カーソル位置・装置識別) に答える。
+        # key_pressed はキー入力と同じ「機器へ送る文字」の経路
+        for response in terminal._screen.take_responses():
+            terminal.key_pressed.emit(response)
+
+        if device_name in self._log_files:
+            # タブは桁を作る文字なので落とすと表が潰れる
+            logged = "".join(
+                e.text if isinstance(e, vt.Print) else e.char
+                for e in events
+                if isinstance(e, vt.Print)
+                or (isinstance(e, vt.Ctrl) and e.char in "\n\t"))
+            if logged:
+                try:
+                    self._log_files[device_name].write(logged)
+                    self._log_files[device_name].flush()
+                except Exception as e:
+                    import sys
+                    print(f"[ERROR] ログ書き込みエラー: {str(e)}", file=sys.stderr)
     
     def enable_reconnect(self, device_name: str, reconnect_callback):
         """
@@ -565,302 +883,6 @@ class TerminalWidget(QWidget):
                 pass
             terminal.reconnect_requested.connect(lambda: reconnect_callback(device_name))
     
-    # 全画面アプリが代替画面へ切り替えるときのモード番号
-    # （1049 が現行、1047 / 47 は古い実装）。ただし端末種別を vt100 と
-    # 名乗っているため、nano や vi はこれを送ってこない。実機で採った
-    # 限り、目印になるのは下の 2 つだった。
-    ALT_SCREEN_MODES = ("1049", "1047", "47")
-
-    ALT_SCREEN_NOTICE = (
-        "[NetBelt] nano や vi のような全画面アプリの表示には対応していません。"
-        "画面が崩れますが、機器との接続は切れていません。"
-    )
-
-    # 端末が名乗っている画面の高さ。実際の表示から取れないときに使う
-    DEFAULT_SCREEN_LINES = 24
-
-    # 途中で切れたエスケープを次の受信まで持ち越す上限。これを超えたら
-    # 完成する見込みが無いとみなして、今までどおり読み飛ばす。
-    # ウィンドウタイトル(OSC)は長い。パスまで含めると 64 では足りない
-    # （`ESC]0;user@host: /home/user/configs/2026` で 75 バイト）。
-    MAX_PENDING_ESCAPE = 128
-
-    # 「まだ伸びうる」形。終端の文字がまだ来ていないもの。
-    #   ESC 単体 / ESC[ とパラメータ / ESC] と本文 / ESC と中間文字
-    # OSC の本文のあとに ESC を 1 つ許すのは、終端が ESC + backslash の
-    # 形のときに、ちょうどその間で切れるとタイトルが画面へ漏れるため。
-    _INCOMPLETE_ESCAPE = re.compile(
-        "\x1b(?:\\[[0-9:;<=>?]*[ -/]*|][^\x07\x1b]*\x1b?|[ -/]*)?$")
-
-    def _visible_lines(self, terminal: QTextEdit) -> int:
-        """画面に見えているおおよその行数を返す。"""
-        from PyQt6.QtGui import QFontMetrics
-        try:
-            spacing = QFontMetrics(terminal.font()).lineSpacing()
-            height = terminal.viewport().height()
-            if spacing > 0 and height > 0:
-                return max(1, min(200, height // spacing))
-        except Exception:
-            pass
-        return self.DEFAULT_SCREEN_LINES
-
-    def _is_full_screen_draw(self, private: bool, params_str: str,
-                             command: str) -> bool:
-        """全画面アプリが画面を組み立て始めた合図かを判定する。
-
-        代替画面への切り替え（ESC[?1049h など）が本来の合図だが、
-        こちらは端末種別を vt100 と名乗っており、その terminfo には
-        代替画面が無い。そのため nano も vi も送ってこない。
-
-        実機で採った限り、代わりに届くのは次の 2 つ。
-          ESC[<上>;<下>r   スクロール範囲の設定。描画より前に届く
-          ESC[<行>;<桁>H   行と桁を指定したカーソル移動
-        同じ条件で採った普通のシェル操作には、どちらも現れなかった。
-        """
-        if private:
-            codes = params_str[1:].split(';') if len(params_str) > 1 else []
-            return (command == 'h'
-                    and any(c in self.ALT_SCREEN_MODES for c in codes))
-        if not params_str:
-            return False        # 引数なしの ESC[H / ESC[r は画面の初期化
-        if command == 'r':
-            return True         # スクロール範囲を切るのは全画面アプリだけ
-        return command in ('H', 'f') and ';' in params_str
-
-    def _note_full_screen_app(self, terminal: QTextEdit, cursor) -> None:
-        """崩れる理由を、一度だけ画面に出す。
-
-        このターミナルは行を追記していく作りで、行・桁を指定して
-        描く仕組みを持たない。全画面アプリは画面のどこにでも書くので、
-        すべてが同じ場所に重なって出る。黙って崩れた画面を見せるより、
-        崩れる理由を伝えるほうがよい。
-
-        抜けたことを知る手立てが無い（代替画面を使っていないので
-        戻りの合図も来ない）ため、1 接続につき一度だけにする。
-        """
-        from PyQt6.QtGui import QTextCursor
-
-        if getattr(terminal, "_fullscreen_warned", False):
-            return
-        terminal._fullscreen_warned = True
-        cursor.movePosition(QTextCursor.MoveOperation.End)
-        cursor.insertText('\n' + self.ALT_SCREEN_NOTICE + '\n')
-
-    def _render_cursor_for(self, terminal: QTextEdit):
-        """機器出力の書き込み位置を返す（ユーザーの選択とは独立）
-
-        端末は行編集をカーソル移動と上書きで行い、カーソルを戻す指示と
-        上書きする文字が別々のパケットで届く。そのため書き込み位置は
-        append_output を跨いで保つ必要がある。一方で、この位置に
-        terminal.textCursor() を使うと、利用者が範囲選択している最中に
-        出力が届いたとき insertText が選択範囲を置き換えてしまう。
-        書き込み位置は選択とは別に持つ。
-        """
-        from PyQt6.QtGui import QTextCursor
-
-        cursor = getattr(terminal, "_render_cursor", None)
-        if cursor is None or cursor.document() is not terminal.document():
-            cursor = QTextCursor(terminal.document())
-            cursor.movePosition(QTextCursor.MoveOperation.End)
-            terminal._render_cursor = cursor
-        cursor.clearSelection()
-        return cursor
-
-    def _process_control_codes(self, terminal: QTextEdit, text: str) -> str:
-        """機器から届いた制御コードを解釈して画面へ反映する。
-
-        端末（Cisco IOS 等）は行編集を「上書き描画」で行う。
-          - \b はカーソルを左へ動かすだけで、文字は消さない
-          - \b + 空白 + \b が来たときだけ、その位置の文字が消える
-          - 行の途中に文字を入れると、残り全体を送り直してから \b で戻ってくる
-        そのため通常文字は、行末なら追記、途中なら既存文字を置換する。
-
-        Args:
-            terminal: 描画先のターミナル
-            text: 受信テキスト
-
-        Returns:
-            str: ログ記録用に、画面へ出したテキスト
-        """
-        import re
-        from PyQt6.QtGui import QTextCursor
-
-        text = text.replace('\x00', '')   # NUL は捨てる（BEL は OSC 終端に使うため後段で処理）
-
-        # 前回の受信が途中で切れていたら、その続きとして繋ぐ
-        pending = getattr(terminal, "_pending_escape", "")
-        if pending:
-            terminal._pending_escape = ""
-            text = pending + text
-
-        logged = []          # ログへ残す内容（画面に出した文字と改行）
-        cursor = self._render_cursor_for(terminal)
-
-        def put(s):
-            """カーソル位置へ書く。行末なら追記、途中なら上書き（端末と同じ挙動）。"""
-            for ch in s:
-                if not cursor.atBlockEnd():
-                    cursor.deleteChar()      # 上書き（挿入すると行が伸びてしまう）
-                cursor.insertText(ch)
-
-        i = 0
-        n = len(text)
-        while i < n:
-            ch = text[i]
-
-            # --- エスケープシーケンス ---
-            if ch == '\x1b':
-                # CSI: ESC [ <パラメータ 0x30-0x3F> <中間 0x20-0x2F> <終端 0x40-0x7E>
-                match = re.match(r'\x1b\[([0-9:;<=>?]*)([ -/]*)([@-~])', text[i:])
-                if match:
-                    params_str, _intermediate, command = match.groups()
-                    # '?' 等で始まるプライベートパラメータ（DECSET/DECRST。bash の
-                    # ブラケットペースト ESC[?2004h など）は解釈せず読み飛ばす
-                    private = bool(params_str) and params_str[0] in '<=>?'
-                    params = [] if private else (params_str.split(';') if params_str else [])
-                    first = params[0] if params else ''
-                    try:
-                        # パラメータ省略時、移動系は 1、消去系は 0 が既定
-                        num = int(first) if first else 1
-                        mode = int(first) if first else 0
-                    except ValueError:
-                        # SGR の ':' 区切り副パラメータなど。移動・消去系では起きない
-                        num, mode = 1, 0
-                    if self._is_full_screen_draw(private, params_str,
-                                                 command):
-                        self._note_full_screen_app(terminal, cursor)
-
-                    if private:
-                        pass                # 私用パラメータは解釈しない
-                    elif command == 'D':        # カーソル左
-                        for _ in range(num):
-                            cursor.movePosition(QTextCursor.MoveOperation.Left)
-                    elif command == 'C':        # カーソル右
-                        for _ in range(num):
-                            cursor.movePosition(QTextCursor.MoveOperation.Right)
-                    elif command == 'K':        # 行内の消去
-                        if mode == 1:           # 行頭からカーソルまで
-                            cursor.movePosition(QTextCursor.MoveOperation.StartOfLine,
-                                                QTextCursor.MoveMode.KeepAnchor)
-                        elif mode == 2:         # 行全体
-                            cursor.movePosition(QTextCursor.MoveOperation.StartOfLine)
-                            cursor.movePosition(QTextCursor.MoveOperation.EndOfLine,
-                                                QTextCursor.MoveMode.KeepAnchor)
-                        else:                   # 0: カーソルから行末まで
-                            cursor.movePosition(QTextCursor.MoveOperation.EndOfLine,
-                                                QTextCursor.MoveMode.KeepAnchor)
-                        cursor.removeSelectedText()
-                    elif command == 'J':        # 画面の消去（NX-OS が行編集で使う）
-                        if mode == 2:           # 画面全体
-                            # 端末では「今見えている画面」を消す指示だが、
-                            # ここは追記していく文書で、画面という区切りが
-                            # 無い。消すとセッションの記録ごと失われ、
-                            # Linux で clear を打っただけでそれまでの
-                            # show 出力が全部消える。端末と同じように、
-                            # 上へ送り出して見えなくするだけにする。
-                            # なお端末種別を vt100 と名乗っているため、
-                            # Linux の clear は ESC[2J ではなく ESC[H ESC[J
-                            # を送る。ここへは届かない。備えとして残す。
-                            cursor.movePosition(
-                                QTextCursor.MoveOperation.End)
-                            cursor.insertText(
-                                '\n' * self._visible_lines(terminal))
-                        elif mode == 3:         # スクロールバックの消去
-                            pass                # 記録は消さない
-                        elif mode == 1:         # 先頭からカーソルまで
-                            cursor.movePosition(QTextCursor.MoveOperation.Start,
-                                                QTextCursor.MoveMode.KeepAnchor)
-                            cursor.removeSelectedText()
-                        else:                   # 0: カーソルから末尾まで
-                            cursor.movePosition(QTextCursor.MoveOperation.End,
-                                                QTextCursor.MoveMode.KeepAnchor)
-                            cursor.removeSelectedText()
-                    i += len(match.group())
-                    continue
-                # OSC: ESC ] ... 終端は BEL または ST(ESC \)。ウィンドウタイトル等
-                match = re.match(r'\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)', text[i:])
-                if match:
-                    i += len(match.group())
-                    continue
-                # 受信の切れ目にかかっただけかもしれない。次と繋げれば
-                # 完成する形なら、捨てずに持ち越す。捨てると残りが文字と
-                # して画面へ漏れる。
-                # 2バイト系より前に見ること。あちらは終端に 0x30-0x7E を
-                # 許すので、ESC[ や ESC] で切れていると「2バイトの命令」
-                # として食べてしまう（実測で 161 箇所中 45 箇所しか減らず）。
-                if (n - i <= self.MAX_PENDING_ESCAPE
-                        and self._INCOMPLETE_ESCAPE.match(text, i)):
-                    terminal._pending_escape = text[i:]
-                    i = n
-                    continue
-                # 2バイト系: ESC ( B（文字集合指定）, ESC = / ESC >（キーパッドモード）等
-                match = re.match(r'\x1b[ -/]*[0-~]', text[i:])
-                if match:
-                    i += len(match.group())
-                    continue
-                # 本当に未知のシーケンス。ESC 1文字だけ捨てて必ず前進する
-                # （ここで前進しないと無限ループになり、アプリが固まる）
-                i += 1
-                continue
-
-            # --- ベル ---
-            if ch == '\x07':
-                i += 1
-                continue
-
-            # --- バックスペース ---
-            # 端末では \b は「カーソルを左へ動かす」だけ。文字を消すときは、機器が
-            # 空白で上書きしてから \b で戻る列を送ってくるので、特別扱いは不要。
-            if ch in ('\b', '\x08'):
-                bs = 0
-                j = i
-                while j < n and text[j] in ('\b', '\x08'):
-                    bs += 1
-                    j += 1
-                for _ in range(bs):
-                    cursor.movePosition(QTextCursor.MoveOperation.Left)
-                i = j
-                continue
-
-            # --- 改行 ---
-            if ch == '\n':
-                cursor.movePosition(QTextCursor.MoveOperation.End)
-                cursor.insertText('\n')
-                logged.append('\n')
-                i += 1
-                continue
-
-            # --- 復帰 ---
-            if ch == '\r':
-                j = i
-                while j < n and text[j] == '\r':
-                    j += 1
-                if j < n and text[j] == '\n':
-                    cursor.movePosition(QTextCursor.MoveOperation.End)
-                    cursor.insertText('\n')
-                    logged.append('\n')
-                    i = j + 1
-                    continue
-                cursor.movePosition(QTextCursor.MoveOperation.StartOfLine)
-                i = j
-                continue
-
-            # --- 通常文字（連続分をまとめて書く）---
-            j = i
-            while j < n and text[j] not in ('\x1b', '\x07', '\b', '\x08', '\r', '\n'):
-                j += 1
-            chunk = text[i:j]
-            put(chunk)
-            logged.append(chunk)
-            i = j
-
-        # 選択中に視覚カーソルを動かすと選択が外れる。コピーしようと
-        # している最中に機器がログを送ってくるだけで範囲が消えてしまう。
-        if not terminal.textCursor().hasSelection():
-            terminal.setTextCursor(cursor)
-        terminal.ensureCursorVisible()
-        return ''.join(logged)
-
 
     def _close_tab(self, index: int) -> None:
         """

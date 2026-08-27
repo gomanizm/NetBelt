@@ -114,11 +114,13 @@ class TerminalCursorTest(unittest.TestCase):
         self.assertEqual(self._text(w), "abc")
 
     def test_esc_k_variants(self):
-        # ESC[1K は行頭からカーソルまで、ESC[2K は行全体
+        # ESC[1K は行頭からカーソルまで (カーソル位置を含む) を空白に
+        # する。ECMA-48 の EL は消した分を詰めない。旧実装は削除して
+        # 左へ詰めており ("def")、桁がずれる方が誤りだった
         w = self._terminal()
         w.append_output("dev", "abcdef")
         w.append_output("dev", (ESC + "[D") * 3 + ESC + "[1K")
-        self.assertEqual(self._text(w), "def")
+        self.assertEqual(self._text(w), "    ef")
 
 if __name__ == "__main__":
     unittest.main()

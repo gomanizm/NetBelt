@@ -67,14 +67,22 @@ class ConnectThreadSafetyTest(unittest.TestCase):
             + "\n  ".join(offenders))
 
     def test_connection_failure_goes_through_signal(self):
-        """接続失敗の通知が3種ともシグナル経由であること。"""
+        """接続失敗の通知が3種ともシグナル経由であること。
+
+        見ているのはスレッドの安全性であって文言ではないので、
+        改行の書き方 (端末向けの CRLF) には依存させない。
+        """
+        import re
+
+        through_signal = re.findall(
+            r'\.output_received\.emit\("[\\rn]*接続失敗', self.src)
         self.assertEqual(
-            self.src.count('.output_received.emit("\\n接続失敗\\n")'), 3,
+            len(through_signal), 3,
             "接続失敗の通知がシグナル経由になっていない")
-        self.assertNotIn(
-            'self.terminal_widget.append_output(device_name, "\\n接続失敗\\n")',
-            self.src,
-            "ウィジェットの直接呼び出しが残っている")
+        direct = re.findall(
+            r'terminal_widget\.\w+\([^)]*接続失敗', self.src)
+        self.assertEqual(
+            direct, [], "ウィジェットの直接呼び出しが残っている")
 
 
 if __name__ == "__main__":

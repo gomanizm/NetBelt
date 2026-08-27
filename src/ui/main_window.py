@@ -247,6 +247,11 @@ class MainWindow(QMainWindow):
         self.snmp_panel_action.triggered.connect(self._toggle_snmp_panel)
 
         view_menu.addSeparator()
+        self.toggle_device_list_action = view_menu.addAction("接続先リスト表示/非表示")
+        self.toggle_device_list_action.setCheckable(True)
+        self.toggle_device_list_action.setChecked(True)
+        self.toggle_device_list_action.triggered.connect(
+            self._toggle_device_list)
         self.toggle_tool_area_action = view_menu.addAction("ツールエリア表示/非表示")
         self.toggle_tool_area_action.setCheckable(True)
         self.toggle_tool_area_action.setChecked(True)
@@ -304,6 +309,7 @@ class MainWindow(QMainWindow):
         self.device_tree.group_add_requested.connect(self._on_add_group)
         self.device_tree.group_edit_requested.connect(self._on_edit_group)
         self.device_tree.group_delete_requested.connect(self._on_delete_group)
+        self.device_tree.hide_requested.connect(self._toggle_device_list)
         splitter.addWidget(self.device_tree)
         
         # 右側: ターミナル
@@ -317,6 +323,7 @@ class MainWindow(QMainWindow):
         self.terminal_widget.macro_settings_requested.connect(self._on_macro_settings_from_context)
         self.terminal_widget.keepalive_start_requested.connect(self._on_keepalive_start_requested)
         self.terminal_widget.keepalive_stop_requested.connect(self._on_keepalive_stop_requested)
+        self.terminal_widget.terminal_resized.connect(self._on_terminal_resized)
         splitter.addWidget(self.terminal_widget)
         
         # デフォルトの分割比率を設定（30% : 70%）
@@ -329,9 +336,11 @@ class MainWindow(QMainWindow):
         self.tool_tabs.tabBar().customContextMenuRequested.connect(self._tool_area_context_menu)
         splitter.addWidget(self.tool_tabs)
         splitter.setSizes([250, 650, 300])
-        splitter.setCollapsible(0, False)
+        # 接続先リストとツールエリアはハンドルを引いて畳める。
+        # ターミナルは本体なので畳ませない
+        splitter.setCollapsible(0, True)
         splitter.setCollapsible(1, False)
-        splitter.setCollapsible(2, True)   # ツールエリアはハンドルで折り畳み可
+        splitter.setCollapsible(2, True)
         
         layout.addWidget(splitter)
         
@@ -368,9 +377,25 @@ class MainWindow(QMainWindow):
     
     def _create_status_bar(self):
         """ステータスバー作成"""
+        from PyQt6.QtWidgets import QLabel
+
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
+        # 端末の大きさ。右端の常設欄に置くので、showMessage の
+        # 一時メッセージとは場所を取り合わない
+        self.terminal_size_label = QLabel("")
+        self.terminal_size_label.setToolTip(
+            "いま機器へ伝えている端末の大きさ（桁×行）")
+        self.status_bar.addPermanentWidget(self.terminal_size_label)
         self.status_bar.showMessage("準備完了")
+
+    def _show_terminal_size(self, device_name: str) -> None:
+        """表示中のターミナルの大きさを、ステータスバーへ出す。"""
+        if not device_name:
+            self.terminal_size_label.setText("")
+            return
+        cols, rows = self.terminal_widget.grid_size_for(device_name)
+        self.terminal_size_label.setText("%d x %d" % (cols, rows))
     
     def _load_devices(self):
         """設定ファイルから接続先リストを読み込み"""
@@ -598,6 +623,9 @@ class MainWindow(QMainWindow):
         
         # SSH接続を作成
         ssh = SSHConnection(host, port, username, password, ssh_key, self)
+        # pty 要求 (RFC 4254 6.2) に、いまの表示領域の行数・桁数を使う
+        cols, rows = self.terminal_widget.grid_size_for(device_name)
+        ssh.set_terminal_size(cols, rows)
         
         # シグナル接続
         ssh.output_received.connect(lambda text: self.terminal_widget.append_output(device_name, text))
@@ -638,7 +666,7 @@ class MainWindow(QMainWindow):
                 if not success:
                     # GUIスレッド外からウィジェットを直接触らない。
                     # 既に append_output へ接続済みのシグナルへ流す。
-                    ssh.output_received.emit("\n接続失敗\n")
+                    ssh.output_received.emit("\r\n接続失敗\r\n")
             except Exception as e:
                 ssh.error_occurred.emit(f"接続スレッドエラー: {str(e)}")
         
@@ -709,7 +737,7 @@ class MainWindow(QMainWindow):
                 if not success:
                     # GUIスレッド外からウィジェットを直接触らない。
                     # 既に append_output へ接続済みのシグナルへ流す。
-                    serial_conn.output_received.emit("\n接続失敗\n")
+                    serial_conn.output_received.emit("\r\n接続失敗\r\n")
             except Exception as e:
                 serial_conn.error_occurred.emit(f"接続スレッドエラー: {str(e)}")
         
@@ -778,7 +806,7 @@ class MainWindow(QMainWindow):
                 if not success:
                     # GUIスレッド外からウィジェットを直接触らない。
                     # 既に append_output へ接続済みのシグナルへ流す。
-                    telnet.output_received.emit("\n接続失敗\n")
+                    telnet.output_received.emit("\r\n接続失敗\r\n")
             except Exception as e:
                 telnet.error_occurred.emit(f"接続スレッドエラー: {str(e)}")
         
@@ -854,6 +882,8 @@ class MainWindow(QMainWindow):
             # いま見ている機器に SFTP が無いなら、前の機器のものを残さない
             self.sftp_panel.clear()
 
+        self._show_terminal_size(device_name)
+
     def _find_group_of_device(self, device_name: str):
         """機器名から所属グループを返す(見つからなければNone)"""
         for group in self.config_manager.get_groups():
@@ -901,7 +931,7 @@ class MainWindow(QMainWindow):
             del self.connections[device_name]
         
         # 切断メッセージと再接続方法を表示
-        self.terminal_widget.append_output(
+        self.terminal_widget.show_notice(
             device_name, 
             "\n\n========================================\n"
             "セッションが切断されました\n"
@@ -922,7 +952,7 @@ class MainWindow(QMainWindow):
             self._on_connection_closed(device_name)
         else:
             # その他のエラー
-            self.terminal_widget.append_output(device_name, f"\nエラー: {error}\n")
+            self.terminal_widget.show_notice(device_name, f"\nエラー: {error}\n")
             if device_name in self.connections:
                 del self.connections[device_name]
     
@@ -935,11 +965,11 @@ class MainWindow(QMainWindow):
         """
         # 機器情報を取得
         if device_name not in self.device_info:
-            self.terminal_widget.append_output(device_name, "\n再接続情報が見つかりません\n")
+            self.terminal_widget.show_notice(device_name, "\n再接続情報が見つかりません\n")
             return
         
         # 再接続メッセージ
-        self.terminal_widget.append_output(device_name, "再接続中...\n\n")
+        self.terminal_widget.show_notice(device_name, "再接続中...\n\n")
         
         # 接続処理を実行
         device_data = self.device_info[device_name]
@@ -961,6 +991,18 @@ class MainWindow(QMainWindow):
         # 接続処理を実行（ダブルクリックと同じ処理）
         self._on_connect_requested(device_data)
     
+    def _on_terminal_resized(self, device_name: str, cols: int, rows: int):
+        """端末の行数・桁数の変化を機器へ伝える (RFC 4254 6.7)。
+
+        SSH だけが対応している。Telnet (RFC 1073) と シリアルは未対応
+        なので、伝えられない接続では黙って何もしない。
+        """
+        conn = self.connections.get(device_name)
+        if conn is not None and hasattr(conn, "set_terminal_size"):
+            conn.set_terminal_size(cols, rows)
+        if device_name == self.terminal_widget.get_current_tab_name():
+            self.terminal_size_label.setText("%d x %d" % (cols, rows))
+
     def _on_tab_closed(self, device_name: str):
         """
         タブが閉じられたときの処理
@@ -1469,6 +1511,29 @@ class MainWindow(QMainWindow):
         self.tool_tabs.setVisible(show)
         if hasattr(self, "toggle_tool_area_action"):
             self.toggle_tool_area_action.setChecked(show)
+
+    # 接続先リストを戻すときの幅。畳んだ状態から出すと 0 のままなので、
+    # 何も見えず「戻らない」と受け取られる
+    DEVICE_LIST_WIDTH = 250
+
+    def _toggle_device_list(self):
+        """接続先リストの表示/非表示を切り替える。
+
+        仕切りを幅 0 まで引いた状態は、見た目は隠れているのに
+        ウィジェットとしては表示中。分割位置は次回起動へ持ち越されるので、
+        そのまま終了すると「表示メニューを押しても何も起きない」
+        （実際には一度隠してから出し直している）ように見える。
+        幅が無いものは隠れていると見なす。
+        """
+        sizes = self.main_splitter.sizes()
+        hidden = self.device_tree.isHidden() or (sizes and sizes[0] < 40)
+        self.device_tree.setVisible(hidden)
+        if hidden and sizes and sizes[0] < 40:
+            spare = max(sizes[1] - self.DEVICE_LIST_WIDTH, 100)
+            self.main_splitter.setSizes(
+                [self.DEVICE_LIST_WIDTH, spare] + sizes[2:])
+        if hasattr(self, "toggle_device_list_action"):
+            self.toggle_device_list_action.setChecked(hidden)
 
     def _toggle_sftp_panel(self):
         """SFTPクライアントパネルの表示/非表示を切り替え"""

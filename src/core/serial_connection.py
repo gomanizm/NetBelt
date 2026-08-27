@@ -63,7 +63,8 @@ class SerialConnection(QObject):
             self._should_stop = False
             
             # 接続成功メッセージ
-            self.output_received.emit(f"\n接続しました: {self.port} ({self.baudrate} baud)\n")
+            self.output_received.emit(
+                f"\r\n接続しました: {self.port} ({self.baudrate} baud)\r\n")
             self.connected.emit()
             
             # 読み取りスレッドを開始
@@ -73,12 +74,12 @@ class SerialConnection(QObject):
             
         except serial.SerialException as e:
             error_msg = f"接続失敗: {str(e)}"
-            self.output_received.emit(f"\n{error_msg}\n")
+            self.output_received.emit(f"\r\n{error_msg}\r\n")
             self.error_occurred.emit(error_msg)
             return False
         except Exception as e:
             error_msg = f"予期しないエラー: {str(e)}"
-            self.output_received.emit(f"\n{error_msg}\n")
+            self.output_received.emit(f"\r\n{error_msg}\r\n")
             self.error_occurred.emit(error_msg)
             return False
     

@@ -101,6 +101,38 @@ jobs:
         name: NetBelt-Portable
         path: NetBelt-v*-Windows-Portable.zip
         
+    # 更新の通知はリリース本文をそのまま出す。案内文だけだと、利用者は
+    # 何が変わったのか分からない。CHANGELOG のこの版の節を先頭へ置き、
+    # 案内文 (.github/release-body.md) をその下へ続ける。
+    # タグのときだけに絞らない。公開はしないので手動実行でも走らせ、
+    # 本文の組み立てが壊れていないことをタグを打つ前に確かめられるようにする
+    - name: Build release notes
+      shell: pwsh
+      run: |
+        $version = '${{ steps.version.outputs.version }}'
+        $lines = Get-Content CHANGELOG.md -Encoding utf8
+        $start = $null
+        $end = $lines.Count
+        # -like は [ ] を文字クラスとして解釈するので使えない。
+        # "## [1.2.0]*" は「1 . 2 0 のどれか1文字」という意味になり一致しない
+        for ($i = 0; $i -lt $lines.Count; $i++) {
+          if ($lines[$i].StartsWith("## [$version]")) { $start = $i + 1; continue }
+          if ($null -ne $start -and $lines[$i].StartsWith('## [')) { $end = $i; break }
+        }
+        if ($null -eq $start) { throw "CHANGELOG.md に [$version] の節がありません" }
+        $section = ($lines[$start..($end - 1)] -join "`n").Trim()
+        if (-not $section) { throw "[$version] の節が空です" }
+
+        $template = (Get-Content .github/release-body.md -Encoding utf8) -join "`n"
+        $template = $template.Replace('{{TAG}}', $env:GITHUB_REF_NAME)
+
+        $body = "## v$version で変わったこと`n`n$section`n`n---`n`n$template"
+        Set-Content -Path release_notes.md -Value $body -Encoding utf8
+        Write-Host "本文 $($body.Length) 文字 (うち変更点 $($section.Length) 文字)"
+        Write-Host "--- 先頭 8 行 ---"
+        Get-Content release_notes.md -Encoding utf8 -TotalCount 8 | Write-Host
+        if ($body -match '\{\{TAG\}\}') { throw 'テンプレートの置換が残っています' }
+
     - name: Create Release
       if: startsWith(github.ref, 'refs/tags/')
       uses: softprops/action-gh-release@v3
@@ -108,56 +140,7 @@ jobs:
         files: |
           NetBelt-v*-Windows-Portable.zip
           NetBelt-v*-Windows-Portable.zip.sha256
-        body: |
-          ## NetBelt ポータブル版
-          
-          ### 📄 ライセンスと対応するソースコード
-          
-          NetBelt は GNU General Public License v3.0 で配布しています。
-          
-          この実行ファイルには PyQt6 (GPL-3.0)、Qt (LGPL-3.0)、paramiko (LGPL-2.1-or-later)
-          などが組み込まれています。**この実行ファイルに対応するソースコード**は、
-          本リリースに自動添付される Source code アーカイブ、および
-          https://github.com/gomanizm/NetBelt のタグ `${{ github.ref_name }}` で入手できます。
-          ビルドは同梱の `requirements.txt`（バージョン固定済み）と `NetBelt.spec`、
-          Python 3.11 で再現できます。
-          
-          組み込まれた第三者パッケージの一覧・ライセンス本文・配布元は、
-          ZIP 内の `THIRD-PARTY-NOTICES.txt` を参照してください。
-          
-          ### 📦 パッケージ内容
-          - `NetBelt.exe` - アプリケーション本体
-          - `README.txt` - 使い方ガイド
-          - `LICENSE.txt` - NetBelt のライセンス（GPL-3.0）
-          - `THIRD-PARTY-NOTICES.txt` - 同梱した第三者パッケージのライセンス表示
-          - `CHANGELOG.txt` - この版で変わったこと
-          - `.sha256` - ZIP のチェックサム。自動更新がダウンロード後に照合し、
-            一致しなければ更新を中止します（破損の検知が目的で、GitHub 自体が
-            侵害された場合の改ざんは検知できません）
-          - `mibs/` - MIB ファイルの配置先（既定では空。README を参照）
-          
-          ### 🚀 インストール方法
-          1. ZIPファイルをダウンロード
-          2. 任意のフォルダに展開
-          3. `NetBelt.exe` をダブルクリックして起動
-          
-          ### 💻 動作環境
-          - Windows 10 / Windows 11 (64bit)
-          - Pythonのインストールは不要
-          - すべての依存ファイルが含まれています
-          
-          ### ✨ 主な機能
-          - SSH、Telnet、シリアル接続に対応
-          - デバイス管理とグループ化
-          - マクロ機能
-          - SNMP Trap / Syslog 受信（カスタムMIB対応）
-          - SFTP ファイル転送
-          
-          ### 📝 初回起動
-          - 初回起動時に `config.json` が自動生成されます
-          - MIB ファイルは同梱していません。`mibs/README.md` の手順で配置してください
-          
-          詳しい使い方は [README.md](https://github.com/gomanizm/NetBelt/blob/main/README.md) をご覧ください。
+        body_path: release_notes.md
         draft: false
         prerelease: false
       env:

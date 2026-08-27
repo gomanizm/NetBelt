@@ -23,11 +23,19 @@ class TerminalEscapeTest(unittest.TestCase):
         cls.app = QApplication.instance() or QApplication([])
 
     def _screen(self, payload):
+        """画面に見えている文字を返す。
+
+        画面は常に行数ぶんの高さで描かれる (clear で下端に履歴が
+        せり上がってこないようにするため) ので、判定に関係の無い
+        末尾の空行は落とす。ここで見たいのは、エスケープが文字と
+        して出ていないかどうか。
+        """
         from ui.terminal_widget import TerminalWidget
         w = TerminalWidget()
         w.create_terminal_tab("dev")
         w.append_output("dev", payload)
-        return w._terminals["dev"].toPlainText()
+        text = w._terminals["dev"].toPlainText()
+        return text.rstrip("\n")
 
     # --- DECSET/DECRST (ESC[?<n>h / ESC[?<n>l) ---
 

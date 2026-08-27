@@ -139,7 +139,13 @@ class UpdateDialog(QDialog):
         # リリースノート表示エリア
         self.notes_text = QTextEdit()
         self.notes_text.setReadOnly(True)
-        self.notes_text.setPlainText(self.update_info.get('release_notes', 'リリースノートがありません'))
+        # リリースノートは Markdown で書かれている。そのまま出すと
+        # 見出しの # や箇条書きの - が記号のまま並んで読みにくい
+        notes = self.update_info.get('release_notes') or 'リリースノートがありません'
+        try:
+            self.notes_text.setMarkdown(notes)
+        except Exception:
+            self.notes_text.setPlainText(notes)
         self.notes_text.setMaximumHeight(150)
         layout.addWidget(self.notes_text)
         
