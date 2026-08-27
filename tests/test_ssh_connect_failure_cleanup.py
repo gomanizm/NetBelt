@@ -17,6 +17,8 @@ ip ssh time-out、OpenSSH の LoginGraceTime、いずれも既定 120 秒）、
 効かず、この場合は機器側のセッションも長く占有される。
 """
 import sys
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -36,10 +38,14 @@ class SshConnectFailureCleanupTest(unittest.TestCase):
         if shell_error is not None:
             client.invoke_shell.side_effect = shell_error
 
+        # threading.Thread を丸ごと差し替えると、シェルを開く側の見張り
+        # スレッドまで Mock になって is_alive() が真を返し、開けたのに
+        # 「開かなかった」と判定されてしまう。読み取りループの中身だけを
+        # 差し替えて、スレッドは本物のまま即座に終わるようにする。
         with mock.patch("core.ssh_connection.paramiko.SSHClient",
                         return_value=client), \
              mock.patch.object(SSHConnection, "_setup_host_keys"), \
-             mock.patch("core.ssh_connection.threading.Thread"):
+             mock.patch.object(SSHConnection, "_read_output"):
             ok = conn.connect()
         return ok, client
 
@@ -85,6 +91,73 @@ class SshConnectFailureCleanupTest(unittest.TestCase):
         ok, client = self._attempt(password="")
         self.assertFalse(ok)
         client.close.assert_called_once()
+
+    def test_a_shell_that_never_opens_gives_up(self):
+        """シェルが開かないまま待ち続けないこと。
+
+        認証が通ったあとの pty-req / shell 要求は paramiko の
+        channel_timeout の管轄外で、channel.py の _wait_for_event() が
+        引数なしの event.wait() で待つため無期限に止まる（実測で 120 秒
+        経っても抜けなかった）。connect_kwargs へ channel_timeout を
+        足してもこの段階は救えない。
+
+        待っている間は connected も error_occurred も出ないので、UI は
+        「接続します...」と空のタブのまま固まって見える。
+        機器が混んでいる、TACACS+ の exec 認可の応答を待っている、
+        vty が枯渇している、といった場面で起きる。
+        """
+        outcome, seen, client = self._connect_against_a_silent_shell()
+
+        self.assertIn("returned", outcome,
+                      "上限を過ぎても待ち続けている（呼び出しが戻らない）")
+        self.assertFalse(outcome["returned"], "開いていないのに成功を返している")
+        self.assertTrue(seen, "何も知らせずに戻っている（UI は固まったまま）")
+        client.close.assert_called_once()
+
+    def test_giving_up_on_the_shell_says_why(self):
+        """諦めた理由が利用者に伝わること。"""
+        _, seen, _ = self._connect_against_a_silent_shell()
+        self.assertIn("シェル", " ".join(seen),
+                      "何が起きたのか分からない文面: %s" % seen)
+
+    def _connect_against_a_silent_shell(self):
+        """シェル要求に応答しない機器を相手に connect() を試みる。
+
+        connect() を別スレッドで走らせ、こちらは上限までしか待たない。
+        本体に上限が無いと connect() は永久に戻らないので、直接呼ぶと
+        テストがハングしてスイート全体を止めてしまう。落ちるようにする。
+        """
+        never = threading.Event()
+        self.addCleanup(never.set)
+
+        conn = SSHConnection("192.0.2.1", 22, "admin", password="pw")
+        conn.SHELL_TIMEOUT_SECONDS = 0.5
+        client = mock.Mock()
+        client.invoke_shell.side_effect = lambda **kw: never.wait()
+
+        seen = []
+        conn.error_occurred.connect(seen.append)
+        outcome = {}
+
+        def attempt():
+            with mock.patch("core.ssh_connection.paramiko.SSHClient",
+                            return_value=client), \
+                 mock.patch.object(SSHConnection, "_setup_host_keys"):
+                outcome["returned"] = conn.connect()
+
+        worker = threading.Thread(target=attempt, daemon=True)
+        worker.start()
+        worker.join(timeout=5.0)
+
+        # error_occurred はワーカースレッドから emit されるのでキュー接続
+        # になる。イベントループを回さないと届かない。
+        from PyQt6.QtWidgets import QApplication
+        app = QApplication.instance()
+        if app is not None:
+            for _ in range(5):
+                app.processEvents()
+                time.sleep(0.02)
+        return outcome, seen, client
 
     def test_a_successful_connection_keeps_the_client(self):
         """成功したときに閉じてしまわないこと。"""

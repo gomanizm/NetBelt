@@ -94,6 +94,47 @@ class SSHConnection(QObject):
                     "確認してください。%s" % (self.username, note))
         return "認証失敗: ユーザー名またはパスワードが間違っています"
 
+    # シェルが開くのを待つ上限。
+    # paramiko の channel_timeout（既定 3600 秒）が効くのは CHANNEL_OPEN
+    # までで、その後の pty-req / shell 要求は channel.py の
+    # _wait_for_event() が引数なしの event.wait() で待つため無期限になる。
+    # connect_kwargs へ channel_timeout を足してもこの段階は救えない。
+    # 認証が通ったあとなので、機器側のログイン猶予も効かない。
+    SHELL_TIMEOUT_SECONDS = 30
+
+    def _open_shell(self):
+        """インタラクティブシェルを開く（上限まで待って開かなければ None）
+
+        応答を返さない機器に当たると invoke_shell が無期限に止まり、
+        connected も error_occurred も出ないまま接続スレッドが居座る。
+        UI は「接続します...」と空のタブのままで、失敗表示も再接続の
+        案内も出ないので、利用者からは固まったようにしか見えない。
+
+        別スレッドで開かせ、上限を過ぎたら諦める。取り残されたスレッドは
+        呼び出し側（_fail -> dispose）が接続を閉じた時点で例外になって
+        終わる。daemon なのでアプリの終了も妨げない。
+        """
+        client = self.client
+        outcome = {}
+
+        def open_it():
+            try:
+                outcome['channel'] = client.invoke_shell(
+                    term='vt100', width=self.term_cols, height=self.term_rows)
+            except Exception as e:
+                outcome['error'] = e
+
+        worker = threading.Thread(target=open_it, daemon=True)
+        worker.start()
+        worker.join(timeout=self.SHELL_TIMEOUT_SECONDS)
+
+        if worker.is_alive():
+            return None
+        if 'error' in outcome:
+            # 例外はこれまでどおり呼び出し側の except で分類させる
+            raise outcome['error']
+        return outcome.get('channel')
+
     def _fail(self, message: str) -> bool:
         """接続に失敗したときの後始末と通知
 
@@ -183,8 +224,13 @@ class SSHConnection(QObject):
             self.client.connect(**connect_kwargs)
             
             # インタラクティブシェルを開始 (RFC 4254 6.2 pty-req)
-            self.channel = self.client.invoke_shell(
-                term='vt100', width=self.term_cols, height=self.term_rows)
+            self.channel = self._open_shell()
+            if self.channel is None:
+                return self._fail(
+                    "シェルを開けませんでした（%d 秒待って応答がありません）。\n"
+                    "機器が混んでいる、exec 認可の応答を待っている、"
+                    "vty が空いていない、などが考えられます。"
+                    % self.SHELL_TIMEOUT_SECONDS)
             self.channel.settimeout(0.1)
             
             self.is_connected = True
