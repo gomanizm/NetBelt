@@ -245,8 +245,14 @@ class Screen(object):
             removed_wrap = self.wrapped.pop(self.scroll_top)
             self.lines.insert(self.scroll_bottom, self._blank_line())
             self.wrapped.insert(self.scroll_bottom, False)
-            if (not self.alt_active and self.scroll_top == 0
-                    and self.scroll_bottom == self.rows - 1):
+            # 記録するかどうかは上端が画面の先頭かどうかで決まる (xterm と同じ)。
+            # 下端まで全画面であることを求めると、端末が 30 行あって機器が 24 行と
+            # 信じている場合の ESC[1;24r がそのまま受理されたときに、以後の出力が
+            # 黙って記録から落ちる。窓の大きさを伝えるのは SSH だけなので、
+            # Telnet・シリアルでは普通に起こる。
+            # 上端が先頭でないときは、押し出された行は画面上に残っているので
+            # 記録しない。
+            if not self.alt_active and self.scroll_top == 0:
                 self.history.append(removed)
                 self._new_history.append((removed, removed_wrap))
         self.dirty.update(range(self.scroll_top, self.scroll_bottom + 1))
@@ -411,7 +417,14 @@ class Screen(object):
     def _set_margins(self, p):
         top = _param(p, 0, 1) - 1
         bottom = _param(p, 1, self.rows) - 1
-        if 0 <= top < bottom <= self.rows - 1:
+        # xterm は画面からはみ出した指定を丸めて受理する。丸めずに捨てると、
+        # 直前に受理した狭い範囲がそのまま残り続ける。ncurses は部分スクロール
+        # の最適化で狭い範囲を設定し、最後に csr(0, lines-1) で全画面へ戻すが、
+        # その lines はアプリが信じている行数 (多くは 24) なので、画面がそれより
+        # 小さいと復帰側だけが拒否されて狭い範囲が固着する。
+        top = max(0, min(top, self.rows - 1))
+        bottom = max(0, min(bottom, self.rows - 1))
+        if top < bottom:
             self.scroll_top = top
             self.scroll_bottom = bottom
             self._move(0, 0)            # DECSTBM はカーソルも戻す
