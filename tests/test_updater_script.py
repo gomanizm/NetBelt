@@ -284,6 +284,72 @@ class UpdaterScriptTest(unittest.TestCase):
         self.assertNotEqual(code, 0, "実行ファイルが無いのに成功と報告した\n" + out)
         self.assertIn("NetBelt.exe", out)
 
+    # --- 自分自身を上書きされても壊れないこと ---------------------------
+
+    def _zip_with_a_longer_updater(self):
+        """配布 zip と同じく updater.bat を含み、長さだけ変えた zip。
+
+        CI は `copy updater.bat portable\\` で updater.bat を配布物へ
+        入れるので、更新のたびに実行中の自分自身が上書きされる。
+        cmd.exe はバッチファイルを行ではなくバイト位置で読み進めるため、
+        新旧の長さが違うと、上書き後の続きが新しいファイルの見当違いの
+        位置から読まれる。日本語の行の断片がコマンドとして実行され、
+        更新の手順が二周三周する。長さが同じなら発火しないので、
+        ここでは必ず長さを変える。
+        """
+        original = io.open(UPDATER, encoding="utf-8", newline="").read()
+        marker = "\r\n:run\r\n"
+        at = original.index(marker) + len(marker)
+        padding = "".join("rem padding %03d\r\n" % i for i in range(40))
+        longer = original[:at] + padding + original[at:]
+        self.assertNotEqual(len(longer.encode("utf-8")),
+                            len(original.encode("utf-8")),
+                            "長さが変わっていないと再現しない")
+        return self._make_zip({"NetBelt.exe": "new",
+                               "updater.bat": longer})
+
+    def test_an_update_that_replaces_the_updater_still_succeeds(self):
+        """updater.bat 自身を含む更新でも、成功と報告して終わること。"""
+        self._write(os.path.join(self.app_dir, "NetBelt.exe"), "old")
+        zip_path = self._zip_with_a_longer_updater()
+
+        code, out = self._run(zip_path)
+
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self._installed(), "new", out)
+
+    def test_replacing_the_updater_runs_the_sequence_exactly_once(self):
+        """更新の手順がちょうど一周して終わること。
+
+        読み取り位置がどこへ着地するかはファイル長の差で変わるため、
+        症状は毎回同じではない（手順が二周三周してアプリが二重に起動
+        することも、断片が実行されて途中で死ぬこともある）。症状では
+        なく「一周して完了する」ことで判定する。0 回なら途中で死に、
+        2 回以上なら周回している。
+        """
+        self._write(os.path.join(self.app_dir, "NetBelt.exe"), "old")
+        zip_path = self._zip_with_a_longer_updater()
+
+        code, out = self._run(zip_path)
+
+        self.assertEqual(out.count("更新が完了しました"), 1,
+                         "更新の手順が一周していない\n" + out)
+
+    def test_the_new_updater_is_installed(self):
+        """新しい updater.bat がちゃんと置かれること。
+
+        自己上書きを避けるために配布物から外してしまうと、updater は
+        二度と更新されず、将来の zip の形と食い違ったままになる。
+        """
+        self._write(os.path.join(self.app_dir, "NetBelt.exe"), "old")
+        zip_path = self._zip_with_a_longer_updater()
+
+        self._run(zip_path)
+
+        installed = io.open(self.updater, encoding="utf-8", newline="").read()
+        self.assertIn("rem padding 000", installed,
+                      "新しい updater.bat が置かれていない")
+
 
 class UpdaterEncodingTest(unittest.TestCase):
     """文字化けの原因を作らないことを、ファイルの形として固定する。

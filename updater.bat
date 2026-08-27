@@ -28,8 +28,25 @@ chcp 65001 >nul
 set "SELF=%~f0"
 set "A1=%~1"
 set "A2=%~2"
-cmd /d /c ""!SELF!" "!A1!" "!A2!" --utf8"
-exit /b !errorlevel!
+rem Where to install. Taken here, because the run below happens from a
+rem copy in TEMP, where %~dp0 would point at TEMP, not the install folder.
+rem The trailing backslash is dropped so that a quoted "...\" does not
+rem escape its own closing quote when passed on as an argument.
+set "HOME_DIR=%~dp0"
+if "!HOME_DIR:~-1!"=="\" set "HOME_DIR=!HOME_DIR:~0,-1!"
+rem Run from a copy in TEMP. The update overwrites every file in the
+rem install folder, this script included, and cmd.exe reads a batch file
+rem by byte offset, so a script replaced while it runs carries on at a
+rem meaningless position in the new file: fragments of lines get executed
+rem and the whole sequence can run again. From TEMP the install folder is
+rem only ever written to, never read from.
+set "TMPRUNNER=%TEMP%\NetBeltUpdater_%RANDOM%.bat"
+copy /y "!SELF!" "!TMPRUNNER!" >nul 2>&1
+set "RUNNER=!TMPRUNNER!"
+if not exist "!TMPRUNNER!" set "RUNNER=!SELF!"
+rem Deliberately one line: nothing may be read from this file after the
+rem child has replaced it.
+cmd /d /c ""!RUNNER!" "!A1!" "!A2!" --utf8 "!HOME_DIR!"" & set "RC=!errorlevel!" & del "!TMPRUNNER!" >nul 2>&1 & exit /b !RC!
 
 :run
 setlocal enabledelayedexpansion
@@ -70,7 +87,10 @@ if "%~2"=="" (
 
 set "ZIP_FILE=%~1"
 set "APP_PATH=%~2"
+REM インストール先。TEMP の写しから走るので %~dp0 は当てにならない。
+REM 呼び出し元が第4引数で渡してくる（手で直接実行されたときだけ %~dp0）。
 set "APP_DIR=%~dp0"
+if not "%~4"=="" set "APP_DIR=%~4\"
 set "TEMP_DIR=%TEMP%\NetBeltUpdate_%RANDOM%"
 
 echo [1/6] 更新情報
