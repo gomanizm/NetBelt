@@ -52,13 +52,27 @@ class DeviceListHidingTest(unittest.TestCase):
         self.assertFalse(w.device_tree.isHidden())
         self.assertTrue(w.toggle_device_list_action.isChecked())
 
-    def test_coming_back_from_a_collapsed_handle_has_width(self):
-        """ハンドルで幅 0 まで畳んだあとでも、戻したら見えること。"""
+    def test_one_click_brings_back_a_list_collapsed_to_zero(self):
+        """幅 0 まで畳んだ状態からは、1 回で戻ること。
+
+        分割位置は次回起動へ持ち越される。幅 0 のまま終了したあと、
+        表示メニューを押しても何も起きない（実際には一度隠してから
+        出し直している）ように見えると、戻せないと受け取られる。
+        """
         w = self.window()
         sizes = w.main_splitter.sizes()
         w.main_splitter.setSizes([0, sum(sizes[:2])] + sizes[2:])
-        w._toggle_device_list()          # 隠す
-        w._toggle_device_list()          # 戻す
+        w._toggle_device_list()          # 1 回で戻る
+        self.assertFalse(w.device_tree.isHidden())
+        self.assertGreaterEqual(w.main_splitter.sizes()[0], 100)
+
+    def test_coming_back_from_hiding_has_width(self):
+        """隠してから戻したときも、幅があること。"""
+        w = self.window()
+        sizes = w.main_splitter.sizes()
+        w.main_splitter.setSizes([0, sum(sizes[:2])] + sizes[2:])
+        w.device_tree.setVisible(False)
+        w._toggle_device_list()
         self.assertFalse(w.device_tree.isHidden())
         self.assertGreaterEqual(w.main_splitter.sizes()[0], 100)
 

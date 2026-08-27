@@ -1517,17 +1517,23 @@ class MainWindow(QMainWindow):
     DEVICE_LIST_WIDTH = 250
 
     def _toggle_device_list(self):
-        """接続先リストの表示/非表示を切り替える。"""
-        show = self.device_tree.isHidden()
-        self.device_tree.setVisible(show)
-        if show:
-            sizes = self.main_splitter.sizes()
-            if sizes and sizes[0] < 40:
-                spare = max(sizes[1] - self.DEVICE_LIST_WIDTH, 100)
-                self.main_splitter.setSizes(
-                    [self.DEVICE_LIST_WIDTH, spare] + sizes[2:])
+        """接続先リストの表示/非表示を切り替える。
+
+        仕切りを幅 0 まで引いた状態は、見た目は隠れているのに
+        ウィジェットとしては表示中。分割位置は次回起動へ持ち越されるので、
+        そのまま終了すると「表示メニューを押しても何も起きない」
+        （実際には一度隠してから出し直している）ように見える。
+        幅が無いものは隠れていると見なす。
+        """
+        sizes = self.main_splitter.sizes()
+        hidden = self.device_tree.isHidden() or (sizes and sizes[0] < 40)
+        self.device_tree.setVisible(hidden)
+        if hidden and sizes and sizes[0] < 40:
+            spare = max(sizes[1] - self.DEVICE_LIST_WIDTH, 100)
+            self.main_splitter.setSizes(
+                [self.DEVICE_LIST_WIDTH, spare] + sizes[2:])
         if hasattr(self, "toggle_device_list_action"):
-            self.toggle_device_list_action.setChecked(show)
+            self.toggle_device_list_action.setChecked(hidden)
 
     def _toggle_sftp_panel(self):
         """SFTPクライアントパネルの表示/非表示を切り替え"""
