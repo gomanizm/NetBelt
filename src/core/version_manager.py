@@ -20,6 +20,13 @@ except ImportError:
     APP_NAME = "NetBelt"
 
 
+# cmd が区切りや展開に使う文字。.bat は CreateProcess 経由で
+# cmd.exe /c "<コマンドライン>" として起動されるため、外側の引用符が
+# 剥がれた状態で cmd が読み直す。引用符で包んでも意味が変わってしまう。
+# 実測: ^ は黙って消え、%VAR% は展開され、& 以降は別のコマンドとして走る。
+_CMD_UNSAFE = "&^%"
+
+
 def updater_command(updater_path: str, zip_path: str, app_path: str) -> str:
     """updater.bat を起動するコマンド行を組み立てる
 
@@ -32,9 +39,20 @@ def updater_command(updater_path: str, zip_path: str, app_path: str) -> str:
     起動元が2箇所（起動時の未適用更新と、更新ダイアログの「適用」）に
     分かれていて、片方だけ直した状態で再発した。組み立てはここへ寄せる。
 
-    注意: パスに & が含まれる場合は、この形でも cmd の解釈で壊れる。
-    未解決。
+    引用符で包んでも救えない文字 (& ^ %) は、黙って失敗させずに
+    ValueError にする。呼び出し側はどちらも QMessageBox で理由を出せる。
+    updater.bat 自身も同じ理由で ! を検出して中止する。
+
+    Raises:
+        ValueError: cmd が意味を変えてしまう文字がパスに含まれるとき
     """
+    for path in (updater_path, zip_path, app_path):
+        found = [c for c in _CMD_UNSAFE if c in path]
+        if found:
+            raise ValueError(
+                "パスに %s が含まれているため、更新を適用できません。\n"
+                "フォルダ名を変えるか、新しい ZIP を手で展開してください。\n"
+                "対象: %s" % (" ".join(found), path))
     return '"{}" "{}" "{}"'.format(updater_path, zip_path, app_path)
 
 

@@ -473,6 +473,50 @@ class UpdaterLaunchTest(unittest.TestCase):
         self.assertEqual(sent.count('"'), 6,
                          "3 つの引数それぞれを包むこと: %r" % sent)
 
+    def test_paths_cmd_would_mangle_are_refused(self):
+        """cmd が意味を変えてしまう文字を含むパスは、黙って失敗させないこと。
+
+        .bat は CreateProcess 経由で cmd.exe /c "<コマンドライン>" として
+        起動されるため、外側の引用符が剥がれた状態で cmd が読み直す。
+        実測では ^ は黙って消え、%VAR% は展開され、& 以降は別のコマンドと
+        して実行される。どれも「アプリだけ終了して更新が当たらない」形に
+        なり、& では パスの断片がコマンドとして走る。
+
+        updater.bat 自身も同じ理由で ! を検出して中止するので、こちらでも
+        気づける形にする（呼び出し側が理由を表示できるよう例外にする）。
+        """
+        from core.version_manager import updater_command
+
+        for bad in ("C:\\Tools\\R&D\\updater.bat",
+                    "C:\\Tools\\caret^dir\\updater.bat",
+                    "C:\\Tools\\pct%PATH%dir\\updater.bat"):
+            with self.subTest(path=bad):
+                with self.assertRaises(ValueError) as caught:
+                    updater_command(bad, "C:\\tmp\\x.zip", "C:\\app\\NetBelt.exe")
+                self.assertIn("パス", str(caught.exception),
+                              "理由が利用者に伝わる文面になっていない")
+
+    def test_the_offending_path_is_named(self):
+        """どのパスが原因かを示すこと（3つ渡すので特定できないと困る）。"""
+        from core.version_manager import updater_command
+        zip_path = "C:\\tmp\\R&D\\x.zip"
+        with self.assertRaises(ValueError) as caught:
+            updater_command("C:\\app\\updater.bat", zip_path, "C:\\app\\NetBelt.exe")
+        self.assertIn(zip_path, str(caught.exception))
+
+    def test_paths_that_used_to_break_are_still_accepted(self):
+        """今回直した , = や、空白・アポストロフィは通ること。"""
+        from core.version_manager import updater_command
+        for good in ("C:\\Tools\\Net,Belt\\updater.bat",
+                     "C:\\Tools\\Key=Val\\updater.bat",
+                     "C:\\Program Files\\NetBelt\\updater.bat",
+                     "C:\\Tools\\O'Brien\\updater.bat",
+                     "C:\\Tools\\(x86)\\updater.bat"):
+            with self.subTest(path=good):
+                command = updater_command(good, "C:\\tmp\\x.zip",
+                                          "C:\\app\\NetBelt.exe")
+                self.assertIn('"%s"' % good, command)
+
     def _dialog_with_a_downloaded_zip(self, zip_path):
         from ui.dialogs.update_dialog import UpdateDialog
         dialog = UpdateDialog(None, {
