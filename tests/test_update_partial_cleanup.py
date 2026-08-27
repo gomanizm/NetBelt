@@ -96,6 +96,36 @@ class PartialDownloadCleanupTest(unittest.TestCase):
         self.assertEqual(self.mgr.get_pending_update_files(), [],
                          "未検証の書きかけを適用候補にしている")
 
+    def _place_zip_with_sidecars(self, age_hours=48.0):
+        """検証を通った ZIP と、その傍らのファイル一式を置く。"""
+        base = os.path.join(self.tmp, "NetBelt-update.zip")
+        for path in (base, base + ".sha256", base + ".version"):
+            with io.open(path, "wb") as f:
+                f.write(b"x")
+            old = time.time() - age_hours * 3600
+            os.utime(path, (old, old))
+        return base
+
+    def test_removing_an_expired_zip_takes_its_sidecars_with_it(self):
+        """期限切れの ZIP を消すとき、傍らのファイルも片付けること。
+
+        download_update は検証を通った ZIP の隣に .sha256 と .version を
+        書く。掃除が ZIP しか見ないと、この2つが孤児として残り続ける
+        （適用したときは updater.bat が3つとも消すので、適用しなかった
+        ぶんだけ溜まる）。
+        """
+        self._place_zip_with_sidecars(age_hours=48)
+        self.mgr.cleanup_old_updates(max_age_hours=24)
+        self.assertEqual(self._leftovers(), [],
+                         "傍らのファイルが残っている: %s" % self._leftovers())
+
+    def test_a_recent_zip_keeps_its_sidecars(self):
+        """まだ期限内の更新は、傍らのファイルごと残すこと。"""
+        self._place_zip_with_sidecars(age_hours=0)
+        self.mgr.cleanup_old_updates(max_age_hours=24)
+        self.assertEqual(len(self._leftovers()), 3,
+                         "期限内の更新まで消している: %s" % self._leftovers())
+
     def test_a_finished_zip_is_still_offered(self):
         """検証を通った ZIP はこれまでどおり拾うこと。"""
         path = os.path.join(self.tmp, "NetBelt-update.zip")

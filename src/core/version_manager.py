@@ -499,6 +499,12 @@ class VersionManager:
                     os.remove(zip_path)
                     print(f"[VersionManager] 古い更新ファイルを削除: {zip_path}")
                     deleted_count += 1
+                    # 検証を通った ZIP の隣には .sha256 と .version がある。
+                    # ZIP だけ消すと孤児として残り続ける（適用したときは
+                    # updater.bat が3つとも消すので、適用しなかったぶんが
+                    # 溜まる）。
+                    for suffix in ('.sha256', '.version'):
+                        self._discard(zip_path + suffix)
             except Exception as e:
                 print(f"[VersionManager] ファイル削除エラー: {e}")
 
