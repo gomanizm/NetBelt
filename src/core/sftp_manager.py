@@ -11,7 +11,11 @@ class SFTPManager(QObject):
     
     # シグナル定義
     file_list_ready = pyqtSignal(list)  # ファイル一覧取得完了 [(name, size, mtime, mode, is_dir), ...]
-    transfer_progress = pyqtSignal(int, int)  # 転送進捗 (転送済みバイト数, 全体バイト数)
+    # 転送進捗 (転送済みバイト数, 全体バイト数)
+    # int で宣言すると C++ の 32bit int に対応し、2GiB を超えるバイト数が
+    # 例外も出さずに黙って丸められる（負値や桁落ちした値になる）。
+    # NX-OS / IOS-XE のイメージはこの用途そのものなので object で渡す。
+    transfer_progress = pyqtSignal(object, object)
     transfer_complete = pyqtSignal(str)  # 転送完了 (メッセージ)
     error_occurred = pyqtSignal(str)  # エラー発生
     connected = pyqtSignal()  # 接続成功

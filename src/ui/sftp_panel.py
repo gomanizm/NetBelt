@@ -111,6 +111,10 @@ class SFTPPanel(QWidget):
     # 「空のファイル」「1970年更新」という別の嘘になり、転送の判断を誤らせる。
     UNKNOWN_TEXT = "不明"
 
+    # 進捗バーの目盛りの数。バイト数を直に渡すと 2GiB 超で 32bit を
+    # あふれるので、割合をこの目盛りへ載せる。
+    PROGRESS_STEPS = 1000
+
     # 未接続のときに出す案内。接続すると消す。
     HINT_TEXT = (
         "ターミナルで機器へ SSH 接続すると、このパネルが使えるようになります。\n"
@@ -408,13 +412,25 @@ class SFTPPanel(QWidget):
             total: 全体バイト数
         """
         self.progress_bar.setVisible(True)
-        self.progress_bar.setMaximum(total)
-        self.progress_bar.setValue(transferred)
-        
-        # パーセンテージを表示
-        if total > 0:
-            percent = int(transferred * 100 / total)
-            self.progress_bar.setFormat(f"{percent}% ({self._format_size(transferred)} / {self._format_size(total)})")
+
+        # QProgressBar の目盛りは 32bit int なので、バイト数をそのまま渡せない。
+        # 2GiB を超えると全体サイズが負に化け、Qt が範囲外の現在値を reset()
+        # するためバーは空のまま1ミリも動かない。4GiB を超えると逆に正の
+        # 小さい値へ回り、真の 20% ほどで「100%」に達したあと 125%、-150%
+        # まで出る。バイト数ではなく割合を固定の目盛りへ載せる。
+        if total and total > 0:
+            total = int(total)
+            done = max(0, min(int(transferred), total))
+            self.progress_bar.setRange(0, self.PROGRESS_STEPS)
+            self.progress_bar.setValue(done * self.PROGRESS_STEPS // total)
+            percent = done * 100 // total
+            self.progress_bar.setFormat(
+                f"{percent}% ({self._format_size(done)} / {self._format_size(total)})")
+        else:
+            # 全体サイズが分からない転送。割合を出しようがないので
+            # 目盛りを伏せて（Qt の不定表示）転送済みだけ見せる
+            self.progress_bar.setRange(0, 0)
+            self.progress_bar.setFormat(self._format_size(transferred))
     
     def _on_transfer_complete(self, message: str):
         """
