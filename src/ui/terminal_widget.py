@@ -9,6 +9,18 @@ from core.terminal.attrs import DEFAULT
 from core.terminal.screen import Screen, BLANK
 
 # SGR の基本 16 色 (xterm の既定値)。0-7 が基本、8-15 が明色
+def _u16(text: str) -> int:
+    """文書上の長さ（UTF-16 のコード単位）を返す。
+
+    QTextDocument の位置は UTF-16 のコード単位で数える。Python の len()
+    はコードポイント数なので、BMP 外の文字（絵文字、CJK 拡張B など）が
+    1つ画面に出るたびに1つずつずれる。ずれた添字を setPosition へ渡すと、
+    書き換え範囲が本来より手前を指し、改行の手前へ文字を挿し込んだり
+    隣の文字を巻き込んで消したりする。位置を数えるときは必ずこれを使う。
+    """
+    return len(text.encode("utf-16-le")) // 2
+
+
 ANSI_COLOURS = (
     "#000000", "#cd0000", "#00cd00", "#cdcd00",
     "#0000ee", "#cd00cd", "#00cdcd", "#e5e5e5",
@@ -763,10 +775,10 @@ class TerminalWidget(QWidget):
         painter = QTextCursor(terminal.document())
         for text, attr in self._runs(cells):
             painter.setPosition(offset)
-            painter.setPosition(offset + len(text),
+            painter.setPosition(offset + _u16(text),
                                 QTextCursor.MoveMode.KeepAnchor)
             painter.setCharFormat(self._char_format(attr))
-            offset += len(text)
+            offset += _u16(text)
 
     def _render_screen(self, terminal: QTextEdit) -> None:
         """画面の中身を文書へ写す。
@@ -837,14 +849,17 @@ class TerminalWidget(QWidget):
             while (suffix < limit - prefix
                    and old_text[-1 - suffix] == new_text[-1 - suffix]):
                 suffix += 1
-            probe.setPosition(start + prefix)
-            probe.setPosition(start + len(old_text) - suffix,
+            # 添字は Python の文字数なので、文書の位置へ直してから渡す
+            probe.setPosition(start + _u16(old_text[:prefix]))
+            probe.setPosition(start + _u16(old_text[:len(old_text) - suffix]),
                               QTextCursor.MoveMode.KeepAnchor)
             # 書式は空で入れる。insertText は挿入位置の書式を引き継ぐので、
             # 指定しないと直前の色や反転が新しい文字へ伝染する
             probe.insertText(new_text[prefix:len(new_text) - suffix],
                              QTextCharFormat())
-            touched = (prefix, len(new_text) - suffix)
+            # 下の行との突き合わせは文書の位置で行うので、単位を揃える
+            touched = (_u16(new_text[:prefix]),
+                       _u16(new_text[:len(new_text) - suffix]))
         region.setPosition(start)
 
         # 変わった行に色・太字・反転を塗り直す
@@ -854,22 +869,23 @@ class TerminalWidget(QWidget):
         # 思っていても、入れ直した文字は書式を失っている
         at = 0
         for r, line in enumerate(rows):
-            if at <= touched[1] and at + len(line) >= touched[0]:
+            if at <= touched[1] and at + _u16(line) >= touched[0]:
                 dirty.add(r)
-            at += len(line) + 1
+            at += _u16(line) + 1
         offset = start
         for r in range(len(rows)):
             if r in dirty:
                 self._paint_row(terminal, offset, cell_rows[r])
-            offset += len(rows[r]) + 1
+            offset += _u16(rows[r]) + 1
 
         # キャレット (点滅カーソル) を画面カーソルの位置へ。範囲選択の
         # 最中に動かすと選択が消えるので、そのときは触らない
         if not terminal.textCursor().hasSelection():
             pos = start
             for r in range(screen.cursor_row):
-                pos += len(rows[r]) + 1
-            pos += min(screen.cursor_col, len(rows[screen.cursor_row]))
+                pos += _u16(rows[r]) + 1
+            row = rows[screen.cursor_row]
+            pos += _u16(row[:min(screen.cursor_col, len(row))])
             caret = QTextCursor(terminal.document())
             caret.setPosition(pos)
             terminal.setTextCursor(caret)
