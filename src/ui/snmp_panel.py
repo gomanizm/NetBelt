@@ -148,6 +148,9 @@ class SNMPPanel(QWidget):
         self.trap_tree_model = QStandardItemModel()
         self.trap_data_list = []  # 完全なTrapデータ（エクスポート用）
         self.max_traps = self._configured_max_traps()
+        # WALK が途中で途切れたときの理由。結果より先に届き、結果を
+        # 表示するときに使って忘れる
+        self._partial_reason = None
         
         self._init_ui()
         
@@ -963,15 +966,33 @@ class SNMPPanel(QWidget):
         self.snmp_manager = manager
         if self.snmp_manager:
             self.snmp_manager.operation_completed.connect(self._on_operation_completed)
+            self.snmp_manager.operation_partial.connect(self._on_operation_partial)
             self.snmp_manager.trap_received.connect(self._on_trap_received)
             self.snmp_manager.trap_receiver_started.connect(self._on_trap_receiver_started)
             self.snmp_manager.trap_receiver_stopped.connect(self._on_trap_receiver_stopped)
             self.snmp_manager.error_occurred.connect(self._on_error_occurred)
     
+    def _on_operation_partial(self, reason: str):
+        """WALK が途中で途切れたことを受け取る（結果はこのあと届く）。
+
+        取れた分は捨てずに表へ出すが、全部ではないと分からないまま
+        使われると、機器に無いものを「無い」と読み違える。
+        """
+        self._partial_reason = reason
+
     def _on_operation_completed(self, success: bool, result):
         if success:
             self.result_model.set_results(result)
-            self.status_label.setText(f"完了: {len(result)}件")
+            # 直前に「途中で切れた」と知らされていれば、そう書く。
+            # 一度使ったら忘れる（次の完走に持ち越さない）
+            reason = getattr(self, "_partial_reason", None)
+            self._partial_reason = None
+            if reason:
+                self.status_label.setText(
+                    "途中まで: %d件（%s のため中断。全部ではありません）"
+                    % (len(result), reason))
+            else:
+                self.status_label.setText(f"完了: {len(result)}件")
         else:
             QMessageBox.critical(self, "エラー", str(result))
             self.status_label.setText("エラー")
