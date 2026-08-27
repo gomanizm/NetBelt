@@ -133,19 +133,21 @@ class TelnetConnection(QObject):
     
     def _read_output(self):
         """バックグラウンドで出力を読み取る"""
-        buffer = b''
-        
+        buffer = b''      # UTF-8 の途中で切れた分
+        pending = b''     # 途中で切れた制御シーケンス（次の受信と繋げる）
+
         while not self._stop_reading and self.is_connected:
             try:
                 if self.socket:
                     try:
                         data = self.socket.recv(4096)
                         if data:
-                            buffer += data
-                            
-                            # Telnet制御シーケンスの処理
-                            buffer = self._process_telnet_commands(buffer)
-                            
+                            # Telnet制御シーケンスの処理。途中で切れた分は
+                            # pending に残し、次の受信の先頭へ繋ぐ
+                            clean, pending = self._process_telnet_commands(
+                                pending + data)
+                            buffer += clean
+
                             # バッファ内のデータをデコードして送信
                             if buffer:
                                 try:
@@ -186,15 +188,25 @@ class TelnetConnection(QObject):
                     self.disconnected.emit()
                 break
     
-    def _process_telnet_commands(self, data: bytes) -> bytes:
+    # 未完のシーケンスを持ち越す上限。壊れた相手が IAC SB を送り続けて
+    # 終端を寄こさない場合に、際限なく溜め込まないようにする。
+    # 実際のサブネゴシエーションは数十バイトで収まる。
+    MAX_PENDING_BYTES = 4096
+
+    def _process_telnet_commands(self, data: bytes):
         """
         Telnet制御コマンドを処理
-        
+
+        シーケンスは TCP の切れ目をまたぐ。途中で切れた分をその場で
+        捨てたり通常データとして出したりすると、0xFF が画面へ漏れて
+        UTF-8 デコードを壊し、応答も返せずに機器が待ち続ける。
+        揃っていない分は次の受信まで持ち越す。
+
         Args:
-            data: 受信データ
-            
+            data: 受信データ（前回の持ち越しを先頭に連結したもの）
+
         Returns:
-            bytes: 制御コマンドを除去したデータ
+            (画面へ出すデータ, 次の受信へ持ち越す未完のシーケンス)
         """
         # Telnet制御シーケンス
         # IAC (Interpret As Command) = 0xFF (255)
@@ -207,51 +219,62 @@ class TelnetConnection(QObject):
         SE = 240  # Subnegotiation End
         
         output = bytearray()
+        pending = b''
         i = 0
-        
+
         while i < len(data):
-            if data[i] == IAC and i + 1 < len(data):
-                # IAC コマンド処理
-                cmd = data[i + 1]
-                
-                if cmd == IAC:
-                    # IAC IAC = エスケープされた 0xFF
-                    output.append(IAC)
-                    i += 2
-                elif cmd in (DO, DONT, WILL, WONT):
-                    # 3バイトコマンド: IAC + CMD + OPTION
-                    if i + 2 < len(data):
-                        option = data[i + 2]
-                        # 基本的な応答: DOに対してWONT、WILLに対してDONT
-                        if cmd == DO:
-                            # 要求された機能を拒否
-                            self._send_telnet_command(bytes([IAC, WONT, option]))
-                        elif cmd == WILL:
-                            # 提案された機能を拒否
-                            self._send_telnet_command(bytes([IAC, DONT, option]))
-                        i += 3
-                    else:
-                        i += 2
-                elif cmd == SB:
-                    # サブネゴシエーション: IAC SB ... IAC SE まで読み飛ばす
-                    j = i + 2
-                    while j < len(data) - 1:
-                        if data[j] == IAC and data[j + 1] == SE:
-                            i = j + 2
-                            break
-                        j += 1
-                    else:
-                        # SE が見つからない場合は残りを破棄
-                        i = len(data)
-                else:
-                    # その他のコマンドは2バイトとして扱う
-                    i += 2
-            else:
+            if data[i] != IAC:
                 # 通常のデータ
                 output.append(data[i])
                 i += 1
-        
-        return bytes(output)
+                continue
+
+            # ここから IAC。揃っていなければ次の受信まで持ち越す。
+            # 通常データとして出すと 0xFF が画面へ漏れる。
+            if i + 1 >= len(data):
+                pending = data[i:]
+                break
+
+            cmd = data[i + 1]
+
+            if cmd == IAC:
+                # IAC IAC = エスケープされた 0xFF
+                output.append(IAC)
+                i += 2
+            elif cmd in (DO, DONT, WILL, WONT):
+                # 3バイトコマンド: IAC + CMD + OPTION
+                if i + 2 >= len(data):
+                    # オプションが次の受信に入っている。捨てると応答も
+                    # 返せず、待っている機器はプロンプトを出さない
+                    pending = data[i:]
+                    break
+                option = data[i + 2]
+                # 基本的な応答: DOに対してWONT、WILLに対してDONT
+                if cmd == DO:
+                    # 要求された機能を拒否
+                    self._send_telnet_command(bytes([IAC, WONT, option]))
+                elif cmd == WILL:
+                    # 提案された機能を拒否
+                    self._send_telnet_command(bytes([IAC, DONT, option]))
+                i += 3
+            elif cmd == SB:
+                # サブネゴシエーション: IAC SB ... IAC SE まで読み飛ばす
+                end = data.find(bytes([IAC, SE]), i + 2)
+                if end == -1:
+                    # 終端がまだ来ていない。破棄すると以降の本文まで失う
+                    pending = data[i:]
+                    break
+                i = end + 2
+            else:
+                # その他のコマンドは2バイトとして扱う
+                i += 2
+
+        if len(pending) > self.MAX_PENDING_BYTES:
+            # 終端を寄こさない相手。溜め込み続けるより捨てる
+            print("[Telnet] 未完の制御シーケンスが大きすぎるため破棄しました")
+            pending = b''
+
+        return bytes(output), pending
     
     def _send_telnet_command(self, command: bytes):
         """
