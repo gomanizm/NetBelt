@@ -281,6 +281,15 @@ class SyslogPanel(QWidget):
         recv_btn_layout.addWidget(self.stop_btn)
         layout.addLayout(recv_btn_layout)
 
+        # 手動FW許可（3CDaemon方式で通らない時の復旧用・押した時だけ管理者昇格/UAC）
+        fw_layout = QHBoxLayout()
+        self.fw_allow_btn = QPushButton("ファイアウォールで許可（管理者）")
+        self.fw_allow_btn.setToolTip("受信できない場合に押してください。Windowsファイアウォールの受信許可を追加します（管理者昇格/UACが1回出ます）。")
+        self.fw_allow_btn.clicked.connect(self._on_fw_allow)
+        fw_layout.addWidget(self.fw_allow_btn)
+        fw_layout.addStretch()
+        layout.addLayout(fw_layout)
+
         # 受信状態（サーバーパネルと同じ GroupBox 形式）
         recv_status_group = QGroupBox("受信状態")
         recv_status_layout = QVBoxLayout()
@@ -401,6 +410,21 @@ class SyslogPanel(QWidget):
         group.setLayout(layout)
         return group
     
+    def _on_fw_allow(self):
+        """手動でファイアウォール受信許可を追加（管理者昇格）。
+
+        起動時には触らない（TFTP/FTP と同じ 3CDaemon 方式）ので、
+        Windows の初回プロンプトを拒否した等で受信できない環境はここで直す。
+        """
+        if self.syslog_receiver is None:
+            # 受信器は親ウィンドウから後で入る。押せる状態でも未設定はあり得る
+            self.status_label.setText("受信器がまだ用意されていません")
+            return
+        self.status_label.setText("ファイアウォール許可を実行します（管理者昇格）...")
+        ok, _msg = self.syslog_receiver.fix_firewall()
+        self.status_label.setText(
+            "ファイアウォール許可: %s" % ("完了" if ok else "未反映/失敗"))
+
     def _protocol_port(self, proto):
         """指定プロトコルの待受ポート"""
         return self.udp_port_spin.value() if proto == "UDP" else self.tcp_port_spin.value()

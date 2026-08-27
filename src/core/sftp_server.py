@@ -274,13 +274,11 @@ class SFTPServerManager(QObject):
         self.root_dir = os.path.abspath(root_dir)
         self.username = username
         self.password = password
-        # 受信ポートの Windows ファイアウォール受信許可を用意（Windowsのみ・冪等・必要時UAC）
-        try:
-            from .firewall import ensure_inbound_allow
-            _ok, _msg = ensure_inbound_allow("SFTP Server", "TCP", port)
-            print(f"[SFTP Server] ファイアウォール: {_msg}")
-        except Exception as _e:
-            print(f"[SFTP Server] ファイアウォール設定エラー: {_e}")
+        # ファイアウォールは自動設定しない（3CDaemon 方式）。管理者昇格(UAC)を避けるため、
+        # 受信許可は Windows 標準の初回プロンプト／既存の許可ルールに委ねる。
+        # 自動で足すと、ポートを変えて使うたびポート名入りのルールが恒久登録され、
+        # 停止しても消えずに残骸が増える。通らない環境は fix_firewall() で直す。
+        print("[SFTP Server] ファイアウォール: 自動設定なし（Windowsの許可に委ねます）")
         
         # ルートディレクトリが存在しない場合は作成
         if not os.path.exists(self.root_dir):
@@ -321,6 +319,24 @@ class SFTPServerManager(QObject):
         
         return True
     
+    def fix_firewall(self, port: int = 2222):
+        """手動: Windows FW 受信許可を追加（管理者昇格/UAC）
+
+        起動時には触らない（TFTP/FTP と同じ 3CDaemon 方式）。Windows の
+        初回プロンプトを拒否したなどで接続が通らない環境の復旧用で、
+        押したときだけ昇格する。
+        """
+        try:
+            from .firewall import ensure_inbound_allow, ensure_self_program_allow
+            ok, msg = ensure_inbound_allow("SFTP Server", "TCP", port)
+            print(f"[SFTP Server] ファイアウォール: {msg}")
+            ok2, msg2 = ensure_self_program_allow()
+            print(f"[SFTP Server] ファイアウォール(自exe): {msg2}")
+            return (ok and ok2), msg
+        except Exception as e:
+            print(f"[SFTP Server] ファイアウォール設定エラー: {e}")
+            return False, str(e)
+
     def stop(self):
         """SFTPサーバーを停止"""
         if not self.is_running:

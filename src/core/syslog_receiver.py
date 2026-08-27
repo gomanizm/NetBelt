@@ -210,13 +210,11 @@ class SyslogReceiver(QObject):
             return True
         # プロトコルごとに別ポートを指定できる（self.port は既定値としてのみ使う）
         use_port = self.port if port is None else port
-        # 受信ポートの Windows ファイアウォール受信許可（Windowsのみ・冪等・必要時UAC）
-        try:
-            from .firewall import ensure_inbound_allow
-            _ok, _msg = ensure_inbound_allow("Syslog", proto, use_port)
-            print("[Syslog] ファイアウォール(%s): %s" % (proto, _msg))
-        except Exception as _e:
-            print("[Syslog] ファイアウォール設定エラー: %s" % _e)
+        # ファイアウォールは自動設定しない（3CDaemon 方式）。管理者昇格(UAC)を避けるため、
+        # 受信許可は Windows 標準の初回プロンプト／既存の許可ルールに委ねる。
+        # 自動で足すと、ポートを変えて使うたびポート名入りのルールが恒久登録され、
+        # 停止しても消えずに残骸が増える。通らない環境は fix_firewall() で直す。
+        print("[Syslog] ファイアウォール: 自動設定なし（Windowsの許可に委ねます）")
 
         # bind はスレッド外で行い、失敗を呼び出し側へ即座に返す
         try:
@@ -252,6 +250,30 @@ class SyslogReceiver(QObject):
         print("[Syslog] %s Server started on port %d" % (proto, entry["port"]))
         self.started.emit()
         return True
+
+    def fix_firewall(self):
+        """手動: Windows FW 受信許可を追加（管理者昇格/UAC）
+
+        起動時には触らない（TFTP/FTP と同じ 3CDaemon 方式）。Windows の
+        初回プロンプトを拒否したなどで受信が通らない環境の復旧用で、
+        押したときだけ昇格する。稼働中のプロトコルぶんだけ足す。
+        """
+        try:
+            from .firewall import ensure_inbound_allow, ensure_self_program_allow
+            if not self._servers:
+                return False, "受信していません"
+            results = []
+            for proto, server in list(self._servers.items()):
+                ok, msg = ensure_inbound_allow("Syslog", proto, server.get("port"))
+                print("[Syslog] ファイアウォール(%s): %s" % (proto, msg))
+                results.append(ok)
+            ok2, msg2 = ensure_self_program_allow()
+            print("[Syslog] ファイアウォール(自exe): %s" % msg2)
+            results.append(ok2)
+            return all(results), msg2
+        except Exception as e:
+            print("[Syslog] ファイアウォール設定エラー: %s" % e)
+            return False, str(e)
 
     def stop_protocol(self, proto: str):
         """1プロトコルだけ停止する（他方は動き続ける）"""

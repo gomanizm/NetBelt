@@ -102,6 +102,15 @@ class SFTPServerPanel(QWidget):
         button_layout.addWidget(self.stop_btn)
         
         layout.addLayout(button_layout)
+
+        # 手動FW許可（3CDaemon方式で通らない時の復旧用・押した時だけ管理者昇格/UAC）
+        fw_layout = QHBoxLayout()
+        self.fw_allow_btn = QPushButton("ファイアウォールで許可（管理者）")
+        self.fw_allow_btn.setToolTip("接続が通らない場合に押してください。Windowsファイアウォールの受信許可を追加します（管理者昇格/UACが1回出ます）。")
+        self.fw_allow_btn.clicked.connect(self._on_fw_allow)
+        fw_layout.addWidget(self.fw_allow_btn)
+        fw_layout.addStretch()
+        layout.addLayout(fw_layout)
         
         # ステータス表示
         status_group = QGroupBox("サーバー状態")
@@ -254,6 +263,16 @@ class SFTPServerPanel(QWidget):
         self._add_log(f"エラー: {error_message}")
         QMessageBox.critical(self, "SFTPサーバー エラー", error_message)
     
+    def _on_fw_allow(self):
+        """手動でファイアウォール受信許可を追加（管理者昇格）。
+
+        起動時には触らない（TFTP/FTP と同じ 3CDaemon 方式）ので、
+        Windows の初回プロンプトを拒否した等で通らない環境はここで直す。
+        """
+        self._add_log("ファイアウォール許可を実行します（管理者昇格）...")
+        ok, _msg = self.sftp_server.fix_firewall(self.port_spin.value())
+        self._add_log("ファイアウォール許可: %s" % ("完了" if ok else "未反映/失敗"))
+
     def _add_log(self, message: str):
         """ログにメッセージを追加"""
         timestamp = datetime.now().strftime("%H:%M:%S")
