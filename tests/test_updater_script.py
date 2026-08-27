@@ -367,6 +367,43 @@ class UpdaterEncodingTest(unittest.TestCase):
         """BOM を付けないこと。cmd.exe が 1 行目ごと読み違える。"""
         self.assertNotEqual(self.raw[:3], b"\xef\xbb\xbf")
 
+    def test_every_batch_file_is_checked_out_as_crlf(self):
+        """.bat が誰の手元でも CRLF で取り出されること。
+
+        test_the_line_endings_stay_crlf は作業ツリーのファイルを見る。
+        core.autocrlf=true の環境ではチェックアウト時に CRLF へ変換
+        されるので、その設定に頼っているだけの状態でも常に緑になり、
+        この穴を検知できない。
+
+        cmd.exe は LF だけのバッチファイルを 1 行も正しく実行できない
+        （行の途中や日本語コメントの断片がコマンドとして実行され、
+        更新が当たらない）。autocrlf に守られない経路は2つある:
+          - GitHub が各リリースへ自動添付する Source code アーカイブ
+            （.github/release-body.md が GPL の対応ソースとして案内する）
+          - core.autocrlf=false / input での clone（Linux・macOS を含む）
+
+        eol=crlf が付いていれば、どちらの経路でも CRLF で取り出される。
+        index 側が LF なのは text 属性の正常な姿なので、そこは見ない。
+        """
+        listed = subprocess.run(
+            ["git", "ls-files", "--", "*.bat"],
+            cwd=REPO_ROOT, capture_output=True, text=True, timeout=30)
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        batch_files = [p for p in listed.stdout.split() if p]
+        self.assertTrue(batch_files, "追跡下の .bat が見つからない")
+
+        attrs = subprocess.run(
+            ["git", "check-attr", "eol", "--"] + batch_files,
+            cwd=REPO_ROOT, capture_output=True, text=True, timeout=30)
+        self.assertEqual(attrs.returncode, 0, attrs.stderr)
+
+        unprotected = [line for line in attrs.stdout.splitlines()
+                       if not line.endswith(": eol: crlf")]
+        self.assertEqual(
+            unprotected, [],
+            "CRLF が保証されていない .bat がある（cmd.exe で動かない）: %s\n"
+            ".gitattributes に `*.bat text eol=crlf` が要る" % unprotected)
+
     def test_the_line_endings_stay_crlf(self):
         self.assertEqual(self.raw.count(b"\n") - self.raw.count(b"\r\n"), 0)
 
