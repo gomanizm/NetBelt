@@ -18,6 +18,7 @@ class DeviceTree(QWidget):
     group_add_requested = pyqtSignal()  # グループ追加要求
     group_edit_requested = pyqtSignal(str)  # グループ編集要求（グループ名）
     group_delete_requested = pyqtSignal(str)  # グループ削除要求（グループ名）
+    hide_requested = pyqtSignal()  # このエリアを隠す要求（戻すのは表示メニュー）
     
     # 一般的なボーレート値
     BAUD_RATES = [300, 1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600]
@@ -173,10 +174,19 @@ class DeviceTree(QWidget):
         # 再度追加
         self._add_serial_ports_group()
     
+    def _add_hide_action(self, menu):
+        """どの右クリックメニューにも「非表示」を足す。
+
+        機器の上・グループの上・空欄のどこで押しても同じように隠せる
+        ようにする。戻すのは表示メニューから。
+        """
+        menu.addSeparator()
+        return menu.addAction("接続先リストを非表示")
+
     def _show_context_menu(self, position):
         """
         右クリックメニューを表示
-        
+
         Args:
             position: クリック位置
         """
@@ -237,11 +247,15 @@ class DeviceTree(QWidget):
             duplicate_action = menu.addAction("複製")
             baudrate_actions = []
         
+        hide_action = self._add_hide_action(menu)
+
         # メニュー実行
         action = menu.exec(self.tree.viewport().mapToGlobal(position))
-        
+
         # アクション処理
-        if action == connect_action:
+        if action == hide_action:
+            self.hide_requested.emit()
+        elif action == connect_action:
             self.device_connect.emit(group_name, device_data)
         elif action == edit_action and edit_action is not None:
             self.device_edit.emit(group_name, device_data)
@@ -287,11 +301,14 @@ class DeviceTree(QWidget):
         """
         menu = QMenu(self)
         add_group_action = menu.addAction("グループを追加")
-        
+        hide_action = self._add_hide_action(menu)
+
         action = menu.exec(self.tree.viewport().mapToGlobal(position))
-        
+
         if action == add_group_action:
             self.group_add_requested.emit()
+        elif action == hide_action:
+            self.hide_requested.emit()
     
     def _show_group_menu(self, position, group_item: QTreeWidgetItem):
         """
@@ -302,22 +319,22 @@ class DeviceTree(QWidget):
             group_item: グループアイテム
         """
         group_name = group_item.text(0)
-        
-        # コンソール接続グループは編集・削除不可
-        if group_name == "コンソール接続":
-            return
-        
         menu = QMenu(self)
-        edit_action = menu.addAction("グループを編集")
-        
-        # Defaultグループは削除不可
-        delete_action = None
-        if group_name != "Default":
-            delete_action = menu.addAction("グループを削除")
-        
+
+        # コンソール接続グループは編集・削除不可。それでも非表示は出す
+        edit_action = delete_action = None
+        if group_name != "コンソール接続":
+            edit_action = menu.addAction("グループを編集")
+            # Defaultグループは削除不可
+            if group_name != "Default":
+                delete_action = menu.addAction("グループを削除")
+        hide_action = self._add_hide_action(menu)
+
         action = menu.exec(self.tree.viewport().mapToGlobal(position))
-        
-        if action == edit_action:
+
+        if action == hide_action:
+            self.hide_requested.emit()
+        elif action == edit_action and edit_action is not None:
             self.group_edit_requested.emit(group_name)
         elif action == delete_action and delete_action is not None:
             self.group_delete_requested.emit(group_name)

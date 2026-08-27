@@ -247,6 +247,11 @@ class MainWindow(QMainWindow):
         self.snmp_panel_action.triggered.connect(self._toggle_snmp_panel)
 
         view_menu.addSeparator()
+        self.toggle_device_list_action = view_menu.addAction("接続先リスト表示/非表示")
+        self.toggle_device_list_action.setCheckable(True)
+        self.toggle_device_list_action.setChecked(True)
+        self.toggle_device_list_action.triggered.connect(
+            self._toggle_device_list)
         self.toggle_tool_area_action = view_menu.addAction("ツールエリア表示/非表示")
         self.toggle_tool_area_action.setCheckable(True)
         self.toggle_tool_area_action.setChecked(True)
@@ -304,6 +309,7 @@ class MainWindow(QMainWindow):
         self.device_tree.group_add_requested.connect(self._on_add_group)
         self.device_tree.group_edit_requested.connect(self._on_edit_group)
         self.device_tree.group_delete_requested.connect(self._on_delete_group)
+        self.device_tree.hide_requested.connect(self._toggle_device_list)
         splitter.addWidget(self.device_tree)
         
         # 右側: ターミナル
@@ -330,9 +336,11 @@ class MainWindow(QMainWindow):
         self.tool_tabs.tabBar().customContextMenuRequested.connect(self._tool_area_context_menu)
         splitter.addWidget(self.tool_tabs)
         splitter.setSizes([250, 650, 300])
-        splitter.setCollapsible(0, False)
+        # 接続先リストとツールエリアはハンドルを引いて畳める。
+        # ターミナルは本体なので畳ませない
+        splitter.setCollapsible(0, True)
         splitter.setCollapsible(1, False)
-        splitter.setCollapsible(2, True)   # ツールエリアはハンドルで折り畳み可
+        splitter.setCollapsible(2, True)
         
         layout.addWidget(splitter)
         
@@ -1503,6 +1511,23 @@ class MainWindow(QMainWindow):
         self.tool_tabs.setVisible(show)
         if hasattr(self, "toggle_tool_area_action"):
             self.toggle_tool_area_action.setChecked(show)
+
+    # 接続先リストを戻すときの幅。畳んだ状態から出すと 0 のままなので、
+    # 何も見えず「戻らない」と受け取られる
+    DEVICE_LIST_WIDTH = 250
+
+    def _toggle_device_list(self):
+        """接続先リストの表示/非表示を切り替える。"""
+        show = self.device_tree.isHidden()
+        self.device_tree.setVisible(show)
+        if show:
+            sizes = self.main_splitter.sizes()
+            if sizes and sizes[0] < 40:
+                spare = max(sizes[1] - self.DEVICE_LIST_WIDTH, 100)
+                self.main_splitter.setSizes(
+                    [self.DEVICE_LIST_WIDTH, spare] + sizes[2:])
+        if hasattr(self, "toggle_device_list_action"):
+            self.toggle_device_list_action.setChecked(show)
 
     def _toggle_sftp_panel(self):
         """SFTPクライアントパネルの表示/非表示を切り替え"""
