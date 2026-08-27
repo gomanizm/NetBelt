@@ -82,21 +82,28 @@ class TelnetConnection(QObject):
             self.error_occurred.emit(f"予期しないエラー: {str(e)}")
             return False
     
-    def disconnect(self):
-        """Telnet接続を切断"""
+    def dispose(self):
+        """ソケットを閉じて資源を手放す（切断の通知は出さない）
+
+        機器側都合の切断やエラーを受けたあとの後始末で使う。ここで
+        disconnected を出すと、いま処理中の切断処理が再入する。
+        """
         self._stop_reading = True
         self.is_connected = False
-        
+
         if self._read_thread and self._read_thread.is_alive():
             self._read_thread.join(timeout=2)
-        
+
         if self.socket:
             try:
                 self.socket.close()
-            except:
+            except Exception:
                 pass
             self.socket = None
-        
+
+    def disconnect(self):
+        """Telnet接続を切断"""
+        self.dispose()
         self.disconnected.emit()
     
     def send_command(self, command: str):

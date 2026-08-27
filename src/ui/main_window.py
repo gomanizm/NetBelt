@@ -910,6 +910,27 @@ class MainWindow(QMainWindow):
         )
         self.status_bar.showMessage(f"{device_name}: 自動実行コマンドを送信します...")
 
+    def _dispose_connection(self, device_name: str):
+        """接続を閉じてから辞書から外す
+
+        辞書から del するだけだと、シリアルは COM ポートを掴んだまま、
+        SSH は SSHClient と Transport スレッドを抱えたまま残る。各接続は
+        parent=self で作られていて Qt からも参照され続けるため、参照を
+        捨てても解放されない。Windows の COM は同一プロセス内でも排他な
+        ので、掴まれたままだと再接続が Access is denied で通らず、アプリを
+        再起動するまで復旧できない。
+
+        disconnect() ではなく dispose() を呼ぶ。disconnect() は末尾で
+        disconnected を出すので、切断処理の中から呼ぶと再入する。
+        """
+        conn = self.connections.pop(device_name, None)
+        if conn is None:
+            return
+        try:
+            conn.dispose()
+        except Exception as e:
+            print(f"[Connection] {device_name} の後始末に失敗: {e}")
+
     def _on_connection_closed(self, device_name: str):
         """接続切断時の処理（SSH/シリアル共通）"""
         self.status_bar.showMessage(f"{device_name} から切断されました")
@@ -926,10 +947,9 @@ class MainWindow(QMainWindow):
             if self.sftp_panel.current_device == device_name:
                 self.sftp_panel.clear()
         
-        # 接続を削除
-        if device_name in self.connections:
-            del self.connections[device_name]
-        
+        # 接続を閉じてから削除（閉じないとポートを掴んだまま残る）
+        self._dispose_connection(device_name)
+
         # 切断メッセージと再接続方法を表示
         self.terminal_widget.show_notice(
             device_name, 
@@ -953,8 +973,7 @@ class MainWindow(QMainWindow):
         else:
             # その他のエラー
             self.terminal_widget.show_notice(device_name, f"\nエラー: {error}\n")
-            if device_name in self.connections:
-                del self.connections[device_name]
+            self._dispose_connection(device_name)
     
     def _reconnect_device(self, device_name: str):
         """

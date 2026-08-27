@@ -200,22 +200,31 @@ class SSHConnection(QObject):
             self.error_occurred.emit(f"接続エラー: {str(e)}")
             return False
     
-    def disconnect(self):
-        """SSH接続を切断"""
+    def dispose(self):
+        """チャネルと SSHClient を閉じて資源を手放す（通知は出さない）
+
+        機器側都合の切断やエラーを受けたあとの後始末で使う。ここで
+        disconnected を出すと、いま処理中の切断処理が再入する。
+        閉じずに参照だけ捨てると、Transport スレッド自身がオブジェクトを
+        参照し続けるため GC でも回収されない。
+        """
         self._stop_reading = True
         self.is_connected = False
-        
+
         if self._read_thread and self._read_thread.is_alive():
             self._read_thread.join(timeout=2)
-        
+
         if self.channel:
             self.channel.close()
             self.channel = None
-        
+
         if self.client:
             self.client.close()
             self.client = None
-        
+
+    def disconnect(self):
+        """SSH接続を切断"""
+        self.dispose()
         self.disconnected.emit()
     
     def send_command(self, command: str):
