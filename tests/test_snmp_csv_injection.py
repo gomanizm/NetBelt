@@ -124,6 +124,49 @@ class SnmpCsvInjectionTest(unittest.TestCase):
         self.assertEqual(self._read(path)[1][2], "-1",
                          "負の数まで文字列にしている")
 
+    def test_values_that_python_reads_as_numbers_but_excel_does_not(self):
+        """Python が数として読める値でも、表計算が数式にするものは通さないこと。
+
+        float() は -inf / +nan / -1_000 を受け付けるが、Excel は先頭が
+        - や + のセルを数式として解釈する（-inf なら #NAME? になる）。
+        「数として読めるか」の判定を float() に任せると、この隙間が残る。
+        """
+        panel = self._panel()
+        for value in ("-inf", "+nan", "-1_000", "-Infinity"):
+            with self.subTest(value=value):
+                path = self._path("num_%s.csv" % abs(hash(value)))
+                panel._export_results_to_csv(
+                    path, [["1.3.6.1.2.1.1.5.0", "Integer", value]])
+                self.assertNotEqual(
+                    self._read(path)[1][2], value,
+                    "表計算が数式として読む値をそのまま書いている")
+
+    def test_a_leading_space_does_not_smuggle_a_formula_through(self):
+        """先頭に空白を置いて判定をすり抜けさせないこと。
+
+        表計算ソフトは前置きの空白を落として解釈することがある。
+        """
+        panel = self._panel()
+        smuggled = " " + DANGEROUS
+        path = self._path("space.csv")
+
+        panel._export_results_to_csv(
+            path, [["1.3.6.1.2.1.1.5.0", "OctetString", smuggled]])
+
+        self.assertNotEqual(self._read(path)[1][2], smuggled,
+                            "空白を前置しただけで素通りしている")
+
+    def test_plain_numbers_are_still_left_alone(self):
+        """普通の数値は、これまでどおり数値のまま書くこと。"""
+        panel = self._panel()
+        for value in ("-1", "0", "42", "-3.5", "+7", "1.25e3"):
+            with self.subTest(value=value):
+                path = self._path("plain_%s.csv" % abs(hash(value)))
+                panel._export_results_to_csv(
+                    path, [["1.3.6.1.2.1.2.2.1.1", "Integer", value]])
+                self.assertEqual(self._read(path)[1][2], value,
+                                 "普通の数値まで文字列にしている")
+
     def test_the_header_row_is_unchanged(self):
         panel = self._panel()
         path = self._path("header.csv")

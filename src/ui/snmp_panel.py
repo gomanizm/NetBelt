@@ -11,6 +11,7 @@ from PyQt6.QtCore import Qt, QAbstractTableModel, QModelIndex, QThread, pyqtSign
 from PyQt6.QtGui import QAction, QStandardItemModel, QStandardItem
 from datetime import datetime
 import json
+import re
 from core.mib_resolver import get_resolver, MIBResolver
 from core.snmp_manager import v3_password_error
 
@@ -108,6 +109,13 @@ class SNMPPanel(QWidget):
     # 100,000 件で約 1.2GB。クリアするまで解放されない）。
     # Syslog パネルの max_messages と同じ考え方・同じ既定値にしてある。
     DEFAULT_MAX_TRAPS = 1000
+
+    # 表計算ソフトがセルを数式として読み始める先頭文字。
+    _CSV_FORMULA_STARTERS = "=+-@"
+    # そのまま数値として書いてよい形。float() で判定すると -inf / +nan /
+    # -1_000 まで「数」になるが、表計算は先頭の - や + を見て数式として
+    # 解釈するので、通してはいけない。
+    _CSV_PLAIN_NUMBER = re.compile(r"^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$")
 
     # v3 認証コンボの選択肢。(表示ラベル, core へ渡すキー) の組。
     # キーは core.snmp_manager の V3_*_PROTOCOL_NAMES と一致させること。
@@ -675,13 +683,21 @@ class SNMPPanel(QWidget):
         読める値はそのまま通す。
         """
         text = "" if value is None else str(value)
-        if not text or text[0] not in "=+-@\t\r":
+        if not text:
             return text
-        try:
-            float(text)
-        except ValueError:
-            return "'" + text
-        return text
+
+        # 表計算ソフトは前置きの空白を落として解釈することがあるので、
+        # 判定も落としてから行う（空白を1つ置くだけで抜けられてしまう）。
+        stripped = text.lstrip()
+        if not stripped or stripped[0] not in SNMPPanel._CSV_FORMULA_STARTERS:
+            return text
+
+        # 数として読める値はそのまま通す。ただし判定を float() に任せると
+        # -inf / +nan / -1_000 まで通ってしまう。Python が数として読めても、
+        # 表計算は先頭の - や + を見て数式として解釈する（-inf なら #NAME?）。
+        if SNMPPanel._CSV_PLAIN_NUMBER.match(stripped):
+            return text
+        return "'" + text
 
     def _export_results_to_csv(self, file_path: str, results):
         """CSV形式で GET/WALK 結果を書き出す"""
