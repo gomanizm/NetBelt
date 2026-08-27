@@ -128,6 +128,27 @@ class ResizeKeepsContentTest(WidgetRenderTest):
 
     KEY = "ssh-ed25519 " + "A" * 68 + " user@example.com"
 
+    def test_a_narrow_spell_leaves_no_chopped_lines_behind(self):
+        """窓を戻したら、刻まれた行が残らないこと。
+
+        実機試験で「ls /etc/ のあと窓を縮めて戻すと表示が崩れ、
+        以後のコマンドにも残る」と報告された。狭い間に履歴へ流れた
+        行も繋がっていなければならない。
+        """
+        long_line = "x" * 100
+        w = self.widget(24, 40)
+        w.append_output("dev", "\r\n".join([long_line] * 30) + "\r\n$ ")
+        self.assertGreater(len(w._terminals["dev"]._screen.history), 0,
+                           "履歴へ流れていない (前提が崩れている)")
+        w._grid_size = lambda t: (24, 100)
+        w._apply_grid_size("dev")
+
+        printed = [l for l in self.screen_text(w).split("\n") if l.strip()]
+        chopped = [l for l in printed
+                   if l != long_line and l.rstrip() != "$"]
+        self.assertEqual(chopped, [], "刻まれた行が残っている")
+        self.assertEqual(printed.count(long_line), 30)
+
     def test_a_long_line_survives_repeated_shrinking(self):
         w = self.widget(24, 120)
         w.append_output("dev", "$ cat ~/.ssh/authorized_keys\r\n"

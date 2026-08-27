@@ -712,23 +712,28 @@ class TerminalWidget(QWidget):
         screen = terminal._screen
         region = terminal._region
 
-        for line in screen.take_new_history():
+        for line, wrapped in screen.take_new_history():
+            # 折り返しで続いている行は、改行で切らずに次の行と繋げる。
+            # 切ると、窓を縮めている間に流れた出力が刻まれたまま記録に
+            # 残り、窓を戻しても直らない
+            cells = list(line) if wrapped else self._visible_cells(line)
+            text = "".join(cell[0] for cell in cells)
             # 押し出された行は、画面領域の先頭として文書にもう書いて
             # ある。同じ内容なら書き直さず、記録との境目を進めるだけに
             # する。書き直すと画面領域が丸ごと入れ替わり、そこにある
             # 範囲選択が消える (機器がログを 1 行吐くだけで起きる)
-            text = "".join(cell[0] for cell in self._visible_cells(line))
             probe = QTextCursor(terminal.document())
             probe.setPosition(region.position())
             probe.movePosition(QTextCursor.MoveOperation.EndOfBlock,
                                QTextCursor.MoveMode.KeepAnchor)
-            if (probe.selectedText() == text
+            if (not wrapped and probe.selectedText() == text
                     and not probe.atEnd()):
                 region.setPosition(probe.position() + 1)
                 continue
-            for run, attr in self._runs(self._visible_cells(line)):
+            for run, attr in self._runs(cells):
                 region.insertText(run, self._char_format(attr))
-            region.insertText("\n", QTextCharFormat())
+            if not wrapped:
+                region.insertText("\n", QTextCharFormat())
 
         cell_rows = [self._visible_cells(line) for line in screen.lines]
         # カーソルの行は、カーソルの桁まで空白を残す。プロンプト末尾の

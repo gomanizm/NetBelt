@@ -369,6 +369,40 @@ class ResizeTest(unittest.TestCase):
         self.assertEqual(s.text()[0], "l14")
         self.assertEqual((s.cursor_row, s.cursor_col), (9, 3))
 
+    def test_narrowing_then_widening_puts_the_line_back(self):
+        """窓を戻したら元どおりに繋がること。
+
+        折り返しで続いている行と、機器が改行を送った切れ目とを
+        区別していないと、縮めたときに刻まれたまま戻らない。
+        実機試験で ls /etc/ の出力が崩れたのがこれ。
+        """
+        line = "x" * 100
+        s = Screen(24, 120)
+        feed(s, line)
+        s.set_size(24, 40)
+        self.assertEqual(s.text()[:3], ["x" * 40, "x" * 40, "x" * 20])
+        s.set_size(24, 120)
+        self.assertEqual(s.text()[0], line)
+        self.assertEqual(s.text()[1], "")
+
+    def test_a_real_line_break_is_never_joined(self):
+        """機器が送った改行は、広げても繋がないこと。"""
+        s = Screen(24, 40)
+        feed(s, "first\r\nsecond")
+        s.set_size(24, 120)
+        self.assertEqual(s.text()[:2], ["first", "second"])
+
+    def test_columns_survive_a_round_trip(self):
+        """桁で並んだ出力 (ls の多段組) が往復で崩れないこと。"""
+        rows = ["a.conf".ljust(20) + "b.conf".ljust(20) + "c.conf",
+                "d.conf".ljust(20) + "e.conf".ljust(20) + "f.conf"]
+        s = Screen(24, 80)
+        feed(s, "\r\n".join(rows))
+        before = s.text()
+        s.set_size(24, 30)
+        s.set_size(24, 80)
+        self.assertEqual(s.text(), before)
+
     def test_the_screen_behind_an_alternate_screen_is_not_lost(self):
         """vi を開いている間に窓を縮めても、裏のシェル画面を捨てないこと。"""
         s = feed(Screen(), "\r\n".join("shell-%02d" % i for i in range(24)))

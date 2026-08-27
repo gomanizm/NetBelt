@@ -40,6 +40,11 @@ class Screen(object):
         """RIS 相当。履歴とタイトルだけは残す (セッションの記録なので)。"""
         self.lines = self._blank_lines()
         self._other = self._blank_lines()   # 裏画面 (代替画面用)
+        # wrapped[r] = その行は折り返しで次の行へ続いている。
+        # 機器が送った改行との区別が付かないと、窓を戻したときに
+        # 繋ぎ直せず、出力が刻まれたまま残る
+        self.wrapped = [False] * self.rows
+        self._other_wrapped = [False] * self.rows
         self.alt_active = False
         self.cursor_row = 0
         self.cursor_col = 0
@@ -86,7 +91,7 @@ class Screen(object):
                 for line in self.lines]
 
     def take_new_history(self):
-        """前回から増えた履歴行を返して忘れる。"""
+        """前回から増えた履歴を (行, 折り返しで続くか) で返して忘れる。"""
         new = self._new_history
         self._new_history = []
         return new
@@ -121,22 +126,26 @@ class Screen(object):
 
         if self.alt_active:
             cursor = self._saved_main[:2] if self._saved_main else (0, 0)
+            marks = self._other_wrapped
         else:
             cursor = (self.cursor_row, self.cursor_col)
-        reflowed, cursor = self._reflow(main, cols, cursor)
+            marks = self.wrapped
+        reflowed, marks, cursor = self._reflow(main, marks, cols, cursor)
 
         # 入りきらない分は、まず下の空行から捨てる。中身が無いので
         # 捨てても記録は減らない。それでも余るときだけ上を履歴へ送る
         while (len(reflowed) > rows and cursor[0] < len(reflowed) - 1
                and all(c == BLANK for c in reflowed[-1])):
             reflowed.pop()
+            marks.pop()
         while len(reflowed) > rows:
             removed = reflowed.pop(0)
             self.history.append(removed)
-            self._new_history.append(removed)
+            self._new_history.append((removed, marks.pop(0)))
             cursor = (max(0, cursor[0] - 1), cursor[1])
         while len(reflowed) < rows:
             reflowed.append([BLANK] * cols)
+            marks.append(False)
 
         del alt[rows:]
         for line in alt:
@@ -147,12 +156,15 @@ class Screen(object):
 
         if self.alt_active:
             self._other[:] = reflowed
+            self._other_wrapped = marks
+            self.wrapped = [False] * rows       # 代替画面は組み直さない
             if self._saved_main:
                 self._saved_main = (min(cursor[0], rows - 1),
                                     min(cursor[1], cols - 1),
                                     self._saved_main[2])
         else:
             self.lines[:] = reflowed
+            self.wrapped = marks
             self.cursor_row = min(cursor[0], rows - 1)
             self.cursor_col = min(cursor[1], cols - 1)
         self.rows, self.cols = rows, cols
@@ -162,30 +174,53 @@ class Screen(object):
         self._pending_wrap = False
         self.dirty = set(range(rows))
 
-    def _reflow(self, lines, cols, cursor):
-        """行の並びを cols 幅で組み直す。(新しい行, 新しいカーソル) を返す。"""
+    def _reflow(self, lines, wrapped, cols, cursor):
+        """行の並びを cols 幅で組み直す。
+
+        折り返しで続いている行はいったん繋いでから割り直す。繋がずに
+        割るだけだと、窓を縮めて戻したときに刻まれたまま残る
+        (ls /etc/ のような出力が実機試験で崩れた)。
+
+        (新しい行, 新しい印, 新しいカーソル) を返す。
+        """
         cursor_row, cursor_col = cursor
-        out = []
+        out, out_wrapped = [], []
         new_cursor = (0, 0)
-        for r, line in enumerate(lines):
-            cells = list(line)
-            end = len(cells)
-            while end and cells[end - 1] == BLANK:
-                end -= 1
-            if r == cursor_row:
-                end = max(end, cursor_col)      # カーソル手前の空白は残す
-            cells = cells[:end]
+        r = 0
+        while r < len(lines):
+            # 続いている行をひとかたまり (論理行) にする
+            cells, offset, hit = [], None, False
+            while True:
+                row = list(lines[r])
+                end = len(row)
+                while end and row[end - 1] == BLANK:
+                    end -= 1
+                if r == cursor_row:
+                    end = max(end, cursor_col)  # カーソル手前の空白は残す
+                    offset = len(cells) + cursor_col
+                    hit = True
+                if r < len(wrapped) and wrapped[r]:
+                    end = len(row)              # 続くなら右端まで中身
+                cells.extend(row[:end])
+                if not (r < len(wrapped) and wrapped[r]
+                        and r + 1 < len(lines)):
+                    break
+                r += 1
+            r += 1
+
             first = len(out)
             if not cells:
                 out.append([BLANK] * cols)
+                out_wrapped.append(False)
             else:
                 for i in range(0, len(cells), cols):
                     chunk = cells[i:i + cols]
                     chunk.extend([BLANK] * (cols - len(chunk)))
                     out.append(chunk)
-            if r == cursor_row:
-                new_cursor = (first + cursor_col // cols, cursor_col % cols)
-        return out, new_cursor
+                    out_wrapped.append(i + cols < len(cells))
+            if hit:
+                new_cursor = (first + offset // cols, offset % cols)
+        return out, out_wrapped, new_cursor
 
     # ---- 印字と C0 -------------------------------------------------
 
@@ -195,7 +230,7 @@ class Screen(object):
                 continue
             if self._pending_wrap:      # 右端の 1 文字あとの折り返し
                 self.cursor_col = 0
-                self._linefeed()
+                self._linefeed(from_wrap=True)
             if self._g[self._charset] == "0":
                 ch = DEC_GRAPHICS.get(ch, ch)
             line = self.lines[self.cursor_row]
@@ -227,8 +262,10 @@ class Screen(object):
             self._charset = "("
         # BEL・NUL などは何もしない
 
-    def _linefeed(self):
+    def _linefeed(self, from_wrap=False):
         self._pending_wrap = False
+        # 折り返しで送られたのか、機器が改行を送ったのかを覚える
+        self.wrapped[self.cursor_row] = from_wrap
         if self.cursor_row == self.scroll_bottom:
             self._scroll_up(1)
         elif self.cursor_row + 1 < self.rows:
@@ -237,17 +274,21 @@ class Screen(object):
     def _scroll_up(self, n):
         for _ in range(n):
             removed = self.lines.pop(self.scroll_top)
+            removed_wrap = self.wrapped.pop(self.scroll_top)
             self.lines.insert(self.scroll_bottom, self._blank_line())
+            self.wrapped.insert(self.scroll_bottom, False)
             if (not self.alt_active and self.scroll_top == 0
                     and self.scroll_bottom == self.rows - 1):
                 self.history.append(removed)
-                self._new_history.append(removed)
+                self._new_history.append((removed, removed_wrap))
         self.dirty.update(range(self.scroll_top, self.scroll_bottom + 1))
 
     def _scroll_down(self, n):
         for _ in range(n):
             self.lines.pop(self.scroll_bottom)
+            self.wrapped.pop(self.scroll_bottom)
             self.lines.insert(self.scroll_top, self._blank_line())
+            self.wrapped.insert(self.scroll_top, False)
         self.dirty.update(range(self.scroll_top, self.scroll_bottom + 1))
 
     # ---- CSI -------------------------------------------------------
@@ -382,10 +423,15 @@ class Screen(object):
         if to_alt and with_cursor:
             self._saved_main = (self.cursor_row, self.cursor_col, self.attr)
         self.lines, self._other = self._other, self.lines
+        # 折り返しの印も画面と一緒に入れ替える。裏へ回ったメイン画面の
+        # 印を失うと、戻ってきたときに組み直しで繋ぎ直せなくなる
+        self.wrapped, self._other_wrapped = (
+            self._other_wrapped, self.wrapped)
         self.alt_active = to_alt
         if to_alt:                      # 代替画面は白紙で始まる
             for r in range(self.rows):
                 self.lines[r] = self._blank_line()
+                self.wrapped[r] = False
             self._move(0, 0)
         elif with_cursor and self._saved_main:
             row, col, attr = self._saved_main
@@ -419,9 +465,9 @@ class Screen(object):
             for r in range(self.rows):
                 if any(c != BLANK for c in self.lines[r]):
                     last = r
-            for line in self.lines[:last + 1]:
+            for r, line in enumerate(self.lines[:last + 1]):
                 self.history.append(line)
-                self._new_history.append(line)
+                self._new_history.append((line, self.wrapped[r]))
         if wipes_all:
             rng = range(0, self.rows)
         elif mode == 0:
@@ -432,6 +478,7 @@ class Screen(object):
             rng = range(0, self.cursor_row)
         for r in rng:
             self.lines[r] = self._blank_line()
+            self.wrapped[r] = False
         self.dirty.update(rng)
         self._pending_wrap = False
 
@@ -445,6 +492,8 @@ class Screen(object):
             rng = range(0, self.cols)
         for c in rng:
             line[c] = BLANK
+        if mode != 1:               # 行末まで消したら続きは無い
+            self.wrapped[self.cursor_row] = False
         self.dirty.add(self.cursor_row)
         self._pending_wrap = False
 
@@ -455,10 +504,14 @@ class Screen(object):
         for _ in range(n):
             if insert:
                 self.lines.pop(self.scroll_bottom)
+                self.wrapped.pop(self.scroll_bottom)
                 self.lines.insert(self.cursor_row, self._blank_line())
+                self.wrapped.insert(self.cursor_row, False)
             else:
                 self.lines.pop(self.cursor_row)
+                self.wrapped.pop(self.cursor_row)
                 self.lines.insert(self.scroll_bottom, self._blank_line())
+                self.wrapped.insert(self.scroll_bottom, False)
         self.dirty.update(range(self.cursor_row, self.scroll_bottom + 1))
         self._pending_wrap = False
 
