@@ -712,6 +712,11 @@ class TerminalWidget(QWidget):
         screen = terminal._screen
         region = terminal._region
 
+        # 組み直しの直後は、文書に残っている「今の画面」が組み直し前の
+        # ものなので、内容が一致しても同じ行とは限らない。境目を進める
+        # 近道は使えない (使うと押し出された行が書かれずに消える)
+        reflowed = screen.take_reflowed()
+
         for line, wrapped in screen.take_new_history():
             # 折り返しで続いている行は、改行で切らずに次の行と繋げる。
             # 切ると、窓を縮めている間に流れた出力が刻まれたまま記録に
@@ -726,7 +731,8 @@ class TerminalWidget(QWidget):
             probe.setPosition(region.position())
             probe.movePosition(QTextCursor.MoveOperation.EndOfBlock,
                                QTextCursor.MoveMode.KeepAnchor)
-            if (not wrapped and probe.selectedText() == text
+            if (not reflowed and not wrapped
+                    and probe.selectedText() == text
                     and not probe.atEnd()):
                 region.setPosition(probe.position() + 1)
                 continue

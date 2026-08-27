@@ -45,6 +45,7 @@ class Screen(object):
         # 繋ぎ直せず、出力が刻まれたまま残る
         self.wrapped = [False] * self.rows
         self._other_wrapped = [False] * self.rows
+        self._reflowed = False
         self.alt_active = False
         self.cursor_row = 0
         self.cursor_col = 0
@@ -102,6 +103,16 @@ class Screen(object):
         self.dirty = set()
         return dirty
 
+    def take_reflowed(self):
+        """前回の描画のあとに組み直しが起きたかを返して忘れる。
+
+        組み直すと行の切れ目が全部変わるので、描画側が持っている
+        「前回描いた内容」との突き合わせが当てにならなくなる。
+        """
+        reflowed = self._reflowed
+        self._reflowed = False
+        return reflowed
+
     def take_responses(self):
         """機器へ送り返すべき応答 (DSR/DA) を返して忘れる。"""
         responses = self.responses
@@ -109,118 +120,67 @@ class Screen(object):
         return responses
 
     def set_size(self, rows, cols):
-        """端末の大きさを変える。書かれた内容は一文字も捨てない。
+        """端末の大きさを変える。書かれた行には触らない。
 
-        桁が狭くなったら、はみ出す分は切らずに次の行へ送る (組み直し)。
-        切り捨てると、窓を縮めただけで出力の末尾が永久に失われる。
-        行が足りなくなった分は上から履歴へ送る。
+        桁が広がったら足りない分を空白で埋めるだけ。狭くなっても
+        切らないし、割り直しもしない。割り直すと窓を往復するたびに
+        行の切れ目が変わり、そのたびに中身が削れていった。実端末も
+        既に書かれた行は組み直さない。狭いときの見た目は表示側が
+        折り返して面倒を見る。
 
-        代替画面 (vi 等) の中身だけは組み直さない。アプリはサイズ変更を
-        受けて描き直すので、組み直しても上書きされるだけ。ただし裏へ
-        退避しているメイン画面は、見えていなくても記録なので守る。
+        行数が減ったぶんは、まず下の空行を捨て、足りなければ上の行を
+        履歴へ送る (書かれた行を黙って消さないため)。
         """
         if (rows, cols) == (self.rows, self.cols) or rows < 1 or cols < 1:
             return
-        main = self._other if self.alt_active else self.lines
-        alt = self.lines if self.alt_active else self._other
+        for line in self.lines + self._other:
+            if len(line) < cols:
+                line.extend([BLANK] * (cols - len(line)))
 
+        # メイン画面は記録なので、あふれたら履歴へ送る。代替画面
+        # (vi 等) はアプリが描き直すので、切っても構わない
         if self.alt_active:
-            cursor = self._saved_main[:2] if self._saved_main else (0, 0)
-            marks = self._other_wrapped
+            main, main_marks = self._other, self._other_wrapped
+            alt, alt_marks = self.lines, self.wrapped
+            keep_row = (self._saved_main[0] if self._saved_main else 0)
         else:
-            cursor = (self.cursor_row, self.cursor_col)
-            marks = self.wrapped
-        reflowed, marks, cursor = self._reflow(main, marks, cols, cursor)
+            main, main_marks = self.lines, self.wrapped
+            alt, alt_marks = self._other, self._other_wrapped
+            keep_row = self.cursor_row
 
-        # 入りきらない分は、まず下の空行から捨てる。中身が無いので
-        # 捨てても記録は減らない。それでも余るときだけ上を履歴へ送る
-        while (len(reflowed) > rows and cursor[0] < len(reflowed) - 1
-               and all(c == BLANK for c in reflowed[-1])):
-            reflowed.pop()
-            marks.pop()
-        while len(reflowed) > rows:
-            removed = reflowed.pop(0)
-            self.history.append(removed)
-            self._new_history.append((removed, marks.pop(0)))
-            cursor = (max(0, cursor[0] - 1), cursor[1])
-        while len(reflowed) < rows:
-            reflowed.append([BLANK] * cols)
-            marks.append(False)
-
-        del alt[rows:]
-        for line in alt:
-            del line[cols:]
-            line.extend([BLANK] * (cols - len(line)))
-        while len(alt) < rows:
-            alt.append([BLANK] * cols)
-
+        while len(main) > rows:
+            if keep_row < len(main) - 1 and all(c == BLANK for c in main[-1]):
+                main.pop()
+                main_marks.pop()
+            else:
+                self.history.append(main.pop(0))
+                self._new_history.append((self.history[-1],
+                                          main_marks.pop(0)))
+                keep_row = max(0, keep_row - 1)
+        while len(main) < rows:
+            main.append([BLANK] * cols)
+            main_marks.append(False)
         if self.alt_active:
-            self._other[:] = reflowed
-            self._other_wrapped = marks
-            self.wrapped = [False] * rows       # 代替画面は組み直さない
             if self._saved_main:
-                self._saved_main = (min(cursor[0], rows - 1),
-                                    min(cursor[1], cols - 1),
+                self._saved_main = (min(keep_row, rows - 1),
+                                    min(self._saved_main[1], cols - 1),
                                     self._saved_main[2])
         else:
-            self.lines[:] = reflowed
-            self.wrapped = marks
-            self.cursor_row = min(cursor[0], rows - 1)
-            self.cursor_col = min(cursor[1], cols - 1)
+            self.cursor_row = keep_row
+
+        del alt[rows:]
+        del alt_marks[rows:]
+        while len(alt) < rows:
+            alt.append([BLANK] * cols)
+            alt_marks.append(False)
+
         self.rows, self.cols = rows, cols
         self.scroll_top, self.scroll_bottom = 0, rows - 1
         self.cursor_row = min(self.cursor_row, rows - 1)
         self.cursor_col = min(self.cursor_col, cols - 1)
         self._pending_wrap = False
         self.dirty = set(range(rows))
-
-    def _reflow(self, lines, wrapped, cols, cursor):
-        """行の並びを cols 幅で組み直す。
-
-        折り返しで続いている行はいったん繋いでから割り直す。繋がずに
-        割るだけだと、窓を縮めて戻したときに刻まれたまま残る
-        (ls /etc/ のような出力が実機試験で崩れた)。
-
-        (新しい行, 新しい印, 新しいカーソル) を返す。
-        """
-        cursor_row, cursor_col = cursor
-        out, out_wrapped = [], []
-        new_cursor = (0, 0)
-        r = 0
-        while r < len(lines):
-            # 続いている行をひとかたまり (論理行) にする
-            cells, offset, hit = [], None, False
-            while True:
-                row = list(lines[r])
-                end = len(row)
-                while end and row[end - 1] == BLANK:
-                    end -= 1
-                if r == cursor_row:
-                    end = max(end, cursor_col)  # カーソル手前の空白は残す
-                    offset = len(cells) + cursor_col
-                    hit = True
-                if r < len(wrapped) and wrapped[r]:
-                    end = len(row)              # 続くなら右端まで中身
-                cells.extend(row[:end])
-                if not (r < len(wrapped) and wrapped[r]
-                        and r + 1 < len(lines)):
-                    break
-                r += 1
-            r += 1
-
-            first = len(out)
-            if not cells:
-                out.append([BLANK] * cols)
-                out_wrapped.append(False)
-            else:
-                for i in range(0, len(cells), cols):
-                    chunk = cells[i:i + cols]
-                    chunk.extend([BLANK] * (cols - len(chunk)))
-                    out.append(chunk)
-                    out_wrapped.append(i + cols < len(cells))
-            if hit:
-                new_cursor = (first + offset // cols, offset % cols)
-        return out, out_wrapped, new_cursor
+        self._reflowed = True
 
     # ---- 印字と C0 -------------------------------------------------
 
@@ -484,12 +444,14 @@ class Screen(object):
 
     def _erase_line(self, mode):
         line = self.lines[self.cursor_row]
+        # 行は桁より長いことがある (窓を縮めても切らないため)。
+        # 消すときは行の実際の長さで見る
         if mode == 0:
-            rng = range(self.cursor_col, self.cols)
+            rng = range(self.cursor_col, len(line))
         elif mode == 1:
             rng = range(0, self.cursor_col + 1)
         else:
-            rng = range(0, self.cols)
+            rng = range(0, len(line))
         for c in rng:
             line[c] = BLANK
         if mode != 1:               # 行末まで消したら続きは無い
@@ -530,7 +492,8 @@ class Screen(object):
 
     def _erase_chars(self, n):
         line = self.lines[self.cursor_row]
-        for c in range(self.cursor_col, min(self.cols, self.cursor_col + n)):
+        for c in range(self.cursor_col,
+                       min(len(line), self.cursor_col + n)):
             line[c] = BLANK
         self.dirty.add(self.cursor_row)
         self._pending_wrap = False

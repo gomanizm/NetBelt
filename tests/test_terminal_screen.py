@@ -336,16 +336,32 @@ class ResizeTest(unittest.TestCase):
         self.assertEqual(s.text()[0], "show version")
         self.assertEqual(len(s.lines[0]), 132)
 
-    def test_narrowing_wraps_instead_of_cutting(self):
-        """桁が狭くなっても一文字も捨てないこと。
+    def test_narrowing_leaves_a_written_line_alone(self):
+        """桁が狭くなっても、書かれた行には触らないこと。
 
-        以前は del line[cols:] で切り捨てており、窓を縮めるだけで
-        出力の末尾が永久に失われていた (実機試験で報告された)。
-        長い鍵や show 出力を読んでいる最中に窓を縮めると消える。
+        切り捨てると窓を縮めただけで末尾が永久に失われ、割り直すと
+        窓を往復するたびに切れ目が変わって中身が削れていった
+        (どちらも実機試験で出た)。実端末も書かれた行は組み直さない。
+        狭いときの見た目は表示側が折り返して面倒を見る。
         """
         s = feed(Screen(), "0123456789")
         s.set_size(24, 8)
-        self.assertEqual(s.text()[:2], ["01234567", "89"])
+        self.assertEqual(s.text()[0], "0123456789")
+
+    def test_a_round_trip_changes_nothing(self):
+        """縮めて戻す、を繰り返しても中身が一文字も変わらないこと。
+
+        実機試験で「最小→戻すを繰り返すたびに 1 行ずつ消えていく」と
+        報告された。組み直しをやめたので、往復は何もしないのと同じ。
+        """
+        key = "ssh-ed25519 " + "A" * 68 + " user@example.com"
+        s = Screen(24, 120)
+        feed(s, "$ cat ~/.ssh/authorized_keys\r\n" + key + "\r\n$ ")
+        before = s.text()
+        for _ in range(5):
+            s.set_size(5, 20)
+            s.set_size(24, 120)
+        self.assertEqual(s.text(), before)
 
     def test_repeated_narrowing_still_keeps_everything(self):
         key = "ssh-ed25519 " + "A" * 68 + " user@example.com"
@@ -369,21 +385,20 @@ class ResizeTest(unittest.TestCase):
         self.assertEqual(s.text()[0], "l14")
         self.assertEqual((s.cursor_row, s.cursor_col), (9, 3))
 
-    def test_narrowing_then_widening_puts_the_line_back(self):
-        """窓を戻したら元どおりに繋がること。
+    def test_a_long_line_stays_one_line_through_a_round_trip(self):
+        """長い行は、縮めても刻まれず、戻しても元のままであること。
 
-        折り返しで続いている行と、機器が改行を送った切れ目とを
-        区別していないと、縮めたときに刻まれたまま戻らない。
-        実機試験で ls /etc/ の出力が崩れたのがこれ。
+        実機試験で ls /etc/ の出力が刻まれたまま戻らなくなった。
+        刻まないので、戻す必要も無い。
         """
         line = "x" * 100
         s = Screen(24, 120)
         feed(s, line)
         s.set_size(24, 40)
-        self.assertEqual(s.text()[:3], ["x" * 40, "x" * 40, "x" * 20])
-        s.set_size(24, 120)
         self.assertEqual(s.text()[0], line)
         self.assertEqual(s.text()[1], "")
+        s.set_size(24, 120)
+        self.assertEqual(s.text()[0], line)
 
     def test_a_real_line_break_is_never_joined(self):
         """機器が送った改行は、広げても繋がないこと。"""
