@@ -255,7 +255,8 @@ class SFTPPanel(QWidget):
         
         self.sftp_manager = sftp_manager
         self.hint_label.setVisible(False)
-        # 接続先が変わるので、前の接続で観測した一覧は使えない
+        # 接続先が変わるので、前の接続で観測した一覧も進捗も使えない
+        self._reset_progress()
         self._current_entries = {}
         self._pending_upload_names = set()
         self.current_device = device_name
@@ -297,7 +298,7 @@ class SFTPPanel(QWidget):
         self.target_label.setText(self.NO_TARGET_TEXT)
         self.hint_label.setVisible(True)
         self.status_label.setText("")
-        self.progress_bar.setVisible(False)
+        self._reset_progress()
         self.sftp_manager = None
         self.current_device = ""
         # 残しておくと、次の接続で一覧を取る前に古い名前で上書き判定してしまう
@@ -385,6 +386,19 @@ class SFTPPanel(QWidget):
         
         self.status_label.setText(f"{len(file_list)} 項目")
     
+    def _reset_progress(self):
+        """進捗バーを片付ける
+
+        接続先が変わったら必ず呼ぶ。残しておくと、接続先の表示は新しい
+        機器に変わっているのに、その直下のバーは前の機器の途中経過を
+        出したままになる。前の機器の転送が終わっても通知はもう繋がって
+        いないので、放っておくと消えない。
+        """
+        self.progress_bar.setVisible(False)
+        self.progress_bar.setFormat("%p%")
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.reset()
+
     def _update_progress(self, transferred: int, total: int):
         """
         転送進捗を更新
