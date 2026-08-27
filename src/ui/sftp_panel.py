@@ -428,9 +428,13 @@ class SFTPPanel(QWidget):
                 f"{percent}% ({self._format_size(done)} / {self._format_size(total)})")
         else:
             # 全体サイズが分からない転送。割合を出しようがないので
-            # 目盛りを伏せて（Qt の不定表示）転送済みだけ見せる
+            # 目盛りを伏せる（Qt の不定表示＝動くだけのバー）。
+            # QProgressBar は minimum==maximum のとき text() を空にするので、
+            # setFormat した文字列は画面に出ない。転送済みの量はバーの外、
+            # ステータス欄へ出す。
             self.progress_bar.setRange(0, 0)
-            self.progress_bar.setFormat(self._format_size(transferred))
+            self.status_label.setText(
+                "転送中: %s" % self._format_size(transferred))
     
     def _on_transfer_complete(self, message: str):
         """

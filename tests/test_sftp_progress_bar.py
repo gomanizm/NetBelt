@@ -186,6 +186,20 @@ class LargeTransferProgressTest(unittest.TestCase):
                       "全体サイズの表示が化けている: %r"
                       % panel.progress_bar.format())
 
+    def test_an_unknown_total_still_shows_how_much_moved(self):
+        """全体サイズが分からない転送でも、送れた量が読めること。
+
+        QProgressBar は minimum==maximum のとき text() を空文字にするので、
+        目盛りを伏せた状態で setFormat した文字列は画面に出ない。
+        「割合は出せないが転送済みは見せる」と決めた以上、出す場所が要る。
+        """
+        panel, manager = self._wired()
+        manager.transfer_progress.emit(12345, 0)
+
+        shown = panel.progress_bar.text() + " " + panel.status_label.text()
+        self.assertIn("12.1 KB", shown,
+                      "転送済みのバイト数がどこにも出ていない: %r" % shown)
+
     def test_a_small_transfer_still_shows_its_percentage(self):
         """これまでどおり、小さい転送も割合を出すこと。"""
         panel, manager = self._wired()
