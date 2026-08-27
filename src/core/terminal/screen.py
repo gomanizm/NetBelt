@@ -234,6 +234,15 @@ class Screen(object):
         self._pending_wrap = False
         # 折り返しで送られたのか、機器が改行を送ったのかを覚える
         self.wrapped[self.cursor_row] = from_wrap
+        if from_wrap:
+            # 折り返した時点で、この行の内容はちょうど今の桁幅ぶん。
+            # 桁を狭めても行は切り詰めない設計 (触ると往復のたびに削れる)
+            # なので、それより後ろには広かった頃の文字が残っている。
+            # 描画側は折り返し行のセルを丸ごと次の行へ繋げるため、残して
+            # おくと 1 行の途中へ古い文字や空白の塊が差し込まれる。
+            # 「行の長さ = 折り返し位置」という前提をここで回復する。
+            # 機器が送った改行 (from_wrap=False) では触らない。
+            del self.lines[self.cursor_row][self.cols:]
         if self.cursor_row == self.scroll_bottom:
             self._scroll_up(1)
         elif self.cursor_row + 1 < self.rows:
