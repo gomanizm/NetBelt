@@ -156,6 +156,13 @@ class SyslogReceiver(QObject):
         # proto -> {"socket":…, "thread":…, "stop":Event, "port":int}
         self._servers = {}
         self.tcp_clients = []
+        # TCP で受け取る 1 行の上限。改行が来ないと受信バッファは
+        # 際限なく伸び、走査も O(n^2) になって受信スレッドが停滞する。
+        # 待受は 0.0.0.0 で、開始時にファイアウォールの受信許可も足すので、
+        # LAN 上の認証されていないホストから引き起こせる。
+        # RFC 5424 の 2048 オクテットは「最低これだけは受けよ」であって
+        # 上限ではない。実機は長い行を出すので、実用と防御の釣り合いで 64KiB。
+        self.max_line_bytes = 64 * 1024
 
     @property
     def is_running(self):
@@ -320,6 +327,12 @@ class SyslogReceiver(QObject):
                         daemon=True,
                     )
                     client_thread.start()
+                    # 終わった接続のスレッドを外しておく。append するだけだと
+                    # 接続を繰り返すほどリストが単調に増え、stop() まで
+                    # 解放されない。入れ替えでなく in-place で詰めるのは、
+                    # stop() が同じリストを走査しているため。
+                    self.tcp_clients[:] = [
+                        t for t in self.tcp_clients if t.is_alive()]
                     self.tcp_clients.append(client_thread)
                 except socket.timeout:
                     continue
@@ -344,6 +357,22 @@ class SyslogReceiver(QObject):
                     if not data:
                         break
                     buffer += data
+                    # 改行が来ないまま上限を超えたら、その相手との接続を
+                    # 切る。黙って切り捨てると障害解析に要る末尾を失うので、
+                    # 切ったことは記録に残す。
+                    if b"\n" not in buffer and len(buffer) > self.max_line_bytes:
+                        # 一覧に並ぶので、機器からの行と同じ RFC 3164 の形で
+                        # 組み立てる。生の文言のまま渡すと、先頭の語が
+                        # 日時やホスト名として食われて読めなくなる。
+                        # PRI 12 = facility 1 (user) / severity 4 (Warning)
+                        self.message_received.emit(SyslogMessage(
+                            "<12>%s NetBelt 改行の無いデータが %d バイトを"
+                            "超えたため、この接続を切断しました"
+                            % (datetime.now().strftime("%b %d %H:%M:%S"),
+                               self.max_line_bytes),
+                            client_ip, "TCP", listen_port))
+                        self.message_count += 1
+                        break
                     while b"\n" in buffer:
                         line, buffer = buffer.split(b"\n", 1)
                         try:
