@@ -369,9 +369,25 @@ class MainWindow(QMainWindow):
     
     def _create_status_bar(self):
         """ステータスバー作成"""
+        from PyQt6.QtWidgets import QLabel
+
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
+        # 端末の大きさ。右端の常設欄に置くので、showMessage の
+        # 一時メッセージとは場所を取り合わない
+        self.terminal_size_label = QLabel("")
+        self.terminal_size_label.setToolTip(
+            "いま機器へ伝えている端末の大きさ（桁×行）")
+        self.status_bar.addPermanentWidget(self.terminal_size_label)
         self.status_bar.showMessage("準備完了")
+
+    def _show_terminal_size(self, device_name: str) -> None:
+        """表示中のターミナルの大きさを、ステータスバーへ出す。"""
+        if not device_name:
+            self.terminal_size_label.setText("")
+            return
+        cols, rows = self.terminal_widget.grid_size_for(device_name)
+        self.terminal_size_label.setText("%d x %d" % (cols, rows))
     
     def _load_devices(self):
         """設定ファイルから接続先リストを読み込み"""
@@ -858,6 +874,8 @@ class MainWindow(QMainWindow):
             # いま見ている機器に SFTP が無いなら、前の機器のものを残さない
             self.sftp_panel.clear()
 
+        self._show_terminal_size(device_name)
+
     def _find_group_of_device(self, device_name: str):
         """機器名から所属グループを返す(見つからなければNone)"""
         for group in self.config_manager.get_groups():
@@ -974,6 +992,8 @@ class MainWindow(QMainWindow):
         conn = self.connections.get(device_name)
         if conn is not None and hasattr(conn, "set_terminal_size"):
             conn.set_terminal_size(cols, rows)
+        if device_name == self.terminal_widget.get_current_tab_name():
+            self.terminal_size_label.setText("%d x %d" % (cols, rows))
 
     def _on_tab_closed(self, device_name: str):
         """
