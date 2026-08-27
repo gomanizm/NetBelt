@@ -103,6 +103,12 @@ class MIBLoaderThread(QThread):
 class SNMPPanel(QWidget):
     """SNMPパネル"""
 
+    # 保持する Trap の件数。上限が無いと、受信を張りっぱなしにする常用で
+    # メモリが単調に増え続ける（VarBind 3件の Trap あたり約 12KB、
+    # 100,000 件で約 1.2GB。クリアするまで解放されない）。
+    # Syslog パネルの max_messages と同じ考え方・同じ既定値にしてある。
+    DEFAULT_MAX_TRAPS = 1000
+
     # v3 認証コンボの選択肢。(表示ラベル, core へ渡すキー) の組。
     # キーは core.snmp_manager の V3_*_PROTOCOL_NAMES と一致させること。
     AUTH_PROTOCOL_CHOICES = (
@@ -133,6 +139,7 @@ class SNMPPanel(QWidget):
         self.result_model = SNMPResultTableModel()
         self.trap_tree_model = QStandardItemModel()
         self.trap_data_list = []  # 完全なTrapデータ（エクスポート用）
+        self.max_traps = self._configured_max_traps()
         
         self._init_ui()
         
@@ -624,6 +631,32 @@ class SNMPPanel(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "エラー", "エクスポート中にエラーが発生しました:\n" + str(e))
 
+    def _configured_max_traps(self) -> int:
+        """settings.snmp.max_traps を読む（壊れていれば既定値）
+
+        config.json は手で編集できるので、数でない値や 0 以下が来る。
+        そのまま使うと上限が消えたり、1件も残らなくなる。
+        """
+        try:
+            settings = self.config_manager.config.get("settings", {})
+            value = int(settings.get("snmp", {}).get(
+                "max_traps", self.DEFAULT_MAX_TRAPS))
+        except (AttributeError, TypeError, ValueError):
+            return self.DEFAULT_MAX_TRAPS
+        return value if value > 0 else self.DEFAULT_MAX_TRAPS
+
+    def _trim_traps(self):
+        """上限を超えたぶんの古い Trap を捨てる
+
+        新しいものを先頭へ挿しているので、余るのは末尾。表示行と保存
+        データを同じ数だけ削り、エクスポートの中身と画面が食い違わない
+        ようにする。
+        """
+        while len(self.trap_data_list) > self.max_traps:
+            self.trap_data_list.pop()
+        while self.trap_tree_model.rowCount() > self.max_traps:
+            self.trap_tree_model.removeRow(self.trap_tree_model.rowCount() - 1)
+
     @staticmethod
     def _csv_safe(value):
         """表計算ソフトが数式として解釈しうる値を、文字列として書き出す
@@ -986,7 +1019,10 @@ class SNMPPanel(QWidget):
             # 親の最初の列に子行を追加
             timestamp_item.appendRow([child_timestamp, child_source,
                                       child_security, child_oid, child_value])
-    
+
+        # 上限を超えたぶんの古い Trap を捨てる
+        self._trim_traps()
+
     def _on_trap_receiver_started(self):
         """Trap受信開始時の処理"""
         print("[SNMPPanel] Trap受信が正常に開始されました")
