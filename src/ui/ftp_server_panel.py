@@ -63,7 +63,17 @@ class FTPServerPanel(QWidget):
         settings_layout.addWidget(self.password_edit, 3, 1)
         self.anonymous_check = QCheckBox("匿名を許可")
         settings_layout.addWidget(self.anonymous_check, 4, 1)
-        settings_layout.addWidget(QLabel("passiveポート範囲:"), 5, 0)
+        # ログインの許可と書き込みの許可を分ける。束ねると、匿名を許した
+        # つもりで誰でもファイルを置き換えられる状態になる。
+        self.anonymous_write_check = QCheckBox("匿名からの書き込みを許可")
+        self.anonymous_write_check.setToolTip(
+            "機器から copy running-config ftp://… で送るときに必要です。\n"
+            "許可すると、資格情報なしでルートディレクトリへファイルを置けます。")
+        settings_layout.addWidget(self.anonymous_write_check, 5, 1)
+        self.anonymous_check.toggled.connect(
+            self.anonymous_write_check.setEnabled)
+        self.anonymous_write_check.setEnabled(self.anonymous_check.isChecked())
+        settings_layout.addWidget(QLabel("passiveポート範囲:"), 6, 0)
         passive_layout = QHBoxLayout()
         self.passive_lo_spin = QSpinBox(); self.passive_lo_spin.setRange(1024, 65535); self.passive_lo_spin.setValue(50100)
         self.passive_hi_spin = QSpinBox(); self.passive_hi_spin.setRange(1024, 65535); self.passive_hi_spin.setValue(50150)
@@ -71,12 +81,13 @@ class FTPServerPanel(QWidget):
         passive_layout.addWidget(QLabel("-"))
         passive_layout.addWidget(self.passive_hi_spin)
         passive_layout.addStretch()
-        settings_layout.addLayout(passive_layout, 5, 1)
+        settings_layout.addLayout(passive_layout, 6, 1)
         settings_group.setLayout(settings_layout)
         layout.addWidget(settings_group)
         # 起動中に無効化する入力群
         self._inputs = [self.port_spin, self.root_dir_edit, self.username_edit, self.password_edit,
-            self.anonymous_check, self.passive_lo_spin, self.passive_hi_spin]
+            self.anonymous_check, self.anonymous_write_check,
+            self.passive_lo_spin, self.passive_hi_spin]
         # 制御ボタン
         button_layout = QHBoxLayout()
         self.start_btn = QPushButton("▶ サーバー起動")
@@ -155,7 +166,15 @@ class FTPServerPanel(QWidget):
         if settings.get("port"): self.port_spin.setValue(settings["port"])
         if settings.get("username"): self.username_edit.setText(settings["username"])
         if settings.get("password"): self.password_edit.setText(settings["password"])
-        self.anonymous_check.setChecked(bool(settings.get("anonymous", False)))
+        anonymous = bool(settings.get("anonymous", False))
+        self.anonymous_check.setChecked(anonymous)
+        # 書き込みの可否を持っていない古い設定は、これまでどおり
+        # 書き込みを許した状態で読む。黙って読み取り専用にすると、
+        # 機器からのアップロードがある日から通らなくなる。
+        # 新規（匿名も未設定）は許可しない側から始める。
+        self.anonymous_write_check.setChecked(
+            bool(settings.get("anonymous_write", anonymous)))
+        self.anonymous_write_check.setEnabled(anonymous)
         if settings.get("passive_low"): self.passive_lo_spin.setValue(settings["passive_low"])
         if settings.get("passive_high"): self.passive_hi_spin.setValue(settings["passive_high"])
 
@@ -172,6 +191,7 @@ class FTPServerPanel(QWidget):
         username = self.username_edit.text().strip()
         password = self.password_edit.text().strip()
         anonymous = self.anonymous_check.isChecked()
+        anonymous_write = anonymous and self.anonymous_write_check.isChecked()
         lo = self.passive_lo_spin.value()
         hi = self.passive_hi_spin.value()
         if not root_dir:
@@ -182,8 +202,10 @@ class FTPServerPanel(QWidget):
             return
         # 起動前に設定を保存してからサーバーを起動
         self.config_manager.set_server_settings("ftp_server", {"root_directory": root_dir, "port": port,
-            "username": username, "password": password, "anonymous": anonymous, "passive_low": lo, "passive_high": hi})
-        success = self.ftp_server.start(port, root_dir, username, password, anonymous=anonymous, passive_ports=(lo, hi))
+            "username": username, "password": password, "anonymous": anonymous,
+            "anonymous_write": anonymous_write, "passive_low": lo, "passive_high": hi})
+        success = self.ftp_server.start(port, root_dir, username, password, anonymous=anonymous,
+                                        passive_ports=(lo, hi), anonymous_write=anonymous_write)
         if not success:
             return  # エラーはシグナルで通知される
         self.start_btn.setVisible(False); self.stop_btn.setVisible(True)
