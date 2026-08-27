@@ -379,6 +379,9 @@ class TerminalWidget(QWidget):
         # タブウィジェット
         self.tab_widget = QTabWidget()
         self.tab_widget.setTabsClosable(True)
+        # 横ドラッグで並べ替えられる。機器の対応付けはタブ名と
+        # ウィジェットで持っていて、位置には依存しない
+        self.tab_widget.setMovable(True)
         self.tab_widget.tabCloseRequested.connect(self._close_tab)
         self.tab_widget.currentChanged.connect(self._on_current_tab_changed)
         
