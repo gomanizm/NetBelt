@@ -137,32 +137,54 @@ class DeviceDialog(QDialog):
         self.password_edit.setText(self.device_data.get("password", ""))
         self.ssh_key_edit.setText(self.device_data.get("ssh_key", ""))
         
-        # プロトコル設定
+        # プロトコル設定。コンボの初期選択は index 0 の "ssh" なので、
+        # 保存値が telnet / console のときだけ currentTextChanged が発火し、
+        # 既定ポートで上書きされていた（telnet 2323 が 23 に戻る）。
+        # 信号を止めるだけでは秘密鍵欄の有効/無効まで飛ぶので、
+        # UI の同期は明示的に呼ぶ。
         protocol = self.device_data.get("protocol", "ssh")
         index = self.protocol_combo.findText(protocol)
         if index >= 0:
+            self.protocol_combo.blockSignals(True)
             self.protocol_combo.setCurrentIndex(index)
+            self.protocol_combo.blockSignals(False)
+        self._sync_protocol_ui(self.protocol_combo.currentText())
         
         # マクロ読み込み
         for macro in self.device_data.get("macros", []):
             self.macro_list.addItem(macro.get("name", ""))
     
     def _on_protocol_changed(self, protocol: str):
-        """プロトコル変更時の処理"""
+        """プロトコルを選び直したときの処理（利用者の操作）"""
+        self._sync_protocol_ui(protocol)
+        self._apply_default_port(protocol)
+
+    def _sync_protocol_ui(self, protocol: str):
+        """プロトコルに合わせて入力欄の見た目を揃える（入力値は変えない）
+
+        保存済みの機器を読み込むときにも呼ぶ。ここでポート欄を触ると、
+        保存されている値が既定値で上書きされてしまう。
+        """
         # SSHの場合のみ秘密鍵フィールドを有効化
         is_ssh = protocol == "ssh"
         self.ssh_key_edit.setEnabled(is_ssh)
         self.ssh_key_btn.setEnabled(is_ssh)
         self.ssh_key_label.setEnabled(is_ssh)
-        
-        # デフォルトポート設定
+
+        if protocol == "console":
+            self.host_edit.setPlaceholderText("例: COM1 または /dev/ttyUSB0")
+
+    def _apply_default_port(self, protocol: str):
+        """そのプロトコルの既定ポートを入れる
+
+        利用者が自分で選び直したときだけ呼ぶ。読み込みでは呼ばない。
+        """
         if protocol == "ssh":
             self.port_edit.setText("22")
         elif protocol == "telnet":
             self.port_edit.setText("23")
         elif protocol == "console":
             self.port_edit.setText("")
-            self.host_edit.setPlaceholderText("例: COM1 または /dev/ttyUSB0")
     
     def _browse_ssh_key(self):
         """SSH秘密鍵ファイルを参照"""
