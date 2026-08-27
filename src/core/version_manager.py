@@ -24,7 +24,13 @@ class VersionManager:
     """バージョン管理とアップデート機能を提供するクラス"""
     
     CURRENT_VERSION = __version__
-    GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+    # 1回で複数世代ぶんを取る。/releases/latest だと最新1件しか返らず、
+    # 何世代か飛ばしている利用者へ「その間に何が変わったか」を出せない。
+    # 一覧なら要求は同じ1回のままで、下書きと事前公開は自分で除ける。
+    GITHUB_API_URL = (
+        f"https://api.github.com/repos/{GITHUB_REPO}/releases?per_page=10")
+    # 通知に載せる世代数の上限。全部並べると読まれない
+    MAX_NOTES_GENERATIONS = 5
     UPDATE_DIR = os.path.join(tempfile.gettempdir(), f"{APP_NAME}Updates")
     
     def __init__(self, github_token: Optional[str] = None):
@@ -82,6 +88,63 @@ class VersionManager:
         
         return 0
     
+    @staticmethod
+    def _published(payload) -> list:
+        """公開済みのリリースだけを、新しい順で返す。
+
+        一覧には下書きと事前公開も混ざる。並び順は GitHub が新しい順で
+        返すが、当てにせず版で並べ直す。
+        """
+        if isinstance(payload, dict):       # 単一リリースを渡された場合
+            payload = [payload]
+        if not isinstance(payload, list):
+            return []
+        published = [r for r in payload
+                     if isinstance(r, dict)
+                     and not r.get('draft') and not r.get('prerelease')
+                     and r.get('tag_name')]
+        return sorted(
+            published,
+            key=lambda r: VersionManager._version_key(
+                r.get('tag_name', '').lstrip('v')),
+            reverse=True)
+
+    @staticmethod
+    def _version_key(version: str) -> tuple:
+        """並べ替え用に版を数値の組へ。読めない部分は 0 として扱う。"""
+        parts = []
+        for chunk in str(version).split('.')[:4]:
+            digits = ''.join(c for c in chunk if c.isdigit())
+            parts.append(int(digits) if digits else 0)
+        while len(parts) < 4:
+            parts.append(0)
+        return tuple(parts)
+
+    def collect_notes(self, releases: list) -> str:
+        """いま入っている版より新しいリリースの内容を、まとめて返す。
+
+        リリースノートに README や告知しか無いと、利用者は何が変わったのか
+        分からない。何世代か飛ばしている場合は、その間のぶんも並べる。
+        多すぎると読まれないので上限を設ける。
+        """
+        newer = [r for r in releases
+                 if self.compare_versions(
+                     self.CURRENT_VERSION,
+                     r.get('tag_name', '').lstrip('v')) < 0]
+        if not newer:
+            return releases[0].get('body', '') if releases else ''
+
+        shown = newer[:self.MAX_NOTES_GENERATIONS]
+        blocks = []
+        for release in shown:
+            version = release.get('tag_name', '').lstrip('v')
+            body = (release.get('body') or '').strip()
+            blocks.append("# v%s\n\n%s" % (version, body or '(内容なし)'))
+        if len(newer) > len(shown):
+            blocks.append("（さらに古い %d 世代ぶんは省略しました）"
+                          % (len(newer) - len(shown)))
+        return "\n\n---\n\n".join(blocks)
+
     def check_for_updates(self, timeout: int = 10) -> Optional[Dict]:
         """
         GitHubから最新バージョンを確認
@@ -107,9 +170,13 @@ class VersionManager:
             
             response = requests.get(self.GITHUB_API_URL, headers=headers, timeout=timeout)
             response.raise_for_status()
-            
-            data = response.json()
-            
+
+            payload = response.json()
+            releases = self._published(payload)
+            if not releases:
+                return None
+            data = releases[0]
+
             # 最新バージョンを取得
             latest_version = data.get('tag_name', '').lstrip('v')
             
@@ -146,7 +213,7 @@ class VersionManager:
             return {
                 'available': is_newer,
                 'version': latest_version,
-                'release_notes': data.get('body', ''),
+                'release_notes': self.collect_notes(releases),
                 'download_url': download_url,
                 'sha256_url': sha256_url,
                 'published_at': data.get('published_at', '')
