@@ -42,6 +42,10 @@ class InteractiveTerminal(QTextEdit):
         self._is_recording = False  # ログ記録中フラグ
         self._macro_list = []  # 利用可能なマクロリスト
         self._keepalive_active = False  # キープアライブ動作中フラグ
+        # まだ送り切っていない貼り付け。まとめて送ると GUI が止まるので、
+        # 区切りごとにイベントループへ譲りながら流す
+        self._send_queue = []
+        self._sending = False
     
     def set_keepalive_status(self, active: bool):
         """キープアライブの状態を設定"""
@@ -94,22 +98,57 @@ class InteractiveTerminal(QTextEdit):
         """
         if not text or not self.can_send_input():
             return False
+        # 改行は端末と同じく CR で送る
+        payload = text.replace('\r\n', '\r').replace('\n', '\r')
         # アプリが ESC[?2004h を送ってきていたら、貼り付けを目印で
         # 包む (xterm のブラケットペースト)。bash はこれで貼り付けを
         # 即実行せず 1 かたまりの編集として扱える
         screen = getattr(self, "_screen", None)
-        bracketed = screen is not None and screen.bracketed_paste
-        if bracketed:
-            self.key_pressed.emit("\x1b[200~")
-        # 1文字ずつ送る。改行は端末と同じく CR で送る
-        for char in text:
-            if char == '\n' or char == '\r':
-                self.key_pressed.emit('\r')
-            else:
-                self.key_pressed.emit(char)
-        if bracketed:
-            self.key_pressed.emit("\x1b[201~")
+        if screen is not None and screen.bracketed_paste:
+            payload = "\x1b[200~" + payload + "\x1b[201~"
+        self._send_queue.append(payload)
+        if not self._sending:
+            self._drain_send_queue()
         return True
+
+    # 1回に送り出す文字数。大きすぎると譲る間隔が空き、小さすぎると
+    # 往復が増える。設定 100 行ぶんがおよそ 2,000 文字なので、
+    # その規模なら数回で終わる。
+    SEND_CHUNK = 512
+
+    def _drain_send_queue(self):
+        """溜めた送信を、区切りごとにイベントループへ譲りながら流す。
+
+        以前は貼り付けを 1 文字ずつ emit していた。受け口は同一スレッドの
+        send_command へ直結（DirectConnection）なので、文字数ぶんの同期
+        送信が GUI スレッドで回り、その間は再描画も操作も通らなかった。
+
+        送信そのものにかかる時間は非同期にしても縮まらない。縮められるのは
+        「その間 GUI が息をするか」なので、まとめて送りつつ間で譲る。
+
+        最初のひと区切りはその場で送る。短い貼り付けの振る舞いを変えない
+        ため（呼んだ直後に送信済みであることを前提にしている箇所がある）。
+        """
+        from PyQt6.QtCore import QTimer
+
+        if not self._send_queue:
+            self._sending = False
+            return
+
+        self._sending = True
+        payload = self._send_queue[0]
+        chunk, rest = payload[:self.SEND_CHUNK], payload[self.SEND_CHUNK:]
+        if rest:
+            self._send_queue[0] = rest
+        else:
+            self._send_queue.pop(0)
+
+        self.key_pressed.emit(chunk)
+
+        if self._send_queue:
+            QTimer.singleShot(0, self._drain_send_queue)
+        else:
+            self._sending = False
 
     def custom_paste(self):
         """カスタムペースト機能 - ペーストされたテキストをSSHセッションに送信"""

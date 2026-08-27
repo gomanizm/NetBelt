@@ -249,7 +249,10 @@ class SSHConnection(QObject):
         try:
             # キー入力をそのまま送信（改行は追加しない）
             # InteractiveTerminalからEnterキーは'\r'として送られてくる
-            self.channel.send(command.encode('utf-8'))
+            # send は送れたバイト数を返すだけで、渡した全部を送ったとは
+            # 限らない。1文字ずつ送っていた頃はまず起きなかったが、
+            # 貼り付けをまとめて渡すようになったので取りこぼしうる。
+            self.channel.sendall(command.encode('utf-8'))
         except Exception as e:
             self.error_occurred.emit(f"送信エラー: {str(e)}")
 

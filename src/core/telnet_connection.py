@@ -119,7 +119,10 @@ class TelnetConnection(QObject):
         try:
             # キー入力をそのまま送信
             # Enterキーは'\r'として送られてくる
-            self.socket.send(command.encode('utf-8'))
+            # send は送れたバイト数を返すだけで、渡した全部を送ったとは
+            # 限らない。貼り付けをまとめて渡すようになったので、
+            # 残りを送り切る sendall を使う。
+            self.socket.sendall(command.encode('utf-8'))
         except socket.error as e:
             self.error_occurred.emit(f"送信エラー: {str(e)}")
             if self.is_connected:
