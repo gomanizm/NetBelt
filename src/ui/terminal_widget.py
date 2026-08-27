@@ -126,7 +126,30 @@ class InteractiveTerminal(QTextEdit):
         """
         if source.hasText():
             self.send_text(source.text())
-    
+
+    def inputMethodEvent(self, event):
+        """IME の入力を機器送信へ振り替える
+
+        日本語入力の確定文字列は keyPressEvent ではなくこちらへ来る。
+        受けずに既定動作へ流すと、QTextEdit が確定文字を文書へ直接挿入し、
+        機器が受け取っていない文字が入力済みに見える。さらに範囲選択が
+        あると選択範囲を置換するので、履歴を選んだまま確定すると機器の
+        出力がその場で書き換わる。画面領域しか描き直さないため復元されず、
+        文書を読む全ログ保存にも壊れたまま残る。
+
+        変換中の未確定文字列（preedit）は機器へ送らず、画面にも出さない。
+        端末の面は機器の出力を写したものなので、割り込ませると描画とずれる。
+
+        送れる状態かどうかは can_send_input() が見る。keyPressEvent の
+        早期 return はこの経路には効かないので、ここでも通す必要がある。
+        貼り付けではないため、ブラケットペーストの目印では包まない。
+        """
+        event.accept()
+        commit = event.commitString()
+        if commit and self.can_send_input():
+            self.key_pressed.emit(commit)
+
+
     def set_macro_list(self, macros: list):
         """
         利用可能なマクロリストを設定
