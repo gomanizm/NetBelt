@@ -94,10 +94,27 @@ class SSHConnection(QObject):
                     "確認してください。%s" % (self.username, note))
         return "認証失敗: ユーザー名またはパスワードが間違っています"
 
+    def _fail(self, message: str) -> bool:
+        """接続に失敗したときの後始末と通知
+
+        paramiko の SSHClient.connect() は失敗しても自分ではトランスポートを
+        閉じない。閉じずに戻ると、機器へ張った TCP セッションと Transport
+        スレッドが生き残る。呼び出し側も失敗時は disconnect() を呼ばないので、
+        SSHConnection を捨てても Transport スレッド自身がオブジェクトを
+        参照し続け、GC でも回収されない。
+
+        機器側は認証前のログイン猶予（Cisco IOS の ip ssh time-out、
+        OpenSSH の LoginGraceTime、いずれも既定 120 秒）でいずれ切るが、
+        invoke_shell の失敗は認証が通ったあとなので猶予が効かない。
+        """
+        self.dispose()
+        self.error_occurred.emit(message)
+        return False
+
     def connect(self) -> bool:
         """
         SSH接続を開始
-        
+
         Returns:
             bool: 接続成功時True
         """
@@ -143,14 +160,12 @@ class SSHConnection(QObject):
                         # 集めた理由を捨てない。特にパスフレーズ付きの鍵は
                         # 「対応する鍵タイプが無い」と出ると原因が分からない。
                         if needs_passphrase:
-                            self.error_occurred.emit(
+                            return self._fail(
                                 "秘密鍵の読み込みエラー: この鍵はパスフレーズで保護されています。"
                                 "パスフレーズ無しの鍵を指定してください。")
-                        else:
-                            self.error_occurred.emit(
-                                "秘密鍵の読み込みエラー: 対応する鍵タイプが見つかりません。\n"
-                                + "\n".join(key_errors))
-                        return False
+                        return self._fail(
+                            "秘密鍵の読み込みエラー: 対応する鍵タイプが見つかりません。\n"
+                            + "\n".join(key_errors))
 
                     connect_kwargs['pkey'] = key
                     # 指定された鍵だけを使う。True にすると、その鍵が拒否された
@@ -158,13 +173,11 @@ class SSHConnection(QObject):
                     # 意図したのと違う身元で接続することになる。
                     connect_kwargs['look_for_keys'] = False
                 except Exception as e:
-                    self.error_occurred.emit(f"秘密鍵の読み込みエラー: {str(e)}")
-                    return False
+                    return self._fail(f"秘密鍵の読み込みエラー: {str(e)}")
             elif self.password:
                 connect_kwargs['password'] = self.password
             else:
-                self.error_occurred.emit("パスワードまたは秘密鍵が必要です")
-                return False
+                return self._fail("パスワードまたは秘密鍵が必要です")
             
             # SSH接続を実行
             self.client.connect(**connect_kwargs)
@@ -185,20 +198,16 @@ class SSHConnection(QObject):
             return True
             
         except paramiko.AuthenticationException:
-            self.error_occurred.emit(self._auth_failure_message())
-            return False
+            return self._fail(self._auth_failure_message())
         except paramiko.BadHostKeyException:
-            self.error_occurred.emit(
+            return self._fail(
                 "ホストキーが変更されています(中間者攻撃の可能性)。"
                 "意図的な変更の場合は ~/.netbelt/known_hosts の該当ホスト行を削除してください。"
             )
-            return False
         except paramiko.SSHException as e:
-            self.error_occurred.emit(f"SSH接続エラー: {str(e)}")
-            return False
+            return self._fail(f"SSH接続エラー: {str(e)}")
         except Exception as e:
-            self.error_occurred.emit(f"接続エラー: {str(e)}")
-            return False
+            return self._fail(f"接続エラー: {str(e)}")
     
     def dispose(self):
         """チャネルと SSHClient を閉じて資源を手放す（通知は出さない）
