@@ -14,6 +14,7 @@ ModuleNotFoundError になる。conftest は pytest が必ず import できる�
 """
 import os
 import socket
+import sys
 import threading
 
 import pytest
@@ -50,6 +51,43 @@ def qapp():
     if leftovers:
         print("\n[conftest] 終了時に非デーモンスレッドが残っています: %s"
               % ", ".join(t.name for t in leftovers))
+
+
+@pytest.fixture(autouse=True)
+def no_startup_update_check():
+    """テスト中は起動時の更新チェックを走らせない。
+
+    MainWindow() を組むと _check_for_updates_on_startup が走る。これは
+    config.json の update_settings.check_on_startup（既定 True）だけを見て、
+    バックグラウンドスレッドで api.github.com へ問い合わせ、トークンが
+    あれば（環境変数 GITHUB_TOKEN か config.json）Authorization ヘッダに
+    載せて送る。テストは MainWindow を何度も組むので、pytest を1回回す
+    だけで外部への HTTPS が何度も飛ぶ。
+
+    さらに _check_pending_updates は %TEMP% に検証済みで現行版より新しい
+    ZIP があるとモーダルを出す。offscreen では閉じる相手がいないので、
+    そういう端末ではテストが止まる。
+
+    個々のテストが自分でパッチする形だと、書き忘れたファイルから漏れる
+    （実際、複数のファイルで抜けていた）。ここで一律に止める。
+    自分でパッチしているテストは、その上に重ねてかかるだけで影響しない。
+    """
+    import os
+    from unittest import mock
+
+    src = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "src")
+    if src not in sys.path:
+        sys.path.insert(0, src)
+    try:
+        from ui.main_window import MainWindow
+    except Exception:
+        # PyQt を使わないテストでは import できなくてよい
+        yield
+        return
+
+    with mock.patch.object(MainWindow, "_check_for_updates_on_startup"):
+        yield
 
 
 def free_udp_port():
