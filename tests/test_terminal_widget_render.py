@@ -145,6 +145,23 @@ class ResizeKeepsContentTest(WidgetRenderTest):
             w._apply_grid_size("dev")
         self.assertEqual(self.screen_text(w).rstrip("\n"), before)
 
+    def test_a_wrapped_line_rejoins_without_a_gap(self):
+        """折り返した行が履歴へ入るとき、隙間なく繋がること。
+
+        実機試験で、窓を広げてから流すと鍵の途中に空白の塊が
+        入ると報告された。広げたときに折り返し行を埋めていたのが原因。
+        """
+        line = "x" * 100
+        w = self.widget(24, 73)
+        w.append_output("dev", line + "\r\n")
+        w._grid_size = lambda t: (24, 120)
+        w._apply_grid_size("dev")
+        w.append_output("dev", "\r\n".join("f-%02d" % i for i in range(30)))
+
+        found = [l for l in self.screen_text(w).split("\n")
+                 if l.startswith("x")]
+        self.assertEqual(found, [line])
+
     def test_a_narrow_spell_loses_no_characters(self):
         """狭い窓で出た行は、折り返しはそのままでも欠けないこと。
 

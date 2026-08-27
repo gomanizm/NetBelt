@@ -400,6 +400,37 @@ class ResizeTest(unittest.TestCase):
         s.set_size(24, 120)
         self.assertEqual(s.text()[0], line)
 
+    def test_widening_does_not_pad_a_wrapped_line(self):
+        """折り返し行を、広げたときに空白で埋めないこと。
+
+        行の長さがそのまま「どこで折り返したか」なので、埋めると
+        繋いだときに埋め草ぶんの隙間が開く。実機試験で、窓を広げると
+        鍵の途中に空白が入ると報告された。
+        """
+        line = "x" * 100
+        s = Screen(24, 73)
+        feed(s, line)
+        self.assertTrue(s.wrapped[0])
+        s.set_size(24, 120)
+        self.assertEqual(len(s.lines[0]), 73, "折り返し行が埋められた")
+        joined = ("".join(c[0] for c in s.lines[0])
+                  + "".join(c[0] for c in s.lines[1]).rstrip())
+        self.assertEqual(joined, line)
+
+    def test_a_short_line_is_still_padded(self):
+        """折り返していない行は、これまでどおり広げること。"""
+        s = feed(Screen(24, 40), "short")
+        s.set_size(24, 100)
+        self.assertEqual(len(s.lines[0]), 100)
+
+    def test_writing_past_the_end_of_a_wrapped_line_still_works(self):
+        """埋めていない行の先へ書いても落ちないこと。"""
+        s = Screen(24, 40)
+        feed(s, "y" * 60)               # row0 は 40 セルのまま折り返す
+        s.set_size(24, 100)
+        feed(s, "\x1b[1;90HZ")          # 90 桁目へ書く
+        self.assertEqual(s.text()[0][89], "Z")
+
     def test_a_real_line_break_is_never_joined(self):
         """機器が送った改行は、広げても繋がないこと。"""
         s = Screen(24, 40)

@@ -133,9 +133,14 @@ class Screen(object):
         """
         if (rows, cols) == (self.rows, self.cols) or rows < 1 or cols < 1:
             return
-        for line in self.lines + self._other:
-            if len(line) < cols:
-                line.extend([BLANK] * (cols - len(line)))
+        # 折り返しで次へ続く行は埋めない。行の長さがそのまま「どこで
+        # 折り返したか」なので、埋めると繋いだときに埋め草ぶんの隙間が
+        # 開く (窓を広げると鍵の途中に空白が入る、として報告された)
+        for lines, marks in ((self.lines, self.wrapped),
+                             (self._other, self._other_wrapped)):
+            for r, line in enumerate(lines):
+                if len(line) < cols and not (r < len(marks) and marks[r]):
+                    line.extend([BLANK] * (cols - len(line)))
 
         # メイン画面は記録なので、あふれたら履歴へ送る。代替画面
         # (vi 等) はアプリが描き直すので、切っても構わない
@@ -194,6 +199,9 @@ class Screen(object):
             if self._g[self._charset] == "0":
                 ch = DEC_GRAPHICS.get(ch, ch)
             line = self.lines[self.cursor_row]
+            if self.cursor_col >= len(line):
+                # 折り返し行は埋めていないので、書くときに伸ばす
+                line.extend([BLANK] * (self.cursor_col + 1 - len(line)))
             line[self.cursor_col] = (ch, self.attr)
             self.dirty.add(self.cursor_row)
             if self.cursor_col + 1 < self.cols:
