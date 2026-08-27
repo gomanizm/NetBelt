@@ -113,5 +113,44 @@ class ReleaseSelectionTest(unittest.TestCase):
         self.assertFalse(info["available"])
 
 
+class DialogDisplayTest(unittest.TestCase):
+    """通知として実際に何が見えるか。"""
+
+    @classmethod
+    def setUpClass(cls):
+        import os
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PyQt6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    def shown(self, releases, current="1.1.0"):
+        from ui.dialogs.update_dialog import UpdateDialog
+        info = check(releases, current=current)
+        # ダイアログを変数で持つ。手放すと Qt 側が中身ごと片付けてしまう
+        self.dialog = UpdateDialog(None, info)
+        return self.dialog.notes_text.toPlainText()
+
+    def test_every_skipped_version_reaches_the_dialog(self):
+        text = self.shown([release("1.3.0", "### 追加\n- 機能C"),
+                           release("1.2.0", "### 追加\n- 機能B"),
+                           release("1.1.1", "### 修正\n- 不具合A")])
+        for word in ("1.3.0", "機能C", "1.2.0", "機能B", "1.1.1", "不具合A"):
+            self.assertIn(word, text)
+
+    def test_markdown_is_rendered_not_shown_as_symbols(self):
+        """見出しや箇条書きの記号が、そのまま並ばないこと。"""
+        text = self.shown([release("1.3.0", "### 追加\n- 機能C")])
+        self.assertNotIn("###", text)
+        self.assertNotIn("# v1.3.0", text)
+        self.assertIn("機能C", text)
+
+    def test_an_empty_body_does_not_leave_the_box_blank(self):
+        from ui.dialogs.update_dialog import UpdateDialog
+        info = check([release("1.3.0", "")], current="1.1.0")
+        info["release_notes"] = ""
+        self.dialog = UpdateDialog(None, info)
+        self.assertIn("ありません", self.dialog.notes_text.toPlainText())
+
+
 if __name__ == "__main__":
     unittest.main()
