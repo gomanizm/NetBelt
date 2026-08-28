@@ -5,15 +5,15 @@ TFTP と FTP は「自動設定しない（3CDaemon 方式）」を明示的に�
 初回プロンプトか既存ルールに委ね、通らない環境のために手動ボタン
 （fix_firewall）を残してある。
 
-Syslog と SFTP サーバだけがこの方針から取り残されていた。待受のたびに
-ensure_inbound_allow を無条件に呼ぶため、
+Syslog・SFTP サーバ・SNMP Trap 受信だけがこの方針から取り残されていた。
+待受のたびに ensure_inbound_allow を無条件に呼ぶため、
 
   - 「受信開始」を押しただけで UAC が出る
   - 作られるルールはポート番号入りの名前で恒久登録され、停止処理にも
     どこにも削除が無いので、ポートを変えて使うたび残骸が増える
   - 同じ操作でも TFTP/FTP ではルールが作られず、挙動が一貫しない
 
-4つのサーバで揃える。
+待ち受ける5つ（FTP / TFTP / Syslog / SFTP / SNMP Trap）で揃える。
 """
 import os
 import socket
@@ -68,6 +68,7 @@ class FirewallPolicyTest(unittest.TestCase):
         self.assertTrue(receiver.start_protocol("UDP", 0))
 
         self.allow.assert_not_called()
+        self.allow_program.assert_not_called()
 
     def test_starting_the_sftp_server_does_not_touch_the_firewall(self):
         from core.sftp_server import SFTPServerManager
@@ -79,6 +80,7 @@ class FirewallPolicyTest(unittest.TestCase):
                                      username="netbelt", password="pw"))
 
         self.allow.assert_not_called()
+        self.allow_program.assert_not_called()
 
     def test_starting_tftp_still_does_not_touch_the_firewall(self):
         """既に方針どおりのものは、そのままであること。"""
@@ -90,6 +92,7 @@ class FirewallPolicyTest(unittest.TestCase):
         self.assertTrue(server.start(port=0, root_dir=root))
 
         self.allow.assert_not_called()
+        self.allow_program.assert_not_called()
 
     def test_starting_the_trap_receiver_does_not_touch_the_firewall(self):
         """Trap 受信も待ち受ける側なので、同じ扱いにすること。"""
@@ -100,6 +103,7 @@ class FirewallPolicyTest(unittest.TestCase):
         manager.start_trap_receiver(port=free_udp_port(), communities=["public"])
 
         self.allow.assert_not_called()
+        self.allow_program.assert_not_called()
 
     # --- 手動で直す口があること ---
 
@@ -115,6 +119,8 @@ class FirewallPolicyTest(unittest.TestCase):
 
         self.assertTrue(self.allow.called,
                         "手動でも受信許可を足せない")
+        self.assertTrue(self.allow_program.called,
+                        "自exe の許可を足していない")
 
     def test_the_sftp_server_can_fix_the_firewall_by_hand(self):
         from core.sftp_server import SFTPServerManager
@@ -128,6 +134,7 @@ class FirewallPolicyTest(unittest.TestCase):
         server.fix_firewall(port=port)
 
         self.assertTrue(self.allow.called, "手動でも受信許可を足せない")
+        self.assertTrue(self.allow_program.called, "自exe の許可を足していない")
 
     def test_the_trap_receiver_can_fix_the_firewall_by_hand(self):
         from core.snmp_manager import SNMPManager
@@ -140,6 +147,7 @@ class FirewallPolicyTest(unittest.TestCase):
         manager.fix_firewall(port=port)
 
         self.assertTrue(self.allow.called, "手動でも受信許可を足せない")
+        self.assertTrue(self.allow_program.called, "自exe の許可を足していない")
 
     # --- 4つのパネルで揃っていること ---
 

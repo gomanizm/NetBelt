@@ -110,6 +110,24 @@ class SyslogTcpLineLimitTest(unittest.TestCase):
             "切ったことがどこにも残っていない: %s"
             % [m.message[:60] for m in self.seen])
 
+    def test_an_overlong_line_that_arrives_complete_is_also_refused(self):
+        """上限超過と改行が同じ受信で来ても、受理しないこと。
+
+        判定を「改行がまだ来ていないとき」に限ると、上限を超えた行が
+        終端の改行ごと 1 回の recv で届いた場合に素通りする。長さの上限を
+        設けた意図（1 行にいくらでも積ませない）を満たさない。
+        """
+        limit = self.recv.max_line_bytes
+        c = self._client()
+        c.sendall(b"<134>" + b"A" * (limit + 1000) + b"\n")
+
+        self.assertTrue(
+            self._wait(lambda: any("切断" in m.message for m in self.seen)),
+            "終端付きの長すぎる行がそのまま受理されている")
+        self.assertFalse(
+            any(len(m.message) > limit for m in self.seen),
+            "上限を超えた行が一覧へ入っている")
+
     def test_a_normal_line_still_arrives(self):
         """通常のメッセージはこれまでどおり受け取ること。"""
         c = self._client()

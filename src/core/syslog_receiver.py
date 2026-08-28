@@ -379,17 +379,24 @@ class SyslogReceiver(QObject):
                     if not data:
                         break
                     buffer += data
-                    # 改行が来ないまま上限を超えたら、その相手との接続を
-                    # 切る。黙って切り捨てると障害解析に要る末尾を失うので、
-                    # 切ったことは記録に残す。
-                    if b"\n" not in buffer and len(buffer) > self.max_line_bytes:
+                    # いま組み立てている 1 行が上限を超えたら、その相手との
+                    # 接続を切る。黙って切り捨てると障害解析に要る末尾を
+                    # 失うので、切ったことは記録に残す。
+                    #
+                    # 「改行がまだ来ていないとき」に限ると、上限を超えた行が
+                    # 終端の改行ごと 1 回の recv で届いた場合に素通りする。
+                    # 見るのは受信バッファ全体ではなく、次の改行までの長さ。
+                    newline_at = buffer.find(b"\n")
+                    current_line = (len(buffer) if newline_at == -1
+                                    else newline_at)
+                    if current_line > self.max_line_bytes:
                         # 一覧に並ぶので、機器からの行と同じ RFC 3164 の形で
                         # 組み立てる。生の文言のまま渡すと、先頭の語が
                         # 日時やホスト名として食われて読めなくなる。
                         # PRI 12 = facility 1 (user) / severity 4 (Warning)
                         self.message_received.emit(SyslogMessage(
-                            "<12>%s NetBelt 改行の無いデータが %d バイトを"
-                            "超えたため、この接続を切断しました"
+                            "<12>%s NetBelt 1行が %d バイトを超えたため、"
+                            "この接続を切断しました"
                             % (datetime.now().strftime("%b %d %H:%M:%S"),
                                self.max_line_bytes),
                             client_ip, "TCP", listen_port))
