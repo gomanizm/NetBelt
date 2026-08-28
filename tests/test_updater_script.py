@@ -423,6 +423,24 @@ class UpdaterEncodingTest(unittest.TestCase):
         self.assertEqual(non_ascii, [],
                          "コードページ確定前に非 ASCII がある: %r" % non_ascii)
 
+    def test_a_failed_self_copy_does_not_fall_back_to_running_in_place(self):
+        """TEMP への写しが作れなかったとき、元の場所で走らないこと。
+
+        更新は展開したファイルをインストール先へ丸ごと上書きするので、
+        元の場所で走ると実行中の自分自身が置き換わる。cmd はバッチを
+        バイト位置で読み進めるため、そこから先が壊れる。TEMP の写しから
+        走るのはそれを避けるための仕組みで、写せなかったときに元の場所へ
+        戻すと、避けたはずの不具合をそのまま呼び戻すことになる。
+
+        写せない状況（TEMP が書けない・空きが無い）は手元で作れないので、
+        「戻す分岐が無いこと」をファイルの形として固定する。
+        """
+        marker = "%TEMP%"
+        self.assertIn(marker, self.text, "TEMP の写しから走る仕組みが無い")
+        head = self.text[:self.text.index("\r\n:run\r\n")]
+        self.assertNotIn('set "RUNNER=!SELF!"', head,
+                         "写しを作れないとき、元の場所で走る分岐が残っている")
+
     def test_the_restart_is_not_judged_by_errorlevel(self):
         """start の戻り値で成否を判定しないこと。
 
@@ -495,6 +513,20 @@ class UpdaterLaunchTest(unittest.TestCase):
                     updater_command(bad, "C:\\tmp\\x.zip", "C:\\app\\NetBelt.exe")
                 self.assertIn("パス", str(caught.exception),
                               "理由が利用者に伝わる文面になっていない")
+
+    def test_an_exclamation_mark_is_refused_before_the_app_quits(self):
+        """`!` も起動前に断ること。
+
+        updater.bat 自身も `!` を検出して中止するが、そのときには
+        呼び出し側が既に QApplication.quit() を呼んでいる。つまり
+        「更新は絶対に当たらないのに、アプリだけ先に終了する」という、
+        利用者から見て一番困る形になる。手前で止める。
+        """
+        from core.version_manager import updater_command
+        with self.assertRaises(ValueError) as caught:
+            updater_command("C:\\Tools\\Wow!\\updater.bat",
+                            "C:\\tmp\\x.zip", "C:\\app\\NetBelt.exe")
+        self.assertIn("パス", str(caught.exception))
 
     def test_the_offending_path_is_named(self):
         """どのパスが原因かを示すこと（3つ渡すので特定できないと困る）。"""

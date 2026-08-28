@@ -42,11 +42,20 @@ rem and the whole sequence can run again. From TEMP the install folder is
 rem only ever written to, never read from.
 set "TMPRUNNER=%TEMP%\NetBeltUpdater_%RANDOM%.bat"
 copy /y "!SELF!" "!TMPRUNNER!" >nul 2>&1
-set "RUNNER=!TMPRUNNER!"
-if not exist "!TMPRUNNER!" set "RUNNER=!SELF!"
+rem No falling back to running in place. The update overwrites every file
+rem in the install folder, this script included, so running from there is
+rem the very fault the copy exists to avoid. Stop instead.
+if not exist "!TMPRUNNER!" goto :nocopy
 rem Deliberately one line: nothing may be read from this file after the
 rem child has replaced it.
-cmd /d /c ""!RUNNER!" "!A1!" "!A2!" --utf8 "!HOME_DIR!"" & set "RC=!errorlevel!" & del "!TMPRUNNER!" >nul 2>&1 & exit /b !RC!
+cmd /d /c ""!TMPRUNNER!" "!A1!" "!A2!" --utf8 "!HOME_DIR!"" & set "RC=!errorlevel!" & del "!TMPRUNNER!" >nul 2>&1 & exit /b !RC!
+
+:nocopy
+echo ERROR: could not copy the updater to TEMP.
+echo   The update has not been applied. Free some space in TEMP, or
+echo   extract the new ZIP over this folder by hand.
+pause
+exit /b 1
 
 :run
 setlocal enabledelayedexpansion

@@ -24,7 +24,11 @@ except ImportError:
 # cmd.exe /c "<コマンドライン>" として起動されるため、外側の引用符が
 # 剥がれた状態で cmd が読み直す。引用符で包んでも意味が変わってしまう。
 # 実測: ^ は黙って消え、%VAR% は展開され、& 以降は別のコマンドとして走る。
-_CMD_UNSAFE = "&^%"
+#
+# ! も入れる。updater.bat 自身も遅延展開と両立しないため中止するが、
+# そのときには呼び出し側が既に QApplication.quit() を呼んでいるので、
+# 「更新は絶対に当たらないのにアプリだけ先に終了する」形になる。
+_CMD_UNSAFE = "&^%!"
 
 
 def updater_command(updater_path: str, zip_path: str, app_path: str) -> str:
