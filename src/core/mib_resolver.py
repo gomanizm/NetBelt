@@ -210,9 +210,13 @@ class MIBResolver:
     # その配下（Trap が実際に運ぶ通知 OID を含む）が丸ごと落ちる。
     _MIB_DEFINITION_PATTERNS = (
         r'(\w+)\s+OBJECT\s+IDENTIFIER\s*::=\s*\{\s*(\w+)\s+(\d+)\s*\}',
-        r'(\w+)\s+OBJECT-TYPE[^:]*::=\s*\{\s*(\w+)\s+(\d+)\s*\}',
-        r'(\w+)\s+NOTIFICATION-TYPE[^:]*::=\s*\{\s*(\w+)\s+(\d+)\s*\}',
-        r'(\w+)\s+MODULE-IDENTITY[^:]*::=\s*\{\s*(\w+)\s+(\d+)\s*\}',
+        # 型キーワードから ::= までは「コロンを含まない並び」ではない。
+        # 実 MIB はほぼ必ず DESCRIPTION を持ち、そこへ RFC 参照や URL を
+        # 書くので、[^:]* にすると本文にコロンが出た時点で定義ごと
+        # 取りこぼす。最短一致で次の ::= { 名前 数字 } まで進める。
+        r'(\w+)\s+OBJECT-TYPE\b.*?::=\s*\{\s*(\w+)\s+(\d+)\s*\}',
+        r'(\w+)\s+NOTIFICATION-TYPE\b.*?::=\s*\{\s*(\w+)\s+(\d+)\s*\}',
+        r'(\w+)\s+MODULE-IDENTITY\b.*?::=\s*\{\s*(\w+)\s+(\d+)\s*\}',
     )
 
     def _extract_mib_definitions(self, filepath: str) -> list:
@@ -235,7 +239,10 @@ class MIBResolver:
             with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
                 content = f.read()
             for pattern in self._MIB_DEFINITION_PATTERNS:
-                for match in re.finditer(pattern, content, re.MULTILINE):
+                # DOTALL が要る。定義は複数行にまたがるので、`.` が改行を
+                # 拾わないと型キーワードから ::= まで届かない
+                for match in re.finditer(pattern, content,
+                                         re.MULTILINE | re.DOTALL):
                     definitions.append(
                         (match.group(1), match.group(2), match.group(3)))
         except Exception as e:

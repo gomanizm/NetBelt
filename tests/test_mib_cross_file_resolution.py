@@ -122,6 +122,40 @@ class MibCrossFileResolutionTest(unittest.TestCase):
                       "MODULE-IDENTITY の配下が丸ごと落ちている")
         self.assertEqual(resolved.get("1.3.6.1.4.1.77777.7.3"), "cTrap")
 
+    def test_a_description_containing_a_colon_does_not_hide_the_definition(self):
+        """DESCRIPTION に `:` があっても定義を拾えること。
+
+        型キーワードから `::=` までを「コロンを含まない並び」として
+        探すと、`DESCRIPTION "Reference: RFC 1234"` や URL のように
+        本文へコロンが入る定義を全部取りこぼす。実 MIB はほぼ必ず
+        DESCRIPTION を持ち、そこに RFC 参照や URL を書くので、
+        これに当たると名前解決はほとんど働かない。
+        """
+        self._write("E-DESC.my",
+                    "eVendor OBJECT IDENTIFIER ::= { enterprises 55555 }\n"
+                    "eTrap NOTIFICATION-TYPE\n"
+                    "    STATUS current\n"
+                    '    DESCRIPTION "Reference: RFC 1234, '
+                    'see http://example.com/mib"\n'
+                    "    ::= { eVendor 9 }\n")
+
+        resolved = self._resolved()
+        self.assertIn("eTrap", set(resolved.values()),
+                      "本文にコロンがある定義を取りこぼしている")
+        self.assertEqual(resolved.get("1.3.6.1.4.1.55555.9"), "eTrap")
+
+    def test_an_object_type_with_a_colon_in_its_description_resolves(self):
+        """OBJECT-TYPE でも同じこと。"""
+        self._write("F-DESC.my",
+                    "fVendor OBJECT IDENTIFIER ::= { enterprises 44444 }\n"
+                    "fName OBJECT-TYPE\n"
+                    "    SYNTAX DisplayString\n"
+                    '    DESCRIPTION "Format: name:value"\n'
+                    "    ::= { fVendor 4 }\n")
+
+        self.assertIn("fName", set(self._resolved().values()),
+                      "本文にコロンがある OBJECT-TYPE を取りこぼしている")
+
     def test_a_definition_with_no_parent_anywhere_is_simply_skipped(self):
         """親がどこにも無い定義で止まらないこと。"""
         self._write("D-ORPHAN.my",
