@@ -125,7 +125,10 @@ pip install -r requirements.txt
 python -m PyInstaller --clean NetBelt.spec
 ```
 
-`dist/NetBelt.exe` が生成されます。
+`dist/NetBelt.exe` が生成されます。`updater.bat` を `dist/` へコピーして、
+exe と同じフォルダに置いたまま配布してください（`build.bat` を使う場合は
+自動でコピーされます）。自動更新は最後にこのスクリプトを exe の隣から
+探すため、無いと更新を適用できません。
 
 ## テスト
 

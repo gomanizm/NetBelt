@@ -22,18 +22,31 @@ python -m PyInstaller --clean NetBelt.spec
 echo.
 
 if exist "dist\NetBelt.exe" (
+    rem exe は自動更新の最後に updater.bat を自分の隣から探す。
+    rem 入れ忘れると、更新を落とせても適用の直前で必ず失敗する。
+    copy /y updater.bat dist\ >nul
+    if errorlevel 1 (
+        echo [3/3] ビルド失敗
+        echo updater.bat を dist へコピーできませんでした。
+        echo 自動更新が動かないため、中止します。
+        pause
+        exit /b 1
+    )
     echo [3/3] ビルド成功！
     echo.
     echo 実行ファイルの場所: dist\NetBelt.exe
+    echo 更新用スクリプト: dist\updater.bat
     echo.
     echo ================================
     echo ビルド完了！
     echo ================================
     echo.
     echo 配布方法:
-    echo 1. dist フォルダ内の NetBelt.exe を他のユーザーに配布してください
-    echo 2. このファイルは単独で動作します（Pythonインストール不要）
-    echo 3. 初回起動時に config.json が自動生成されます
+    echo 1. dist フォルダ内の NetBelt.exe と updater.bat を、同じ
+    echo    フォルダに置いたまま配布してください
+    echo 2. updater.bat が exe の隣に無いと、自動更新が適用されません
+    echo 3. Python のインストールは不要です
+    echo 4. 初回起動時に config.json が自動生成されます
     echo.
 ) else (
     echo [3/3] ビルド失敗
