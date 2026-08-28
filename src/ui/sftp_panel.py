@@ -321,6 +321,29 @@ class SFTPPanel(QWidget):
         """
         return manager is not None and self.sftp_manager is manager
 
+    def _begin(self):
+        """操作を始めた時点の「相手」と「場所」を控える。
+
+        _still_on で相手の同一性は固定できるが、場所は固定できない。
+        ディレクトリ移動も一覧の取得も非同期で、完了時に
+        manager.current_path が書き換わる。ダイアログを閉じたあとで
+        get_current_path() を読み直すと、利用者が選んだのとは別の
+        ディレクトリに対して削除・改名・作成をしてしまう。相手が
+        同じままでも起こるので、_still_on とは別に必要になる。
+
+        Returns:
+            (マネージャ, 開始時点のパス)。繋がっていなければ (None, None)
+        """
+        manager = self.sftp_manager
+        if manager is None:
+            return None, None
+        return manager, manager.get_current_path()
+
+    @staticmethod
+    def _remote_path(base: str, name: str) -> str:
+        """リモートのパスを組み立てる（ルート直下の // を避ける）"""
+        return f"/{name}" if base == "/" else f"{base}/{name}"
+
     def _abandon(self, what: str):
         """接続が変わったので操作を取りやめたことを伝える。
 
@@ -554,7 +577,7 @@ class SFTPPanel(QWidget):
     
     def _on_upload(self):
         """アップロードボタンがクリックされた"""
-        manager = self.sftp_manager
+        manager, base_path = self._begin()
         if not manager:
             return
 
@@ -567,18 +590,22 @@ class SFTPPanel(QWidget):
         )
         
         if file_path:
-            self._upload_with_confirmation(file_path, manager)
+            self._upload_with_confirmation(file_path, manager, base_path)
 
-    def _upload_with_confirmation(self, file_path: str, manager=None):
+    def _upload_with_confirmation(self, file_path: str, manager=None,
+                                  base_path=None):
         """
         上書き確認を挟んでアップロードする
 
         Args:
             file_path: ローカルのファイルパス
             manager: 操作を始めた時点のマネージャ。省略時はいまの接続
+            base_path: 操作を始めた時点のリモートのディレクトリ
         """
         if manager is None:
-            manager = self.sftp_manager
+            manager, base_path = self._begin()
+            if manager is None:
+                return
         name = os.path.basename(file_path)
         confirm = self._get_sftp_setting(
             "confirm_overwrite", self.SFTP_SETTING_DEFAULTS["confirm_overwrite"])
@@ -610,7 +637,10 @@ class SFTPPanel(QWidget):
             self._abandon("アップロード")
             return
         self._pending_upload_names.add(name)
-        manager.upload_file(file_path)
+        # 送り先を明示する。省略すると SFTPManager が呼ばれた時点の
+        # current_path を使うので、確認ダイアログの間にディレクトリが
+        # 変わっていると別の場所へ置いてしまう
+        manager.upload_file(file_path, self._remote_path(base_path, name))
     
     def _on_download(self):
         """ダウンロードボタンがクリックされた"""
@@ -637,7 +667,7 @@ class SFTPPanel(QWidget):
         Args:
             file_info: ファイル情報
         """
-        manager = self.sftp_manager
+        manager, base_path = self._begin()
         if not manager:
             return
 
@@ -658,13 +688,12 @@ class SFTPPanel(QWidget):
             if not self._still_on(manager):
                 self._abandon("ダウンロード")
                 return
-            current_path = manager.get_current_path()
-            remote_path = f"{current_path}/{file_info['name']}" if current_path != "/" else f"/{file_info['name']}"
+            remote_path = self._remote_path(base_path, file_info['name'])
             manager.download_file(remote_path, local_path)
     
     def _on_create_directory(self):
         """新規ディレクトリ作成"""
-        manager = self.sftp_manager
+        manager, base_path = self._begin()
         if not manager:
             return
 
@@ -679,9 +708,7 @@ class SFTPPanel(QWidget):
             if not self._still_on(manager):
                 self._abandon("フォルダの作成")
                 return
-            current_path = manager.get_current_path()
-            new_path = f"{current_path}/{dir_name}" if current_path != "/" else f"/{dir_name}"
-            manager.create_directory(new_path)
+            manager.create_directory(self._remote_path(base_path, dir_name))
     
     def _on_delete(self):
         """削除ボタンがクリックされた"""
@@ -704,7 +731,7 @@ class SFTPPanel(QWidget):
         Args:
             file_info: ファイル情報
         """
-        manager = self.sftp_manager
+        manager, base_path = self._begin()
         if not manager:
             return
 
@@ -724,8 +751,7 @@ class SFTPPanel(QWidget):
         if not self._still_on(manager):
             self._abandon("削除")
             return
-        current_path = manager.get_current_path()
-        item_path = f"{current_path}/{file_info['name']}" if current_path != "/" else f"/{file_info['name']}"
+        item_path = self._remote_path(base_path, file_info['name'])
         manager.delete_item(item_path, file_info['is_dir'])
     
     def _on_rename_selected(self, file_info: dict):
@@ -735,7 +761,7 @@ class SFTPPanel(QWidget):
         Args:
             file_info: ファイル情報
         """
-        manager = self.sftp_manager
+        manager, base_path = self._begin()
         if not manager:
             return
 
@@ -751,10 +777,8 @@ class SFTPPanel(QWidget):
             if not self._still_on(manager):
                 self._abandon("名前の変更")
                 return
-            current_path = manager.get_current_path()
-            old_path = f"{current_path}/{file_info['name']}" if current_path != "/" else f"/{file_info['name']}"
-            new_path = f"{current_path}/{new_name}" if current_path != "/" else f"/{new_name}"
-            manager.rename_item(old_path, new_path)
+            manager.rename_item(self._remote_path(base_path, file_info['name']),
+                                self._remote_path(base_path, new_name))
     
     def _on_chmod_selected(self, file_info: dict):
         """
@@ -763,7 +787,7 @@ class SFTPPanel(QWidget):
         Args:
             file_info: ファイル情報
         """
-        manager = self.sftp_manager
+        manager, base_path = self._begin()
         if not manager:
             return
 
@@ -786,8 +810,7 @@ class SFTPPanel(QWidget):
                 if not self._still_on(manager):
                     self._abandon("パーミッションの変更")
                     return
-                current_path = manager.get_current_path()
-                item_path = f"{current_path}/{file_info['name']}" if current_path != "/" else f"/{file_info['name']}"
+                item_path = self._remote_path(base_path, file_info['name'])
                 manager.change_permissions(item_path, new_mode)
             except ValueError:
                 QMessageBox.warning(self, "入力エラー", "パーミッションは8進数で入力してください（例: 755）")
@@ -809,7 +832,7 @@ class SFTPPanel(QWidget):
         Args:
             event: ドロップイベント
         """
-        manager = self.sftp_manager
+        manager, base_path = self._begin()
         if not manager:
             return
 
@@ -819,7 +842,7 @@ class SFTPPanel(QWidget):
         for url in urls:
             file_path = url.toLocalFile()
             if os.path.isfile(file_path):
-                self._upload_with_confirmation(file_path, manager)
+                self._upload_with_confirmation(file_path, manager, base_path)
     
     @staticmethod
     def _format_size(size: int) -> str:

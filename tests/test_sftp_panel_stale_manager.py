@@ -196,6 +196,49 @@ class SftpPanelStaleManagerTest(unittest.TestCase):
         rtr_a.delete_item.assert_not_called()
         rtr_b.delete_item.assert_not_called()
 
+    # --- 2b. ダイアログ中に、同じ機器のディレクトリが変わった ---
+
+    def test_delete_uses_the_directory_it_started_in(self):
+        """確認の最中にディレクトリが変わっても、選んだ場所を消すこと。
+
+        接続先の同一性だけを固定しても足りない。一覧やディレクトリ移動は
+        バックグラウンドで完了し、そのとき manager.current_path が
+        書き換わる。ダイアログのあとで読み直すと、利用者が選んだのとは
+        別のディレクトリの同名ファイルを消してしまう。
+        """
+        from PyQt6.QtWidgets import QMessageBox
+        from ui import sftp_panel as mod
+        panel, manager = self._panel_with_manager()
+        manager.get_current_path.return_value = "/etc"
+
+        def confirm_then_move_away(*args, **kwargs):
+            # 遅れて届いた一覧が現在地を書き換える
+            manager.get_current_path.return_value = "/var/tmp"
+            return QMessageBox.StandardButton.Yes
+
+        with mock.patch.object(mod.QMessageBox, "question",
+                               side_effect=confirm_then_move_away):
+            panel._on_delete_selected(self._file_info("boot.cfg"))
+
+        manager.delete_item.assert_called_once_with("/etc/boot.cfg", False)
+
+    def test_upload_targets_the_directory_it_started_in(self):
+        """アップロード先も、始めた時点のディレクトリであること。"""
+        from ui import sftp_panel as mod
+        panel, manager = self._panel_with_manager()
+        manager.get_current_path.return_value = "/etc"
+
+        def choose_then_move_away(*args, **kwargs):
+            manager.get_current_path.return_value = "/var/tmp"
+            return ("C:/tmp/new.cfg", "")
+
+        with mock.patch.object(mod.QFileDialog, "getOpenFileName",
+                               side_effect=choose_then_move_away):
+            panel._on_upload()
+
+        manager.upload_file.assert_called_once_with("C:/tmp/new.cfg",
+                                                      "/etc/new.cfg")
+
     # --- 3. 何も起きなければ、これまでどおり動くこと ---
 
     def test_upload_still_happens_when_nothing_changed(self):
@@ -207,7 +250,8 @@ class SftpPanelStaleManagerTest(unittest.TestCase):
                                return_value=("C:/tmp/new.cfg", "")):
             panel._on_upload()
 
-        manager.upload_file.assert_called_once_with("C:/tmp/new.cfg")
+        manager.upload_file.assert_called_once_with("C:/tmp/new.cfg",
+                                                      "/new.cfg")
 
     def test_delete_still_happens_when_nothing_changed(self):
         """接続が変わらなければ、これまでどおり削除すること。"""
