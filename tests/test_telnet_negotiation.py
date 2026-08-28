@@ -120,6 +120,36 @@ class TelnetNegotiationTest(unittest.TestCase):
         self.assertEqual(out, b"Router> show version\r\n")
         self.assertEqual(pending, b"")
 
+    def test_an_oversized_subnegotiation_does_not_leak_its_tail(self):
+        """大きすぎるサブネゴシエーションを捨てたあと、同期が戻ること。
+
+        溜め込みを止めるために持ち越しを空にするだけだと、「いま SB の
+        途中にいる」という状態まで失う。その後に届く本体の続きは通常
+        データとして画面へ流れ、終端の IAC SE だけが 2 バイトコマンドと
+        して消費されるため、以後の解釈もずれる。
+        メモリの上限には効いても、同期の回復になっていない。
+        """
+        conn, _ = self._conn()
+        out, _ = self._feed(
+            conn,
+            bytes([IAC, SB, 24, 0]) + b"X" * (conn.MAX_PENDING_BYTES + 500),
+            b"MOREBODY" + bytes([IAC, SE]) + b"Router>")
+
+        self.assertEqual(out, b"Router>",
+                         "捨てたサブネゴシエーションの続きが画面へ漏れている")
+
+    def test_normal_traffic_resumes_after_an_oversized_subnegotiation(self):
+        """読み飛ばしが終われば、次の交渉にも普通に応答すること。"""
+        conn, sent = self._conn()
+        self._feed(
+            conn,
+            bytes([IAC, SB, 24, 0]) + b"X" * (conn.MAX_PENDING_BYTES + 500),
+            b"tail" + bytes([IAC, SE]),
+            bytes([IAC, DO, ECHO]) + b"Router>")
+
+        self.assertIn(bytes([IAC, WONT, ECHO]), sent,
+                      "読み飛ばしのあと交渉に応答していない: %s" % sent)
+
     def test_a_peer_that_only_sends_iac_does_not_grow_the_buffer(self):
         """壊れた相手が IAC を送り続けても、溜め込み続けないこと。"""
         conn, _ = self._conn()

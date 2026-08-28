@@ -34,6 +34,10 @@ class TelnetConnection(QObject):
         self.password = password
         
         self.socket: Optional[socket.socket] = None
+        # 大きすぎるサブネゴシエーションを捨てた後、その終端 (IAC SE) が
+        # 来るまで読み飛ばし続けるための状態。持ち越しを空にするだけだと
+        # 「いま SB の途中にいる」ことまで忘れ、本体の続きが画面へ漏れる
+        self._discarding_sb = False
         self.is_connected = False
         self._read_thread: Optional[threading.Thread] = None
         self._stop_reading = False
@@ -222,6 +226,17 @@ class TelnetConnection(QObject):
         pending = b''
         i = 0
 
+        # 直前に大きすぎるサブネゴシエーションを捨てていたら、その終端が
+        # 来るまで読み飛ばす。ここで普通のデータとして扱うと、本体の続きが
+        # 画面へ漏れ、終端の IAC SE だけがコマンドとして消費されて
+        # 以後の解釈もずれる。
+        if self._discarding_sb:
+            end = data.find(bytes([IAC, SE]))
+            if end == -1:
+                return b'', b''
+            self._discarding_sb = False
+            data = data[end + 2:]
+
         while i < len(data):
             if data[i] != IAC:
                 # 通常のデータ
@@ -270,8 +285,11 @@ class TelnetConnection(QObject):
                 i += 2
 
         if len(pending) > self.MAX_PENDING_BYTES:
-            # 終端を寄こさない相手。溜め込み続けるより捨てる
+            # 終端を寄こさない相手。溜め込み続けるより捨てる。
+            # ただし SB の途中なら、終端が来るまで読み飛ばす状態を残す。
+            # 空にするだけだと、続きを通常データとして画面へ出してしまう。
             print("[Telnet] 未完の制御シーケンスが大きすぎるため破棄しました")
+            self._discarding_sb = pending[:2] == bytes([IAC, SB])
             pending = b''
 
         return bytes(output), pending
