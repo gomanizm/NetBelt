@@ -110,6 +110,95 @@ class PasteChunkingTest(unittest.TestCase):
         self.assertEqual("".join(sent), "conf t\r")
 
 
+class OrderDuringAPasteTest(unittest.TestCase):
+    """貼り付けの最中に入った入力が、貼り付けを追い越さないこと。
+
+    貼り付けを分割して送るようにしたことで、送っている間もイベント
+    ループが回るようになった。その副作用として、キー入力・IME の確定・
+    機器の問い合わせへの応答が key_pressed を直接叩くと、まだ送り終えて
+    いない貼り付けの残りを追い越して先に届く。
+
+    1文字ずつ同期送信していた頃は GUI が完全に止まっていたため起こり
+    得なかった。CLI では「途中まで貼られた行が先に実行される」
+    「手で打った文字が貼り付け本文の途中へ割り込む」という壊れ方になる。
+
+    送るものは 1 本の列に並べる。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PyQt6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    def _session(self):
+        from ui.terminal_widget import TerminalWidget
+        w = TerminalWidget()
+        w.create_terminal_tab("dev")
+        terminal = w._terminals["dev"]
+        terminal.set_input_enabled(True)
+        sent = []
+        terminal.key_pressed.connect(sent.append)
+        return w, terminal, sent
+
+    def _settle(self, rounds=200):
+        from PyQt6.QtWidgets import QApplication
+        for _ in range(rounds):
+            QApplication.instance().processEvents()
+
+    def test_a_keystroke_during_a_paste_does_not_jump_ahead(self):
+        """貼り付け中に押した Enter が、貼り付けより先に届かないこと。"""
+        from PyQt6.QtCore import Qt, QEvent
+        from PyQt6.QtGui import QKeyEvent
+        _, terminal, sent = self._session()
+        body = "A" * 2000
+
+        terminal.send_text(body)
+        terminal.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress,
+                                         Qt.Key.Key_Return,
+                                         Qt.KeyboardModifier.NoModifier))
+        self._settle()
+
+        joined = "".join(sent)
+        self.assertEqual(joined, body + "\r",
+                         "打鍵が貼り付けを追い越している（CR の位置=%d）"
+                         % joined.find("\r"))
+
+    def test_an_ime_commit_during_a_paste_does_not_jump_ahead(self):
+        """IME の確定も同じ列に並ぶこと。"""
+        from PyQt6.QtGui import QInputMethodEvent
+        _, terminal, sent = self._session()
+        body = "B" * 2000
+
+        terminal.send_text(body)
+        event = QInputMethodEvent()
+        event.setCommitString("あ")
+        terminal.inputMethodEvent(event)
+        self._settle()
+
+        self.assertEqual("".join(sent), body + "あ",
+                         "IME の確定が貼り付けを追い越している")
+
+    def test_a_device_query_answer_does_not_land_inside_a_paste(self):
+        """機器の問い合わせへの応答が、貼り付けの途中に割り込まないこと。
+
+        割り込むと、貼り付けた本文の途中へ制御列が挿し込まれて機器へ
+        届く（機器から見ると設定が壊れる）。
+        """
+        w, terminal, sent = self._session()
+        body = "C" * 2000
+
+        terminal.send_text(body)
+        # 送っている最中に機器がカーソル位置を問い合わせてくる
+        w.append_output("dev", "\x1b[6n")
+        self._settle()
+
+        joined = "".join(sent)
+        self.assertTrue(joined.startswith(body),
+                        "応答が貼り付けの途中へ割り込んでいる: %r"
+                        % joined[:40])
+
+
 class PartialSendTest(unittest.TestCase):
     """まとめて送ると、部分送信を取りこぼす。"""
 

@@ -118,15 +118,32 @@ class InteractiveTerminal(QTextEdit):
         screen = getattr(self, "_screen", None)
         if screen is not None and screen.bracketed_paste:
             payload = "\x1b[200~" + payload + "\x1b[201~"
-        self._send_queue.append(payload)
-        if not self._sending:
-            self._drain_send_queue()
+        self._queue_send(payload)
         return True
 
     # 1回に送り出す文字数。大きすぎると譲る間隔が空き、小さすぎると
     # 往復が増える。設定 100 行ぶんがおよそ 2,000 文字なので、
     # その規模なら数回で終わる。
     SEND_CHUNK = 512
+
+    def _queue_send(self, payload: str):
+        """機器へ送るものを列の末尾へ積む
+
+        機器へ向かうものは、貼り付けも打鍵も IME の確定も問い合わせへの
+        応答も、すべてここを通す。直接 key_pressed を叩くと、まだ送り
+        終えていない貼り付けの残りを追い越して先に届く。1文字ずつ同期
+        送信していた頃は GUI が完全に止まっていたので起こらなかったが、
+        区切りごとにイベントループへ譲るようにしたことで起きるように
+        なった。CLI では途中まで貼られた行が先に実行されてしまう。
+
+        列が空なら _drain_send_queue がその場で送るので、打鍵1つの
+        ために往復が増えることはない。
+        """
+        if not payload:
+            return
+        self._send_queue.append(payload)
+        if not self._sending:
+            self._drain_send_queue()
 
     def _drain_send_queue(self):
         """溜めた送信を、区切りごとにイベントループへ譲りながら流す。
@@ -198,7 +215,7 @@ class InteractiveTerminal(QTextEdit):
         event.accept()
         commit = event.commitString()
         if commit and self.can_send_input():
-            self.key_pressed.emit(commit)
+            self._queue_send(commit)
 
 
     def set_macro_list(self, macros: list):
@@ -373,26 +390,26 @@ class InteractiveTerminal(QTextEdit):
                 self.reconnect_requested.emit()
                 return
             # 通常モードの場合はSSHに送信
-            self.key_pressed.emit('\r')
+            self._queue_send('\r')
         elif key == Qt.Key.Key_Backspace:
-            self.key_pressed.emit('\x7f')  # DEL文字
+            self._queue_send('\x7f')  # DEL文字
         elif key == Qt.Key.Key_Tab:
-            self.key_pressed.emit('\t')
+            self._queue_send('\t')
         elif key == Qt.Key.Key_Escape:
-            self.key_pressed.emit('\x1b')
+            self._queue_send('\x1b')
         elif key == Qt.Key.Key_Up:
-            self.key_pressed.emit(self._cursor_key('A'))
+            self._queue_send(self._cursor_key('A'))
         elif key == Qt.Key.Key_Down:
-            self.key_pressed.emit(self._cursor_key('B'))
+            self._queue_send(self._cursor_key('B'))
         elif key == Qt.Key.Key_Right:
-            self.key_pressed.emit(self._cursor_key('C'))
+            self._queue_send(self._cursor_key('C'))
         elif key == Qt.Key.Key_Left:
-            self.key_pressed.emit(self._cursor_key('D'))
+            self._queue_send(self._cursor_key('D'))
         else:
             # 通常の文字入力
             text = event.text()
             if text:
-                self.key_pressed.emit(text)
+                self._queue_send(text)
 
 
 class TerminalWidget(QWidget):
@@ -926,7 +943,7 @@ class TerminalWidget(QWidget):
         # 機器からの問い合わせ (カーソル位置・装置識別) に答える。
         # key_pressed はキー入力と同じ「機器へ送る文字」の経路
         for response in terminal._screen.take_responses():
-            terminal.key_pressed.emit(response)
+            terminal._queue_send(response)
 
         if device_name in self._log_files:
             # タブは桁を作る文字なので落とすと表が潰れる
