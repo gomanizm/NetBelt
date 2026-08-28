@@ -33,6 +33,14 @@ def free_port():
     return port
 
 
+def free_udp_port():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
 class FirewallPolicyTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -83,6 +91,16 @@ class FirewallPolicyTest(unittest.TestCase):
 
         self.allow.assert_not_called()
 
+    def test_starting_the_trap_receiver_does_not_touch_the_firewall(self):
+        """Trap 受信も待ち受ける側なので、同じ扱いにすること。"""
+        from core.snmp_manager import SNMPManager
+        manager = SNMPManager()
+        self.addCleanup(manager.stop_trap_receiver)
+
+        manager.start_trap_receiver(port=free_udp_port(), communities=["public"])
+
+        self.allow.assert_not_called()
+
     # --- 手動で直す口があること ---
 
     def test_syslog_can_fix_the_firewall_by_hand(self):
@@ -111,6 +129,18 @@ class FirewallPolicyTest(unittest.TestCase):
 
         self.assertTrue(self.allow.called, "手動でも受信許可を足せない")
 
+    def test_the_trap_receiver_can_fix_the_firewall_by_hand(self):
+        from core.snmp_manager import SNMPManager
+        manager = SNMPManager()
+        self.addCleanup(manager.stop_trap_receiver)
+        port = free_udp_port()
+        manager.start_trap_receiver(port=port, communities=["public"])
+        self.allow.reset_mock()
+
+        manager.fix_firewall(port=port)
+
+        self.assertTrue(self.allow.called, "手動でも受信許可を足せない")
+
     # --- 4つのパネルで揃っていること ---
 
     def test_every_server_panel_offers_the_manual_fix(self):
@@ -126,7 +156,8 @@ class FirewallPolicyTest(unittest.TestCase):
         self.addCleanup(window.close)
 
         missing = [name for name in ("ftp_server_panel", "tftp_server_panel",
-                                     "syslog_panel", "sftp_server_panel")
+                                     "syslog_panel", "sftp_server_panel",
+                                     "snmp_panel")
                    if not hasattr(getattr(window, name), "fw_allow_btn")]
         self.assertEqual(missing, [],
                          "手動でファイアウォールを直すボタンが無いパネル: %s"

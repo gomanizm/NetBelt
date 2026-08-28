@@ -386,6 +386,15 @@ class SNMPPanel(QWidget):
         recv_btn_layout.addWidget(self.trap_stop_button)
         layout.addLayout(recv_btn_layout)
 
+        # 手動FW許可（3CDaemon方式で通らない時の復旧用・押した時だけ管理者昇格/UAC）
+        fw_layout = QHBoxLayout()
+        self.fw_allow_btn = QPushButton("ファイアウォールで許可（管理者）")
+        self.fw_allow_btn.setToolTip("Trap が届かない場合に押してください。Windowsファイアウォールの受信許可を追加します（管理者昇格/UACが1回出ます）。")
+        self.fw_allow_btn.clicked.connect(self._on_fw_allow)
+        fw_layout.addWidget(self.fw_allow_btn)
+        fw_layout.addStretch()
+        layout.addLayout(fw_layout)
+
         # 受信状態（サーバーパネルと同じ GroupBox 形式）
         trap_status_group = QGroupBox("受信状態")
         trap_status_layout = QVBoxLayout()
@@ -972,6 +981,20 @@ class SNMPPanel(QWidget):
             self.snmp_manager.trap_receiver_stopped.connect(self._on_trap_receiver_stopped)
             self.snmp_manager.error_occurred.connect(self._on_error_occurred)
     
+    def _on_fw_allow(self):
+        """手動でファイアウォール受信許可を追加（管理者昇格）。
+
+        起動時には触らない（TFTP/FTP と同じ 3CDaemon 方式）ので、
+        Windows の初回プロンプトを拒否した等で Trap が届かない環境は
+        ここで直す。
+        """
+        if self.snmp_manager is None:
+            self.trap_status_label.setText("SNMP マネージャがまだ用意されていません")
+            return
+        ok, _msg = self.snmp_manager.fix_firewall(self.trap_port_spinbox.value())
+        self.trap_status_label.setText(
+            "ファイアウォール許可: %s" % ("完了" if ok else "未反映/失敗"))
+
     def _on_operation_partial(self, reason: str):
         """WALK が途中で途切れたことを受け取る（結果はこのあと届く）。
 
