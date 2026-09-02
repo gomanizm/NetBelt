@@ -11,6 +11,9 @@ class SFTPManager(QObject):
     
     # シグナル定義
     file_list_ready = pyqtSignal(list)  # ファイル一覧取得完了 [(name, size, mtime, mode, is_dir), ...]
+    # ワーカーから GUI スレッドへ「一覧が取れた」を運ぶ内部用。current_path の
+    # 更新と file_list_ready の発火を同じスレッド・同じ順序で行うために挟む
+    _listing_done = pyqtSignal(str, list)
     # 転送進捗 (転送済みバイト数, 全体バイト数)
     # int で宣言すると C++ の 32bit int に対応し、2GiB を超えるバイト数が
     # 例外も出さずに黙って丸められる（負値や桁落ちした値になる）。
@@ -36,6 +39,7 @@ class SFTPManager(QObject):
         self.ssh_client: Optional[paramiko.SSHClient] = None
         self.is_connected = False
         self.current_path = "/"
+        self._listing_done.connect(self._on_listing_done)
     
     # GUI スレッドから直接呼ぶ操作が、転送の終わりを待つ最大時間。
     # 長く待つと転送中ずっと画面が固まるので、短く切って諦める。
@@ -130,6 +134,16 @@ class SFTPManager(QObject):
                   "（SSH の切断で解放されます）")
         self.disconnected.emit()
     
+    def _on_listing_done(self, path: str, file_list: list):
+        """一覧が取れたときの GUI スレッド側の処理。
+
+        current_path の更新と file_list_ready の発火を、同じスレッドで
+        この順に行う。受け手（パネル）はスロットの中で get_current_path()
+        を見て表示を組み立てるので、通知より先に更新されている必要がある。
+        """
+        self.current_path = path
+        self.file_list_ready.emit(file_list)
+
     def list_directory(self, path: str = None):
         """
         ディレクトリ内のファイル一覧を取得（バックグラウンド）
@@ -170,11 +184,11 @@ class SFTPManager(QObject):
                 # 名前でソート（ディレクトリが先）
                 file_list.sort(key=lambda x: (not x['is_dir'], x['name'].lower()))
                 
-                # 現在のパスを更新
-                self.current_path = path
-                
-                # シグナルを発火
-                self.file_list_ready.emit(file_list)
+                # current_path はここで書かない。書いてから emit すると、
+                # シグナルが GUI へ届くまでの間「場所は新しい、画面は古い一覧」
+                # になり、その窓で始めた操作が見ていないディレクトリへ飛ぶ。
+                # 更新と通知を GUI スレッドで同じ順序に行う
+                self._listing_done.emit(path, file_list)
                 
             except Exception as e:
                 self.error_occurred.emit(f"ディレクトリ一覧取得エラー: {str(e)}")
