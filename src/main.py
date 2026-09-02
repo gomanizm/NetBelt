@@ -1,7 +1,9 @@
 import sys
 import os
 import traceback
-from PyQt6.QtWidgets import QApplication, QMessageBox
+# PyQt6 はここで import しない。exe で PyQt6 自体の読み込みに失敗する
+# （DLL が読めない、展開が壊れた）と、ログの差し替えより前なので
+# 痕跡が残らない。必要になった場所で読み込む
 
 
 def _setup_logging():
@@ -64,6 +66,7 @@ def install_excepthook(log_path=None):
         if log_path:
             message += "\n\n詳細の記録先:\n%s" % log_path
         try:
+            from PyQt6.QtWidgets import QMessageBox
             QMessageBox.critical(None, "NetBelt", message)
         except Exception:
             pass
@@ -75,9 +78,10 @@ def main():
     log_path = _setup_logging()
     install_excepthook(log_path)
 
-    # UI の import はログの差し替えより後に行う。import 中に落ちたとき、
-    # モジュール先頭で読み込んでいると退避が間に合わず、起動しない理由が
-    # どこにも残らない
+    # PyQt6 と UI の import はログの差し替えより後に行う。import 中に
+    # 落ちたとき、モジュール先頭で読み込んでいると退避が間に合わず、
+    # 起動しない理由がどこにも残らない
+    from PyQt6.QtWidgets import QApplication
     from ui.main_window import MainWindow
 
     app = QApplication(sys.argv)

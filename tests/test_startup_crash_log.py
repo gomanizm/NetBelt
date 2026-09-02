@@ -73,7 +73,7 @@ class CrashLogTest(unittest.TestCase):
         self._capture()
         main.install_excepthook(self.log_path)
 
-        with mock.patch.object(main.QMessageBox, "critical"):
+        with mock.patch("PyQt6.QtWidgets.QMessageBox.critical"):
             sys.excepthook(*_a_traceback("SLOT_BOOM"))
 
         logged = self._logged()
@@ -88,7 +88,7 @@ class CrashLogTest(unittest.TestCase):
         self._capture()
         main.install_excepthook(self.log_path)
 
-        with mock.patch.object(main.QMessageBox, "critical") as critical:
+        with mock.patch("PyQt6.QtWidgets.QMessageBox.critical") as critical:
             sys.excepthook(*_a_traceback("SLOT_BOOM"))
 
         self.assertTrue(critical.called, "利用者に何も知らせていない")
@@ -106,7 +106,7 @@ class CrashLogTest(unittest.TestCase):
         self._capture()
         main.install_excepthook(self.log_path)
 
-        with mock.patch.object(main.QMessageBox, "critical",
+        with mock.patch("PyQt6.QtWidgets.QMessageBox.critical",
                                side_effect=RuntimeError("no QApplication")):
             sys.excepthook(*_a_traceback("SLOT_BOOM"))
 
@@ -124,7 +124,7 @@ class CrashLogTest(unittest.TestCase):
         except KeyboardInterrupt:
             info = sys.exc_info()
 
-        with mock.patch.object(main.QMessageBox, "critical") as critical:
+        with mock.patch("PyQt6.QtWidgets.QMessageBox.critical") as critical:
             sys.excepthook(*info)
 
         self.assertFalse(critical.called,
@@ -148,7 +148,10 @@ class CrashLogTest(unittest.TestCase):
             elif isinstance(node, ast.Import):
                 top_level.extend(a.name for a in node.names)
 
-        offenders = [m for m in top_level if m.startswith(("ui", "core"))]
+        # PyQt6 も含める。exe で PyQt6 自体の読み込みに失敗する
+        # （DLL が読めない、展開が壊れた）と、同じく痕跡が残らない
+        offenders = [m for m in top_level
+                     if m.startswith(("ui", "core", "PyQt6"))]
         self.assertEqual(offenders, [],
                          "ログの差し替えより先に import している: %s" % offenders)
 
@@ -177,7 +180,8 @@ class CrashLogEndToEndTest(unittest.TestCase):
         # 呼ばれたことだけ印を残して差し替える
         def _stub(parent, title, text):
             f.write("dialog-shown\\n")
-        main.QMessageBox.critical = _stub
+        from PyQt6.QtWidgets import QMessageBox
+        QMessageBox.critical = _stub
         main.install_excepthook(log)
         def boom():
             raise RuntimeError("SLOT_BOOM_E2E")
