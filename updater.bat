@@ -6,9 +6,12 @@ rem a block is expanded when the block is parsed, i.e. before the child
 rem has run, so the real exit code would always be lost.
 rem ------------------------------------------------------------------
 rem Detect '!' before delayed expansion is on. Afterwards %~f0 has
-rem already lost it, so the check would never fire.
+rem already lost it, so the check would never fire. %TEMP% is included:
+rem the script runs from a copy made there, and a '!' in that path
+rem breaks the copy just the same, but would otherwise be reported as
+rem "could not copy the updater", which points at the wrong cause.
 set "BANG="
-echo."%~f0" "%~1" "%~2"| findstr /C:"!" >nul && set "BANG=1"
+echo."%~f0" "%~1" "%~2" "%TEMP%"| findstr /C:"!" >nul && set "BANG=1"
 
 setlocal enabledelayedexpansion
 if "%~3"=="--utf8" goto :run
@@ -19,7 +22,8 @@ rem printing Japanese here is the very fault this file was fixed for.
 if defined BANG (
     echo ERROR: the path contains an exclamation mark.
     echo   NetBelt cannot update itself from a folder whose path
-    echo   contains that character. Rename the folder, or extract
+    echo   contains that character. This includes the TEMP folder
+    echo   the updater runs from. Rename the folder, or extract
     echo   the new ZIP over this one by hand.
     pause
     exit /b 1
