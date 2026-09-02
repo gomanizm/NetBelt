@@ -387,8 +387,15 @@ class SyslogReceiver(QObject):
                     # 終端の改行ごと 1 回の recv で届いた場合に素通りする。
                     # 見るのは受信バッファ全体ではなく、次の改行までの長さ。
                     newline_at = buffer.find(b"\n")
-                    current_line = (len(buffer) if newline_at == -1
-                                    else newline_at)
+                    if newline_at == -1:
+                        current_line = len(buffer)
+                    else:
+                        current_line = newline_at
+                        # CRLF の CR は配信前に落とすので中身ではない。
+                        # 数えると、同じ中身の行が LF なら通り CRLF なら
+                        # 切られる
+                        if buffer[newline_at - 1:newline_at] == b"\r":
+                            current_line -= 1
                     if current_line > self.max_line_bytes:
                         # 一覧に並ぶので、機器からの行と同じ RFC 3164 の形で
                         # 組み立てる。生の文言のまま渡すと、先頭の語が
