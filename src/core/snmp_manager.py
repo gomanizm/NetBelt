@@ -144,12 +144,16 @@ class SNMPWorker(QThread):
     # シグナル定義
     result_ready = pyqtSignal(bool, object)  # (success, result)
     progress_update = pyqtSignal(str)  # ステータスメッセージ
-    
+    # WALK が途中で途切れたときの理由。取れた分は result_ready で普通に
+    # 渡すので、不完全であることはこちらで伝える
+    partial_result = pyqtSignal(str)
+
     def __init__(self, operation: str, params: dict):
         super().__init__()
         self.operation = operation
         self.params = params
         self._cancelled = False
+        self._partial_reason = None
     
     def run(self):
         """スレッドのメイン処理"""
@@ -166,6 +170,9 @@ class SNMPWorker(QThread):
                 return
             
             if not self._cancelled:
+                if self._partial_reason:
+                    # 表には出すが、全部ではないことを先に伝える
+                    self.partial_result.emit(self._partial_reason)
                 self.result_ready.emit(True, result)
         
         except Exception as e:
@@ -240,10 +247,19 @@ class SNMPWorker(QThread):
             if self._cancelled:
                 break
             
-            if errorIndication:
-                raise Exception(f"SNMP Error: {errorIndication}")
-            elif errorStatus:
-                raise Exception(f"SNMP Error: {errorStatus.prettyPrint()}")
+            if errorIndication or errorStatus:
+                reason = (str(errorIndication) if errorIndication
+                          else errorStatus.prettyPrint())
+                if not results:
+                    # 1件も取れていない。見せるものが無いのでエラーのまま
+                    raise Exception(f"SNMP Error: {reason}")
+                # 取れた分は捨てない。WALK は OID のステップごとに1往復で、
+                # 1リクエストあたり最大6秒（timeout 1 秒 x retries 5）待つ。
+                # ステップ数の多いウォークほど途中で1回落ちる確率が上がる
+                # ので、そこまでの成果を捨てると成果がゼロになりやすい。
+                # 不完全であることは呼び出し側が伝える。
+                self._partial_reason = reason
+                break
             
             for varBind in varBinds:
                 oid_str = varBind[0].prettyPrint()
@@ -619,6 +635,9 @@ class SNMPManager(QObject):
     operation_started = pyqtSignal(str)  # 操作名
     operation_completed = pyqtSignal(bool, object)  # (success, result)
     progress_update = pyqtSignal(str)  # ステータスメッセージ
+    # WALK が途中で途切れたときの理由。結果は operation_completed で
+    # 普通に届くので、不完全であることだけをこちらで伝える
+    operation_partial = pyqtSignal(str)
     error_occurred = pyqtSignal(str)  # エラーメッセージ
     trap_received = pyqtSignal(dict)  # Trap受信
     trap_receiver_started = pyqtSignal()  # Trap受信開始
@@ -655,6 +674,7 @@ class SNMPManager(QObject):
         self.worker.result_ready.connect(self._on_operation_completed)
         self.worker.finished.connect(self._on_worker_finished)
         self.worker.progress_update.connect(self.progress_update.emit)
+        self.worker.partial_result.connect(self.operation_partial.emit)
         self.worker.start()
         
         self.operation_started.emit(f"SNMP GET: {host}")
@@ -682,6 +702,7 @@ class SNMPManager(QObject):
         self.worker.result_ready.connect(self._on_operation_completed)
         self.worker.finished.connect(self._on_worker_finished)
         self.worker.progress_update.connect(self.progress_update.emit)
+        self.worker.partial_result.connect(self.operation_partial.emit)
         self.worker.start()
         
         self.operation_started.emit(f"SNMP WALK: {host} - {oid}")
@@ -712,6 +733,24 @@ class SNMPManager(QObject):
         """操作が実行中かどうか"""
         return self.worker is not None and self.worker.isRunning()
     
+    def fix_firewall(self, port: int = 162):
+        """手動: Windows FW 受信許可を追加（管理者昇格/UAC）
+
+        起動時には触らない（TFTP/FTP と同じ 3CDaemon 方式）。Windows の
+        初回プロンプトを拒否したなどで Trap が届かない環境の復旧用で、
+        押したときだけ昇格する。
+        """
+        try:
+            from .firewall import ensure_inbound_allow, ensure_self_program_allow
+            ok, msg = ensure_inbound_allow("SNMP Trap", "UDP", port)
+            print(f"[SNMP] ファイアウォール: {msg}")
+            ok2, msg2 = ensure_self_program_allow()
+            print(f"[SNMP] ファイアウォール(自exe): {msg2}")
+            return (ok and ok2), msg
+        except Exception as e:
+            print(f"[SNMP] ファイアウォール設定エラー: {e}")
+            return False, str(e)
+
     def start_trap_receiver(self, port: int = 162, communities: List[str] = None,
                             v3_users: List[dict] = None):
         """
@@ -726,13 +765,11 @@ class SNMPManager(QObject):
             self.error_occurred.emit("既にTrap受信が実行中です")
             return False
         
-        # 受信ポートの Windows ファイアウォール受信許可を用意（Windowsのみ・冪等・必要時UAC）
-        try:
-            from .firewall import ensure_inbound_allow
-            _ok, _msg = ensure_inbound_allow("SNMP Trap", "UDP", port)
-            print(f"[SNMP] ファイアウォール: {_msg}")
-        except Exception as _e:
-            print(f"[SNMP] ファイアウォール設定エラー: {_e}")
+        # ファイアウォールは自動設定しない（3CDaemon 方式）。管理者昇格(UAC)を避けるため、
+        # 受信許可は Windows 標準の初回プロンプト／既存の許可ルールに委ねる。
+        # 自動で足すと、ポートを変えて使うたびポート名入りのルールが恒久登録され、
+        # 停止しても消えずに残骸が増える。通らない環境は fix_firewall() で直す。
+        print("[SNMP] ファイアウォール: 自動設定なし（Windowsの許可に委ねます）")
         self.trap_receiver = SNMPTrapReceiver(port, communities, v3_users)
         self.trap_receiver.trap_received.connect(self.trap_received.emit)
         self.trap_receiver.error_occurred.connect(self.error_occurred.emit)

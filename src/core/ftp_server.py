@@ -41,8 +41,17 @@ class FTPServerManager(QObject):
         self._tx.pop((ip, filename, direction), None)  # 完了で解放し次の転送は新規行に
         self.transfer_complete.emit(ip, filename, int(done), int(total), direction)
 
+    # 匿名に与える権限。認証ユーザー用の "elradfmwMT" を使い回すと、
+    # 資格情報なしでルート配下を上書き・削除・改名・フォルダ作成できる。
+    # このパネルの主用途は `copy running-config ftp://…`、つまり機器が
+    # コンフィグを置きに来る経路なので、書き込みを許す場合もそれに要る
+    # 分だけにする（d 削除 / f 改名 / m フォルダ作成 / M chmod / T chmtime は不要）。
+    ANON_PERM_READ = "elr"          # cd / 一覧 / 取得
+    ANON_PERM_WRITE = "elrw"        # + 置く
+
     def start(self, port=21, root_dir="./ftp_root", username="",
-              password="", anonymous=False, passive_ports=(50100, 50150)):
+              password="", anonymous=False, passive_ports=(50100, 50150),
+              anonymous_write=False):
         if self.is_running:
             self.error_occurred.emit("サーバーは既に実行中です")
             return False
@@ -57,7 +66,10 @@ class FTPServerManager(QObject):
             if username and password:
                 authorizer.add_user(username, password, root_dir, perm="elradfmwMT")
             if anonymous:
-                authorizer.add_anonymous(root_dir, perm="elradfmwMT")
+                authorizer.add_anonymous(
+                    root_dir,
+                    perm=(self.ANON_PERM_WRITE if anonymous_write
+                          else self.ANON_PERM_READ))
             if not authorizer.has_user(username) and not authorizer.has_user("anonymous"):
                 self.error_occurred.emit("ユーザー名/パスワードを入力するか、匿名を許可してください")
                 return False
@@ -146,13 +158,25 @@ class FTPServerManager(QObject):
         self.started.emit()
         return True
 
+    # 待受スレッドの終了を待つ上限。close_all() 後、serve_forever は
+    # 次に poll(timeout=1.0) から戻った時点で抜けるので、通常は 1 秒以内
+    STOP_TIMEOUT_SECONDS = 3.0
+
     def stop(self):
+        thread, self._thread = self._thread, None
         if self._server:
             try:
                 self._server.close_all()
             except Exception:
                 pass
             self._server = None
+        # スレッドが抜けるまで待ってから戻る。close_all() は socket_map を
+        # 空にするだけで、スレッドは次に poll() から戻るまで ioloop の中に
+        # いる。待たずに戻ると、直後にこのマネージャ（QObject）が破棄された
+        # とき、生き残ったスレッドからの emit が解放済みオブジェクトへ届いて
+        # プロセスごと落ちる（停止直後にパネルやアプリを閉じる操作で起こる）
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=self.STOP_TIMEOUT_SECONDS)
         self.is_running = False
         self._tx.clear()
         self.stopped.emit()

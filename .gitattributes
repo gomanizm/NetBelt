@@ -7,3 +7,15 @@
 # Linux での clone や、リリースに添付される Source code アーカイブ
 # （GPL の対応ソース）だけが壊れた状態で配られていた。
 tests/fixtures/*.bin -text
+
+# バッチファイルは CRLF で格納する。
+#
+# 上と同じ機構で、逆向きに壊れていた。作業ツリーが CRLF なのは
+# core.autocrlf=true のおかげで、格納されているバイト列は LF だった。
+# cmd.exe は LF だけのバッチファイルを 1 行も正しく実行できない
+# （行の途中や日本語コメントの断片がコマンドとして実行される）。
+# autocrlf に守られない経路 — GitHub が各リリースへ自動添付する
+# Source code アーカイブ（GPL の対応ソース）と、
+# core.autocrlf=false / input での clone — だけが壊れた updater.bat を
+# 受け取り、そこからビルドした NetBelt は自動更新が一切効かなかった。
+*.bat text eol=crlf

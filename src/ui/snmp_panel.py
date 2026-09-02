@@ -11,6 +11,7 @@ from PyQt6.QtCore import Qt, QAbstractTableModel, QModelIndex, QThread, pyqtSign
 from PyQt6.QtGui import QAction, QStandardItemModel, QStandardItem
 from datetime import datetime
 import json
+import re
 from core.mib_resolver import get_resolver, MIBResolver
 from core.snmp_manager import v3_password_error
 
@@ -103,6 +104,19 @@ class MIBLoaderThread(QThread):
 class SNMPPanel(QWidget):
     """SNMPパネル"""
 
+    # 保持する Trap の件数。上限が無いと、受信を張りっぱなしにする常用で
+    # メモリが単調に増え続ける（VarBind 3件の Trap あたり約 12KB、
+    # 100,000 件で約 1.2GB。クリアするまで解放されない）。
+    # Syslog パネルの max_messages と同じ考え方・同じ既定値にしてある。
+    DEFAULT_MAX_TRAPS = 1000
+
+    # 表計算ソフトがセルを数式として読み始める先頭文字。
+    _CSV_FORMULA_STARTERS = "=+-@"
+    # そのまま数値として書いてよい形。float() で判定すると -inf / +nan /
+    # -1_000 まで「数」になるが、表計算は先頭の - や + を見て数式として
+    # 解釈するので、通してはいけない。
+    _CSV_PLAIN_NUMBER = re.compile(r"^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$")
+
     # v3 認証コンボの選択肢。(表示ラベル, core へ渡すキー) の組。
     # キーは core.snmp_manager の V3_*_PROTOCOL_NAMES と一致させること。
     AUTH_PROTOCOL_CHOICES = (
@@ -133,6 +147,13 @@ class SNMPPanel(QWidget):
         self.result_model = SNMPResultTableModel()
         self.trap_tree_model = QStandardItemModel()
         self.trap_data_list = []  # 完全なTrapデータ（エクスポート用）
+        self.max_traps = self._configured_max_traps()
+        # WALK が途中で途切れたときの理由。結果より先に届き、結果を
+        # 表示するときに使って忘れる
+        self._partial_reason = None
+        # 直近の結果が途中までだった理由。書き出しに添えるため、次の完走か
+        # クリアまで持ち続ける
+        self._last_partial_reason = None
         
         self._init_ui()
         
@@ -367,6 +388,15 @@ class SNMPPanel(QWidget):
         self.trap_stop_button.setStyleSheet("QPushButton { background-color: #f44336; color: white; padding: 8px; font-weight: bold; }")
         recv_btn_layout.addWidget(self.trap_stop_button)
         layout.addLayout(recv_btn_layout)
+
+        # 手動FW許可（3CDaemon方式で通らない時の復旧用・押した時だけ管理者昇格/UAC）
+        fw_layout = QHBoxLayout()
+        self.fw_allow_btn = QPushButton("ファイアウォールで許可（管理者）")
+        self.fw_allow_btn.setToolTip("Trap が届かない場合に押してください。Windowsファイアウォールの受信許可を追加します（管理者昇格/UACが1回出ます）。")
+        self.fw_allow_btn.clicked.connect(self._on_fw_allow)
+        fw_layout.addWidget(self.fw_allow_btn)
+        fw_layout.addStretch()
+        layout.addLayout(fw_layout)
 
         # 受信状態（サーバーパネルと同じ GroupBox 形式）
         trap_status_group = QGroupBox("受信状態")
@@ -624,22 +654,90 @@ class SNMPPanel(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "エラー", "エクスポート中にエラーが発生しました:\n" + str(e))
 
+    def _configured_max_traps(self) -> int:
+        """settings.snmp.max_traps を読む（壊れていれば既定値）
+
+        config.json は手で編集できるので、数でない値や 0 以下が来る。
+        そのまま使うと上限が消えたり、1件も残らなくなる。
+        """
+        try:
+            settings = self.config_manager.config.get("settings", {})
+            value = int(settings.get("snmp", {}).get(
+                "max_traps", self.DEFAULT_MAX_TRAPS))
+        except (AttributeError, TypeError, ValueError):
+            return self.DEFAULT_MAX_TRAPS
+        return value if value > 0 else self.DEFAULT_MAX_TRAPS
+
+    def _trim_traps(self):
+        """上限を超えたぶんの古い Trap を捨てる
+
+        新しいものを先頭へ挿しているので、余るのは末尾。表示行と保存
+        データを同じ数だけ削り、エクスポートの中身と画面が食い違わない
+        ようにする。
+        """
+        while len(self.trap_data_list) > self.max_traps:
+            self.trap_data_list.pop()
+        while self.trap_tree_model.rowCount() > self.max_traps:
+            self.trap_tree_model.removeRow(self.trap_tree_model.rowCount() - 1)
+
+    @staticmethod
+    def _csv_safe(value):
+        """表計算ソフトが数式として解釈しうる値を、文字列として書き出す
+
+        csv モジュールは区切り文字と引用符しかエスケープしない。先頭が
+        = + - @ の値はそのまま残り、Excel / LibreOffice で開いた瞬間に
+        数式（DDE を含む）として評価される。
+
+        値は攻撃者が選べる。v1/v2c ならコミュニティ名を知っている者が
+        UDP パケット1発で任意の VarBind を入れられるし、GET/WALK 側も
+        sysName / sysLocation / sysContact など機器側で自由に書ける
+        文字列が入る。エクスポートは障害チケットや報告書へ回る前提なので、
+        受け取った側の端末で発火する。
+
+        負の数まで文字列にすると表として読みにくくなるので、数として
+        読める値はそのまま通す。
+        """
+        text = "" if value is None else str(value)
+        if not text:
+            return text
+
+        # 表計算ソフトは前置きの空白を落として解釈することがあるので、
+        # 判定も落としてから行う（空白を1つ置くだけで抜けられてしまう）。
+        stripped = text.lstrip()
+        if not stripped or stripped[0] not in SNMPPanel._CSV_FORMULA_STARTERS:
+            return text
+
+        # 数として読める値はそのまま通す。ただし判定を float() に任せると
+        # -inf / +nan / -1_000 まで通ってしまう。Python が数として読めても、
+        # 表計算は先頭の - や + を見て数式として解釈する（-inf なら #NAME?）。
+        if SNMPPanel._CSV_PLAIN_NUMBER.match(stripped):
+            return text
+        return "'" + text
+
     def _export_results_to_csv(self, file_path: str, results):
         """CSV形式で GET/WALK 結果を書き出す"""
         import csv
+        reason = getattr(self, "_last_partial_reason", None)
         with open(file_path, "w", newline="", encoding="utf-8") as f:
+            if reason:
+                # 途中までの結果であることを、見出しの前に残す
+                f.write("# 途中まで: %s のため中断。全部ではありません\n" % reason)
             writer = csv.writer(f)
             writer.writerow(["OID", "Type", "Value"])
             for row in results:
-                writer.writerow(list(row))
+                writer.writerow([self._csv_safe(cell) for cell in row])
 
     def _export_results_to_json(self, file_path: str, results):
         """JSON形式で GET/WALK 結果を書き出す"""
         import json
+        reason = getattr(self, "_last_partial_reason", None)
         data = {
             "exported_at": datetime.now().isoformat(),
             "host": self.host_edit.text(),
             "count": len(results),
+            # 途中までの結果かどうか。機械で読む側が見落とさないよう明示する
+            "complete": reason is None,
+            "partial_reason": reason,
             "results": [
                 {"oid": row[0], "type": row[1], "value": row[2]} for row in results
             ],
@@ -654,6 +752,9 @@ class SNMPPanel(QWidget):
             f.write("エクスポート日時: " + datetime.now().strftime("%Y-%m-%d %H:%M:%S") + "\n")
             f.write("対象ホスト: " + self.host_edit.text() + "\n")
             f.write("件数: " + str(len(results)) + "\n")
+            reason = getattr(self, "_last_partial_reason", None)
+            if reason:
+                f.write("注意: 途中まで（%s のため中断。全部ではありません）\n" % reason)
             f.write("=" * 60 + "\n")
             for row in results:
                 f.write("OID  : " + str(row[0]) + "\n")
@@ -663,6 +764,7 @@ class SNMPPanel(QWidget):
 
     def _on_clear_clicked(self):
         self.result_model.clear_results()
+        self._last_partial_reason = None
         self.status_label.setText("結果をクリアしました")
     
     def _on_trap_start_clicked(self):
@@ -712,6 +814,21 @@ class SNMPPanel(QWidget):
         self.mib_thread.finished_signal.connect(self._on_background_mib_load_finished)
         self.mib_thread.start()
     
+    # MIB 読み込みスレッドの終了を待つ上限（ミリ秒）。通常は数 ms で終わる
+    MIB_LOADER_WAIT_MS = 5000
+
+    def wait_for_background_work(self):
+        """バックグラウンドの MIB 読み込みが終わるのを待つ。
+
+        ウィンドウを閉じるときに呼ぶ。待たずにパネルが破棄されると、
+        実行中の QThread の破棄で Qt が abort するか、終わったスレッドの
+        finished_signal が解放済みのパネルへ届いて落ちる。起動直後に
+        閉じたときに踏む。
+        """
+        thread = getattr(self, "mib_thread", None)
+        if thread is not None and thread.isRunning():
+            thread.wait(self.MIB_LOADER_WAIT_MS)
+
     def _on_background_mib_load_finished(self, success: bool):
         """バックグラウンドMIB読み込み完了時の処理"""
         self.mib_loading = False
@@ -825,10 +942,12 @@ class SNMPPanel(QWidget):
                 # VarBindsがある場合は各VarBindを1行として出力
                 if varbinds:
                     for vb in varbinds:
-                        writer.writerow(head + [vb['oid'], vb['value']])
+                        writer.writerow(
+                            [self._csv_safe(c)
+                             for c in head + [vb['oid'], vb['value']]])
                 else:
                     # VarBindsがない場合は1行だけ出力
-                    writer.writerow(head + ['', ''])
+                    writer.writerow([self._csv_safe(c) for c in head + ['', '']])
     
     def _export_to_json(self, file_path: str):
         """JSON形式でエクスポート"""
@@ -886,15 +1005,51 @@ class SNMPPanel(QWidget):
         self.snmp_manager = manager
         if self.snmp_manager:
             self.snmp_manager.operation_completed.connect(self._on_operation_completed)
+            self.snmp_manager.operation_partial.connect(self._on_operation_partial)
             self.snmp_manager.trap_received.connect(self._on_trap_received)
             self.snmp_manager.trap_receiver_started.connect(self._on_trap_receiver_started)
             self.snmp_manager.trap_receiver_stopped.connect(self._on_trap_receiver_stopped)
             self.snmp_manager.error_occurred.connect(self._on_error_occurred)
     
+    def _on_fw_allow(self):
+        """手動でファイアウォール受信許可を追加（管理者昇格）。
+
+        起動時には触らない（TFTP/FTP と同じ 3CDaemon 方式）ので、
+        Windows の初回プロンプトを拒否した等で Trap が届かない環境は
+        ここで直す。
+        """
+        if self.snmp_manager is None:
+            self.trap_status_label.setText("SNMP マネージャがまだ用意されていません")
+            return
+        ok, _msg = self.snmp_manager.fix_firewall(self.trap_port_spinbox.value())
+        self.trap_status_label.setText(
+            "ファイアウォール許可: %s" % ("完了" if ok else "未反映/失敗"))
+
+    def _on_operation_partial(self, reason: str):
+        """WALK が途中で途切れたことを受け取る（結果はこのあと届く）。
+
+        取れた分は捨てずに表へ出すが、全部ではないと分からないまま
+        使われると、機器に無いものを「無い」と読み違える。
+        """
+        self._partial_reason = reason
+
     def _on_operation_completed(self, success: bool, result):
         if success:
             self.result_model.set_results(result)
-            self.status_label.setText(f"完了: {len(result)}件")
+            # 直前に「途中で切れた」と知らされていれば、そう書く。
+            # 一度使ったら忘れる（次の完走に持ち越さない）
+            reason = getattr(self, "_partial_reason", None)
+            self._partial_reason = None
+            # 書き出しに添えるため、次の完走かクリアまで持ち続ける。
+            # 画面の表示だけだと、保存したファイルは完走した結果と
+            # 区別が付かず、受け取った側が「機器に無い」と読み違える
+            self._last_partial_reason = reason or None
+            if reason:
+                self.status_label.setText(
+                    "途中まで: %d件（%s のため中断。全部ではありません）"
+                    % (len(result), reason))
+            else:
+                self.status_label.setText(f"完了: {len(result)}件")
         else:
             QMessageBox.critical(self, "エラー", str(result))
             self.status_label.setText("エラー")
@@ -958,7 +1113,10 @@ class SNMPPanel(QWidget):
             # 親の最初の列に子行を追加
             timestamp_item.appendRow([child_timestamp, child_source,
                                       child_security, child_oid, child_value])
-    
+
+        # 上限を超えたぶんの古い Trap を捨てる
+        self._trim_traps()
+
     def _on_trap_receiver_started(self):
         """Trap受信開始時の処理"""
         print("[SNMPPanel] Trap受信が正常に開始されました")

@@ -284,6 +284,72 @@ class UpdaterScriptTest(unittest.TestCase):
         self.assertNotEqual(code, 0, "実行ファイルが無いのに成功と報告した\n" + out)
         self.assertIn("NetBelt.exe", out)
 
+    # --- 自分自身を上書きされても壊れないこと ---------------------------
+
+    def _zip_with_a_longer_updater(self):
+        """配布 zip と同じく updater.bat を含み、長さだけ変えた zip。
+
+        CI は `copy updater.bat portable\\` で updater.bat を配布物へ
+        入れるので、更新のたびに実行中の自分自身が上書きされる。
+        cmd.exe はバッチファイルを行ではなくバイト位置で読み進めるため、
+        新旧の長さが違うと、上書き後の続きが新しいファイルの見当違いの
+        位置から読まれる。日本語の行の断片がコマンドとして実行され、
+        更新の手順が二周三周する。長さが同じなら発火しないので、
+        ここでは必ず長さを変える。
+        """
+        original = io.open(UPDATER, encoding="utf-8", newline="").read()
+        marker = "\r\n:run\r\n"
+        at = original.index(marker) + len(marker)
+        padding = "".join("rem padding %03d\r\n" % i for i in range(40))
+        longer = original[:at] + padding + original[at:]
+        self.assertNotEqual(len(longer.encode("utf-8")),
+                            len(original.encode("utf-8")),
+                            "長さが変わっていないと再現しない")
+        return self._make_zip({"NetBelt.exe": "new",
+                               "updater.bat": longer})
+
+    def test_an_update_that_replaces_the_updater_still_succeeds(self):
+        """updater.bat 自身を含む更新でも、成功と報告して終わること。"""
+        self._write(os.path.join(self.app_dir, "NetBelt.exe"), "old")
+        zip_path = self._zip_with_a_longer_updater()
+
+        code, out = self._run(zip_path)
+
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self._installed(), "new", out)
+
+    def test_replacing_the_updater_runs_the_sequence_exactly_once(self):
+        """更新の手順がちょうど一周して終わること。
+
+        読み取り位置がどこへ着地するかはファイル長の差で変わるため、
+        症状は毎回同じではない（手順が二周三周してアプリが二重に起動
+        することも、断片が実行されて途中で死ぬこともある）。症状では
+        なく「一周して完了する」ことで判定する。0 回なら途中で死に、
+        2 回以上なら周回している。
+        """
+        self._write(os.path.join(self.app_dir, "NetBelt.exe"), "old")
+        zip_path = self._zip_with_a_longer_updater()
+
+        code, out = self._run(zip_path)
+
+        self.assertEqual(out.count("更新が完了しました"), 1,
+                         "更新の手順が一周していない\n" + out)
+
+    def test_the_new_updater_is_installed(self):
+        """新しい updater.bat がちゃんと置かれること。
+
+        自己上書きを避けるために配布物から外してしまうと、updater は
+        二度と更新されず、将来の zip の形と食い違ったままになる。
+        """
+        self._write(os.path.join(self.app_dir, "NetBelt.exe"), "old")
+        zip_path = self._zip_with_a_longer_updater()
+
+        self._run(zip_path)
+
+        installed = io.open(self.updater, encoding="utf-8", newline="").read()
+        self.assertIn("rem padding 000", installed,
+                      "新しい updater.bat が置かれていない")
+
 
 class UpdaterEncodingTest(unittest.TestCase):
     """文字化けの原因を作らないことを、ファイルの形として固定する。
@@ -300,6 +366,43 @@ class UpdaterEncodingTest(unittest.TestCase):
     def test_the_file_stays_utf8_without_a_bom(self):
         """BOM を付けないこと。cmd.exe が 1 行目ごと読み違える。"""
         self.assertNotEqual(self.raw[:3], b"\xef\xbb\xbf")
+
+    def test_every_batch_file_is_checked_out_as_crlf(self):
+        """.bat が誰の手元でも CRLF で取り出されること。
+
+        test_the_line_endings_stay_crlf は作業ツリーのファイルを見る。
+        core.autocrlf=true の環境ではチェックアウト時に CRLF へ変換
+        されるので、その設定に頼っているだけの状態でも常に緑になり、
+        この穴を検知できない。
+
+        cmd.exe は LF だけのバッチファイルを 1 行も正しく実行できない
+        （行の途中や日本語コメントの断片がコマンドとして実行され、
+        更新が当たらない）。autocrlf に守られない経路は2つある:
+          - GitHub が各リリースへ自動添付する Source code アーカイブ
+            （.github/release-body.md が GPL の対応ソースとして案内する）
+          - core.autocrlf=false / input での clone（Linux・macOS を含む）
+
+        eol=crlf が付いていれば、どちらの経路でも CRLF で取り出される。
+        index 側が LF なのは text 属性の正常な姿なので、そこは見ない。
+        """
+        listed = subprocess.run(
+            ["git", "ls-files", "--", "*.bat"],
+            cwd=REPO_ROOT, capture_output=True, text=True, timeout=30)
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        batch_files = [p for p in listed.stdout.split() if p]
+        self.assertTrue(batch_files, "追跡下の .bat が見つからない")
+
+        attrs = subprocess.run(
+            ["git", "check-attr", "eol", "--"] + batch_files,
+            cwd=REPO_ROOT, capture_output=True, text=True, timeout=30)
+        self.assertEqual(attrs.returncode, 0, attrs.stderr)
+
+        unprotected = [line for line in attrs.stdout.splitlines()
+                       if not line.endswith(": eol: crlf")]
+        self.assertEqual(
+            unprotected, [],
+            "CRLF が保証されていない .bat がある（cmd.exe で動かない）: %s\n"
+            ".gitattributes に `*.bat text eol=crlf` が要る" % unprotected)
 
     def test_the_line_endings_stay_crlf(self):
         self.assertEqual(self.raw.count(b"\n") - self.raw.count(b"\r\n"), 0)
@@ -319,6 +422,24 @@ class UpdaterEncodingTest(unittest.TestCase):
         non_ascii = [c for c in head if ord(c) > 127]
         self.assertEqual(non_ascii, [],
                          "コードページ確定前に非 ASCII がある: %r" % non_ascii)
+
+    def test_a_failed_self_copy_does_not_fall_back_to_running_in_place(self):
+        """TEMP への写しが作れなかったとき、元の場所で走らないこと。
+
+        更新は展開したファイルをインストール先へ丸ごと上書きするので、
+        元の場所で走ると実行中の自分自身が置き換わる。cmd はバッチを
+        バイト位置で読み進めるため、そこから先が壊れる。TEMP の写しから
+        走るのはそれを避けるための仕組みで、写せなかったときに元の場所へ
+        戻すと、避けたはずの不具合をそのまま呼び戻すことになる。
+
+        写せない状況（TEMP が書けない・空きが無い）は手元で作れないので、
+        「戻す分岐が無いこと」をファイルの形として固定する。
+        """
+        marker = "%TEMP%"
+        self.assertIn(marker, self.text, "TEMP の写しから走る仕組みが無い")
+        head = self.text[:self.text.index("\r\n:run\r\n")]
+        self.assertNotIn('set "RUNNER=!SELF!"', head,
+                         "写しを作れないとき、元の場所で走る分岐が残っている")
 
     def test_the_restart_is_not_judged_by_errorlevel(self):
         """start の戻り値で成否を判定しないこと。
@@ -365,6 +486,106 @@ class UpdaterLaunchTest(unittest.TestCase):
         self.assertIsInstance(
             sent, str,
             "リストのまま渡している。コンマや等号で %1 が切れる")
+        self.assertIn('"%s"' % zip_path, sent,
+                      "ZIP のパスが引用符で包まれていない: %r" % sent)
+        self.assertEqual(sent.count('"'), 6,
+                         "3 つの引数それぞれを包むこと: %r" % sent)
+
+    def test_paths_cmd_would_mangle_are_refused(self):
+        """cmd が意味を変えてしまう文字を含むパスは、黙って失敗させないこと。
+
+        .bat は CreateProcess 経由で cmd.exe /c "<コマンドライン>" として
+        起動されるため、外側の引用符が剥がれた状態で cmd が読み直す。
+        実測では ^ は黙って消え、%VAR% は展開され、& 以降は別のコマンドと
+        して実行される。どれも「アプリだけ終了して更新が当たらない」形に
+        なり、& では パスの断片がコマンドとして走る。
+
+        updater.bat 自身も同じ理由で ! を検出して中止するので、こちらでも
+        気づける形にする（呼び出し側が理由を表示できるよう例外にする）。
+        """
+        from core.version_manager import updater_command
+
+        for bad in ("C:\\Tools\\R&D\\updater.bat",
+                    "C:\\Tools\\caret^dir\\updater.bat",
+                    "C:\\Tools\\pct%PATH%dir\\updater.bat"):
+            with self.subTest(path=bad):
+                with self.assertRaises(ValueError) as caught:
+                    updater_command(bad, "C:\\tmp\\x.zip", "C:\\app\\NetBelt.exe")
+                self.assertIn("パス", str(caught.exception),
+                              "理由が利用者に伝わる文面になっていない")
+
+    def test_an_exclamation_mark_is_refused_before_the_app_quits(self):
+        """`!` も起動前に断ること。
+
+        updater.bat 自身も `!` を検出して中止するが、そのときには
+        呼び出し側が既に QApplication.quit() を呼んでいる。つまり
+        「更新は絶対に当たらないのに、アプリだけ先に終了する」という、
+        利用者から見て一番困る形になる。手前で止める。
+        """
+        from core.version_manager import updater_command
+        with self.assertRaises(ValueError) as caught:
+            updater_command("C:\\Tools\\Wow!\\updater.bat",
+                            "C:\\tmp\\x.zip", "C:\\app\\NetBelt.exe")
+        self.assertIn("パス", str(caught.exception))
+
+    def test_the_offending_path_is_named(self):
+        """どのパスが原因かを示すこと（3つ渡すので特定できないと困る）。"""
+        from core.version_manager import updater_command
+        zip_path = "C:\\tmp\\R&D\\x.zip"
+        with self.assertRaises(ValueError) as caught:
+            updater_command("C:\\app\\updater.bat", zip_path, "C:\\app\\NetBelt.exe")
+        self.assertIn(zip_path, str(caught.exception))
+
+    def test_paths_that_used_to_break_are_still_accepted(self):
+        """今回直した , = や、空白・アポストロフィは通ること。"""
+        from core.version_manager import updater_command
+        for good in ("C:\\Tools\\Net,Belt\\updater.bat",
+                     "C:\\Tools\\Key=Val\\updater.bat",
+                     "C:\\Program Files\\NetBelt\\updater.bat",
+                     "C:\\Tools\\O'Brien\\updater.bat",
+                     "C:\\Tools\\(x86)\\updater.bat"):
+            with self.subTest(path=good):
+                command = updater_command(good, "C:\\tmp\\x.zip",
+                                          "C:\\app\\NetBelt.exe")
+                self.assertIn('"%s"' % good, command)
+
+    def _dialog_with_a_downloaded_zip(self, zip_path):
+        from ui.dialogs.update_dialog import UpdateDialog
+        dialog = UpdateDialog(None, {
+            "version": "9.9.9",
+            "release_notes": "test",
+            "download_url": "https://example.com/x.zip",
+            "published_at": "2026-08-27T00:00:00Z",
+        })
+        dialog.downloaded_zip_path = zip_path
+        return dialog
+
+    def test_the_dialog_quotes_its_paths_too(self):
+        """「更新を適用」からの経路も、同じように包むこと。
+
+        cmd の引数分割対策は起動時の未適用更新の経路にだけ入っていて、
+        「今すぐダウンロード → 更新を適用」というダイアログ側の経路は
+        リスト渡しのままだった。インストール先や ZIP のパスに , や =
+        があると updater.bat 自身のパスが途中で切れ、一度も起動しない
+        まま（アプリだけ終了して）更新が永久に当たらない。
+        """
+        from unittest import mock
+
+        base = tempfile.mkdtemp(prefix="netbelt_dlg_")
+        self.addCleanup(shutil.rmtree, base, True)
+        zip_path = os.path.join(base, "Net,Belt-update.zip")
+        io.open(zip_path, "wb").write(b"PK\x03\x04")
+
+        dialog = self._dialog_with_a_downloaded_zip(zip_path)
+        with mock.patch("subprocess.Popen") as popen, \
+             mock.patch("PyQt6.QtWidgets.QApplication.quit"):
+            dialog._on_apply_clicked()
+
+        self.assertTrue(popen.called, "updater を起動していない")
+        sent = popen.call_args[0][0]
+        self.assertIsInstance(
+            sent, str,
+            "リストのまま渡している。コンマや等号で引数が切れる")
         self.assertIn('"%s"' % zip_path, sent,
                       "ZIP のパスが引用符で包まれていない: %r" % sent)
         self.assertEqual(sent.count('"'), 6,

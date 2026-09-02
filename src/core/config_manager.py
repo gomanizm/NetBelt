@@ -1,6 +1,7 @@
 """設定ファイル管理モジュール"""
 import json
 import os
+import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional
 from .crypto import PasswordCrypto
@@ -282,9 +283,31 @@ class ConfigManager:
             save_config = json.loads(json.dumps(self.config))
             self._encrypt_passwords(save_config)
             
-            with open(self.config_path, 'w', encoding='utf-8') as f:
-                json.dump(save_config, f, indent=2, ensure_ascii=False)
-            
+            # 本体を直接開くと、その瞬間に長さ 0 へ切り詰められる。書き終える
+            # までに落ちると（強制終了・シャットダウン・ディスク満杯）全機器と
+            # パスワードが消え、次回起動時のバックアップにも残骸しか入らない。
+            # 同じディレクトリへ書いてから os.replace で差し替える。差し替えは
+            # 不可分なので、失敗しても前の config.json がそのまま残る。
+            # 一時ファイルを同階層に作るのは、os.replace がドライブを跨げないため。
+            tmp_path = None
+            try:
+                fd, tmp_path = tempfile.mkstemp(
+                    dir=str(self.config_path.parent),
+                    prefix=self.config_path.name + ".",
+                    suffix=".tmp")
+                with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                    json.dump(save_config, f, indent=2, ensure_ascii=False)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_path, str(self.config_path))
+                tmp_path = None      # 差し替え済み。後片付けの対象から外す
+            finally:
+                if tmp_path is not None:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+
             return True
         except Exception as e:
             print(f"設定ファイルの保存エラー: {e}")

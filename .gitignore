@@ -61,3 +61,6 @@ mibs/*
 # Release
 release/
 *.zip
+
+# Development work log (kept locally, not published)
+WORKLOG.md

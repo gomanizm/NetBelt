@@ -94,10 +94,68 @@ class SSHConnection(QObject):
                     "確認してください。%s" % (self.username, note))
         return "認証失敗: ユーザー名またはパスワードが間違っています"
 
+    # シェルが開くのを待つ上限。
+    # paramiko の channel_timeout（既定 3600 秒）が効くのは CHANNEL_OPEN
+    # までで、その後の pty-req / shell 要求は channel.py の
+    # _wait_for_event() が引数なしの event.wait() で待つため無期限になる。
+    # connect_kwargs へ channel_timeout を足してもこの段階は救えない。
+    # 認証が通ったあとなので、機器側のログイン猶予も効かない。
+    SHELL_TIMEOUT_SECONDS = 30
+
+    def _open_shell(self):
+        """インタラクティブシェルを開く（上限まで待って開かなければ None）
+
+        応答を返さない機器に当たると invoke_shell が無期限に止まり、
+        connected も error_occurred も出ないまま接続スレッドが居座る。
+        UI は「接続します...」と空のタブのままで、失敗表示も再接続の
+        案内も出ないので、利用者からは固まったようにしか見えない。
+
+        別スレッドで開かせ、上限を過ぎたら諦める。取り残されたスレッドは
+        呼び出し側（_fail -> dispose）が接続を閉じた時点で例外になって
+        終わる。daemon なのでアプリの終了も妨げない。
+        """
+        client = self.client
+        outcome = {}
+
+        def open_it():
+            try:
+                outcome['channel'] = client.invoke_shell(
+                    term='vt100', width=self.term_cols, height=self.term_rows)
+            except Exception as e:
+                outcome['error'] = e
+
+        worker = threading.Thread(target=open_it, daemon=True)
+        worker.start()
+        worker.join(timeout=self.SHELL_TIMEOUT_SECONDS)
+
+        if worker.is_alive():
+            return None
+        if 'error' in outcome:
+            # 例外はこれまでどおり呼び出し側の except で分類させる
+            raise outcome['error']
+        return outcome.get('channel')
+
+    def _fail(self, message: str) -> bool:
+        """接続に失敗したときの後始末と通知
+
+        paramiko の SSHClient.connect() は失敗しても自分ではトランスポートを
+        閉じない。閉じずに戻ると、機器へ張った TCP セッションと Transport
+        スレッドが生き残る。呼び出し側も失敗時は disconnect() を呼ばないので、
+        SSHConnection を捨てても Transport スレッド自身がオブジェクトを
+        参照し続け、GC でも回収されない。
+
+        機器側は認証前のログイン猶予（Cisco IOS の ip ssh time-out、
+        OpenSSH の LoginGraceTime、いずれも既定 120 秒）でいずれ切るが、
+        invoke_shell の失敗は認証が通ったあとなので猶予が効かない。
+        """
+        self.dispose()
+        self.error_occurred.emit(message)
+        return False
+
     def connect(self) -> bool:
         """
         SSH接続を開始
-        
+
         Returns:
             bool: 接続成功時True
         """
@@ -143,14 +201,12 @@ class SSHConnection(QObject):
                         # 集めた理由を捨てない。特にパスフレーズ付きの鍵は
                         # 「対応する鍵タイプが無い」と出ると原因が分からない。
                         if needs_passphrase:
-                            self.error_occurred.emit(
+                            return self._fail(
                                 "秘密鍵の読み込みエラー: この鍵はパスフレーズで保護されています。"
                                 "パスフレーズ無しの鍵を指定してください。")
-                        else:
-                            self.error_occurred.emit(
-                                "秘密鍵の読み込みエラー: 対応する鍵タイプが見つかりません。\n"
-                                + "\n".join(key_errors))
-                        return False
+                        return self._fail(
+                            "秘密鍵の読み込みエラー: 対応する鍵タイプが見つかりません。\n"
+                            + "\n".join(key_errors))
 
                     connect_kwargs['pkey'] = key
                     # 指定された鍵だけを使う。True にすると、その鍵が拒否された
@@ -158,20 +214,23 @@ class SSHConnection(QObject):
                     # 意図したのと違う身元で接続することになる。
                     connect_kwargs['look_for_keys'] = False
                 except Exception as e:
-                    self.error_occurred.emit(f"秘密鍵の読み込みエラー: {str(e)}")
-                    return False
+                    return self._fail(f"秘密鍵の読み込みエラー: {str(e)}")
             elif self.password:
                 connect_kwargs['password'] = self.password
             else:
-                self.error_occurred.emit("パスワードまたは秘密鍵が必要です")
-                return False
+                return self._fail("パスワードまたは秘密鍵が必要です")
             
             # SSH接続を実行
             self.client.connect(**connect_kwargs)
             
             # インタラクティブシェルを開始 (RFC 4254 6.2 pty-req)
-            self.channel = self.client.invoke_shell(
-                term='vt100', width=self.term_cols, height=self.term_rows)
+            self.channel = self._open_shell()
+            if self.channel is None:
+                return self._fail(
+                    "シェルを開けませんでした（%d 秒待って応答がありません）。\n"
+                    "機器が混んでいる、exec 認可の応答を待っている、"
+                    "vty が空いていない、などが考えられます。"
+                    % self.SHELL_TIMEOUT_SECONDS)
             self.channel.settimeout(0.1)
             
             self.is_connected = True
@@ -185,37 +244,42 @@ class SSHConnection(QObject):
             return True
             
         except paramiko.AuthenticationException:
-            self.error_occurred.emit(self._auth_failure_message())
-            return False
+            return self._fail(self._auth_failure_message())
         except paramiko.BadHostKeyException:
-            self.error_occurred.emit(
+            return self._fail(
                 "ホストキーが変更されています(中間者攻撃の可能性)。"
                 "意図的な変更の場合は ~/.netbelt/known_hosts の該当ホスト行を削除してください。"
             )
-            return False
         except paramiko.SSHException as e:
-            self.error_occurred.emit(f"SSH接続エラー: {str(e)}")
-            return False
+            return self._fail(f"SSH接続エラー: {str(e)}")
         except Exception as e:
-            self.error_occurred.emit(f"接続エラー: {str(e)}")
-            return False
+            return self._fail(f"接続エラー: {str(e)}")
     
-    def disconnect(self):
-        """SSH接続を切断"""
+    def dispose(self):
+        """チャネルと SSHClient を閉じて資源を手放す（通知は出さない）
+
+        機器側都合の切断やエラーを受けたあとの後始末で使う。ここで
+        disconnected を出すと、いま処理中の切断処理が再入する。
+        閉じずに参照だけ捨てると、Transport スレッド自身がオブジェクトを
+        参照し続けるため GC でも回収されない。
+        """
         self._stop_reading = True
         self.is_connected = False
-        
+
         if self._read_thread and self._read_thread.is_alive():
             self._read_thread.join(timeout=2)
-        
+
         if self.channel:
             self.channel.close()
             self.channel = None
-        
+
         if self.client:
             self.client.close()
             self.client = None
-        
+
+    def disconnect(self):
+        """SSH接続を切断"""
+        self.dispose()
         self.disconnected.emit()
     
     def send_command(self, command: str):
@@ -231,7 +295,10 @@ class SSHConnection(QObject):
         try:
             # キー入力をそのまま送信（改行は追加しない）
             # InteractiveTerminalからEnterキーは'\r'として送られてくる
-            self.channel.send(command.encode('utf-8'))
+            # send は送れたバイト数を返すだけで、渡した全部を送ったとは
+            # 限らない。1文字ずつ送っていた頃はまず起きなかったが、
+            # 貼り付けをまとめて渡すようになったので取りこぼしうる。
+            self.channel.sendall(command.encode('utf-8'))
         except Exception as e:
             self.error_occurred.emit(f"送信エラー: {str(e)}")
 

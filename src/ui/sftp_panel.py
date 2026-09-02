@@ -107,6 +107,14 @@ class SFTPPanel(QWidget):
 
     NO_TARGET_TEXT = "接続先: なし"
 
+    # サーバが属性を返さなかったときの表示。0 や 1970-01-01 に丸めると
+    # 「空のファイル」「1970年更新」という別の嘘になり、転送の判断を誤らせる。
+    UNKNOWN_TEXT = "不明"
+
+    # 進捗バーの目盛りの数。バイト数を直に渡すと 2GiB 超で 32bit を
+    # あふれるので、割合をこの目盛りへ載せる。
+    PROGRESS_STEPS = 1000
+
     # 未接続のときに出す案内。接続すると消す。
     HINT_TEXT = (
         "ターミナルで機器へ SSH 接続すると、このパネルが使えるようになります。\n"
@@ -251,7 +259,8 @@ class SFTPPanel(QWidget):
         
         self.sftp_manager = sftp_manager
         self.hint_label.setVisible(False)
-        # 接続先が変わるので、前の接続で観測した一覧は使えない
+        # 接続先が変わるので、前の接続で観測した一覧も進捗も使えない
+        self._reset_progress()
         self._current_entries = {}
         self._pending_upload_names = set()
         self.current_device = device_name
@@ -293,13 +302,56 @@ class SFTPPanel(QWidget):
         self.target_label.setText(self.NO_TARGET_TEXT)
         self.hint_label.setVisible(True)
         self.status_label.setText("")
-        self.progress_bar.setVisible(False)
+        self._reset_progress()
         self.sftp_manager = None
         self.current_device = ""
         # 残しておくと、次の接続で一覧を取る前に古い名前で上書き判定してしまう
         self._current_entries = {}
         self._pending_upload_names = set()
     
+    def _still_on(self, manager) -> bool:
+        """操作を始めた時点の機器のままかを返す。
+
+        モーダルダイアログの間も Qt のイベントループは回るので、開いている
+        間に (1) 接続が切れて clear() が走る（sftp_manager が None になる）、
+        (2) 利用者が別タブへ移り、パネルが別機器のマネージャへ差し替わる、
+        のどちらも起こり得る。(1) は AttributeError でプロセスごと落ち、
+        (2) は落ちない代わりに別の機器へ送ってしまう。
+        None 判定だけでは (2) を防げないので、同一性まで見る。
+        """
+        return manager is not None and self.sftp_manager is manager
+
+    def _begin(self):
+        """操作を始めた時点の「相手」と「場所」を控える。
+
+        _still_on で相手の同一性は固定できるが、場所は固定できない。
+        ディレクトリ移動も一覧の取得も非同期で、完了時に
+        manager.current_path が書き換わる。ダイアログを閉じたあとで
+        get_current_path() を読み直すと、利用者が選んだのとは別の
+        ディレクトリに対して削除・改名・作成をしてしまう。相手が
+        同じままでも起こるので、_still_on とは別に必要になる。
+
+        Returns:
+            (マネージャ, 開始時点のパス)。繋がっていなければ (None, None)
+        """
+        manager = self.sftp_manager
+        if manager is None:
+            return None, None
+        return manager, manager.get_current_path()
+
+    @staticmethod
+    def _remote_path(base: str, name: str) -> str:
+        """リモートのパスを組み立てる（ルート直下の // を避ける）"""
+        return f"/{name}" if base == "/" else f"{base}/{name}"
+
+    def _abandon(self, what: str):
+        """接続が変わったので操作を取りやめたことを伝える。
+
+        ここでモーダルを出すと、ドロップした件数ぶん出てしまう。
+        ステータス欄に出すだけにする。
+        """
+        self.status_label.setText("接続先が変わったため、%sを取りやめました" % what)
+
     def _update_file_list(self, file_list: list):
         """
         ファイル一覧を更新
@@ -347,9 +399,11 @@ class SFTPPanel(QWidget):
             # パーミッション
             perm_item = QStandardItem(file_info['permissions'])
             
-            # 更新日時
-            mtime = datetime.fromtimestamp(file_info['mtime'])
-            time_item = QStandardItem(mtime.strftime("%Y-%m-%d %H:%M:%S"))
+            # 更新日時。サーバが ATTR_ACMODTIME を返さなければ None、
+            # paramiko が符号付き 32bit で読むので負値にもなり得る。
+            # ここは file_list_ready のスロット（キュー接続）なので、
+            # 例外を漏らすと PyQt がプロセスごと落とす。
+            time_item = QStandardItem(self._format_mtime(file_info['mtime']))
             
             # データとして元のファイル情報を保持
             name_item.setData(file_info, Qt.ItemDataRole.UserRole)
@@ -359,6 +413,19 @@ class SFTPPanel(QWidget):
         
         self.status_label.setText(f"{len(file_list)} 項目")
     
+    def _reset_progress(self):
+        """進捗バーを片付ける
+
+        接続先が変わったら必ず呼ぶ。残しておくと、接続先の表示は新しい
+        機器に変わっているのに、その直下のバーは前の機器の途中経過を
+        出したままになる。前の機器の転送が終わっても通知はもう繋がって
+        いないので、放っておくと消えない。
+        """
+        self.progress_bar.setVisible(False)
+        self.progress_bar.setFormat("%p%")
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.reset()
+
     def _update_progress(self, transferred: int, total: int):
         """
         転送進捗を更新
@@ -368,13 +435,29 @@ class SFTPPanel(QWidget):
             total: 全体バイト数
         """
         self.progress_bar.setVisible(True)
-        self.progress_bar.setMaximum(total)
-        self.progress_bar.setValue(transferred)
-        
-        # パーセンテージを表示
-        if total > 0:
-            percent = int(transferred * 100 / total)
-            self.progress_bar.setFormat(f"{percent}% ({self._format_size(transferred)} / {self._format_size(total)})")
+
+        # QProgressBar の目盛りは 32bit int なので、バイト数をそのまま渡せない。
+        # 2GiB を超えると全体サイズが負に化け、Qt が範囲外の現在値を reset()
+        # するためバーは空のまま1ミリも動かない。4GiB を超えると逆に正の
+        # 小さい値へ回り、真の 20% ほどで「100%」に達したあと 125%、-150%
+        # まで出る。バイト数ではなく割合を固定の目盛りへ載せる。
+        if total and total > 0:
+            total = int(total)
+            done = max(0, min(int(transferred), total))
+            self.progress_bar.setRange(0, self.PROGRESS_STEPS)
+            self.progress_bar.setValue(done * self.PROGRESS_STEPS // total)
+            percent = done * 100 // total
+            self.progress_bar.setFormat(
+                f"{percent}% ({self._format_size(done)} / {self._format_size(total)})")
+        else:
+            # 全体サイズが分からない転送。割合を出しようがないので
+            # 目盛りを伏せる（Qt の不定表示＝動くだけのバー）。
+            # QProgressBar は minimum==maximum のとき text() を空にするので、
+            # setFormat した文字列は画面に出ない。転送済みの量はバーの外、
+            # ステータス欄へ出す。
+            self.progress_bar.setRange(0, 0)
+            self.status_label.setText(
+                "転送中: %s" % self._format_size(transferred))
     
     def _on_transfer_complete(self, message: str):
         """
@@ -494,9 +577,10 @@ class SFTPPanel(QWidget):
     
     def _on_upload(self):
         """アップロードボタンがクリックされた"""
-        if not self.sftp_manager:
+        manager, base_path = self._begin()
+        if not manager:
             return
-        
+
         # ファイル選択ダイアログ
         file_path, _ = QFileDialog.getOpenFileName(
             self,
@@ -506,15 +590,22 @@ class SFTPPanel(QWidget):
         )
         
         if file_path:
-            self._upload_with_confirmation(file_path)
-    
-    def _upload_with_confirmation(self, file_path: str):
+            self._upload_with_confirmation(file_path, manager, base_path)
+
+    def _upload_with_confirmation(self, file_path: str, manager=None,
+                                  base_path=None):
         """
         上書き確認を挟んでアップロードする
-        
+
         Args:
             file_path: ローカルのファイルパス
+            manager: 操作を始めた時点のマネージャ。省略時はいまの接続
+            base_path: 操作を始めた時点のリモートのディレクトリ
         """
+        if manager is None:
+            manager, base_path = self._begin()
+            if manager is None:
+                return
         name = os.path.basename(file_path)
         confirm = self._get_sftp_setting(
             "confirm_overwrite", self.SFTP_SETTING_DEFAULTS["confirm_overwrite"])
@@ -542,8 +633,14 @@ class SFTPPanel(QWidget):
         # 複数送る間は間に合わない。送信中の名前を別に覚えておき、同じドロップ内の
         # 同名2件目以降にも確認が出るようにする。_current_entries は
         # 「最後に観測したリモートの一覧」のまま保つ（種別を汚さないため）
+        if not self._still_on(manager):
+            self._abandon("アップロード")
+            return
         self._pending_upload_names.add(name)
-        self.sftp_manager.upload_file(file_path)
+        # 送り先を明示する。省略すると SFTPManager が呼ばれた時点の
+        # current_path を使うので、確認ダイアログの間にディレクトリが
+        # 変わっていると別の場所へ置いてしまう
+        manager.upload_file(file_path, self._remote_path(base_path, name))
     
     def _on_download(self):
         """ダウンロードボタンがクリックされた"""
@@ -570,9 +667,10 @@ class SFTPPanel(QWidget):
         Args:
             file_info: ファイル情報
         """
-        if not self.sftp_manager:
+        manager, base_path = self._begin()
+        if not manager:
             return
-        
+
         # 保存先を選択（settings.sftp.default_download_path を初期位置に使う）
         download_dir = self._get_sftp_setting(
             "default_download_path",
@@ -587,15 +685,18 @@ class SFTPPanel(QWidget):
         )
         
         if local_path:
-            current_path = self.sftp_manager.get_current_path()
-            remote_path = f"{current_path}/{file_info['name']}" if current_path != "/" else f"/{file_info['name']}"
-            self.sftp_manager.download_file(remote_path, local_path)
+            if not self._still_on(manager):
+                self._abandon("ダウンロード")
+                return
+            remote_path = self._remote_path(base_path, file_info['name'])
+            manager.download_file(remote_path, local_path)
     
     def _on_create_directory(self):
         """新規ディレクトリ作成"""
-        if not self.sftp_manager:
+        manager, base_path = self._begin()
+        if not manager:
             return
-        
+
         # ディレクトリ名を入力
         dir_name, ok = QInputDialog.getText(
             self,
@@ -604,9 +705,10 @@ class SFTPPanel(QWidget):
         )
         
         if ok and dir_name:
-            current_path = self.sftp_manager.get_current_path()
-            new_path = f"{current_path}/{dir_name}" if current_path != "/" else f"/{dir_name}"
-            self.sftp_manager.create_directory(new_path)
+            if not self._still_on(manager):
+                self._abandon("フォルダの作成")
+                return
+            manager.create_directory(self._remote_path(base_path, dir_name))
     
     def _on_delete(self):
         """削除ボタンがクリックされた"""
@@ -629,9 +731,10 @@ class SFTPPanel(QWidget):
         Args:
             file_info: ファイル情報
         """
-        if not self.sftp_manager:
+        manager, base_path = self._begin()
+        if not manager:
             return
-        
+
         # 確認ダイアログ（settings.sftp.confirm_delete）
         if self._get_sftp_setting(
                 "confirm_delete", self.SFTP_SETTING_DEFAULTS["confirm_delete"]):
@@ -645,9 +748,11 @@ class SFTPPanel(QWidget):
             if reply != QMessageBox.StandardButton.Yes:
                 return
         
-        current_path = self.sftp_manager.get_current_path()
-        item_path = f"{current_path}/{file_info['name']}" if current_path != "/" else f"/{file_info['name']}"
-        self.sftp_manager.delete_item(item_path, file_info['is_dir'])
+        if not self._still_on(manager):
+            self._abandon("削除")
+            return
+        item_path = self._remote_path(base_path, file_info['name'])
+        manager.delete_item(item_path, file_info['is_dir'])
     
     def _on_rename_selected(self, file_info: dict):
         """
@@ -656,9 +761,10 @@ class SFTPPanel(QWidget):
         Args:
             file_info: ファイル情報
         """
-        if not self.sftp_manager:
+        manager, base_path = self._begin()
+        if not manager:
             return
-        
+
         # 新しい名前を入力
         new_name, ok = QInputDialog.getText(
             self,
@@ -668,10 +774,11 @@ class SFTPPanel(QWidget):
         )
         
         if ok and new_name and new_name != file_info['name']:
-            current_path = self.sftp_manager.get_current_path()
-            old_path = f"{current_path}/{file_info['name']}" if current_path != "/" else f"/{file_info['name']}"
-            new_path = f"{current_path}/{new_name}" if current_path != "/" else f"/{new_name}"
-            self.sftp_manager.rename_item(old_path, new_path)
+            if not self._still_on(manager):
+                self._abandon("名前の変更")
+                return
+            manager.rename_item(self._remote_path(base_path, file_info['name']),
+                                self._remote_path(base_path, new_name))
     
     def _on_chmod_selected(self, file_info: dict):
         """
@@ -680,9 +787,10 @@ class SFTPPanel(QWidget):
         Args:
             file_info: ファイル情報
         """
-        if not self.sftp_manager:
+        manager, base_path = self._begin()
+        if not manager:
             return
-        
+
         # 現在のパーミッションを8進数で表示
         current_mode = file_info['mode'] & 0o777
         current_mode_str = oct(current_mode)[2:]  # '0o755' -> '755'
@@ -699,9 +807,11 @@ class SFTPPanel(QWidget):
             try:
                 # 8進数として解釈
                 new_mode = int(new_mode_str, 8)
-                current_path = self.sftp_manager.get_current_path()
-                item_path = f"{current_path}/{file_info['name']}" if current_path != "/" else f"/{file_info['name']}"
-                self.sftp_manager.change_permissions(item_path, new_mode)
+                if not self._still_on(manager):
+                    self._abandon("パーミッションの変更")
+                    return
+                item_path = self._remote_path(base_path, file_info['name'])
+                manager.change_permissions(item_path, new_mode)
             except ValueError:
                 QMessageBox.warning(self, "入力エラー", "パーミッションは8進数で入力してください（例: 755）")
     
@@ -722,14 +832,17 @@ class SFTPPanel(QWidget):
         Args:
             event: ドロップイベント
         """
-        if not self.sftp_manager:
+        manager, base_path = self._begin()
+        if not manager:
             return
-        
+
+        # 複数まとめてドロップされると、送っている途中で切れたり
+        # 別タブへ移ったりし得る。1件ごとに相手を確かめ直す。
         urls = event.mimeData().urls()
         for url in urls:
             file_path = url.toLocalFile()
             if os.path.isfile(file_path):
-                self._upload_with_confirmation(file_path)
+                self._upload_with_confirmation(file_path, manager, base_path)
     
     @staticmethod
     def _format_size(size: int) -> str:
@@ -742,8 +855,29 @@ class SFTPPanel(QWidget):
         Returns:
             str: フォーマットされたサイズ文字列
         """
+        if size is None:
+            return SFTPPanel.UNKNOWN_TEXT
         for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
             if size < 1024.0:
                 return f"{size:.1f} {unit}"
             size /= 1024.0
         return f"{size:.1f} PB"
+
+    @staticmethod
+    def _format_mtime(mtime) -> str:
+        """
+        更新日時を読みやすい形式にフォーマット
+
+        Args:
+            mtime: エポック秒。サーバが返さなければ None
+
+        Returns:
+            str: フォーマットされた日時文字列。読めない値なら「不明」
+        """
+        if mtime is None:
+            return SFTPPanel.UNKNOWN_TEXT
+        try:
+            return datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
+        except (OSError, OverflowError, ValueError, TypeError):
+            # Windows の fromtimestamp は負のタイムスタンプで OSError を投げる
+            return SFTPPanel.UNKNOWN_TEXT

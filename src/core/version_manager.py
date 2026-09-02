@@ -20,6 +20,46 @@ except ImportError:
     APP_NAME = "NetBelt"
 
 
+# cmd が区切りや展開に使う文字。.bat は CreateProcess 経由で
+# cmd.exe /c "<コマンドライン>" として起動されるため、外側の引用符が
+# 剥がれた状態で cmd が読み直す。引用符で包んでも意味が変わってしまう。
+# 実測: ^ は黙って消え、%VAR% は展開され、& 以降は別のコマンドとして走る。
+#
+# ! も入れる。updater.bat 自身も遅延展開と両立しないため中止するが、
+# そのときには呼び出し側が既に QApplication.quit() を呼んでいるので、
+# 「更新は絶対に当たらないのにアプリだけ先に終了する」形になる。
+_CMD_UNSAFE = "&^%!"
+
+
+def updater_command(updater_path: str, zip_path: str, app_path: str) -> str:
+    """updater.bat を起動するコマンド行を組み立てる
+
+    subprocess にリストで渡すと、Windows の list2cmdline は空白かタブを
+    含む引数しか引用符で包まない。ところが cmd はコンマと等号も引数の
+    区切りとして扱うので、パスに , や = が入っていて空白が無いと引数が
+    途中で切れる。updater.bat 自身のパスが切れた場合は一度も起動せず、
+    アプリだけ終了して更新が永久に当たらない。
+
+    起動元が2箇所（起動時の未適用更新と、更新ダイアログの「適用」）に
+    分かれていて、片方だけ直した状態で再発した。組み立てはここへ寄せる。
+
+    引用符で包んでも救えない文字 (& ^ %) は、黙って失敗させずに
+    ValueError にする。呼び出し側はどちらも QMessageBox で理由を出せる。
+    updater.bat 自身も同じ理由で ! を検出して中止する。
+
+    Raises:
+        ValueError: cmd が意味を変えてしまう文字がパスに含まれるとき
+    """
+    for path in (updater_path, zip_path, app_path):
+        found = [c for c in _CMD_UNSAFE if c in path]
+        if found:
+            raise ValueError(
+                "パスに %s が含まれているため、更新を適用できません。\n"
+                "フォルダ名を変えるか、新しい ZIP を手で展開してください。\n"
+                "対象: %s" % (" ".join(found), path))
+    return '"{}" "{}" "{}"'.format(updater_path, zip_path, app_path)
+
+
 class VersionManager:
     """バージョン管理とアップデート機能を提供するクラス"""
     
@@ -288,6 +328,8 @@ class VersionManager:
         Returns:
             ダウンロードしたZIPファイルのパス、またはNone（エラー時）
         """
+        # 受信中に例外が出ても書きかけを残さないよう、外側でも掴んでおく
+        part_path = None
         try:
             # ファイル名を生成
             filename = os.path.basename(url)
@@ -381,6 +423,11 @@ class VersionManager:
         
         except Exception as e:
             print(f"[VersionManager] ダウンロードエラー: {e}")
+            # 受信中に切れた場合、ここまでは書きかけが残ったままだった。
+            # get_pending_update_files は .zip しか拾わないので掃除にも
+            # かからず、利用者が再試行しない限り temp に居座り続ける。
+            if part_path:
+                self._discard(part_path)
             return None
     
     @staticmethod
@@ -456,9 +503,35 @@ class VersionManager:
                     os.remove(zip_path)
                     print(f"[VersionManager] 古い更新ファイルを削除: {zip_path}")
                     deleted_count += 1
+                    # 検証を通った ZIP の隣には .sha256 と .version がある。
+                    # ZIP だけ消すと孤児として残り続ける（適用したときは
+                    # updater.bat が3つとも消すので、適用しなかったぶんが
+                    # 溜まる）。
+                    for suffix in ('.sha256', '.version'):
+                        self._discard(zip_path + suffix)
             except Exception as e:
                 print(f"[VersionManager] ファイル削除エラー: {e}")
-        
+
+        # 書きかけ (.part) も片付ける。get_pending_update_files は
+        # 「適用できる更新」を返す口なので、未検証の断片をそこへ混ぜる
+        # わけにはいかない（検証を通っていないものを適用してしまう）。
+        # 掃除だけはここで面倒を見る。まだ書いている最中かもしれないので、
+        # ZIP と同じく古くなったものだけを対象にする。
+        try:
+            for filename in os.listdir(self.UPDATE_DIR):
+                if not filename.endswith('.part'):
+                    continue
+                part_path = os.path.join(self.UPDATE_DIR, filename)
+                try:
+                    if current_time - os.path.getmtime(part_path) > max_age_seconds:
+                        os.remove(part_path)
+                        print(f"[VersionManager] 書きかけの更新ファイルを削除: {part_path}")
+                        deleted_count += 1
+                except Exception as e:
+                    print(f"[VersionManager] ファイル削除エラー: {e}")
+        except Exception as e:
+            print(f"[VersionManager] 書きかけの確認エラー: {e}")
+
         return deleted_count
     
     @staticmethod

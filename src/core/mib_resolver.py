@@ -170,15 +170,26 @@ class MIBResolver:
             print(f"[MIBResolver] MIBファイルを解析中...")
             cached_mibs = {}
             
+            # ファイルをまたぐ参照があるので、まず全ファイルから定義を集め、
+            # そのあとでまとめて解決する。ベンダー MIB は親ノードを別ファイル
+            # (Cisco なら CISCO-SMI.my の ciscoMgmt) で定義するのが普通で、
+            # 1 ファイルずつ閉じて解決すると、そこにぶら下がる定義が全滅する。
+            all_definitions = []
+            per_file = {}
             for filename in current_files.keys():
                 filepath = os.path.join(mibs_dir, filename)
                 try:
-                    # MIBファイルを解析
-                    temp_mibs = self._parse_mib_file_to_dict(filepath)
-                    cached_mibs.update(temp_mibs)
-                    print(f"[MIBResolver] {filename}: {len(temp_mibs)}件")
+                    definitions = self._extract_mib_definitions(filepath)
+                    per_file[filename] = definitions
+                    all_definitions.extend(definitions)
                 except Exception as e:
                     print(f"[MIBResolver] {filename} エラー: {str(e)}")
+
+            resolved = self._resolve_definitions(all_definitions)
+            cached_mibs = {oid: name for name, oid in resolved.items()}
+            for filename, definitions in per_file.items():
+                got = sum(1 for name, _, _ in definitions if name in resolved)
+                print(f"[MIBResolver] {filename}: {got}件")
             
             # キャッシュファイルに保存
             try:
@@ -194,79 +205,134 @@ class MIBResolver:
         
         return cached_mibs
     
-    def _parse_mib_file_to_dict(self, filepath: str) -> dict:
+    # MIB から拾う定義。現代の MIB はモジュールの根を MODULE-IDENTITY で
+    # 定義するので、これを見ないと単一ファイルで完結していても根が解決できず、
+    # その配下（Trap が実際に運ぶ通知 OID を含む）が丸ごと落ちる。
+    _MIB_DEFINITION_PATTERNS = (
+        r'(\w+)\s+OBJECT\s+IDENTIFIER\s*::=\s*\{\s*(\w+)\s+(\d+)\s*\}',
+        # 型キーワードから ::= までは「コロンを含まない並び」ではない。
+        # 実 MIB はほぼ必ず DESCRIPTION を持ち、そこへ RFC 参照や URL を
+        # 書くので、[^:]* にすると本文にコロンが出た時点で定義ごと
+        # 取りこぼす。最短一致で次の ::= { 名前 数字 } まで進める。
+        r'(\w+)\s+OBJECT-TYPE\b.*?::=\s*\{\s*(\w+)\s+(\d+)\s*\}',
+        r'(\w+)\s+NOTIFICATION-TYPE\b.*?::=\s*\{\s*(\w+)\s+(\d+)\s*\}',
+        r'(\w+)\s+MODULE-IDENTITY\b.*?::=\s*\{\s*(\w+)\s+(\d+)\s*\}',
+    )
+
+    @staticmethod
+    def _blank_comments_and_strings(text: str) -> str:
+        """コメントと文字列の中身を空白にして返す。
+
+        定義は生のテキストに正規表現を掛けて拾う。DESCRIPTION の中や
+        `--` コメントの中に `::= { x n }` と書いてあると、そこで一致が
+        止まって偽の親を記録する。コメントアウトされた
+        `-- old OBJECT-TYPE` が起点になって次の本物の定義を飲むこともある
+        （ベンダー MIB は廃止したオブジェクトをこの形で残す）。
+        先に中身を消しておけば、どちらも起こらない。
+
+        文字列は閉じる `"` まで。コメントは `--` から行末まで、または
+        同じ行の次の `--` まで（ASN.1 の規則）。文字列の中の `--` は
+        コメントではない。改行は残す。
         """
-        MIBファイルを解析してOID→名前の辞書を返す（最適化版）
-        
+        out = []
+        i, n = 0, len(text)
+        while i < n:
+            ch = text[i]
+            if ch == '"':
+                j = text.find('"', i + 1)
+                if j == -1:
+                    j = n
+                out.append('"')
+                out.append(''.join('\n' if c == '\n' else ' '
+                                   for c in text[i + 1:j]))
+                out.append('"')
+                i = j + 1
+            elif ch == '-' and text.startswith('--', i):
+                j = i + 2
+                while j < n and text[j] != '\n':
+                    if text.startswith('--', j):
+                        j += 2
+                        break
+                    j += 1
+                out.append(' ' * (j - i))
+                i = j
+            else:
+                out.append(ch)
+                i += 1
+        return ''.join(out)
+
+    def _extract_mib_definitions(self, filepath: str) -> list:
+        """
+        MIBファイルから (名前, 親の名前, 添字) を抜き出す
+
+        ここでは OID へ解決しない。親が別のファイルで定義されていることが
+        普通にあるため、解決は全ファイルを読み終えてからまとめて行う。
+
         Args:
             filepath: MIBファイルのパス
-        
+
         Returns:
-            OID→名前の辞書
+            (名前, 親の名前, 添字) のリスト
         """
         import re
-        
-        result = {}
-        
+
+        definitions = []
         try:
             with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-                content = f.read()
-            
-            # 一時的な名前→OIDマッピング（解析中に使用）
-            temp_name_to_oid = dict(self.name_to_oid)  # 既存の辞書をコピー
-            
-            # 正規表現を事前にコンパイル（パフォーマンス向上）
-            oid_pattern = re.compile(r'(\w+)\s+OBJECT\s+IDENTIFIER\s*::=\s*\{\s*(\w+)\s+(\d+)\s*\}')
-            object_pattern = re.compile(r'(\w+)\s+OBJECT-TYPE[^:]*::=\s*\{\s*(\w+)\s+(\d+)\s*\}', re.MULTILINE)
-            notif_pattern = re.compile(r'(\w+)\s+NOTIFICATION-TYPE[^:]*::=\s*\{\s*(\w+)\s+(\d+)\s*\}', re.MULTILINE)
-            
-            # OBJECT IDENTIFIER定義を抽出
-            for match in oid_pattern.finditer(content):
-                name = match.group(1)
-                parent = match.group(2)
-                index = match.group(3)
-                
-                # 親のOIDを取得
-                parent_oid = temp_name_to_oid.get(parent)
-                if parent_oid:
-                    oid = f"{parent_oid}.{index}"
-                    result[oid] = name
-                    temp_name_to_oid[name] = oid
-                # 特殊ケース: enterprises
-                elif parent == 'enterprises':
-                    oid = f"1.3.6.1.4.1.{index}"
-                    result[oid] = name
-                    temp_name_to_oid[name] = oid
-            
-            # OBJECT-TYPE定義を抽出
-            for match in object_pattern.finditer(content):
-                name = match.group(1)
-                parent = match.group(2)
-                index = match.group(3)
-                
-                parent_oid = temp_name_to_oid.get(parent)
-                if parent_oid:
-                    oid = f"{parent_oid}.{index}"
-                    result[oid] = name
-                    temp_name_to_oid[name] = oid
-            
-            # NOTIFICATION-TYPE定義を抽出
-            for match in notif_pattern.finditer(content):
-                name = match.group(1)
-                parent = match.group(2)
-                index = match.group(3)
-                
-                parent_oid = temp_name_to_oid.get(parent)
-                if parent_oid:
-                    oid = f"{parent_oid}.{index}"
-                    result[oid] = name
-                    temp_name_to_oid[name] = oid
-        
+                content = self._blank_comments_and_strings(f.read())
+            for pattern in self._MIB_DEFINITION_PATTERNS:
+                # DOTALL が要る。定義は複数行にまたがるので、`.` が改行を
+                # 拾わないと型キーワードから ::= まで届かない
+                for match in re.finditer(pattern, content,
+                                         re.MULTILINE | re.DOTALL):
+                    definitions.append(
+                        (match.group(1), match.group(2), match.group(3)))
         except Exception as e:
             print(f"[MIBResolver] MIBファイル解析エラー: {str(e)}")
-        
-        return result
-    
+
+        return definitions
+
+    def _resolve_definitions(self, definitions: list) -> dict:
+        """
+        (名前, 親の名前, 添字) の並びを OID へ解決する
+
+        親が別のファイルで定義されていることがあるので、解決が進まなく
+        なるまで繰り返す。一度で終える（＝読んだ順に解決する）と、親が
+        後ろのファイルにある定義が os.listdir() の順しだいで落ちる。
+
+        Args:
+            definitions: (名前, 親の名前, 添字) のリスト
+
+        Returns:
+            解決できた 名前→OID の辞書
+        """
+        known = dict(self.name_to_oid)
+        resolved = {}
+        pending = list(definitions)
+
+        while pending:
+            still_pending = []
+            progressed = False
+            for name, parent, index in pending:
+                if parent == 'enterprises':
+                    parent_oid = '1.3.6.1.4.1'
+                else:
+                    parent_oid = known.get(parent)
+                if parent_oid is None:
+                    still_pending.append((name, parent, index))
+                    continue
+                oid = f"{parent_oid}.{index}"
+                known[name] = oid
+                resolved[name] = oid
+                progressed = True
+            if not progressed:
+                # これ以上どれも解決できない（親がどこにも無い）
+                break
+            pending = still_pending
+
+        return resolved
+
+
     def resolve_oid(self, oid: str) -> str:
         """
         OIDを名前に変換

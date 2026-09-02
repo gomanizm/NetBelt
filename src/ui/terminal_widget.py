@@ -9,6 +9,18 @@ from core.terminal.attrs import DEFAULT
 from core.terminal.screen import Screen, BLANK
 
 # SGR の基本 16 色 (xterm の既定値)。0-7 が基本、8-15 が明色
+def _u16(text: str) -> int:
+    """文書上の長さ（UTF-16 のコード単位）を返す。
+
+    QTextDocument の位置は UTF-16 のコード単位で数える。Python の len()
+    はコードポイント数なので、BMP 外の文字（絵文字、CJK 拡張B など）が
+    1つ画面に出るたびに1つずつずれる。ずれた添字を setPosition へ渡すと、
+    書き換え範囲が本来より手前を指し、改行の手前へ文字を挿し込んだり
+    隣の文字を巻き込んで消したりする。位置を数えるときは必ずこれを使う。
+    """
+    return len(text.encode("utf-16-le")) // 2
+
+
 ANSI_COLOURS = (
     "#000000", "#cd0000", "#00cd00", "#cdcd00",
     "#0000ee", "#cd00cd", "#00cdcd", "#e5e5e5",
@@ -42,6 +54,10 @@ class InteractiveTerminal(QTextEdit):
         self._is_recording = False  # ログ記録中フラグ
         self._macro_list = []  # 利用可能なマクロリスト
         self._keepalive_active = False  # キープアライブ動作中フラグ
+        # まだ送り切っていない貼り付け。まとめて送ると GUI が止まるので、
+        # 区切りごとにイベントループへ譲りながら流す
+        self._send_queue = []
+        self._sending = False
     
     def set_keepalive_status(self, active: bool):
         """キープアライブの状態を設定"""
@@ -56,6 +72,10 @@ class InteractiveTerminal(QTextEdit):
         self._reconnect_mode = enabled
         if enabled:
             self._input_enabled = True  # 再接続モードではEnterキーを受け付ける
+            # 送りかけの貼り付けは、切れた接続宛てのもの。残しておくと
+            # 再接続で同じタブを使い回すため、新しい接続へそのまま流れる
+            self._send_queue.clear()
+            self._sending = False
     
     def can_send_input(self) -> bool:
         """
@@ -94,22 +114,81 @@ class InteractiveTerminal(QTextEdit):
         """
         if not text or not self.can_send_input():
             return False
+        # 改行は端末と同じく CR で送る
+        payload = text.replace('\r\n', '\r').replace('\n', '\r')
         # アプリが ESC[?2004h を送ってきていたら、貼り付けを目印で
         # 包む (xterm のブラケットペースト)。bash はこれで貼り付けを
         # 即実行せず 1 かたまりの編集として扱える
         screen = getattr(self, "_screen", None)
-        bracketed = screen is not None and screen.bracketed_paste
-        if bracketed:
-            self.key_pressed.emit("\x1b[200~")
-        # 1文字ずつ送る。改行は端末と同じく CR で送る
-        for char in text:
-            if char == '\n' or char == '\r':
-                self.key_pressed.emit('\r')
-            else:
-                self.key_pressed.emit(char)
-        if bracketed:
-            self.key_pressed.emit("\x1b[201~")
+        if screen is not None and screen.bracketed_paste:
+            payload = "\x1b[200~" + payload + "\x1b[201~"
+        self._queue_send(payload)
         return True
+
+    # 1回に送り出す文字数。大きすぎると譲る間隔が空き、小さすぎると
+    # 往復が増える。設定 100 行ぶんがおよそ 2,000 文字なので、
+    # その規模なら数回で終わる。
+    SEND_CHUNK = 512
+
+    def _queue_send(self, payload: str):
+        """機器へ送るものを列の末尾へ積む
+
+        機器へ向かうものは、貼り付けも打鍵も IME の確定も問い合わせへの
+        応答も、すべてここを通す。直接 key_pressed を叩くと、まだ送り
+        終えていない貼り付けの残りを追い越して先に届く。1文字ずつ同期
+        送信していた頃は GUI が完全に止まっていたので起こらなかったが、
+        区切りごとにイベントループへ譲るようにしたことで起きるように
+        なった。CLI では途中まで貼られた行が先に実行されてしまう。
+
+        列が空なら _drain_send_queue がその場で送るので、打鍵1つの
+        ために往復が増えることはない。
+        """
+        if not payload:
+            return
+        self._send_queue.append(payload)
+        if not self._sending:
+            self._drain_send_queue()
+
+    def _drain_send_queue(self):
+        """溜めた送信を、区切りごとにイベントループへ譲りながら流す。
+
+        以前は貼り付けを 1 文字ずつ emit していた。受け口は同一スレッドの
+        send_command へ直結（DirectConnection）なので、文字数ぶんの同期
+        送信が GUI スレッドで回り、その間は再描画も操作も通らなかった。
+
+        送信そのものにかかる時間は非同期にしても縮まらない。縮められるのは
+        「その間 GUI が息をするか」なので、まとめて送りつつ間で譲る。
+
+        最初のひと区切りはその場で送る。短い貼り付けの振る舞いを変えない
+        ため（呼んだ直後に送信済みであることを前提にしている箇所がある）。
+        """
+        from PyQt6.QtCore import QTimer
+
+        # 再接続待ちに入っていたら、予約済みの排出も含めて打ち切る。
+        # 残りは切れた接続宛てなので、新しい接続へ送ってはいけない
+        if self._reconnect_mode:
+            self._send_queue.clear()
+            self._sending = False
+            return
+
+        if not self._send_queue:
+            self._sending = False
+            return
+
+        self._sending = True
+        payload = self._send_queue[0]
+        chunk, rest = payload[:self.SEND_CHUNK], payload[self.SEND_CHUNK:]
+        if rest:
+            self._send_queue[0] = rest
+        else:
+            self._send_queue.pop(0)
+
+        self.key_pressed.emit(chunk)
+
+        if self._send_queue:
+            QTimer.singleShot(0, self._drain_send_queue)
+        else:
+            self._sending = False
 
     def custom_paste(self):
         """カスタムペースト機能 - ペーストされたテキストをSSHセッションに送信"""
@@ -126,7 +205,30 @@ class InteractiveTerminal(QTextEdit):
         """
         if source.hasText():
             self.send_text(source.text())
-    
+
+    def inputMethodEvent(self, event):
+        """IME の入力を機器送信へ振り替える
+
+        日本語入力の確定文字列は keyPressEvent ではなくこちらへ来る。
+        受けずに既定動作へ流すと、QTextEdit が確定文字を文書へ直接挿入し、
+        機器が受け取っていない文字が入力済みに見える。さらに範囲選択が
+        あると選択範囲を置換するので、履歴を選んだまま確定すると機器の
+        出力がその場で書き換わる。画面領域しか描き直さないため復元されず、
+        文書を読む全ログ保存にも壊れたまま残る。
+
+        変換中の未確定文字列（preedit）は機器へ送らず、画面にも出さない。
+        端末の面は機器の出力を写したものなので、割り込ませると描画とずれる。
+
+        送れる状態かどうかは can_send_input() が見る。keyPressEvent の
+        早期 return はこの経路には効かないので、ここでも通す必要がある。
+        貼り付けではないため、ブラケットペーストの目印では包まない。
+        """
+        event.accept()
+        commit = event.commitString()
+        if commit and self.can_send_input():
+            self._queue_send(commit)
+
+
     def set_macro_list(self, macros: list):
         """
         利用可能なマクロリストを設定
@@ -299,26 +401,26 @@ class InteractiveTerminal(QTextEdit):
                 self.reconnect_requested.emit()
                 return
             # 通常モードの場合はSSHに送信
-            self.key_pressed.emit('\r')
+            self._queue_send('\r')
         elif key == Qt.Key.Key_Backspace:
-            self.key_pressed.emit('\x7f')  # DEL文字
+            self._queue_send('\x7f')  # DEL文字
         elif key == Qt.Key.Key_Tab:
-            self.key_pressed.emit('\t')
+            self._queue_send('\t')
         elif key == Qt.Key.Key_Escape:
-            self.key_pressed.emit('\x1b')
+            self._queue_send('\x1b')
         elif key == Qt.Key.Key_Up:
-            self.key_pressed.emit(self._cursor_key('A'))
+            self._queue_send(self._cursor_key('A'))
         elif key == Qt.Key.Key_Down:
-            self.key_pressed.emit(self._cursor_key('B'))
+            self._queue_send(self._cursor_key('B'))
         elif key == Qt.Key.Key_Right:
-            self.key_pressed.emit(self._cursor_key('C'))
+            self._queue_send(self._cursor_key('C'))
         elif key == Qt.Key.Key_Left:
-            self.key_pressed.emit(self._cursor_key('D'))
+            self._queue_send(self._cursor_key('D'))
         else:
             # 通常の文字入力
             text = event.text()
             if text:
-                self.key_pressed.emit(text)
+                self._queue_send(text)
 
 
 class TerminalWidget(QWidget):
@@ -701,10 +803,10 @@ class TerminalWidget(QWidget):
         painter = QTextCursor(terminal.document())
         for text, attr in self._runs(cells):
             painter.setPosition(offset)
-            painter.setPosition(offset + len(text),
+            painter.setPosition(offset + _u16(text),
                                 QTextCursor.MoveMode.KeepAnchor)
             painter.setCharFormat(self._char_format(attr))
-            offset += len(text)
+            offset += _u16(text)
 
     def _render_screen(self, terminal: QTextEdit) -> None:
         """画面の中身を文書へ写す。
@@ -775,14 +877,17 @@ class TerminalWidget(QWidget):
             while (suffix < limit - prefix
                    and old_text[-1 - suffix] == new_text[-1 - suffix]):
                 suffix += 1
-            probe.setPosition(start + prefix)
-            probe.setPosition(start + len(old_text) - suffix,
+            # 添字は Python の文字数なので、文書の位置へ直してから渡す
+            probe.setPosition(start + _u16(old_text[:prefix]))
+            probe.setPosition(start + _u16(old_text[:len(old_text) - suffix]),
                               QTextCursor.MoveMode.KeepAnchor)
             # 書式は空で入れる。insertText は挿入位置の書式を引き継ぐので、
             # 指定しないと直前の色や反転が新しい文字へ伝染する
             probe.insertText(new_text[prefix:len(new_text) - suffix],
                              QTextCharFormat())
-            touched = (prefix, len(new_text) - suffix)
+            # 下の行との突き合わせは文書の位置で行うので、単位を揃える
+            touched = (_u16(new_text[:prefix]),
+                       _u16(new_text[:len(new_text) - suffix]))
         region.setPosition(start)
 
         # 変わった行に色・太字・反転を塗り直す
@@ -792,22 +897,23 @@ class TerminalWidget(QWidget):
         # 思っていても、入れ直した文字は書式を失っている
         at = 0
         for r, line in enumerate(rows):
-            if at <= touched[1] and at + len(line) >= touched[0]:
+            if at <= touched[1] and at + _u16(line) >= touched[0]:
                 dirty.add(r)
-            at += len(line) + 1
+            at += _u16(line) + 1
         offset = start
         for r in range(len(rows)):
             if r in dirty:
                 self._paint_row(terminal, offset, cell_rows[r])
-            offset += len(rows[r]) + 1
+            offset += _u16(rows[r]) + 1
 
         # キャレット (点滅カーソル) を画面カーソルの位置へ。範囲選択の
         # 最中に動かすと選択が消えるので、そのときは触らない
         if not terminal.textCursor().hasSelection():
             pos = start
             for r in range(screen.cursor_row):
-                pos += len(rows[r]) + 1
-            pos += min(screen.cursor_col, len(rows[screen.cursor_row]))
+                pos += _u16(rows[r]) + 1
+            row = rows[screen.cursor_row]
+            pos += _u16(row[:min(screen.cursor_col, len(row))])
             caret = QTextCursor(terminal.document())
             caret.setPosition(pos)
             terminal.setTextCursor(caret)
@@ -848,7 +954,7 @@ class TerminalWidget(QWidget):
         # 機器からの問い合わせ (カーソル位置・装置識別) に答える。
         # key_pressed はキー入力と同じ「機器へ送る文字」の経路
         for response in terminal._screen.take_responses():
-            terminal.key_pressed.emit(response)
+            terminal._queue_send(response)
 
         if device_name in self._log_files:
             # タブは桁を作る文字なので落とすと表が潰れる
@@ -902,10 +1008,15 @@ class TerminalWidget(QWidget):
         if tab_name in self._terminals:
             self.tab_closed.emit(tab_name)
         
+        # 記録中なら止めてから閉じる。放っておくとファイルハンドルが
+        # 開いたまま残り（Windows ではファイルがロックされたままになる）、
+        # 宙に浮いたダイアログの停止ボタンが以後は別の機器を止めてしまう
+        self._stop_log_recording_for(tab_name, notify=False)
+
         # 辞書から削除
         if tab_name in self._terminals:
             del self._terminals[tab_name]
-        
+
         # タブを削除
         self.tab_widget.removeTab(index)
         
@@ -1061,18 +1172,34 @@ class TerminalWidget(QWidget):
                     f"ログファイルを開けませんでした:\n{str(e)}"
                 )
     
-    def stop_log_recording(self):
-        """現在アクティブなターミナルのログ記録を停止"""
+    def stop_log_recording(self, device_name: str = None):
+        """ログ記録を停止する
+
+        Args:
+            device_name: 止める機器。省略時は表示中のタブ（メニューや
+                右クリックからの操作）。記録中ダイアログの停止ボタンは
+                必ず自分の機器名を渡す。表示中のタブから引き直すと、
+                2台を同時に記録しているときに別の機器を止めてしまう。
+        """
+        if device_name is None:
+            current_index = self.tab_widget.currentIndex()
+            if current_index < 0:
+                return
+            device_name = self.tab_widget.tabText(current_index)
+        self._stop_log_recording_for(device_name)
+
+    def _stop_log_recording_for(self, tab_name: str, notify: bool = True):
+        """指定した機器のログ記録を止めて後始末する
+
+        Args:
+            tab_name: 止める機器
+            notify: 完了の通知を出すか。タブを閉じたときの後始末では
+                出さない（閉じる操作のたびにダイアログが出てしまう）
+        """
         from PyQt6.QtWidgets import QMessageBox
-        
-        # 現在のタブを取得
-        current_index = self.tab_widget.currentIndex()
-        if current_index < 0:
-            return
-        
-        current_widget = self.tab_widget.widget(current_index)
-        tab_name = self.tab_widget.tabText(current_index)
-        
+
+        current_widget = self._terminals.get(tab_name)
+
         # ログファイルを閉じる
         if tab_name in self._log_files:
             try:
@@ -1083,17 +1210,18 @@ class TerminalWidget(QWidget):
                 if isinstance(current_widget, InteractiveTerminal):
                     current_widget._is_recording = False
                 
-                # ダイアログを閉じる
-                if tab_name in self._log_dialogs:
-                    dialog = self._log_dialogs[tab_name]
+                # ダイアログを閉じる。停止ボタン経由だと相手は自分でも
+                # close() を呼んでいるので、二度閉じても平気にしておく
+                dialog = self._log_dialogs.pop(tab_name, None)
+                if dialog is not None:
                     dialog.close()
-                    del self._log_dialogs[tab_name]
-                
-                QMessageBox.information(
-                    self,
-                    "ログ記録停止",
-                    "ログ記録を停止しました。"
-                )
+
+                if notify:
+                    QMessageBox.information(
+                        self,
+                        "ログ記録停止",
+                        "ログ記録を停止しました。"
+                    )
                 
             except Exception as e:
                 QMessageBox.warning(

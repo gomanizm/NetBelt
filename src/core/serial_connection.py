@@ -83,19 +83,31 @@ class SerialConnection(QObject):
             self.error_occurred.emit(error_msg)
             return False
     
-    def disconnect(self):
-        """シリアルポートから切断"""
+    def dispose(self):
+        """ポートを閉じて資源を手放す（切断の通知は出さない）
+
+        機器側都合の切断や読み取りエラーを受けたあとの後始末で使う。
+        ここで disconnected を出すと、いま処理中の切断処理がもう一度
+        呼ばれて案内や後始末が二重になる。
+
+        Windows の COM ポートは同一プロセス内でも排他なので、閉じずに
+        参照だけ捨てると、同じ機器への再接続が Access is denied になる。
+        """
         self._should_stop = True
         self._is_connected = False
-        
+
         # 接続が存在する場合は閉じる
         if self.serial_conn and self.serial_conn.is_open:
             try:
                 self.serial_conn.close()
             except Exception as e:
                 print(f"切断エラー: {e}")
-        
+
         self.serial_conn = None
+
+    def disconnect(self):
+        """シリアルポートから切断"""
+        self.dispose()
         self.disconnected.emit()
     
     def _start_read_thread(self):

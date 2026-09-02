@@ -156,6 +156,13 @@ class SyslogReceiver(QObject):
         # proto -> {"socket":…, "thread":…, "stop":Event, "port":int}
         self._servers = {}
         self.tcp_clients = []
+        # TCP で受け取る 1 行の上限。改行が来ないと受信バッファは
+        # 際限なく伸び、走査も O(n^2) になって受信スレッドが停滞する。
+        # 待受は 0.0.0.0 で、開始時にファイアウォールの受信許可も足すので、
+        # LAN 上の認証されていないホストから引き起こせる。
+        # RFC 5424 の 2048 オクテットは「最低これだけは受けよ」であって
+        # 上限ではない。実機は長い行を出すので、実用と防御の釣り合いで 64KiB。
+        self.max_line_bytes = 64 * 1024
 
     @property
     def is_running(self):
@@ -203,13 +210,11 @@ class SyslogReceiver(QObject):
             return True
         # プロトコルごとに別ポートを指定できる（self.port は既定値としてのみ使う）
         use_port = self.port if port is None else port
-        # 受信ポートの Windows ファイアウォール受信許可（Windowsのみ・冪等・必要時UAC）
-        try:
-            from .firewall import ensure_inbound_allow
-            _ok, _msg = ensure_inbound_allow("Syslog", proto, use_port)
-            print("[Syslog] ファイアウォール(%s): %s" % (proto, _msg))
-        except Exception as _e:
-            print("[Syslog] ファイアウォール設定エラー: %s" % _e)
+        # ファイアウォールは自動設定しない（3CDaemon 方式）。管理者昇格(UAC)を避けるため、
+        # 受信許可は Windows 標準の初回プロンプト／既存の許可ルールに委ねる。
+        # 自動で足すと、ポートを変えて使うたびポート名入りのルールが恒久登録され、
+        # 停止しても消えずに残骸が増える。通らない環境は fix_firewall() で直す。
+        print("[Syslog] ファイアウォール: 自動設定なし（Windowsの許可に委ねます）")
 
         # bind はスレッド外で行い、失敗を呼び出し側へ即座に返す
         try:
@@ -245,6 +250,30 @@ class SyslogReceiver(QObject):
         print("[Syslog] %s Server started on port %d" % (proto, entry["port"]))
         self.started.emit()
         return True
+
+    def fix_firewall(self):
+        """手動: Windows FW 受信許可を追加（管理者昇格/UAC）
+
+        起動時には触らない（TFTP/FTP と同じ 3CDaemon 方式）。Windows の
+        初回プロンプトを拒否したなどで受信が通らない環境の復旧用で、
+        押したときだけ昇格する。稼働中のプロトコルぶんだけ足す。
+        """
+        try:
+            from .firewall import ensure_inbound_allow, ensure_self_program_allow
+            if not self._servers:
+                return False, "受信していません"
+            results = []
+            for proto, server in list(self._servers.items()):
+                ok, msg = ensure_inbound_allow("Syslog", proto, server.get("port"))
+                print("[Syslog] ファイアウォール(%s): %s" % (proto, msg))
+                results.append(ok)
+            ok2, msg2 = ensure_self_program_allow()
+            print("[Syslog] ファイアウォール(自exe): %s" % msg2)
+            results.append(ok2)
+            return all(results), msg2
+        except Exception as e:
+            print("[Syslog] ファイアウォール設定エラー: %s" % e)
+            return False, str(e)
 
     def stop_protocol(self, proto: str):
         """1プロトコルだけ停止する（他方は動き続ける）"""
@@ -320,6 +349,12 @@ class SyslogReceiver(QObject):
                         daemon=True,
                     )
                     client_thread.start()
+                    # 終わった接続のスレッドを外しておく。append するだけだと
+                    # 接続を繰り返すほどリストが単調に増え、stop() まで
+                    # 解放されない。入れ替えでなく in-place で詰めるのは、
+                    # stop() が同じリストを走査しているため。
+                    self.tcp_clients[:] = [
+                        t for t in self.tcp_clients if t.is_alive()]
                     self.tcp_clients.append(client_thread)
                 except socket.timeout:
                     continue
@@ -344,6 +379,36 @@ class SyslogReceiver(QObject):
                     if not data:
                         break
                     buffer += data
+                    # いま組み立てている 1 行が上限を超えたら、その相手との
+                    # 接続を切る。黙って切り捨てると障害解析に要る末尾を
+                    # 失うので、切ったことは記録に残す。
+                    #
+                    # 「改行がまだ来ていないとき」に限ると、上限を超えた行が
+                    # 終端の改行ごと 1 回の recv で届いた場合に素通りする。
+                    # 見るのは受信バッファ全体ではなく、次の改行までの長さ。
+                    newline_at = buffer.find(b"\n")
+                    if newline_at == -1:
+                        current_line = len(buffer)
+                    else:
+                        current_line = newline_at
+                        # CRLF の CR は配信前に落とすので中身ではない。
+                        # 数えると、同じ中身の行が LF なら通り CRLF なら
+                        # 切られる
+                        if buffer[newline_at - 1:newline_at] == b"\r":
+                            current_line -= 1
+                    if current_line > self.max_line_bytes:
+                        # 一覧に並ぶので、機器からの行と同じ RFC 3164 の形で
+                        # 組み立てる。生の文言のまま渡すと、先頭の語が
+                        # 日時やホスト名として食われて読めなくなる。
+                        # PRI 12 = facility 1 (user) / severity 4 (Warning)
+                        self.message_received.emit(SyslogMessage(
+                            "<12>%s NetBelt 1行が %d バイトを超えたため、"
+                            "この接続を切断しました"
+                            % (datetime.now().strftime("%b %d %H:%M:%S"),
+                               self.max_line_bytes),
+                            client_ip, "TCP", listen_port))
+                        self.message_count += 1
+                        break
                     while b"\n" in buffer:
                         line, buffer = buffer.split(b"\n", 1)
                         try:

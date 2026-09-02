@@ -225,6 +225,10 @@ class SFTPServerManager(QObject):
         self.server_socket = None
         self.server_thread = None
         self.client_threads = []
+        # 受け付けたクライアントのソケット。stop() で閉じて、バナー待ちや
+        # チャネル待ちで止まっているハンドラをその場で抜けさせる
+        self._client_sockets = set()
+        self._client_lock = threading.Lock()
         self._stop_event = threading.Event()
         
         # サーバー設定
@@ -274,13 +278,11 @@ class SFTPServerManager(QObject):
         self.root_dir = os.path.abspath(root_dir)
         self.username = username
         self.password = password
-        # 受信ポートの Windows ファイアウォール受信許可を用意（Windowsのみ・冪等・必要時UAC）
-        try:
-            from .firewall import ensure_inbound_allow
-            _ok, _msg = ensure_inbound_allow("SFTP Server", "TCP", port)
-            print(f"[SFTP Server] ファイアウォール: {_msg}")
-        except Exception as _e:
-            print(f"[SFTP Server] ファイアウォール設定エラー: {_e}")
+        # ファイアウォールは自動設定しない（3CDaemon 方式）。管理者昇格(UAC)を避けるため、
+        # 受信許可は Windows 標準の初回プロンプト／既存の許可ルールに委ねる。
+        # 自動で足すと、ポートを変えて使うたびポート名入りのルールが恒久登録され、
+        # 停止しても消えずに残骸が増える。通らない環境は fix_firewall() で直す。
+        print("[SFTP Server] ファイアウォール: 自動設定なし（Windowsの許可に委ねます）")
         
         # ルートディレクトリが存在しない場合は作成
         if not os.path.exists(self.root_dir):
@@ -321,28 +323,76 @@ class SFTPServerManager(QObject):
         
         return True
     
+    def fix_firewall(self, port: int = 2222):
+        """手動: Windows FW 受信許可を追加（管理者昇格/UAC）
+
+        起動時には触らない（TFTP/FTP と同じ 3CDaemon 方式）。Windows の
+        初回プロンプトを拒否したなどで接続が通らない環境の復旧用で、
+        押したときだけ昇格する。
+        """
+        try:
+            from .firewall import ensure_inbound_allow, ensure_self_program_allow
+            ok, msg = ensure_inbound_allow("SFTP Server", "TCP", port)
+            print(f"[SFTP Server] ファイアウォール: {msg}")
+            ok2, msg2 = ensure_self_program_allow()
+            print(f"[SFTP Server] ファイアウォール(自exe): {msg2}")
+            return (ok and ok2), msg
+        except Exception as e:
+            print(f"[SFTP Server] ファイアウォール設定エラー: {e}")
+            return False, str(e)
+
+    # 待受スレッドの終了を待つ上限。accept は 1 秒でタイムアウトするので
+    # 通常はそれ以内に抜ける
+    STOP_TIMEOUT_SECONDS = 3.0
+
     def stop(self):
         """SFTPサーバーを停止"""
-        if not self.is_running:
+        thread = self.server_thread
+        # is_running で判定しない。あのフラグを立てるのはワーカーの先頭で、
+        # start() はスレッドを起こした直後に戻るため、start() の直後に
+        # 呼ばれると「まだ立っていない」窓で空振りし、待受が生き残る
+        if thread is None or not thread.is_alive():
             return
-        
+
         print("[SFTP Server] Stopping server...")
         self._stop_event.set()
         self.is_running = False
-        
+
         # サーバーソケットを閉じる
         if self.server_socket:
             try:
                 self.server_socket.close()
             except Exception:
                 pass
-        
-        # クライアント接続を閉じる
-        for thread in self.client_threads:
-            if thread.is_alive():
-                thread.join(timeout=1)
-        
+
+        # クライアントのソケットを先に閉じる。ハンドラはバナー待ち
+        # （start_server）やチャネル待ち（accept(timeout=20)）で止まって
+        # いることがあり、join だけだと 1 本につき 1 秒固まったうえに
+        # スレッドが残り、あとで client_disconnected を破棄済みの
+        # マネージャへ emit して落ちる。閉じればどちらもすぐ抜ける
+        with self._client_lock:
+            sockets = list(self._client_sockets)
+        for sock in sockets:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+        # クライアント接続の終了を待つ
+        for client in self.client_threads:
+            if client.is_alive():
+                client.join(timeout=1)
+
         self.client_threads.clear()
+        # 待受スレッド自身も待つ。待たずに戻ると、直後にこのマネージャ
+        # （QObject）が破棄されたとき、まだ走っているスレッドからの emit が
+        # 解放済みオブジェクトへ届く（FTP と同じ構造）
+        if thread is not threading.current_thread():
+            thread.join(timeout=self.STOP_TIMEOUT_SECONDS)
         self.stopped.emit()
         print("[SFTP Server] Server stopped")
     
@@ -350,7 +400,12 @@ class SFTPServerManager(QObject):
         """サーバーのメインループ"""
         try:
             # ソケットは start() でバインド済み
-            
+
+            # start() の直後に stop() されていたら、ここで引き返す。
+            # 進むと started が stopped の後に飛び、UI が「起動中」へ戻る
+            if self._stop_event.is_set():
+                return
+
             self.is_running = True
             self.started.emit()
             print(f"[SFTP Server] Server started on port {self.port}")
@@ -361,7 +416,9 @@ class SFTPServerManager(QObject):
                 try:
                     # クライアント接続を待つ
                     client_socket, client_addr = self.server_socket.accept()
-                    
+                    with self._client_lock:
+                        self._client_sockets.add(client_socket)
+
                     print(f"[SFTP Server] Client connected from {client_addr[0]}:{client_addr[1]}")
                     self.client_connected.emit(client_addr[0])
                     
@@ -372,6 +429,11 @@ class SFTPServerManager(QObject):
                         daemon=True
                     )
                     client_thread.start()
+                    # 終わったスレッドを外してから足す（Syslog と同じ）。
+                    # 外さないとサーバを止めるまで単調に増える。stop() が
+                    # 同じリストを走査するので、差し替えずその場で入れ替える
+                    self.client_threads[:] = [t for t in self.client_threads
+                                              if t.is_alive()]
                     self.client_threads.append(client_thread)
                     
                 except socket.timeout:
@@ -430,5 +492,7 @@ class SFTPServerManager(QObject):
             if transport:
                 transport.close()
             client_socket.close()
+            with self._client_lock:
+                self._client_sockets.discard(client_socket)
             self.client_disconnected.emit(client_addr[0])
             print(f"[SFTP Server] Client disconnected from {client_addr[0]}")

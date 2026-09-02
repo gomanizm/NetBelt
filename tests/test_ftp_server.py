@@ -142,8 +142,11 @@ class FtpServerAnonymousTest(unittest.TestCase):
         self._fw_patch.start()
         self.addCleanup(self._fw_patch.stop)
         # username/password を空のまま、anonymous=True で起動できることが本件の検証対象。
+        # 匿名の書き込みは「匿名を許可」とは別の選択になったので、置きに行く
+        # 経路を確かめるここでは明示的に有効にする（test_ftp_anonymous_write.py）。
         self.assertTrue(self.m.start(port=0, root_dir=self.root,
-                                      username="", password="", anonymous=True))
+                                      username="", password="", anonymous=True,
+                                      anonymous_write=True))
         self.assertTrue(self.m.is_running)
         self.port = self.m.port
         time.sleep(0.3)
