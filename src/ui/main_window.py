@@ -1966,6 +1966,13 @@ for details.
                 self.snmp_panel.snmp_manager.stop_trap_receiver()
             except Exception as e:
                 print(f"[Main] SNMP 停止エラー: {e}")
+        # バックグラウンドの MIB 読み込み（QThread）も待つ。起動直後に
+        # 閉じると読み込み中のことがあり、待たずに破棄すると落ちる
+        if hasattr(self, 'snmp_panel'):
+            try:
+                self.snmp_panel.wait_for_background_work()
+            except Exception as e:
+                print(f"[Main] MIB 読み込みの待機エラー: {e}")
 
         # すべてのマクロをクリーンアップ
         for device_name in list(self.connections.keys()):

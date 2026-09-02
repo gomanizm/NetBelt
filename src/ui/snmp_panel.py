@@ -814,6 +814,21 @@ class SNMPPanel(QWidget):
         self.mib_thread.finished_signal.connect(self._on_background_mib_load_finished)
         self.mib_thread.start()
     
+    # MIB 読み込みスレッドの終了を待つ上限（ミリ秒）。通常は数 ms で終わる
+    MIB_LOADER_WAIT_MS = 5000
+
+    def wait_for_background_work(self):
+        """バックグラウンドの MIB 読み込みが終わるのを待つ。
+
+        ウィンドウを閉じるときに呼ぶ。待たずにパネルが破棄されると、
+        実行中の QThread の破棄で Qt が abort するか、終わったスレッドの
+        finished_signal が解放済みのパネルへ届いて落ちる。起動直後に
+        閉じたときに踏む。
+        """
+        thread = getattr(self, "mib_thread", None)
+        if thread is not None and thread.isRunning():
+            thread.wait(self.MIB_LOADER_WAIT_MS)
+
     def _on_background_mib_load_finished(self, success: bool):
         """バックグラウンドMIB読み込み完了時の処理"""
         self.mib_loading = False
