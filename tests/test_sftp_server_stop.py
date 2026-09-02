@@ -167,6 +167,70 @@ class SftpServerStopTest(unittest.TestCase):
                              "終わったスレッドが一覧に残り続けている: %d 件"
                              % len(m.client_threads))
 
+    # --- 4. 黙って繋ぎっぱなしの相手がいても、停止は速く・確実に ---
+
+    def _hold_idle_connections(self, port, n):
+        """接続だけして何も送らない相手を n 本作る（バナー待ちで止まる）。"""
+        held = []
+        for _ in range(n):
+            s = socket.socket()
+            s.settimeout(1)
+            s.connect(("127.0.0.1", port))
+            held.append(s)
+            self.addCleanup(s.close)
+            time.sleep(0.02)
+        return held
+
+    def test_stop_returns_promptly_with_idle_clients_connected(self):
+        """バナーを送らない相手が何本いても、stop() が長く固まらないこと。
+
+        ハンドラは transport.accept(timeout=20) で待つ。stop() は 1 本ずつ
+        1 秒 join していたので、10 本で 10 秒、その間 UI が固まっていた。
+        実測: 10 本で stop() に 10.02 秒。
+        """
+        m = self._manager()
+        port = free_port()
+        self.assertTrue(m.start(port=port, root_dir=self.root,
+                                username=USER, password=PASSWORD))
+        deadline = time.time() + 5
+        while not m.is_running and time.time() < deadline:
+            time.sleep(0.01)
+        self._hold_idle_connections(port, 5)
+        time.sleep(0.3)
+        self.assertGreaterEqual(
+            sum(1 for t in m.client_threads if t.is_alive()), 5,
+            "前提: ハンドラが待ち状態で生きている")
+        started = time.monotonic()
+
+        m.stop()
+
+        self.assertLess(time.monotonic() - started, 3.0,
+                        "黙った相手のぶんだけ stop() が固まっている")
+
+    def test_no_client_handler_outlives_stop(self):
+        """stop() から戻ったあとに、ハンドラスレッドが残っていないこと。
+
+        残っていると、あとで client_disconnected を emit したときに、
+        破棄済みのマネージャへ届いて落ちる（FTP と同じ構造）。
+        実測: stop() の 4.8 秒後まで 10 本が生きていた。
+        """
+        m = self._manager()
+        port = free_port()
+        self.assertTrue(m.start(port=port, root_dir=self.root,
+                                username=USER, password=PASSWORD))
+        deadline = time.time() + 5
+        while not m.is_running and time.time() < deadline:
+            time.sleep(0.01)
+        self._hold_idle_connections(port, 5)
+        time.sleep(0.3)
+        handlers = [t for t in m.client_threads if t.is_alive()]
+        self.assertGreaterEqual(len(handlers), 5, "前提: ハンドラが生きている")
+
+        m.stop()
+
+        self.assertEqual([t for t in handlers if t.is_alive()], [],
+                         "stop() のあともハンドラが生きている")
+
 
 if __name__ == "__main__":
     unittest.main()

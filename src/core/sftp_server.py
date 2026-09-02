@@ -225,6 +225,10 @@ class SFTPServerManager(QObject):
         self.server_socket = None
         self.server_thread = None
         self.client_threads = []
+        # 受け付けたクライアントのソケット。stop() で閉じて、バナー待ちや
+        # チャネル待ちで止まっているハンドラをその場で抜けさせる
+        self._client_sockets = set()
+        self._client_lock = threading.Lock()
         self._stop_event = threading.Event()
         
         # サーバー設定
@@ -361,7 +365,24 @@ class SFTPServerManager(QObject):
             except Exception:
                 pass
 
-        # クライアント接続を閉じる
+        # クライアントのソケットを先に閉じる。ハンドラはバナー待ち
+        # （start_server）やチャネル待ち（accept(timeout=20)）で止まって
+        # いることがあり、join だけだと 1 本につき 1 秒固まったうえに
+        # スレッドが残り、あとで client_disconnected を破棄済みの
+        # マネージャへ emit して落ちる。閉じればどちらもすぐ抜ける
+        with self._client_lock:
+            sockets = list(self._client_sockets)
+        for sock in sockets:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+        # クライアント接続の終了を待つ
         for client in self.client_threads:
             if client.is_alive():
                 client.join(timeout=1)
@@ -395,7 +416,9 @@ class SFTPServerManager(QObject):
                 try:
                     # クライアント接続を待つ
                     client_socket, client_addr = self.server_socket.accept()
-                    
+                    with self._client_lock:
+                        self._client_sockets.add(client_socket)
+
                     print(f"[SFTP Server] Client connected from {client_addr[0]}:{client_addr[1]}")
                     self.client_connected.emit(client_addr[0])
                     
@@ -469,5 +492,7 @@ class SFTPServerManager(QObject):
             if transport:
                 transport.close()
             client_socket.close()
+            with self._client_lock:
+                self._client_sockets.discard(client_socket)
             self.client_disconnected.emit(client_addr[0])
             print(f"[SFTP Server] Client disconnected from {client_addr[0]}")
