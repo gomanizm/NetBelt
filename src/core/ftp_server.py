@@ -158,13 +158,25 @@ class FTPServerManager(QObject):
         self.started.emit()
         return True
 
+    # 待受スレッドの終了を待つ上限。close_all() 後、serve_forever は
+    # 次に poll(timeout=1.0) から戻った時点で抜けるので、通常は 1 秒以内
+    STOP_TIMEOUT_SECONDS = 3.0
+
     def stop(self):
+        thread, self._thread = self._thread, None
         if self._server:
             try:
                 self._server.close_all()
             except Exception:
                 pass
             self._server = None
+        # スレッドが抜けるまで待ってから戻る。close_all() は socket_map を
+        # 空にするだけで、スレッドは次に poll() から戻るまで ioloop の中に
+        # いる。待たずに戻ると、直後にこのマネージャ（QObject）が破棄された
+        # とき、生き残ったスレッドからの emit が解放済みオブジェクトへ届いて
+        # プロセスごと落ちる（停止直後にパネルやアプリを閉じる操作で起こる）
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=self.STOP_TIMEOUT_SECONDS)
         self.is_running = False
         self._tx.clear()
         self.stopped.emit()
