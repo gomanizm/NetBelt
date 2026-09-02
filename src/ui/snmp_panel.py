@@ -151,6 +151,9 @@ class SNMPPanel(QWidget):
         # WALK が途中で途切れたときの理由。結果より先に届き、結果を
         # 表示するときに使って忘れる
         self._partial_reason = None
+        # 直近の結果が途中までだった理由。書き出しに添えるため、次の完走か
+        # クリアまで持ち続ける
+        self._last_partial_reason = None
         
         self._init_ui()
         
@@ -714,7 +717,11 @@ class SNMPPanel(QWidget):
     def _export_results_to_csv(self, file_path: str, results):
         """CSV形式で GET/WALK 結果を書き出す"""
         import csv
+        reason = getattr(self, "_last_partial_reason", None)
         with open(file_path, "w", newline="", encoding="utf-8") as f:
+            if reason:
+                # 途中までの結果であることを、見出しの前に残す
+                f.write("# 途中まで: %s のため中断。全部ではありません\n" % reason)
             writer = csv.writer(f)
             writer.writerow(["OID", "Type", "Value"])
             for row in results:
@@ -723,10 +730,14 @@ class SNMPPanel(QWidget):
     def _export_results_to_json(self, file_path: str, results):
         """JSON形式で GET/WALK 結果を書き出す"""
         import json
+        reason = getattr(self, "_last_partial_reason", None)
         data = {
             "exported_at": datetime.now().isoformat(),
             "host": self.host_edit.text(),
             "count": len(results),
+            # 途中までの結果かどうか。機械で読む側が見落とさないよう明示する
+            "complete": reason is None,
+            "partial_reason": reason,
             "results": [
                 {"oid": row[0], "type": row[1], "value": row[2]} for row in results
             ],
@@ -741,6 +752,9 @@ class SNMPPanel(QWidget):
             f.write("エクスポート日時: " + datetime.now().strftime("%Y-%m-%d %H:%M:%S") + "\n")
             f.write("対象ホスト: " + self.host_edit.text() + "\n")
             f.write("件数: " + str(len(results)) + "\n")
+            reason = getattr(self, "_last_partial_reason", None)
+            if reason:
+                f.write("注意: 途中まで（%s のため中断。全部ではありません）\n" % reason)
             f.write("=" * 60 + "\n")
             for row in results:
                 f.write("OID  : " + str(row[0]) + "\n")
@@ -750,6 +764,7 @@ class SNMPPanel(QWidget):
 
     def _on_clear_clicked(self):
         self.result_model.clear_results()
+        self._last_partial_reason = None
         self.status_label.setText("結果をクリアしました")
     
     def _on_trap_start_clicked(self):
@@ -1010,6 +1025,10 @@ class SNMPPanel(QWidget):
             # 一度使ったら忘れる（次の完走に持ち越さない）
             reason = getattr(self, "_partial_reason", None)
             self._partial_reason = None
+            # 書き出しに添えるため、次の完走かクリアまで持ち続ける。
+            # 画面の表示だけだと、保存したファイルは完走した結果と
+            # 区別が付かず、受け取った側が「機器に無い」と読み違える
+            self._last_partial_reason = reason or None
             if reason:
                 self.status_label.setText(
                     "途中まで: %d件（%s のため中断。全部ではありません）"
