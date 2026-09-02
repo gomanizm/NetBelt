@@ -197,6 +197,35 @@ class TelnetConnection(QObject):
     # 実際のサブネゴシエーションは数十バイトで収まる。
     MAX_PENDING_BYTES = 4096
 
+    @staticmethod
+    def _find_sb_end(data: bytes, start: int):
+        """サブネゴシエーションの終端 IAC SE を探す。
+
+        `find(b"\\xff\\xf0")` では足りない。本文の中の 0xFF は IAC IAC と
+        エスケープされて届くので、`0xFF 0xFF 0xF0` が並ぶと 2 つ目の
+        0xFF と 0xF0 を終端と誤認し、残りの本文が画面へ漏れる。
+        IAC の次のバイトを見て 1 組ずつ進める。
+
+        Returns:
+            (終端 IAC の位置, 末尾に残った対の無い IAC の数)。
+            終端が無ければ位置は None。末尾が IAC 単独で終わっている
+            場合は 1 を返すので、呼び出し側はそのバイトを次の受信へ
+            持ち越せる（次の受信の先頭が SE や IAC と対になる）。
+        """
+        IAC, SE = 255, 240
+        j = start
+        while j < len(data):
+            if data[j] != IAC:
+                j += 1
+                continue
+            if j + 1 >= len(data):
+                return None, 1
+            if data[j + 1] == SE:
+                return j, 0
+            # IAC IAC（エスケープ）や、本文中のその他の IAC x は 1 組で飛ばす
+            j += 2
+        return None, 0
+
     def _process_telnet_commands(self, data: bytes):
         """
         Telnet制御コマンドを処理
@@ -231,8 +260,13 @@ class TelnetConnection(QObject):
         # 画面へ漏れ、終端の IAC SE だけがコマンドとして消費されて
         # 以後の解釈もずれる。
         if self._discarding_sb:
-            end = data.find(bytes([IAC, SE]))
-            if end == -1:
+            end, dangling = self._find_sb_end(data, 0)
+            if end is None:
+                # 終端がまだ来ない。末尾が IAC 単独なら次の受信へ持ち越す。
+                # 捨てると、次の受信が SE で始まる（終端が切れ目で割れた）
+                # ときに二度と再同期できず、以後の受信を全部捨て続ける
+                if dangling:
+                    return b'', data[-dangling:]
                 return b'', b''
             self._discarding_sb = False
             data = data[end + 2:]
@@ -273,9 +307,10 @@ class TelnetConnection(QObject):
                     self._send_telnet_command(bytes([IAC, DONT, option]))
                 i += 3
             elif cmd == SB:
-                # サブネゴシエーション: IAC SB ... IAC SE まで読み飛ばす
-                end = data.find(bytes([IAC, SE]), i + 2)
-                if end == -1:
+                # サブネゴシエーション: IAC SB ... IAC SE まで読み飛ばす。
+                # 本文の IAC IAC を終端と見誤らないよう、1 組ずつ進める
+                end, _ = self._find_sb_end(data, i + 2)
+                if end is None:
                     # 終端がまだ来ていない。破棄すると以降の本文まで失う
                     pending = data[i:]
                     break
