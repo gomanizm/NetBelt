@@ -337,28 +337,41 @@ class SFTPServerManager(QObject):
             print(f"[SFTP Server] ファイアウォール設定エラー: {e}")
             return False, str(e)
 
+    # 待受スレッドの終了を待つ上限。accept は 1 秒でタイムアウトするので
+    # 通常はそれ以内に抜ける
+    STOP_TIMEOUT_SECONDS = 3.0
+
     def stop(self):
         """SFTPサーバーを停止"""
-        if not self.is_running:
+        thread = self.server_thread
+        # is_running で判定しない。あのフラグを立てるのはワーカーの先頭で、
+        # start() はスレッドを起こした直後に戻るため、start() の直後に
+        # 呼ばれると「まだ立っていない」窓で空振りし、待受が生き残る
+        if thread is None or not thread.is_alive():
             return
-        
+
         print("[SFTP Server] Stopping server...")
         self._stop_event.set()
         self.is_running = False
-        
+
         # サーバーソケットを閉じる
         if self.server_socket:
             try:
                 self.server_socket.close()
             except Exception:
                 pass
-        
+
         # クライアント接続を閉じる
-        for thread in self.client_threads:
-            if thread.is_alive():
-                thread.join(timeout=1)
-        
+        for client in self.client_threads:
+            if client.is_alive():
+                client.join(timeout=1)
+
         self.client_threads.clear()
+        # 待受スレッド自身も待つ。待たずに戻ると、直後にこのマネージャ
+        # （QObject）が破棄されたとき、まだ走っているスレッドからの emit が
+        # 解放済みオブジェクトへ届く（FTP と同じ構造）
+        if thread is not threading.current_thread():
+            thread.join(timeout=self.STOP_TIMEOUT_SECONDS)
         self.stopped.emit()
         print("[SFTP Server] Server stopped")
     
@@ -366,7 +379,12 @@ class SFTPServerManager(QObject):
         """サーバーのメインループ"""
         try:
             # ソケットは start() でバインド済み
-            
+
+            # start() の直後に stop() されていたら、ここで引き返す。
+            # 進むと started が stopped の後に飛び、UI が「起動中」へ戻る
+            if self._stop_event.is_set():
+                return
+
             self.is_running = True
             self.started.emit()
             print(f"[SFTP Server] Server started on port {self.port}")
@@ -388,6 +406,11 @@ class SFTPServerManager(QObject):
                         daemon=True
                     )
                     client_thread.start()
+                    # 終わったスレッドを外してから足す（Syslog と同じ）。
+                    # 外さないとサーバを止めるまで単調に増える。stop() が
+                    # 同じリストを走査するので、差し替えずその場で入れ替える
+                    self.client_threads[:] = [t for t in self.client_threads
+                                              if t.is_alive()]
                     self.client_threads.append(client_thread)
                     
                 except socket.timeout:
