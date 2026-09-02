@@ -72,6 +72,10 @@ class InteractiveTerminal(QTextEdit):
         self._reconnect_mode = enabled
         if enabled:
             self._input_enabled = True  # 再接続モードではEnterキーを受け付ける
+            # 送りかけの貼り付けは、切れた接続宛てのもの。残しておくと
+            # 再接続で同じタブを使い回すため、新しい接続へそのまま流れる
+            self._send_queue.clear()
+            self._sending = False
     
     def can_send_input(self) -> bool:
         """
@@ -159,6 +163,13 @@ class InteractiveTerminal(QTextEdit):
         ため（呼んだ直後に送信済みであることを前提にしている箇所がある）。
         """
         from PyQt6.QtCore import QTimer
+
+        # 再接続待ちに入っていたら、予約済みの排出も含めて打ち切る。
+        # 残りは切れた接続宛てなので、新しい接続へ送ってはいけない
+        if self._reconnect_mode:
+            self._send_queue.clear()
+            self._sending = False
+            return
 
         if not self._send_queue:
             self._sending = False
