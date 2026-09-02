@@ -219,6 +219,48 @@ class MIBResolver:
         r'(\w+)\s+MODULE-IDENTITY\b.*?::=\s*\{\s*(\w+)\s+(\d+)\s*\}',
     )
 
+    @staticmethod
+    def _blank_comments_and_strings(text: str) -> str:
+        """コメントと文字列の中身を空白にして返す。
+
+        定義は生のテキストに正規表現を掛けて拾う。DESCRIPTION の中や
+        `--` コメントの中に `::= { x n }` と書いてあると、そこで一致が
+        止まって偽の親を記録する。コメントアウトされた
+        `-- old OBJECT-TYPE` が起点になって次の本物の定義を飲むこともある
+        （ベンダー MIB は廃止したオブジェクトをこの形で残す）。
+        先に中身を消しておけば、どちらも起こらない。
+
+        文字列は閉じる `"` まで。コメントは `--` から行末まで、または
+        同じ行の次の `--` まで（ASN.1 の規則）。文字列の中の `--` は
+        コメントではない。改行は残す。
+        """
+        out = []
+        i, n = 0, len(text)
+        while i < n:
+            ch = text[i]
+            if ch == '"':
+                j = text.find('"', i + 1)
+                if j == -1:
+                    j = n
+                out.append('"')
+                out.append(''.join('\n' if c == '\n' else ' '
+                                   for c in text[i + 1:j]))
+                out.append('"')
+                i = j + 1
+            elif ch == '-' and text.startswith('--', i):
+                j = i + 2
+                while j < n and text[j] != '\n':
+                    if text.startswith('--', j):
+                        j += 2
+                        break
+                    j += 1
+                out.append(' ' * (j - i))
+                i = j
+            else:
+                out.append(ch)
+                i += 1
+        return ''.join(out)
+
     def _extract_mib_definitions(self, filepath: str) -> list:
         """
         MIBファイルから (名前, 親の名前, 添字) を抜き出す
@@ -237,7 +279,7 @@ class MIBResolver:
         definitions = []
         try:
             with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-                content = f.read()
+                content = self._blank_comments_and_strings(f.read())
             for pattern in self._MIB_DEFINITION_PATTERNS:
                 # DOTALL が要る。定義は複数行にまたがるので、`.` が改行を
                 # 拾わないと型キーワードから ::= まで届かない
