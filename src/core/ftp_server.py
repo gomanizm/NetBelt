@@ -61,20 +61,21 @@ class FTPServerManager(QObject):
         # 制御21/passive の受信許可は Windows 標準の初回プロンプト／既存ルールに委ねる。
         self.client_activity.emit("", "ファイアウォール: 自動設定なし（Windowsの許可に委ねます）")
 
-        # pyftpdlib はユーザー名 "anonymous"（大文字小文字を区別しない）を
-        # 特別扱いし、パスワードの照合を省略する。通常ユーザーとして登録すると
-        # 「匿名を許可しない」設定でも任意のパスワードで全権限が通ってしまう。
-        # 匿名を使うなら権限を絞った add_anonymous の経路がある
-        if username and username.strip().lower() == "anonymous":
-            self.error_occurred.emit(
-                "ユーザー名 anonymous は通常ユーザーとして登録できません"
-                "（パスワードが照合されません）。匿名を使う場合は「匿名を許可」を"
-                "有効にしてください")
-            return False
-
         try:
             authorizer = DummyAuthorizer()
             if username and password:
+                # pyftpdlib はユーザー名 "anonymous" を特別扱いし、パスワードの
+                # 照合を省略する（2.2.0 は厳密一致。大文字小文字の違いも紛らわしい
+                # ので保守的に断る）。通常ユーザーとして登録すると「匿名を許可
+                # しない」設定でも任意のパスワードで全権限が通ってしまう。
+                # パスワードが空なら add_user は呼ばれず、権限を絞った匿名の
+                # 経路だけが動くので、その組み合わせは断らない
+                if username.strip().lower() == "anonymous":
+                    self.error_occurred.emit(
+                        "ユーザー名 anonymous は通常ユーザーとして登録できません"
+                        "（パスワードが照合されません）。匿名を使う場合は「匿名を許可」を"
+                        "有効にし、ユーザー名とパスワードは空にしてください")
+                    return False
                 authorizer.add_user(username, password, root_dir, perm="elradfmwMT")
             if anonymous:
                 authorizer.add_anonymous(

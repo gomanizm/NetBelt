@@ -53,11 +53,29 @@ class FtpAnonymousUsernameTest(unittest.TestCase):
                         "理由を言っていない: %s" % errors)
 
     def test_the_check_is_case_insensitive(self):
-        """pyftpdlib は大文字小文字を区別しないので、こちらも区別しないこと。"""
+        """大文字小文字の違いも断ること。
+
+        pyftpdlib 2.2.0 自体は "anonymous" を厳密一致で特別扱いする
+        （"Anonymous" は普通のユーザーとして照合される）。それでも
+        紛らわしい名前は保守的に断る、という選択。
+        """
         m, errors = self._manager()
         self.assertFalse(m.start(port=0, root_dir=self.root,
                                  username="Anonymous", password="secret",
                                  anonymous=False))
+
+    def test_anonymous_with_an_empty_password_and_anonymous_allowed_still_starts(self):
+        """「匿名を許可」＋ユーザー名 anonymous＋パスワード空は、これまでどおり起動すること。
+
+        この組み合わせでは add_user() は呼ばれず（パスワードが空）、
+        権限を絞った add_anonymous() だけが走る。安全な経路なので断らない。
+        断ると「匿名を許可を有効にしてください」という、既に有効な設定を
+        促す矛盾した案内になる。
+        """
+        m, errors = self._manager()
+        started = m.start(port=0, root_dir=self.root,
+                          username="anonymous", password="", anonymous=True)
+        self.assertTrue(started, "安全な匿名設定まで断っている: %s" % errors)
 
     def test_a_wrong_password_for_a_normal_user_is_still_refused(self):
         """通常ユーザーの認証はこれまでどおり効くこと（対照）。"""
