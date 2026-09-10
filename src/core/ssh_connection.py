@@ -18,8 +18,18 @@ class _TofuHostKeyPolicy(paramiko.MissingHostKeyPolicy):
         client.get_host_keys().add(hostname, key.get_name(), key)
         try:
             client.save_host_keys(str(self._known_hosts_path))
-        except Exception:
-            pass
+        except Exception as e:
+            # 黙って続けると、次回もこの機器の鍵を検証できないまま任意の
+            # 鍵を受け入れる。接続は続けるが、そのことを画面に出す
+            on_save_error = getattr(self, "_on_save_error", None)
+            if on_save_error is not None:
+                on_save_error(
+                    "known_hosts を保存できません（%s）。次回、この機器の鍵を"
+                    "検証できません: %s" % (e, self._known_hosts_path))
+
+
+class HostKeyStoreError(Exception):
+    """既知ホスト鍵の保存場所を読めない。検証できない状態で認証へ進まない"""
 
 
 class SSHConnection(QObject):
@@ -69,9 +79,17 @@ class SSHConnection(QObject):
         if known_hosts_path.exists():
             try:
                 client.load_host_keys(str(known_hosts_path))
-            except Exception:
-                pass
-        client.set_missing_host_key_policy(_TofuHostKeyPolicy(known_hosts_path))
+            except Exception as e:
+                # 握りつぶして TOFU にすると、既知の機器でも「未知」扱いになり、
+                # 鍵が変わっていても気づかずにパスワードを送る。検証できない
+                # 状態で認証へ進まない
+                raise HostKeyStoreError(
+                    "既知ホスト鍵 (known_hosts) を読めないため接続を中止しました: %s\n%s"
+                    % (e, known_hosts_path))
+        policy = _TofuHostKeyPolicy(known_hosts_path)
+        policy._on_save_error = lambda message: self.output_received.emit(
+            "\r\n[NetBelt] 警告: %s\r\n" % message)
+        client.set_missing_host_key_policy(policy)
 
     def _auth_failure_message(self) -> str:
         """認証失敗の理由を、実際に使った手段に合わせて返す。
@@ -161,7 +179,10 @@ class SSHConnection(QObject):
         """
         try:
             self.client = paramiko.SSHClient()
-            self._setup_host_keys(self.client)
+            try:
+                self._setup_host_keys(self.client)
+            except HostKeyStoreError as e:
+                return self._fail(str(e))
             
             # 接続パラメータの準備
             connect_kwargs = {
