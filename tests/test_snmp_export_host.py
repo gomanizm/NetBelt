@@ -78,6 +78,30 @@ class SnmpExportHostTest(unittest.TestCase):
         self.assertEqual(data["host"], "192.0.2.10",
                          "失敗した要求先のホスト名で古い結果を書いている")
 
+    def test_a_request_refused_as_busy_does_not_change_the_recorded_host(self):
+        """実行中に別ホストで押しても、受理されなかった要求のホストは記録しないこと。
+
+        マネージャは worker 実行中の要求を「既に操作が実行中です」で断り、
+        開始しない。その要求のホストを記録すると、A の結果に B のホストが
+        付いて保存される。
+        """
+        panel = self._panel()
+        self._walk_from(panel, "192.0.2.10")          # A の WALK が走り出す
+
+        # A が走っている間に B で押す → マネージャは断って開始しない
+        panel.snmp_manager.is_busy = mock.Mock(return_value=True)
+        panel.snmp_manager.snmp_walk = mock.Mock(
+            side_effect=lambda *a, **k: panel.snmp_manager.error_occurred.emit("既に操作が実行中です"))
+        panel.host_edit.setText("192.0.2.99")
+        with mock.patch("ui.snmp_panel.QMessageBox"):
+            panel._on_walk_clicked()
+
+        panel._on_operation_completed(True, list(ROWS))   # A の結果が届く
+
+        data = json.loads(self._export(panel, "json"))
+        self.assertEqual(data["host"], "192.0.2.10",
+                         "断られた要求（B）のホストを A の結果に付けている")
+
     def test_a_successful_request_to_another_host_relabels(self):
         """対照: 別ホストで取り直せば、そのホストになる。"""
         panel = self._panel()
