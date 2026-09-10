@@ -513,6 +513,21 @@ class SFTPPanel(QWidget):
             new_path = f"{current_path}/{file_info['name']}" if current_path != "/" else f"/{file_info['name']}"
             self.sftp_manager.change_directory(new_path)
     
+    def _open_directory(self, file_info: dict, pinned=None):
+        """メニューの「開く」。メニューを開いた時点の相手と場所を基準に移動する。
+
+        行番号（QModelIndex）を捕捉して項目選択時にモデルを読み直すと、
+        メニューの間に一覧が差し替わったとき、同じ行に来た別のディレクトリへ
+        移動してしまう。
+        """
+        manager, base_path = self._pinned_or_begin(pinned)
+        if not manager or not file_info or not file_info.get('is_dir'):
+            return
+        if not self._still_on(manager):
+            self._abandon("ディレクトリの移動")
+            return
+        manager.change_directory(self._remote_path(base_path, file_info['name']))
+
     def _show_context_menu(self, position):
         """
         右クリックメニューを表示
@@ -541,7 +556,8 @@ class SFTPPanel(QWidget):
             if file_info['is_dir']:
                 # ディレクトリの場合
                 open_action = menu.addAction("開く")
-                open_action.triggered.connect(lambda: self._on_item_double_clicked(index))
+                open_action.triggered.connect(
+                    lambda: self._open_directory(file_info, pinned))
             else:
                 # ファイルの場合
                 download_action = menu.addAction("ダウンロード")

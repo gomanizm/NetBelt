@@ -129,6 +129,23 @@ class SftpPanelSwitchAndMenuTest(unittest.TestCase):
 
         manager.rename_item.assert_called_once_with("/A/boot.cfg", "/A/boot.bak")
 
+    def test_open_from_the_menu_uses_the_directory_shown_when_the_menu_opened(self):
+        """「開く」も、メニューを開いた時点の場所を基準に移動すること。
+
+        行番号だけを捕捉して項目選択時にモデルを読み直すと、メニューの間に
+        一覧が差し替わったとき、同じ行に来た別のディレクトリへ移動する。
+        """
+        manager = self._manager("/A")
+        panel = self._panel_with_listing(manager, entries=[_entry("etc", is_dir=True)])
+
+        def listing_for_b_arrives():
+            manager.get_current_path.return_value = "/B"
+            panel._update_file_list([_entry("var", is_dir=True)])   # 同じ行に別のディレクトリ
+
+        self._open_menu_and_trigger(panel, manager, "開く", listing_for_b_arrives)
+
+        manager.change_directory.assert_called_once_with("/A/etc")
+
     def test_a_menu_action_after_a_device_switch_is_abandoned(self):
         """メニューが開いている間に機器が変わったら、どちらにも操作しないこと。"""
         from PyQt6.QtWidgets import QMessageBox
