@@ -511,18 +511,76 @@ class ConfigManager:
         group = self.get_group(group_name)
         if not group:
             return False
-        
+        # 機器名は全グループを通して一意。接続の管理も所属グループの検索も
+        # 名前だけで行うので、別グループに同名があると、先に見つかった方の
+        # auto_commands が送られる
+        if self.find_device_group(device_info.get("name", "")) is not None:
+            return False
+
+        before = list(group["devices"])
         group["devices"].append(device_info)
-        return self.save_config()
-    
+        if self.save_config():
+            return True
+        group["devices"][:] = before   # 保存できなかったらメモリも戻す
+        return False
+
     def remove_device(self, group_name: str, device_name: str) -> bool:
         """機器を削除"""
         group = self.get_group(group_name)
         if not group:
             return False
-        
+
+        before = list(group["devices"])
         group["devices"] = [d for d in group["devices"] if d["name"] != device_name]
-        return self.save_config()
+        if self.save_config():
+            return True
+        # 保存できなかったのにメモリから消したままだと、次の無関係な保存で
+        # 機器がディスクから消える
+        group["devices"] = before
+        return False
+
+    def find_device_group(self, device_name: str) -> Optional[str]:
+        """その名前の機器が属するグループ名を返す（無ければ None）"""
+        for group in self.get_groups():
+            for device in group.get("devices", []):
+                if device.get("name") == device_name:
+                    return group["name"]
+        return None
+
+    def update_device(self, group_name: str, old_name: str,
+                      new_group_name: str, device_info: Dict) -> bool:
+        """機器を差し替える（改名・グループ移動を含む）。保存は 1 回。
+
+        remove_device → add_device の 2 段階にすると、間の状態がディスクに
+        残ったり、片方の保存だけ失敗して機器が消えたり新旧 2 件になったり
+        する。差し替えをメモリ上で組んでから 1 回だけ保存し、失敗したら
+        メモリも元に戻す。
+        """
+        source = self.get_group(group_name)
+        target = self.get_group(new_group_name)
+        if not source or not target:
+            return False
+        new_name = device_info.get("name", "")
+        owner = self.find_device_group(new_name)
+        if owner is not None and not (owner == group_name and new_name == old_name):
+            return False   # 別の機器の名前
+        index = next((i for i, d in enumerate(source["devices"])
+                      if d.get("name") == old_name), None)
+        if index is None:
+            return False
+
+        source_before = list(source["devices"])
+        target_before = list(target["devices"])
+        if source is target:
+            source["devices"][index] = device_info
+        else:
+            del source["devices"][index]
+            target["devices"].append(device_info)
+        if self.save_config():
+            return True
+        source["devices"][:] = source_before
+        target["devices"][:] = target_before
+        return False
     
     def get_global_macros(self) -> List[Dict]:
         """全体共通マクロ一覧を取得"""

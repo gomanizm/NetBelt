@@ -422,7 +422,17 @@ class MainWindow(QMainWindow):
             # 機器データ取得
             device_data = dialog.get_device_data()
             group_name = dialog.get_selected_group()
-            
+
+            # 機器名は全グループを通して一意。同名があると、接続や自動コマンドの
+            # 所属判定が先に見つかった方を選び、別の機器へコマンドが飛ぶ
+            owner = self.config_manager.find_device_group(device_data.get("name", ""))
+            if owner is not None:
+                QMessageBox.warning(
+                    self, "機器名の重複",
+                    "機器名 '%s' は既にグループ '%s' で使われています。\n"
+                    "別の名前を付けてください。" % (device_data.get("name", ""), owner))
+                return
+
             # 設定に追加
             if self.config_manager.add_device(group_name, device_data):
                 # ツリーを再読み込み
@@ -466,14 +476,21 @@ class MainWindow(QMainWindow):
             new_device_data = dialog.get_device_data()
             new_group_name = dialog.get_selected_group()
             old_device_name = device_data["name"]
-            
-            # 古い機器を削除
-            if not self.config_manager.remove_device(group_name, old_device_name):
-                QMessageBox.warning(self, "エラー", "機器の削除に失敗しました。")
+            new_name = new_device_data.get("name", "")
+
+            # 改名先が別の機器の名前なら断る（名前は全グループを通して一意）
+            owner = self.config_manager.find_device_group(new_name)
+            if owner is not None and not (owner == group_name and new_name == old_device_name):
+                QMessageBox.warning(
+                    self, "機器名の重複",
+                    "機器名 '%s' は既にグループ '%s' で使われています。\n"
+                    "別の名前を付けてください。" % (new_name, owner))
                 return
-            
-            # 新しい機器を追加
-            if self.config_manager.add_device(new_group_name, new_device_data):
+
+            # 差し替えは 1 回の保存で行う。削除→追加の 2 段階だと、片方の
+            # 保存だけ失敗したときに機器が消えたり新旧 2 件になったりする
+            if self.config_manager.update_device(group_name, old_device_name,
+                                                 new_group_name, new_device_data):
                 # 開いているタブの再接続は device_info の写しを見る。
                 # ここを更新しないと編集内容が届かず、古い接続情報のまま
                 # 繋がり続ける（存在しない鍵を指定しても、以前の鍵で
@@ -485,9 +502,7 @@ class MainWindow(QMainWindow):
                 self._load_devices()
                 self.status_bar.showMessage(f"機器 '{new_device_data['name']}' を更新しました")
             else:
-                # 失敗した場合は古い機器を復元
-                self.config_manager.add_device(group_name, device_data)
-                QMessageBox.warning(self, "エラー", "機器の更新に失敗しました。")
+                QMessageBox.warning(self, "エラー", "機器の更新に失敗しました。設定は変更されていません。")
     
     def _on_device_delete(self, group_name: str, device_name: str):
         """
