@@ -83,15 +83,22 @@ class MacroCleanupOnDisconnectTest(unittest.TestCase):
         self.assertNotIn("rtrA", window.macro_manager._send_callbacks)
 
     def test_nothing_leaks_into_a_reconnected_session(self):
-        """再接続で送信先を付け直しても、前のマクロの残りが送られないこと。"""
+        """再接続で送信先を付け直しても、前のマクロの残りが送られないこと。
+
+        間隔を短くして、修正前なら残りのコマンドが実際に新しい接続へ
+        届く時間だけ待つ（長い間隔だと待たずに通ってしまい、何も守らない）。
+        """
         window = self._window()
-        self._running_macro(window)
+        sent = []
+        window.connections["rtrA"] = mock.Mock()
+        window.macro_manager.register_send_callback("rtrA", sent.append)
+        window.macro_manager.start_command_list("rtrA", ["conf t", "no shut", "end"], 100)
         window._on_connection_closed("rtrA")
 
         new_session = []
         window.connections["rtrA"] = mock.Mock()
         window.macro_manager.register_send_callback("rtrA", new_session.append)
-        self._pump(0.3)
+        self._pump(0.6)
 
         self.assertEqual(new_session, [],
                          "前のセッションのマクロが新しい接続へ送られた: %s" % new_session)

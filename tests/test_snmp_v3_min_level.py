@@ -124,6 +124,31 @@ class SnmpV3MinLevelTest(unittest.TestCase):
 
         self.assertEqual(got, [], "暗号なしの通知を受け入れている: %s" % got)
 
+    def test_the_warning_is_raised_once_per_user_name(self):
+        """偽の通知で画面が埋まらないよう、ユーザ名ごとに一度だけ知らせること。"""
+        from pysnmp.hlapi import UsmUserData
+        m, port, got = self._receiver()
+        errors = []
+        m.error_occurred.connect(errors.append)
+
+        self._send(UsmUserData(USER), port, "forged-1")
+        self._send(UsmUserData(USER), port, "forged-2")
+        self._pump(1.0)
+
+        self.assertEqual(got, [])
+        self.assertEqual(len(errors), 1, "警告が %d 回出ている: %s" % (len(errors), errors))
+
+    def test_v2c_traps_are_unaffected_by_v3_users(self):
+        """v3 ユーザを登録していても、コミュニティ一致の v2c Trap は届くこと。"""
+        from conftest import trap_bytes
+        m, port, got = self._receiver()
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.addCleanup(s.close)
+        s.sendto(trap_bytes("public"), ("127.0.0.1", port))
+        self._pump(1.0)
+
+        self.assertEqual(len(got), 1, "v2c の通知が届かない")
+
     def test_a_noauth_user_still_receives_noauth_traps(self):
         """noAuthNoPriv で登録したユーザには、これまでどおり鍵なしで届くこと（対照）。"""
         from pysnmp.hlapi import UsmUserData
