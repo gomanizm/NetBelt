@@ -968,8 +968,35 @@ class TerminalWidget(QWidget):
                     self._log_files[device_name].write(logged)
                     self._log_files[device_name].flush()
                 except Exception as e:
-                    import sys
-                    print(f"[ERROR] ログ書き込みエラー: {str(e)}", file=sys.stderr)
+                    self._abort_log_recording(device_name, e)
+
+    def _abort_log_recording(self, device_name: str, error: Exception) -> None:
+        """書き込みに失敗した記録を止めて、知らせる。
+
+        stderr へ print するだけだと、ディスク満杯や共有フォルダの切断のあとも
+        「記録中」の表示とフラグが残り、利用者は記録できていると思って作業を
+        続ける。console=False の exe では stderr の出力先も無い。
+        ハンドルを先に外すので、警告は失敗のたびではなく一度だけ出る。
+        """
+        from PyQt6.QtWidgets import QMessageBox
+
+        handle = self._log_files.pop(device_name, None)
+        if handle is not None:
+            try:
+                handle.close()
+            except Exception:
+                pass   # 壊れたハンドルは閉じるのも失敗しうる
+        terminal = self._terminals.get(device_name)
+        if isinstance(terminal, InteractiveTerminal):
+            terminal._is_recording = False
+        dialog = self._log_dialogs.pop(device_name, None)
+        if dialog is not None:
+            dialog.close()
+        QMessageBox.warning(
+            self, "ログ記録",
+            "%s のログ記録を停止しました。書き込みに失敗しました:\n%s\n\n"
+            "記録は失敗する前の行までです。保存先の空きや接続を確認してから、"
+            "記録を始め直してください。" % (device_name, error))
     
     def enable_reconnect(self, device_name: str, reconnect_callback):
         """
