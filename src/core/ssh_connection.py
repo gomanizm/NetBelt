@@ -84,7 +84,10 @@ class SSHConnection(QObject):
                 # 鍵が変わっていても気づかずにパスワードを送る。検証できない
                 # 状態で認証へ進まない
                 raise HostKeyStoreError(
-                    "既知ホスト鍵 (known_hosts) を読めないため接続を中止しました: %s\n%s"
+                    "既知ホスト鍵 (known_hosts) を読めないため接続を中止しました: %s\n%s\n"
+                    "壊れた行が 1 つあるだけでも読めなくなります。該当行を修正または"
+                    "削除するか、ファイルを退避してから接続し直してください"
+                    "（退避すると全機器が初回接続の扱いになります）。"
                     % (e, known_hosts_path))
         policy = _TofuHostKeyPolicy(known_hosts_path)
         policy._on_save_error = lambda message: self.output_received.emit(

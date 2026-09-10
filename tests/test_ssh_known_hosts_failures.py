@@ -60,6 +60,9 @@ class SshKnownHostsFailuresTest(unittest.TestCase):
         client.connect.assert_not_called()
         self.assertTrue(any("known_hosts" in e for e in errors),
                         "理由を言っていない: %s" % errors)
+        # 壊れた行が 1 つあるだけでも全接続が止まるので、直し方まで言うこと
+        self.assertTrue(any(("修正" in e or "削除" in e) for e in errors),
+                        "対処（該当行の修正・削除）を案内していない: %s" % errors)
 
     def test_a_readable_known_hosts_still_connects(self):
         """対照: 読めれば、これまでどおり接続する。"""
