@@ -40,6 +40,25 @@ class SFTPServerHandler(SFTPServerInterface):
 
         return real_path
 
+    def _get_link_path(self, path):
+        """削除・改名の対象パスを返す（最終要素はリンクを解決しない）。
+
+        _get_real_path は最終要素まで realpath で解決するので、ルート内の
+        alias → target というリンクに対して「alias を消す」と target 自体を
+        消してしまう。閉じ込めの判定は親ディレクトリを解決して行い、
+        最終要素はその名前のまま扱う。リンクを通ってルートの外へ出る
+        パス（escape/secret.txt）は親が外側に解決されるので、これまで
+        どおり拒否される。
+        """
+        relative = path.replace("\\", "/").strip("/")
+        if not relative:
+            raise IOError("Access denied")
+        parent_rel, _, leaf = relative.rpartition("/")
+        if leaf in ("", ".", ".."):
+            raise IOError("Access denied")
+        parent_real = self._get_real_path(parent_rel)
+        return os.path.join(parent_real, leaf)
+
     def list_folder(self, path):
         """ディレクトリ一覧を返す"""
         try:
@@ -132,8 +151,8 @@ class SFTPServerHandler(SFTPServerInterface):
     def remove(self, path):
         """ファイルを削除"""
         try:
-            real_path = self._get_real_path(path)
-            os.remove(real_path)
+            # リンクの先ではなくリンク自体を消す
+            os.remove(self._get_link_path(path))
             return SFTP_OK
         except Exception as e:
             print(f"[SFTP Server] remove error: {e}")
@@ -142,9 +161,8 @@ class SFTPServerHandler(SFTPServerInterface):
     def rename(self, oldpath, newpath):
         """ファイル/ディレクトリ名を変更"""
         try:
-            real_oldpath = self._get_real_path(oldpath)
-            real_newpath = self._get_real_path(newpath)
-            os.rename(real_oldpath, real_newpath)
+            # リンクの先ではなくリンク自体を改名する
+            os.rename(self._get_link_path(oldpath), self._get_link_path(newpath))
             return SFTP_OK
         except Exception as e:
             print(f"[SFTP Server] rename error: {e}")
@@ -163,8 +181,8 @@ class SFTPServerHandler(SFTPServerInterface):
     def rmdir(self, path):
         """ディレクトリを削除"""
         try:
-            real_path = self._get_real_path(path)
-            os.rmdir(real_path)
+            # リンクの先ではなくリンク自体を外す（ジャンクションは rmdir で外れる）
+            os.rmdir(self._get_link_path(path))
             return SFTP_OK
         except Exception as e:
             print(f"[SFTP Server] rmdir error: {e}")
