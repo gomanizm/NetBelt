@@ -352,6 +352,11 @@ class SNMPTrapReceiver(QThread):
         self.communities = (['public'] if communities is None
                             else _clean_communities(communities))
         self.v3_users = list(v3_users or [])
+        # v3 ユーザ名 → 登録時に求めたセキュリティレベル（1=noAuthNoPriv,
+        # 2=authNoPriv, 3=authPriv）。pysnmp は Trap 受信側（非 authoritative）で
+        # 最低レベルの検査をしないため、こちらで見る
+        self._min_level = {}
+        self._warned_weak = set()
         self._running = False
         self._engine = None
         self._transport = None
@@ -427,6 +432,13 @@ class SNMPTrapReceiver(QThread):
                 user.get("auth_protocol", "none"), user.get("priv_protocol", "none"))
             auth_key = user.get("auth_password") or None
             priv_key = user.get("priv_password") or None
+            # このユーザに求めるレベル。これより弱い通知は _on_notification で捨てる
+            if user.get("priv_protocol", "none") != "none":
+                self._min_level[username] = 3
+            elif user.get("auth_protocol", "none") != "none":
+                self._min_level[username] = 2
+            else:
+                self._min_level[username] = 1
 
             # securityEngineId 無しでも1回登録する（送信用・将来の INFORM 用）。
             # 公式サンプル multiple-usm-users.py と同じ構成。
@@ -493,11 +505,44 @@ class SNMPTrapReceiver(QThread):
         同じ通知が二度処理されるため、ここで握りつぶす。
         """
         try:
+            if self._is_weaker_than_registered():
+                return
             self.trap_received.emit(self._build_trap_data(var_binds))
         except TypeError as e:
             print(f"[SNMPTrapReceiver] 通知処理エラー: {e}")
         except Exception as e:
             print(f"[SNMPTrapReceiver] 通知処理エラー: {e}")
+
+    def _is_weaker_than_registered(self) -> bool:
+        """v3 の通知が、登録時に求めたレベルより弱ければ True。
+
+        pysnmp の USM は、受信側が authoritative でない Trap では最低
+        securityLevel の検査を行わない。authPriv で登録したユーザ名に対して
+        鍵を付けない noAuthNoPriv の通知を送ると、そのまま届く（実測）。
+        ユーザ名と engineID は秘密ではないので、鍵を知らない送信者が偽の
+        Trap を一覧へ記録させられる。登録レベル未満は捨てる。
+        """
+        sec = self._last_security
+        if str(sec.get('security_model', '')) != '3':
+            return False
+        name = sec.get('security_name', '')
+        required = self._min_level.get(name)
+        if required is None:
+            return False
+        try:
+            level = int(sec.get('security_level') or 0)
+        except ValueError:
+            level = 0
+        if level >= required:
+            return False
+        # 偽の通知で画面が埋まらないよう、ユーザ名ごとに一度だけ知らせる
+        if name not in self._warned_weak:
+            self._warned_weak.add(name)
+            self.error_occurred.emit(
+                "v3 ユーザ %s に、登録より弱いセキュリティレベル（%d < %d）の"
+                "通知が届いたため捨てました（送信元 %s）"
+                % (name, level, required, sec.get('source_ip', '')))
+        return True
 
     def _build_trap_data(self, var_binds) -> dict:
         """
