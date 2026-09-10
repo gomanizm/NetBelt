@@ -559,7 +559,16 @@ class MainWindow(QMainWindow):
             # 機器データを取得
             new_device_data = dialog.get_device_data()
             new_group_name = dialog.get_selected_group()
-            
+
+            # 複製でも名前の重複は理由を示して断る（追加・編集と同じ）
+            owner = self.config_manager.find_device_group(new_device_data.get("name", ""))
+            if owner is not None:
+                QMessageBox.warning(
+                    self, "機器名の重複",
+                    "機器名 '%s' は既にグループ '%s' で使われています。\n"
+                    "別の名前を付けてください。" % (new_device_data.get("name", ""), owner))
+                return
+
             # 設定に追加
             if self.config_manager.add_device(new_group_name, new_device_data):
                 # ツリーを再読み込み

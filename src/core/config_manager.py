@@ -757,6 +757,9 @@ class ConfigManager:
                 return False
         
         # デバイスを移動元から削除
+        # 保存に失敗したら戻せるよう、両方の一覧を控える（update_device と同じ）
+        source_before = list(source_group["devices"])
+        target_before = list(target_group["devices"])
         source_group["devices"].remove(device_to_move)
         
         # デバイスを移動先に追加
@@ -764,6 +767,11 @@ class ConfigManager:
         
         # 設定を保存
         result = self.save_config()
+        if not result:
+            # 保存できなかったのに移動したままだと、次の無関係な保存で
+            # ディスク側だけが移動した状態になる
+            source_group["devices"][:] = source_before
+            target_group["devices"][:] = target_before
         if result:
             print(f"[INFO] デバイス '{device_name}' を '{source_group_name}' から '{target_group_name}' に移動しました")
         

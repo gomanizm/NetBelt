@@ -110,6 +110,14 @@ class DeviceIdentityTest(unittest.TestCase):
         self.assertEqual(self._names("A"), [("R1", "192.0.2.1")],
                          "保存に失敗したのにメモリから消えている")
 
+    def test_a_failed_save_on_move_restores_memory(self):
+        """ドラッグ＆ドロップの移動（move_device）も、保存に失敗したら戻すこと。"""
+        self.cm.add_device("A", _device("R1", "192.0.2.1"))
+        with mock.patch.object(self.cm, "save_config", return_value=False):
+            self.assertFalse(self.cm.move_device("A", "B", "R1"))
+        self.assertEqual(self._names("A"), [("R1", "192.0.2.1")], "移動元から消えたまま")
+        self.assertEqual(self._names("B"), [], "移動先に残ったまま")
+
     def test_a_failed_save_on_add_restores_memory(self):
         with mock.patch.object(self.cm, "save_config", return_value=False):
             self.assertFalse(self.cm.add_device("A", _device("R1", "192.0.2.1")))
@@ -162,6 +170,18 @@ class DeviceIdentityUiTest(unittest.TestCase):
         self.assertTrue(box.warning.called, "重複を知らせていない")
         shown = " ".join(str(a) for a in box.warning.call_args[0])
         self.assertIn("R1", shown)
+        self.assertEqual(self.window.config_manager.get_group("B")["devices"], [])
+
+    def test_duplicating_onto_an_existing_name_says_why(self):
+        """右クリックの「複製」でも、名前の重複は理由を示して断ること。"""
+        dialog = self._dialog_returning(_device("R1", "192.0.2.3"), "B")
+        with mock.patch("ui.main_window.DeviceDialog", return_value=dialog), \
+             mock.patch("ui.main_window.QMessageBox") as box:
+            self.window._on_device_duplicate("A", _device("R1", "192.0.2.1"))
+
+        self.assertTrue(box.warning.called)
+        shown = " ".join(str(a) for a in box.warning.call_args[0])
+        self.assertIn("R1", shown, "理由（どの名前が重複か）を言っていない: %s" % shown)
         self.assertEqual(self.window.config_manager.get_group("B")["devices"], [])
 
     def test_editing_a_device_saves_once_and_keeps_it_on_a_failure(self):
