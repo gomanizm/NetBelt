@@ -154,6 +154,10 @@ class SNMPPanel(QWidget):
         # 直近の結果が途中までだった理由。書き出しに添えるため、次の完走か
         # クリアまで持ち続ける
         self._last_partial_reason = None
+        # 要求を出した時点のホストと、いま表の結果を取得したホスト。書き出しは
+        # 後者を使う。保存時の入力欄を使うと、A の結果が B の記録になる
+        self._request_host = ""
+        self._result_host = ""
         
         self._init_ui()
         
@@ -607,6 +611,7 @@ class SNMPPanel(QWidget):
             return
 
         params = self._collect_request_params()
+        self._request_host = host
         self.snmp_manager.snmp_get(host, oids, **params)
         self.status_label.setText("GET実行中...")
     
@@ -625,6 +630,7 @@ class SNMPPanel(QWidget):
             return
 
         params = self._collect_request_params()
+        self._request_host = host
         self.snmp_manager.snmp_walk(host, oid, **params)
         self.status_label.setText("WALK実行中...")
     
@@ -733,7 +739,7 @@ class SNMPPanel(QWidget):
         reason = getattr(self, "_last_partial_reason", None)
         data = {
             "exported_at": datetime.now().isoformat(),
-            "host": self.host_edit.text(),
+            "host": self._result_host,
             "count": len(results),
             # 途中までの結果かどうか。機械で読む側が見落とさないよう明示する
             "complete": reason is None,
@@ -750,7 +756,7 @@ class SNMPPanel(QWidget):
         with open(file_path, "w", encoding="utf-8") as f:
             f.write("SNMP GET/WALK 結果\n")
             f.write("エクスポート日時: " + datetime.now().strftime("%Y-%m-%d %H:%M:%S") + "\n")
-            f.write("対象ホスト: " + self.host_edit.text() + "\n")
+            f.write("対象ホスト: " + self._result_host + "\n")
             f.write("件数: " + str(len(results)) + "\n")
             reason = getattr(self, "_last_partial_reason", None)
             if reason:
@@ -1036,6 +1042,8 @@ class SNMPPanel(QWidget):
     def _on_operation_completed(self, success: bool, result):
         if success:
             self.result_model.set_results(result)
+            # 表の結果がどのホストのものかを、要求時の値で固定する
+            self._result_host = self._request_host
             # 直前に「途中で切れた」と知らされていれば、そう書く。
             # 一度使ったら忘れる（次の完走に持ち越さない）
             reason = getattr(self, "_partial_reason", None)
