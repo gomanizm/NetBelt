@@ -217,6 +217,12 @@ class SFTPManager(QObject):
             filename = os.path.basename(local_path)
             remote_path = f"{self.current_path}/{filename}"
         
+        # リモートも最終名へ直接書かない。put() は先にリモートを切り詰めるので、
+        # 切断や容量不足で機器側に途中までの設定ファイルが本来の名前で残る。
+        # 同じディレクトリの一時名へ送り、成功してから置き換える
+        remote_dir, _, remote_name = remote_path.rpartition("/")
+        tmp_remote = "%s/.%s.netbelt-part" % (remote_dir, remote_name)
+
         def upload_thread():
             try:
                 # ファイルサイズを取得
@@ -235,8 +241,18 @@ class SFTPManager(QObject):
                     # 確認だけでは足りない（起きたら None を触ることになる）。
                     if not self.is_connected or self.sftp_client is None:
                         return
-                    self.sftp_client.put(local_path, remote_path,
+                    self.sftp_client.put(local_path, tmp_remote,
                                          callback=progress_callback)
+                    # 全部送れてから最終名へ。posix_rename（OpenSSH 拡張）は
+                    # 既存を上書きできる。無いサーバでは消してから rename
+                    try:
+                        self.sftp_client.posix_rename(tmp_remote, remote_path)
+                    except (AttributeError, IOError):
+                        try:
+                            self.sftp_client.remove(remote_path)
+                        except IOError:
+                            pass
+                        self.sftp_client.rename(tmp_remote, remote_path)
                 
                 # 完了通知
                 self.transfer_complete.emit(f"アップロード完了: {os.path.basename(local_path)}")
@@ -245,6 +261,14 @@ class SFTPManager(QObject):
                 self.list_directory(self.current_path)
                 
             except Exception as e:
+                # 送りかけの一時ファイルを機器に残さない（できる範囲で）。
+                # 最終名のファイルには触っていない
+                try:
+                    with self._sftp_lock:
+                        if self.is_connected and self.sftp_client is not None:
+                            self.sftp_client.remove(tmp_remote)
+                except Exception:
+                    pass
                 self.error_occurred.emit(f"アップロードエラー: {str(e)}")
         
         # バックグラウンドスレッドで実行
@@ -262,6 +286,12 @@ class SFTPManager(QObject):
             self.error_occurred.emit("SFTP接続がありません")
             return
         
+        # 最終の保存先へ直接書かない。paramiko の get() はリモートを読む前に
+        # ローカルを 'wb' で開くので、リモート側で消えていただけでも既存の
+        # 正常なバックアップが 0 バイトになり、途中で切れれば部分ファイルが
+        # 本来の名前で残る。同じディレクトリの一時名へ落として置き換える
+        tmp_local = local_path + ".netbelt-part"
+
         def download_thread():
             try:
                 # ダウンロード実行
@@ -274,13 +304,20 @@ class SFTPManager(QObject):
                     # 確認だけでは足りない（起きたら None を触ることになる）。
                     if not self.is_connected or self.sftp_client is None:
                         return
-                    self.sftp_client.get(remote_path, local_path,
+                    self.sftp_client.get(remote_path, tmp_local,
                                          callback=progress_callback)
                 
+                # 全部落とせてから最終名へ（同じディレクトリなので原子的）
+                os.replace(tmp_local, local_path)
                 # 完了通知
                 self.transfer_complete.emit(f"ダウンロード完了: {os.path.basename(remote_path)}")
                 
             except Exception as e:
+                # 失敗した転送の残骸を消す。既存の保存先には触っていない
+                try:
+                    os.remove(tmp_local)
+                except OSError:
+                    pass
                 self.error_occurred.emit(f"ダウンロードエラー: {str(e)}")
         
         # バックグラウンドスレッドで実行
