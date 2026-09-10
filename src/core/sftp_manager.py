@@ -221,7 +221,12 @@ class SFTPManager(QObject):
         # 切断や容量不足で機器側に途中までの設定ファイルが本来の名前で残る。
         # 同じディレクトリの一時名へ送り、成功してから置き換える
         remote_dir, _, remote_name = remote_path.rpartition("/")
-        tmp_remote = "%s/.%s.netbelt-part" % (remote_dir, remote_name)
+        # スラッシュを含まない相対名なら、一時名も相対のまま（ルート直下に
+        # しない。OpenSSH 系の機器はルートに書けないことが多い）
+        tmp_remote = (remote_dir + "/" if remote_dir else "") + ".%s.netbelt-part" % remote_name
+        # 最終名を消したあとで置き換えに失敗した場合は、一時名が唯一の完全な
+        # 写しになるので消さない
+        keep_tmp = [False]
 
         def upload_thread():
             try:
@@ -244,15 +249,26 @@ class SFTPManager(QObject):
                     self.sftp_client.put(local_path, tmp_remote,
                                          callback=progress_callback)
                     # 全部送れてから最終名へ。posix_rename（OpenSSH 拡張）は
-                    # 既存を上書きできる。無いサーバでは消してから rename
+                    # 既存を上書きできる。無いサーバでは、まず rename を試し、
+                    # 既存があって失敗したときだけ消してからもう一度 rename
+                    # する（先に消すと、rename に失敗した瞬間に元が消える）
                     try:
                         self.sftp_client.posix_rename(tmp_remote, remote_path)
                     except (AttributeError, IOError):
                         try:
-                            self.sftp_client.remove(remote_path)
+                            self.sftp_client.rename(tmp_remote, remote_path)
                         except IOError:
-                            pass
-                        self.sftp_client.rename(tmp_remote, remote_path)
+                            try:
+                                self.sftp_client.remove(remote_path)
+                            except IOError:
+                                pass
+                            try:
+                                self.sftp_client.rename(tmp_remote, remote_path)
+                            except IOError as e:
+                                keep_tmp[0] = True
+                                raise IOError(
+                                    "最終名への置き換えに失敗しました。転送済みの内容は"
+                                    "機器の一時名 %s に残っています: %s" % (tmp_remote, e))
                 
                 # 完了通知
                 self.transfer_complete.emit(f"アップロード完了: {os.path.basename(local_path)}")
@@ -261,14 +277,17 @@ class SFTPManager(QObject):
                 self.list_directory(self.current_path)
                 
             except Exception as e:
-                # 送りかけの一時ファイルを機器に残さない（できる範囲で）。
-                # 最終名のファイルには触っていない
-                try:
-                    with self._sftp_lock:
-                        if self.is_connected and self.sftp_client is not None:
-                            self.sftp_client.remove(tmp_remote)
-                except Exception:
-                    pass
+                # 送りかけの一時ファイルを機器に残さない（できる範囲で。切断後は
+                # 消せず、機器側に .<名前>.netbelt-part が残る）。最終名のファイル
+                # には触っていない。置き換えの途中で失敗した場合は、一時名が唯一の
+                # 完全な写しなので消さない
+                if not keep_tmp[0]:
+                    try:
+                        with self._sftp_lock:
+                            if self.is_connected and self.sftp_client is not None:
+                                self.sftp_client.remove(tmp_remote)
+                    except Exception:
+                        pass
                 self.error_occurred.emit(f"アップロードエラー: {str(e)}")
         
         # バックグラウンドスレッドで実行
@@ -290,7 +309,13 @@ class SFTPManager(QObject):
         # ローカルを 'wb' で開くので、リモート側で消えていただけでも既存の
         # 正常なバックアップが 0 バイトになり、途中で切れれば部分ファイルが
         # 本来の名前で残る。同じディレクトリの一時名へ落として置き換える
-        tmp_local = local_path + ".netbelt-part"
+        # 一時名はダウンロードごとに一意にする（同じ保存先へ続けて落とすと、
+        # 同じ一時名の取り合いで片方が誤って失敗する）
+        import tempfile
+        fd, tmp_local = tempfile.mkstemp(
+            prefix=os.path.basename(local_path) + ".", suffix=".netbelt-part",
+            dir=os.path.dirname(os.path.abspath(local_path)))
+        os.close(fd)
 
         def download_thread():
             try:

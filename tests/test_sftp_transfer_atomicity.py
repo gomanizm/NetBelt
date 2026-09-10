@@ -114,6 +114,75 @@ class SftpTransferAtomicityTest(unittest.TestCase):
         self.assertEqual(renames, [], "失敗したのに最終名へ置き換えている")
         m.sftp_client.remove.assert_called_once_with(put_target)
 
+    def test_a_relative_remote_name_keeps_its_temporary_name_relative(self):
+        """スラッシュを含まないリモート名では、一時名をルート直下にしないこと。"""
+        m = self._manager()
+        local = os.path.join(self.dir, "running.cfg")
+        with io.open(local, "w", encoding="utf-8") as f:
+            f.write("hostname R1")
+
+        m.upload_file(local, "running.cfg")
+
+        self.assertTrue(self._wait(lambda: self.done or self.errors), "終わらない")
+        put_target = m.sftp_client.put.call_args[0][1]
+        self.assertFalse(put_target.startswith("/"),
+                         "相対名なのに一時名が絶対パス: %s" % put_target)
+
+    def test_two_downloads_to_the_same_local_path_both_succeed(self):
+        """同じ保存先へ続けて落としても、片方が誤って失敗にならないこと。"""
+        m = self._manager()
+        local = os.path.join(self.dir, "backup.cfg")
+
+        def get_ok(remote, localpath, callback=None):
+            time.sleep(0.05)
+            with open(localpath, "wb") as f:
+                f.write(remote.encode())
+
+        m.sftp_client.get.side_effect = get_ok
+        m.download_file("/etc/one.cfg", local)
+        m.download_file("/etc/two.cfg", local)
+
+        self.assertTrue(self._wait(lambda: len(self.done) + len(self.errors) >= 2))
+        self.assertEqual(self.errors, [], "同じ一時名の取り合いで誤って失敗している")
+        self.assertEqual(os.listdir(self.dir), ["backup.cfg"], "一時ファイルが残っている")
+
+    def test_the_fallback_renames_first_and_removes_only_when_needed(self):
+        """posix_rename が無いサーバでは、まず rename を試すこと。
+
+        先に最終名を消してから rename すると、rename が失敗した瞬間に
+        機器側の元ファイルが消える。
+        """
+        m = self._manager()
+        local = os.path.join(self.dir, "running.cfg")
+        with io.open(local, "w", encoding="utf-8") as f:
+            f.write("hostname R1")
+        m.sftp_client.posix_rename.side_effect = IOError("Operation unsupported")
+
+        m.upload_file(local, "/flash/running.cfg")
+
+        self.assertTrue(self._wait(lambda: self.done), "完了しない: %s" % self.errors)
+        m.sftp_client.rename.assert_called_once()
+        m.sftp_client.remove.assert_not_called()
+
+    def test_a_failed_rename_after_removing_the_target_keeps_the_temporary_copy(self):
+        """最終名を消したあと rename に失敗したら、唯一の完全な写しである一時名を消さず、名前を知らせること。"""
+        m = self._manager()
+        local = os.path.join(self.dir, "running.cfg")
+        with io.open(local, "w", encoding="utf-8") as f:
+            f.write("hostname R1")
+        m.sftp_client.posix_rename.side_effect = IOError("Operation unsupported")
+        # 1 回目の rename は「既にある」で失敗、remove 後の 2 回目は切断で失敗
+        m.sftp_client.rename.side_effect = [IOError("Failure"), IOError("connection lost")]
+
+        m.upload_file(local, "/flash/running.cfg")
+
+        self.assertTrue(self._wait(lambda: self.errors), "失敗が通知されない")
+        removed = [c[0][0] for c in m.sftp_client.remove.call_args_list]
+        self.assertNotIn("/flash/.running.cfg.netbelt-part", removed,
+                         "唯一の完全な写しを消している")
+        self.assertIn(".running.cfg.netbelt-part", self.errors[0],
+                     "機器に残った一時名を知らせていない: %s" % self.errors)
+
     def test_a_successful_upload_is_moved_into_place(self):
         m = self._manager()
         local = os.path.join(self.dir, "running.cfg")
