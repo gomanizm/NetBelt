@@ -903,11 +903,16 @@ class MainWindow(QMainWindow):
         if not commands:
             return
         from PyQt6.QtCore import QTimer
-        # シェルのプロンプトが出るまで少し待ってから送信する
-        QTimer.singleShot(
-            800,
-            lambda: self.macro_manager.start_command_list(device_name, list(commands), 1000)
-        )
+        # シェルのプロンプトが出るまで少し待ってから送信する。待っている間に
+        # 切断・再接続されていたら始めない（同名の新しい接続へ前の接続向けの
+        # コマンドを送ることになる）。接続オブジェクトの同一性で見る
+        conn = self.connections.get(device_name)
+
+        def start_if_still_this_session():
+            if self.connections.get(device_name) is conn:
+                self.macro_manager.start_command_list(device_name, list(commands), 1000)
+
+        QTimer.singleShot(800, start_if_still_this_session)
         self.status_bar.showMessage(f"{device_name}: 自動実行コマンドを送信します...")
 
     def _dispose_connection(self, device_name: str):
@@ -926,6 +931,13 @@ class MainWindow(QMainWindow):
         conn = self.connections.pop(device_name, None)
         if conn is None:
             return
+        # この接続宛てのマクロ（コマンドリスト・キープアライブ・送信先）も
+        # ここで止める。残すと切断中もインデックスが進み、同名で再接続した
+        # 瞬間に残りのコマンドが新しいセッションへ送られる
+        try:
+            self.macro_manager.cleanup_device(device_name)
+        except Exception as e:
+            print(f"[Connection] {device_name} のマクロ停止に失敗: {e}")
         try:
             conn.dispose()
         except Exception as e:
