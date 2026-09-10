@@ -264,6 +264,11 @@ class SFTPPanel(QWidget):
         self._current_entries = {}
         self._pending_upload_names = set()
         self.current_device = device_name
+        # 前の機器の行と選択も消す。新しい一覧が届くまで残しておくと、
+        # 前の機器の file_info と新しい機器の組み合わせで削除できてしまう
+        self.tree_view.clearSelection()
+        self.model.removeRows(0, self.model.rowCount())
+        self.status_label.setText("一覧を取得しています...")
         
         # シグナル接続
         self.sftp_manager.file_list_ready.connect(self._update_file_list)
@@ -338,6 +343,14 @@ class SFTPPanel(QWidget):
         if manager is None:
             return None, None
         return manager, manager.get_current_path()
+
+    def _pinned_or_begin(self, pinned):
+        """メニューを開いた時点で固定した (manager, path) があればそれを、
+        無ければいまの状態を返す。QAction.triggered から直接呼ばれると
+        pinned には bool（checked）が入るので、組でなければ無視する。"""
+        if isinstance(pinned, tuple) and len(pinned) == 2:
+            return pinned
+        return self._begin()
 
     @staticmethod
     def _remote_path(base: str, name: str) -> str:
@@ -509,17 +522,22 @@ class SFTPPanel(QWidget):
         """
         if not self.sftp_manager:
             return
-        
+
+        # 相手と場所はメニューを開いた時点で固定する。項目を選んでから読むと、
+        # メニューが開いている間に届いた一覧で場所が変わっていて、古い一覧で
+        # 右クリックした名前を別のディレクトリで消す
+        pinned = self._begin()
+
         # 選択されているアイテムを取得
         index = self.tree_view.indexAt(position)
-        
+
         menu = QMenu(self)
-        
+
         if index.isValid():
             # アイテムが選択されている場合
             name_item = self.model.item(index.row(), 0)
             file_info = name_item.data(Qt.ItemDataRole.UserRole)
-            
+
             if file_info['is_dir']:
                 # ディレクトリの場合
                 open_action = menu.addAction("開く")
@@ -527,30 +545,34 @@ class SFTPPanel(QWidget):
             else:
                 # ファイルの場合
                 download_action = menu.addAction("ダウンロード")
-                download_action.triggered.connect(lambda: self._on_download_selected(file_info))
-            
+                download_action.triggered.connect(
+                    lambda: self._on_download_selected(file_info, pinned))
+
             menu.addSeparator()
-            
+
             # 共通メニュー
             rename_action = menu.addAction("名前変更")
-            rename_action.triggered.connect(lambda: self._on_rename_selected(file_info))
-            
+            rename_action.triggered.connect(
+                lambda: self._on_rename_selected(file_info, pinned))
+
             delete_action = menu.addAction("削除")
-            delete_action.triggered.connect(lambda: self._on_delete_selected(file_info))
-            
+            delete_action.triggered.connect(
+                lambda: self._on_delete_selected(file_info, pinned))
+
             menu.addSeparator()
-            
+
             chmod_action = menu.addAction("パーミッション変更")
-            chmod_action.triggered.connect(lambda: self._on_chmod_selected(file_info))
+            chmod_action.triggered.connect(
+                lambda: self._on_chmod_selected(file_info, pinned))
         else:
             # 空白部分の場合
             upload_action = menu.addAction("ファイルをアップロード")
-            upload_action.triggered.connect(self._on_upload)
-            
+            upload_action.triggered.connect(lambda: self._on_upload(pinned))
+
             menu.addSeparator()
-            
+
             mkdir_action = menu.addAction("新規フォルダ作成")
-            mkdir_action.triggered.connect(self._on_create_directory)
+            mkdir_action.triggered.connect(lambda: self._on_create_directory(pinned))
             
             menu.addSeparator()
             
@@ -575,9 +597,9 @@ class SFTPPanel(QWidget):
         if self.sftp_manager:
             self.sftp_manager.change_directory(".")
     
-    def _on_upload(self):
+    def _on_upload(self, pinned=None):
         """アップロードボタンがクリックされた"""
-        manager, base_path = self._begin()
+        manager, base_path = self._pinned_or_begin(pinned)
         if not manager:
             return
 
@@ -660,14 +682,14 @@ class SFTPPanel(QWidget):
         
         self._on_download_selected(file_info)
     
-    def _on_download_selected(self, file_info: dict):
+    def _on_download_selected(self, file_info: dict, pinned=None):
         """
         選択されたファイルをダウンロード
         
         Args:
             file_info: ファイル情報
         """
-        manager, base_path = self._begin()
+        manager, base_path = self._pinned_or_begin(pinned)
         if not manager:
             return
 
@@ -691,9 +713,9 @@ class SFTPPanel(QWidget):
             remote_path = self._remote_path(base_path, file_info['name'])
             manager.download_file(remote_path, local_path)
     
-    def _on_create_directory(self):
+    def _on_create_directory(self, pinned=None):
         """新規ディレクトリ作成"""
-        manager, base_path = self._begin()
+        manager, base_path = self._pinned_or_begin(pinned)
         if not manager:
             return
 
@@ -724,14 +746,14 @@ class SFTPPanel(QWidget):
         
         self._on_delete_selected(file_info)
     
-    def _on_delete_selected(self, file_info: dict):
+    def _on_delete_selected(self, file_info: dict, pinned=None):
         """
         選択されたアイテムを削除
         
         Args:
             file_info: ファイル情報
         """
-        manager, base_path = self._begin()
+        manager, base_path = self._pinned_or_begin(pinned)
         if not manager:
             return
 
@@ -754,14 +776,14 @@ class SFTPPanel(QWidget):
         item_path = self._remote_path(base_path, file_info['name'])
         manager.delete_item(item_path, file_info['is_dir'])
     
-    def _on_rename_selected(self, file_info: dict):
+    def _on_rename_selected(self, file_info: dict, pinned=None):
         """
         選択されたアイテムの名前を変更
         
         Args:
             file_info: ファイル情報
         """
-        manager, base_path = self._begin()
+        manager, base_path = self._pinned_or_begin(pinned)
         if not manager:
             return
 
@@ -780,14 +802,14 @@ class SFTPPanel(QWidget):
             manager.rename_item(self._remote_path(base_path, file_info['name']),
                                 self._remote_path(base_path, new_name))
     
-    def _on_chmod_selected(self, file_info: dict):
+    def _on_chmod_selected(self, file_info: dict, pinned=None):
         """
         選択されたアイテムのパーミッションを変更
         
         Args:
             file_info: ファイル情報
         """
-        manager, base_path = self._begin()
+        manager, base_path = self._pinned_or_begin(pinned)
         if not manager:
             return
 
