@@ -277,14 +277,28 @@ class TFTPServer:
                     f.write(chunk)
                     received += len(chunk)
                     last_ack = struct.pack("!HH", OP_ACK, block)
+                    if len(chunk) < blksize:
+                        # 最終ブロック。ACK はファイルを閉じてから返す。バッファ付きの
+                        # ファイルは close() で最後の書き出しをするので、ディスク満杯や
+                        # 共有フォルダの切断はここで初めて分かる。先に ACK を返すと
+                        # 機器は「送れた」と思って次へ進み、設定は欠けたまま残る
+                        closing, f = f, None
+                        try:
+                            closing.close()
+                        except OSError as e:
+                            _err(xs, addr, 3, "Disk full or allocation exceeded")
+                            self.on_event("protocol_error", addr[0],
+                                          (filename, "アップロード失敗（保存できません）: %s" % e,
+                                           "upload"))
+                            return
+                        xs.sendto(last_ack, addr)
+                        break
                     xs.sendto(last_ack, addr)
                     now = time.monotonic()
                     if now - last_prog >= 0.2:
                         last_prog = now
                         self.on_event("transfer_progress", addr[0], (filename, received, total, "upload"))
                     expected = (expected + 1) & 0xFFFF
-                    if len(chunk) < blksize:
-                        break
                 else:
                     xs.sendto(struct.pack("!HH", OP_ACK, block), addr)  # 重複 DATA へ再 ACK
             self.on_event("transfer_complete", addr[0], (filename, received, total, "upload"))
