@@ -4,8 +4,9 @@
 import codecs
 import serial
 import serial.tools.list_ports
-from PyQt6.QtCore import QObject, pyqtSignal, QThread
+from PyQt6.QtCore import QObject, pyqtSignal
 from typing import List, Dict, Optional
+import threading
 import time
 
 
@@ -31,7 +32,7 @@ class SerialConnection(QObject):
         self.port = port
         self.baudrate = baudrate
         self.serial_conn: Optional[serial.Serial] = None
-        self._read_thread: Optional[QThread] = None
+        self._read_thread: Optional[threading.Thread] = None
         self._is_connected = False
         self._should_stop = False
     
@@ -47,8 +48,12 @@ class SerialConnection(QObject):
             if self._is_connected:
                 self.disconnect()
             
+            # 開いている最中に dispose() されたことを、開き終わってから
+            # 知るための印。ここで戻しておき、生成後にもう一度見る
+            self._should_stop = False
+
             # シリアルポートを開く
-            self.serial_conn = serial.Serial(
+            port = serial.Serial(
                 port=self.port,
                 baudrate=self.baudrate,
                 bytesize=serial.EIGHTBITS,
@@ -59,9 +64,16 @@ class SerialConnection(QObject):
                 rtscts=False,
                 dsrdtr=False
             )
-            
+
+            if self._should_stop:
+                # 開いている間にタブが閉じられた（または後始末が走った）。
+                # このまま続けると、閉じる経路の無いポートが開いたまま残り、
+                # 同じ COM への再接続が Access is denied になる
+                port.close()
+                return False
+
+            self.serial_conn = port
             self._is_connected = True
-            self._should_stop = False
             
             # 接続成功メッセージ
             self.output_received.emit(
@@ -97,6 +109,13 @@ class SerialConnection(QObject):
         self._should_stop = True
         self._is_connected = False
 
+        # 読み取りスレッドの終了を待つ（自分自身からの後始末では待てない）
+        thread = self._read_thread
+        if (thread is not None and thread.is_alive()
+                and thread is not threading.current_thread()):
+            thread.join(timeout=2)
+        self._read_thread = None
+
         # 接続が存在する場合は閉じる
         if self.serial_conn and self.serial_conn.is_open:
             try:
@@ -113,11 +132,9 @@ class SerialConnection(QObject):
     
     def _start_read_thread(self):
         """読み取りスレッドを開始"""
-        import threading
-
-        # スレッドを開始
-        thread = threading.Thread(target=self._read_loop, daemon=True)
-        thread.start()
+        # 後始末で終了を待てるよう、スレッドを保持する
+        self._read_thread = threading.Thread(target=self._read_loop, daemon=True)
+        self._read_thread.start()
 
     def _read_loop(self):
         """データを継続的に読み取る"""
