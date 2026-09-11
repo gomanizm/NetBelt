@@ -1938,9 +1938,15 @@ for details.
                 creationflags=subprocess.CREATE_NEW_CONSOLE
             )
             
-            # アプリケーションを終了
+            # アプリケーションを終了する。ここは MainWindow.__init__
+            # （起動時の未適用更新）から呼ばれることがあり、その時点では
+            # app.exec() がまだ始まっていない。イベントループが回って
+            # いないときの quit() は何もしないので、直接呼ぶと updater
+            # だけ起動してアプリは表示され続ける（updater.bat は 3 秒後に
+            # ロック中の NetBelt.exe へ上書きを試みる）。singleShot(0) で
+            # 予約すれば、exec() に入った直後に処理される
             from PyQt6.QtWidgets import QApplication
-            QApplication.quit()
+            QTimer.singleShot(0, QApplication.quit)
         except Exception as e:
             QMessageBox.critical(
                 self,
