@@ -1116,6 +1116,33 @@ class TerminalWidget(QWidget):
             return os.path.expanduser("~")
         return logs_dir
 
+    def _recording_device_using(self, file_path: str):
+        """file_path を記録先にしている機器名を返す（無ければ None）
+
+        記録中のファイルを別の記録や全ログ保存の保存先に選ぶと、open('w')
+        で記録済みの内容が消え、以降は両者の書き込みが混在する。保存先を
+        決めた直後にここで見て拒否する。パスは絶対化して比べる
+        """
+        import os
+        wanted = os.path.normcase(os.path.abspath(file_path))
+        for device_name, handle in self._log_files.items():
+            name = getattr(handle, "name", None)
+            if not isinstance(name, str):
+                continue
+            if os.path.normcase(os.path.abspath(name)) == wanted:
+                return device_name
+        return None
+
+    def _warn_log_file_in_use(self, title: str, file_path: str, device_name: str):
+        """記録中のファイルが選ばれたことを知らせる"""
+        from PyQt6.QtWidgets import QMessageBox
+        QMessageBox.warning(
+            self,
+            title,
+            f"このファイルは {device_name} のログ記録に使用中です:\n{file_path}\n"
+            "別のファイルを選ぶか、先にそのログ記録を停止してください。"
+        )
+
     def save_current_log(self):
         """現在アクティブなターミナルのログを保存"""
         from PyQt6.QtWidgets import QFileDialog, QMessageBox
@@ -1166,6 +1193,11 @@ class TerminalWidget(QWidget):
             )
             
             if file_path:
+                in_use_by = self._recording_device_using(file_path)
+                if in_use_by is not None:
+                    self._warn_log_file_in_use("ログ保存", file_path, in_use_by)
+                    return
+
                 # プログレスダイアログを表示してログを保存
                 from .dialogs.log_save_dialog import LogSaveProgressDialog
                 
@@ -1224,6 +1256,11 @@ class TerminalWidget(QWidget):
         )
         
         if file_path:
+            in_use_by = self._recording_device_using(file_path)
+            if in_use_by is not None:
+                self._warn_log_file_in_use("ログ記録", file_path, in_use_by)
+                return
+
             try:
                 # ファイルを開く
                 log_file = open(file_path, 'w', encoding='utf-8', buffering=1)  # 行バッファリング
