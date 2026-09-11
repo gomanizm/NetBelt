@@ -63,6 +63,17 @@ class WideCharacterTest(unittest.TestCase):
         s = feed(Screen(rows=2, cols=10), "A" + WIDE + "\x1b[3G\x1b[1K")
         self.assertEqual(s.text()[0], "")
 
+    def test_the_cell_the_wide_character_left_is_not_part_of_the_line(self):
+        """右端に入らなかった分の空きセルを、折り返し行に残さない。
+
+        折り返し行は描画側で末尾を刈らずに次の行へ繋ぐので、残すと
+        コピーとログ保存の本文へ印字していない空白が混ざる。
+        """
+        s = feed(Screen(rows=4, cols=3), "AB" + WIDE + "CDEFGH")
+        self.assertEqual("".join(c[0] for c in s.lines[0]), "AB",
+                         "全角が入らず空けたセルが行に残っている")
+        self.assertTrue(s.wrapped[0])
+
     def test_a_wide_character_at_the_edge_sets_pending_wrap(self):
         s = feed(Screen(rows=2, cols=4), "AB" + WIDE + "C")
         self.assertEqual(s.text()[:2], ["AB" + WIDE, "C"])
@@ -87,10 +98,38 @@ class ZeroWidthCharacterTest(unittest.TestCase):
         self.assertEqual(s.lines[0][0][0], WIDE + ACUTE)
         self.assertEqual(s.text()[0], WIDE + ACUTE + "X")
 
+    def test_a_cell_does_not_grow_without_bound(self):
+        """幅 0 の文字を 1 セルへ無制限に繋げない。
+
+        化けた出力を UTF-8 として読むと結合文字が延々と続くことがあり、
+        可視行の 1 セルが伸び続ける (その行は更新のたび文書へ入る)。
+        """
+        s = feed(Screen(rows=2, cols=10), "a" + ACUTE * 500 + "X")
+        self.assertLessEqual(len(s.lines[0][0][0]), 8,
+                             "1 セルの文字列が限りなく伸びる")
+        self.assertEqual(s.lines[0][1][0], "X", "次の文字が落ちている")
+
     def test_a_combining_mark_with_nothing_before_it_is_dropped(self):
         s = feed(Screen(rows=2, cols=10), ACUTE + "X")
         self.assertEqual(s.text()[0], "X")
         self.assertEqual(s.cursor_col, 1)
+
+
+class CellWidthFastPathTest(unittest.TestCase):
+    """ASCII の早道が、unicodedata の見立てと一致すること。"""
+
+    def test_the_fast_path_agrees_with_unicodedata(self):
+        import unicodedata
+        from core.terminal.screen import _cell_width
+        for cp in range(0x20, 0x0400):
+            ch = chr(cp)
+            if unicodedata.category(ch) in ("Mn", "Me", "Cf"):
+                expected = 0
+            elif unicodedata.east_asian_width(ch) in ("W", "F"):
+                expected = 2
+            else:
+                expected = 1
+            self.assertEqual(_cell_width(ch), expected, hex(cp))
 
 
 class NarrowTextUnchangedTest(unittest.TestCase):
@@ -124,6 +163,28 @@ class CaretAfterAWideCharacterTest(unittest.TestCase):
         self.assertEqual(terminal._screen.cursor_col, 2)
         self.assertEqual(terminal.textCursor().positionInBlock(), 1,
                          "キャレットが全角のぶん右へずれている")
+
+
+class WideCharacterInTheScrollbackTest(unittest.TestCase):
+    """全角で折り返した行を、記録側で確かめる。"""
+
+    @classmethod
+    def setUpClass(cls):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PyQt6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_a_wrapped_wide_character_does_not_insert_a_blank(self):
+        from ui.terminal_widget import TerminalWidget
+        w = TerminalWidget()
+        w._grid_size = lambda t: (4, 3)
+        w.create_terminal_tab("dev")
+        w._apply_grid_size("dev")
+        w.append_output("dev", "AB" + WIDE + "CDEFGH")
+        w.append_output("dev", "\r\n" * 10)     # 履歴へ押し出す
+        text = w._terminals["dev"].toPlainText()
+        self.assertIn("AB" + WIDE + "C", text,
+                      "折り返し位置に印字していない空白が混ざっている")
 
 
 if __name__ == "__main__":

@@ -9,6 +9,12 @@ XTerm Control Sequences。
 幅 0 で直前のセルの文字列へ繋げる。残る制限: 曖昧幅 (A) は 1 セル、
 絵文字の ZWJ 列や肌色修飾は 1 つの書記素にまとめず幅を足す、幅 0 の
 文字が行頭に来たときは前の行へ繋げず捨てる。
+
+折り返しの印 (wrapped[r]) は行単位の近似で、論理行そのものは追って
+いない。そのため、折り返した行の一部だけを (右端まで届かない形で)
+書き直すと印が外れ、履歴・コピー・ログでは次の行との間に改行が入る。
+ECH も同じく行全体の印を外す。印字が複数回に分かれて届いた場合も、
+右端までの書き直しが途中で切れると印は外れる。
 """
 import collections
 import unicodedata
@@ -17,6 +23,11 @@ from core.terminal import parser
 from core.terminal.attrs import DEFAULT, apply_sgr
 
 BLANK = (" ", DEFAULT)
+
+# 1 セルへ繋げる幅 0 の文字の数の上限 (基底の文字を含む長さ)。書記素
+# クラスタとして現実的な長さを超えると表示の意味が無く、化けた出力を
+# UTF-8 として読んだときに可視行の 1 セルが伸び続ける
+MAX_CELL_TEXT = 8
 
 # DEC Special Graphics (ESC ( 0 で指示される罫線用文字集合)
 DEC_GRAPHICS = dict(zip(
@@ -36,6 +47,10 @@ def _cell_width(ch):
     結合文字 (Mn/Me) と書式文字 (Cf: ZWJ・ZWNJ 等) は 0、東アジア幅
     W/F (漢字・かな・絵文字) は 2、それ以外は 1。xterm と同じ数え方。
     """
+    if ch < "\u00ad":
+        # U+00AD (SOFT HYPHEN, Cf) より前は例外なく 1 セル。機器の
+        # 出力はほぼ全部ここで返る (unicodedata を 2 回引かない)
+        return 1
     if unicodedata.category(ch) in ("Mn", "Me", "Cf"):
         return 0
     if unicodedata.east_asian_width(ch) in ("W", "F"):
@@ -217,6 +232,9 @@ class Screen(object):
     # ---- 印字と C0 -------------------------------------------------
 
     def _print(self, text):
+        # この印字が今の行へ入った時点の折り返しの印。書き直しが右端
+        # まで届いたときだけ残す判断に使う
+        entry_row, entry_mark = None, False
         for ch in text:
             if ch == "\x7f":            # DEL は表示しない
                 continue
@@ -228,17 +246,37 @@ class Screen(object):
                 continue
             if width == 2 and self.cols < 2:
                 continue                # 1 桁の画面に全角は置けない
+            from_wrap = False           # この文字で折り返して行が変わった
             if self._pending_wrap:      # 右端の 1 文字あとの折り返し
                 self.cursor_col = 0
                 self._linefeed(from_wrap=True)
+                from_wrap = True
             if width == 2 and self.cursor_col + 1 >= self.cols:
                 # 全角が右端の 1 セルに収まらない。xterm と同じく右端は
                 # 空けたまま丸ごと次の行へ送る (折り返し無効なら手前に重ねる)
                 if self.autowrap:
+                    # 空けたセルは印字していない。折り返し行は描画側で
+                    # 末尾を刈らずに次の行へ繋ぐので、残すとコピーと
+                    # ログへ空白が 1 つ混ざる
+                    skipped = self.lines[self.cursor_row]
+                    keep = self.cols - 1
+                    if keep < len(skipped) and skipped[keep][0] == "":
+                        keep -= 1       # 右端は全角の後ろ半分。丸ごと落とす
+                    del skipped[keep:]
                     self.cursor_col = 0
                     self._linefeed(from_wrap=True)
+                    from_wrap = True
                 else:
                     self.cursor_col = self.cols - 2
+            if from_wrap:
+                entry_row = None        # 行が変わった (巻き上げも含む)
+            elif self.cursor_col == 0 and self.cursor_row:
+                # 折り返しで来たのではなく行頭から書き始めた。ここは
+                # 新しい論理行の先頭なので、前の行の古い印を落とす
+                self.wrapped[self.cursor_row - 1] = False
+            if entry_row != self.cursor_row:
+                entry_row = self.cursor_row
+                entry_mark = self.wrapped[entry_row]
             line = self.lines[self.cursor_row]
             end = self.cursor_col + width
             if end > len(line):
@@ -250,10 +288,12 @@ class Screen(object):
             line[self.cursor_col] = (ch, self.attr)
             if width == 2:
                 line[self.cursor_col + 1] = ("", self.attr)     # 継続セル
-            # 折り返しの印は、折り返しで付き、その行への印字で外れる。
-            # 残すと、EL 無しで書き直された行が履歴で次の行と連結される
-            # (右端まで書けば _linefeed(from_wrap=True) が改めて付ける)
-            self.wrapped[self.cursor_row] = False
+            # 折り返しの印は折り返しでだけ付く。書き直しでは、右端まで
+            # 届いたときに限って元の印を残す (まだ次の行へ続いている)。
+            # 届かなければ外す。残すと、EL 無しで書き直された行が履歴で
+            # 次の行と連結される
+            self.wrapped[self.cursor_row] = (
+                entry_mark and end >= self.cols and self.autowrap)
             self.dirty.add(self.cursor_row)
             if end < self.cols:
                 self.cursor_col = end
@@ -268,7 +308,7 @@ class Screen(object):
 
         右端で折り返し待ちなら今のセル、そうでなければ 1 つ左のセル。
         そこが全角の継続セルなら、その全角本体へ繋げる。前に文字が無い
-        (行頭) ときは捨てる。
+        (行頭) ときと、セルが MAX_CELL_TEXT まで伸びているときは捨てる。
         """
         line = self.lines[self.cursor_row]
         i = self.cursor_col if self._pending_wrap else self.cursor_col - 1
@@ -277,6 +317,8 @@ class Screen(object):
         if not 0 <= i < len(line):
             return
         text, attr = line[i]
+        if len(text) >= MAX_CELL_TEXT:
+            return                      # 伸びすぎたセルへはもう繋げない
         line[i] = (text + ch, attr)
         self.dirty.add(self.cursor_row)
 
