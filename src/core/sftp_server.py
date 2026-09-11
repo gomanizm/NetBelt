@@ -7,6 +7,8 @@ from paramiko import ServerInterface, SFTPServerInterface, SFTPServer, SFTPAttri
 from PyQt6.QtCore import QObject, pyqtSignal
 import stat as stat_module
 from .sockets import set_exclusive_bind
+from .crypto import PasswordCrypto
+from .ftp_server import UNDECRYPTABLE_PASSWORD_MESSAGE
 
 
 class SFTPServerHandler(SFTPServerInterface):
@@ -290,6 +292,10 @@ class SFTPServerManager(QObject):
         # ここでも拒否して弱い既定値のまま起動する経路を残さない。
         if not username or not password:
             self.error_occurred.emit("ユーザー名とパスワードを指定してください")
+            return False
+        # 復号できなかった暗号文をそのまま認証パスワードにしない（FTP と同じ）
+        if PasswordCrypto().is_encrypted(password):
+            self.error_occurred.emit(UNDECRYPTABLE_PASSWORD_MESSAGE)
             return False
         
         self.port = port
