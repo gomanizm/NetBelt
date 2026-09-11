@@ -17,6 +17,7 @@ v1.1.0 の更新で実際に起きたこと:
 更新は成功しているのに失敗と言われると、利用者は手で戻そうとする。
 嘘の失敗報告は、失敗そのものより害が大きい。
 """
+import hashlib
 import io
 import os
 import shutil
@@ -478,7 +479,10 @@ class UpdaterLaunchTest(unittest.TestCase):
             window = MainWindow()
         self.addCleanup(lambda: None)
 
-        with mock.patch("subprocess.Popen") as popen:
+        # 適用は凍結ビルドでしか行わない（ソース実行では、配布物が
+        # リポジトリ直下へ上書きされてしまうので案内だけを出す）
+        with mock.patch("subprocess.Popen") as popen, \
+             mock.patch.object(sys, "frozen", True, create=True):
             window._apply_pending_update(zip_path)
 
         self.assertTrue(popen.called, "updater を起動していない")
@@ -575,10 +579,23 @@ class UpdaterLaunchTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, base, True)
         zip_path = os.path.join(base, "Net,Belt-update.zip")
         io.open(zip_path, "wb").write(b"PK\x03\x04")
+        # 適用は凍結ビルドでしか行わず、直前に「表示した版と同じ、
+        # 検証を通った ZIP か」を確かめる。控えと、インストール先の
+        # 一式（exe と updater.bat）を用意して、その門を通す。
+        io.open(zip_path + ".sha256", "w", encoding="ascii").write(
+            hashlib.sha256(b"PK\x03\x04").hexdigest())
+        io.open(zip_path + ".version", "w", encoding="ascii").write(
+            "9.9.9")
+        exe_path = os.path.join(base, "NetBelt.exe")
+        io.open(exe_path, "wb").write(b"MZ")
+        io.open(os.path.join(base, "updater.bat"), "w",
+                encoding="ascii").write("rem\n")
 
         dialog = self._dialog_with_a_downloaded_zip(zip_path)
         with mock.patch("subprocess.Popen") as popen, \
-             mock.patch("PyQt6.QtWidgets.QApplication.quit"):
+             mock.patch("PyQt6.QtWidgets.QApplication.quit"), \
+             mock.patch.object(sys, "frozen", True, create=True), \
+             mock.patch.object(sys, "executable", exe_path):
             dialog._on_apply_clicked()
 
         self.assertTrue(popen.called, "updater を起動していない")

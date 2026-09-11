@@ -156,13 +156,14 @@ echo   展開完了
 echo.
 
 REM 古いバックアップを削除（7日以上前のもの）
+REM 消すのは、このスクリプトが付けた名前（backup_netbelt_*）だけ。利用者が
+REM 隣に置いた backup_* は機器コンフィグの退避先かもしれず、取り返しが
+REM つかない。判定はディレクトリ自身の日付で行う。以前は forfiles /d を
+REM 中身に対して使っていたため「7日以上前のファイルが1つでもある」で成立し、
+REM 当日のファイルを含むディレクトリごと消していた。
 echo [5/6] ファイルを更新中...
-for /d %%d in ("!APP_DIR!backup_*") do (
-    forfiles /p "%%d" /d -7 >nul 2>&1
-    if not errorlevel 1 (
-        rd /s /q "%%d" 2>nul
-    )
-)
+set "BK_PARENT=!APP_DIR:~0,-1!"
+forfiles /p "!BK_PARENT!" /m "backup_netbelt_*" /d -7 /c "cmd /c if @isdir==TRUE rd /s /q @path" >nul 2>&1
 
 REM 展開されたファイルを確認（ルートに直接あるか、サブフォルダか）
 if exist "!TEMP_DIR!\NetBelt.exe" (
@@ -182,11 +183,18 @@ if exist "!TEMP_DIR!\NetBelt.exe" (
 echo   コピー元: !SOURCE_DIR!
 echo   コピー先: !APP_DIR!
 
+REM 実行ファイルは直接上書きしない。コピーは宛先を先に切り詰めてから
+REM 順に書くので、途中で止まる（コンソールを閉じる・電源断）と旧 exe は
+REM 既に無く、末尾がゼロ埋めの exe だけが残る。一時名で置いてから改名で
+REM 差し替える。同一ボリューム内の改名は途中で止まらない。
+if exist "!SOURCE_DIR!\NetBelt.exe" ren "!SOURCE_DIR!\NetBelt.exe" "NetBelt.exe.new"
+
 REM ファイルをコピー（上書き）
 xcopy "!SOURCE_DIR!\*" "!APP_DIR!" /E /I /Y /Q >nul 2>&1
 if errorlevel 1 (
     echo エラー: ファイルのコピーに失敗しました
     echo   アプリがまだ起動したままだと、上書きできません
+    del "!APP_DIR!NetBelt.exe.new" 2>nul
     rd /s /q "!TEMP_DIR!" 2>nul
     pause
     exit /b 1
@@ -194,6 +202,22 @@ if errorlevel 1 (
 
 REM コピーできたことを確認する。xcopy の戻り値だけでは、
 REM 肝心の実行ファイルが置かれたかどうかは分からない。
+if not exist "!APP_DIR!NetBelt.exe.new" (
+    echo エラー: 更新ファイルに NetBelt.exe が含まれていません
+    echo   場所: !SOURCE_DIR!
+    rd /s /q "!TEMP_DIR!" 2>nul
+    pause
+    exit /b 1
+)
+move /y "!APP_DIR!NetBelt.exe.new" "!APP_DIR!NetBelt.exe" >nul 2>&1
+if errorlevel 1 (
+    echo エラー: NetBelt.exe を差し替えられませんでした
+    echo   アプリがまだ起動したままだと、差し替えられません
+    del "!APP_DIR!NetBelt.exe.new" 2>nul
+    rd /s /q "!TEMP_DIR!" 2>nul
+    pause
+    exit /b 1
+)
 if not exist "!APP_DIR!NetBelt.exe" (
     echo エラー: 更新後の NetBelt.exe が見つかりません
     echo   場所: !APP_DIR!
