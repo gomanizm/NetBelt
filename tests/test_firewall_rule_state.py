@@ -52,6 +52,31 @@ EN_ENABLED_BLOCK = EN_ENABLED_ALLOW.replace(b"Action:                           
                                             b"Action:                               Block")
 NO_MATCH = "\n指定された条件に一致する規則はありません。\n\n".encode("utf-8")
 
+# 未知ロケール: キー/値のどちらも認識語彙に無い（従来どおり名前一致で真にする退避）
+UNKNOWN_LOCALE = """
+Regelname:                            NetBelt - SFTP Server (TCP/2222)
+----------------------------------------------------------------------
+Aktiviert:                            Ja
+Richtung:                             Eingehend
+Protokoll:                            TCP
+Lokaler Port:                         2222
+Aktion:                               Zulassen
+Ok.
+
+""".encode("utf-8")
+
+# 片側一致ロケール: "Action" キーだけ英語と綴りが同じで、値は未知の語
+HALF_KNOWN_LOCALE = """
+Nom de la regle:                      NetBelt - SFTP Server (TCP/2222)
+----------------------------------------------------------------------
+Activee:                              Oui
+Direction:                            Entrant
+Protocole:                            TCP
+Port local:                           2222
+Action:                               Autoriser
+
+""".encode("utf-8")
+
 
 class _CP:
     def __init__(self, rc, out=b""):
@@ -112,6 +137,15 @@ class RuleExistsTest(unittest.TestCase):
         self.assertIn("dir=in", calls[0], "送信ルールまで一致させている")
 
 
+    def test_an_unknown_locale_falls_back_to_name_match(self):
+        self.assertTrue(self._exists(_CP(0, UNKNOWN_LOCALE)),
+                        "解釈できない出力で退避が効いていない")
+
+    def test_a_half_known_locale_falls_back_to_name_match(self):
+        self.assertTrue(self._exists(_CP(0, HALF_KNOWN_LOCALE)),
+                        "キーの片方だけ読めた出力を present と誤判定している")
+
+
 class EnsureInboundAllowTest(unittest.TestCase):
     def setUp(self):
         import core.firewall as fw
@@ -123,6 +157,22 @@ class EnsureInboundAllowTest(unittest.TestCase):
         p = mock.patch("time.sleep")
         p.start()
         self.addCleanup(p.stop)
+
+    def test_a_half_known_locale_does_not_trigger_a_repair(self):
+        calls = []
+
+        def _run(args):
+            calls.append(args)
+            if args[:3] == ["advfirewall", "firewall", "show"]:
+                return _CP(0, HALF_KNOWN_LOCALE)
+            return _CP(0)
+        with mock.patch.object(self.fw, "is_admin", return_value=True), \
+             mock.patch.object(self.fw, "_netsh", side_effect=_run):
+            ok, msg = self.fw.ensure_inbound_allow("SFTP Server", "TCP", 2222)
+        self.assertTrue(ok, msg)
+        self.assertIn("既存の許可ルールを使用", msg)
+        self.assertEqual([a for a in calls if a[2] in ("set", "add")], [],
+                         "解釈できない出力なのにルールを書き換えようとしている")
 
     def test_admin_add_failure_is_reported_as_failure(self):
         with mock.patch.object(self.fw, "is_admin", return_value=True), \
