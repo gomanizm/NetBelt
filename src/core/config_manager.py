@@ -41,6 +41,7 @@ class ConfigManager:
         self.config_path = Path(config_path)
         self.crypto = PasswordCrypto()
         self.load_error = None  # 読み込みエラー情報
+        self.load_warning = None  # 読み込めたが一部を除外したときの警告文
         self.backup_path = None  # バックアップファイルパス
         self.config = self._load_config()
     
@@ -65,6 +66,8 @@ class ConfigManager:
                 # パスワードを復号化
                 self._decrypt_passwords(config)
                 self._notify_undecryptable()
+                # name/host の無い機器は一覧から外す（UI が KeyError で落ちる）
+                self._quarantine_invalid_devices(config)
                 # Defaultグループが存在しない場合は追加（戻り値でフラグを受け取る）
                 need_save = self._ensure_default_group(config)
                 # 一時的にconfigを設定して保存
@@ -195,6 +198,41 @@ class ConfigManager:
                   "別の Windows アカウント/PC で保存された設定の可能性があります。"
                   "該当機器のパスワードは再入力してください。"
                   "（設定ファイル内の元の値は保護されており、上書きされません）")
+
+    @staticmethod
+    def _is_valid_device(device) -> bool:
+        """UI が前提にする必須フィールド（name/host が空でない文字列）を持つか。"""
+        return (isinstance(device, dict)
+                and isinstance(device.get("name"), str) and bool(device["name"])
+                and isinstance(device.get("host"), str) and bool(device["host"]))
+
+    def _quarantine_invalid_devices(self, config: Dict) -> None:
+        """必須フィールドの無い機器を各グループから外し、警告を記録する。
+
+        手編集や他ツールで作られた config.json に {} や {"host": ...} の
+        ような機器が混ざると、DeviceTree の構築が KeyError で落ちて
+        起動できない。JSON 構文エラーとは違い load_error にもならないので、
+        利用者には設定ファイルが原因だと分からなかった。
+        不正な機器だけを除外し、元ファイルはバックアップして知らせる。
+        """
+        removed = 0
+        for group in config.get("groups", []):
+            devices = group.get("devices")
+            if not isinstance(devices, list):
+                continue
+            kept = [d for d in devices if self._is_valid_device(d)]
+            removed += len(devices) - len(kept)
+            group["devices"] = kept
+        if not removed:
+            return
+        self._backup_corrupted_config()
+        message = (f"設定ファイル (config.json) に名前またはホストの無い機器が"
+                   f"{removed}件あり、接続先リストから除外しました。\n"
+                   "除外した機器は次回の保存時に設定ファイルから消えます。")
+        if self.backup_path:
+            message += f"\n\n元のファイルはバックアップしました:\n  {self.backup_path}"
+        self.load_warning = message
+        print(f"[Config] {removed}件の機器に name/host が無いため除外しました")
 
     def _backup_corrupted_config(self) -> None:
         """

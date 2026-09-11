@@ -113,6 +113,9 @@ class MainWindow(QMainWindow):
         # 設定ファイル読み込みエラーをチェック
         if self.config_manager.load_error:
             self._show_config_load_error()
+        if self.config_manager.load_warning:
+            QMessageBox.warning(self, "設定ファイルの警告",
+                                self.config_manager.load_warning)
         
         # MacroManager初期化
         self.macro_manager = MacroManager()
