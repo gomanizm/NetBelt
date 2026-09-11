@@ -34,8 +34,11 @@ class SFTPServerHandler(SFTPServerInterface):
         root_real = os.path.realpath(self.root_dir)
         real_path = os.path.realpath(os.path.join(root_real, relative))
 
-        # セキュリティチェック: ルートディレクトリ外へのアクセスを防ぐ
-        if real_path != root_real and not real_path.startswith(root_real + os.sep):
+        # セキュリティチェック: ルートディレクトリ外へのアクセスを防ぐ。
+        # 接頭辞は join(root, '') で作る。root がドライブ直下（'D:\\'）だと
+        # realpath が区切りで終わるので、単純に os.sep を足すと 'D:\\\\' に
+        # なり、直下のあらゆるパスが外側と判定されてしまう。
+        if real_path != root_real and not real_path.startswith(os.path.join(root_real, "")):
             raise IOError("Access denied")
 
         return real_path
