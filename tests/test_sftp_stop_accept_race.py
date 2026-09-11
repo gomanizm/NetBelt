@@ -107,5 +107,73 @@ class SftpStopAcceptRaceTest(unittest.TestCase):
                          "停止後の接続について client_disconnected が emit された")
 
 
+    def test_a_registered_connection_is_always_in_client_threads(self):
+        """登録済みの接続は必ずハンドラ一覧にも居ること。
+
+        _client_sockets への登録はロックの下だが、ハンドラスレッドの
+        start と client_threads への追加はロックの外に残っていた。その
+        隙間に stop() が入ると、(a) stop() はそのスレッドを join できず、
+        (b) clear() の後に追加されて一覧に 1 本残り、(c) ハンドラは
+        stop() 完了後に起きて、破棄済みかもしれないマネージャへ
+        client_disconnected を emit する。
+
+        ここでは client_connected を DirectConnection で受けて待受スレッドを
+        その隙間に停め、同じ順序を決定的に作る。
+        """
+        from PyQt6.QtCore import Qt
+        from core.sftp_server import SFTPServerManager
+
+        m = SFTPServerManager()
+        self.addCleanup(m.stop)
+        m.STOP_TIMEOUT_SECONDS = 0.5
+        port = free_port()
+        self.assertTrue(m.start(port=port, root_dir=self.root,
+                                username=USER, password=PASSWORD))
+        deadline = time.time() + 5
+        while not m.is_running and time.time() < deadline:
+            time.sleep(0.01)
+
+        stop_returned = threading.Event()
+        started_after_stop = []
+        original_handle = SFTPServerManager._handle_client
+
+        def _handle(self_, sock, addr):
+            if stop_returned.is_set():
+                started_after_stop.append(addr[0])
+            return original_handle(self_, sock, addr)
+
+        hp = mock.patch.object(SFTPServerManager, "_handle_client", _handle)
+        hp.start()
+        self.addCleanup(hp.stop)
+
+        parked = threading.Event()
+        release = threading.Event()
+
+        def _park(_ip):
+            parked.set()
+            release.wait(10)
+
+        m.client_connected.connect(_park, Qt.ConnectionType.DirectConnection)
+
+        client = socket.socket()
+        self.addCleanup(client.close)
+        client.settimeout(3)
+        client.connect(("127.0.0.1", port))
+        self.assertTrue(parked.wait(5), "前提: 待受スレッドが隙間で止まっていない")
+
+        m.stop()
+        stop_returned.set()
+        release.set()
+        time.sleep(1.0)
+        self.app.processEvents()
+
+        self.assertEqual(started_after_stop, [],
+                         "stop() 完了後にハンドラが起動している: %r"
+                         % started_after_stop)
+        self.assertEqual(m.client_threads, [],
+                         "stop() の後にハンドラスレッドが一覧へ追加されている: %r"
+                         % m.client_threads)
+
+
 if __name__ == "__main__":
     unittest.main()

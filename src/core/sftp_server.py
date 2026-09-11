@@ -400,9 +400,15 @@ class SFTPServerManager(QObject):
         # （start_server）やチャネル待ち（accept(timeout=20)）で止まって
         # いることがあり、join だけだと 1 本につき 1 秒固まったうえに
         # スレッドが残り、あとで client_disconnected を破棄済みの
-        # マネージャへ emit して落ちる。閉じればどちらもすぐ抜ける
+        # マネージャへ emit して落ちる。閉じればどちらもすぐ抜ける。
+        # ソケット一覧とスレッド一覧は同じロックの下で取る。待受ループが
+        # 両方を 1 回のロックで登録するので、「_client_sockets に居る接続は
+        # 必ず client_threads にも居る」が保たれる。join はロックの外で
+        # 行う（ハンドラの後始末が同じロックを取るため）
         with self._client_lock:
             sockets = list(self._client_sockets)
+            clients = list(self.client_threads)
+            self.client_threads.clear()
         for sock in sockets:
             try:
                 sock.shutdown(socket.SHUT_RDWR)
@@ -414,11 +420,9 @@ class SFTPServerManager(QObject):
                 pass
 
         # クライアント接続の終了を待つ
-        for client in self.client_threads:
+        for client in clients:
             if client.is_alive():
                 client.join(timeout=1)
-
-        self.client_threads.clear()
         # 待受スレッド自身も待つ。待たずに戻ると、直後にこのマネージャ
         # （QObject）が破棄されたとき、まだ走っているスレッドからの emit が
         # 解放済みオブジェクトへ届く（FTP と同じ構造）
@@ -447,10 +451,11 @@ class SFTPServerManager(QObject):
                 try:
                     # クライアント接続を待つ
                     client_socket, client_addr = self.server_socket.accept()
-                    # 登録と停止判定を同じロックで行う。accept 復帰から登録
-                    # までの間に stop() が一覧を取り終えると、その接続は誰にも
-                    # 閉じられず、停止後にハンドラが起きてバナーを送り、最長
-                    # 20 秒後に破棄済みかもしれないマネージャへ emit する
+                    # 停止判定・ソケット登録・ハンドラの起動とスレッド一覧への
+                    # 追加を、すべて同じロックの下で済ませる。どこかで一度でも
+                    # ロックを離すと、その隙間に stop() が入った接続は誰にも
+                    # 閉じられず join もされず、ハンドラが停止後に起きて
+                    # 破棄済みかもしれないマネージャへ emit する
                     with self._client_lock:
                         if self._stop_event.is_set():
                             try:
@@ -459,23 +464,21 @@ class SFTPServerManager(QObject):
                                 pass
                             break
                         self._client_sockets.add(client_socket)
+                        client_thread = threading.Thread(
+                            target=self._handle_client,
+                            args=(client_socket, client_addr),
+                            daemon=True
+                        )
+                        client_thread.start()
+                        # 終わったスレッドを外してから足す（Syslog と同じ）。
+                        # 外さないとサーバを止めるまで単調に増える。stop() が
+                        # 同じリストを走査するので、差し替えずその場で入れ替える
+                        self.client_threads[:] = [t for t in self.client_threads
+                                                  if t.is_alive()]
+                        self.client_threads.append(client_thread)
 
                     print(f"[SFTP Server] Client connected from {client_addr[0]}:{client_addr[1]}")
                     self.client_connected.emit(client_addr[0])
-                    
-                    # クライアントハンドラスレッドを起動
-                    client_thread = threading.Thread(
-                        target=self._handle_client,
-                        args=(client_socket, client_addr),
-                        daemon=True
-                    )
-                    client_thread.start()
-                    # 終わったスレッドを外してから足す（Syslog と同じ）。
-                    # 外さないとサーバを止めるまで単調に増える。stop() が
-                    # 同じリストを走査するので、差し替えずその場で入れ替える
-                    self.client_threads[:] = [t for t in self.client_threads
-                                              if t.is_alive()]
-                    self.client_threads.append(client_thread)
                     
                 except socket.timeout:
                     # タイムアウトは正常（停止チェックのため）
