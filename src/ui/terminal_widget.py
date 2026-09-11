@@ -35,6 +35,7 @@ class InteractiveTerminal(QTextEdit):
     reconnect_requested = pyqtSignal()  # 再接続要求シグナル
     macro_execute_requested = pyqtSignal(str)  # マクロ実行要求シグナル（マクロ名）
     macro_settings_requested = pyqtSignal()  # マクロ設定画面要求シグナル
+    macro_stop_requested = pyqtSignal()  # 実行中のマクロ（コマンドリスト）停止要求シグナル
     keepalive_start_requested = pyqtSignal()  # キープアライブ開始要求シグナル
     keepalive_stop_requested = pyqtSignal()  # キープアライブ停止要求シグナル
     # Ctrl+ホイールでのフォントサイズ変更要求（回した向き: +1 / -1）
@@ -54,6 +55,7 @@ class InteractiveTerminal(QTextEdit):
         self._is_recording = False  # ログ記録中フラグ
         self._macro_list = []  # 利用可能なマクロリスト
         self._keepalive_active = False  # キープアライブ動作中フラグ
+        self._command_list_active = False  # マクロ（コマンドリスト）実行中フラグ
         # まだ送り切っていない貼り付け。まとめて送ると GUI が止まるので、
         # 区切りごとにイベントループへ譲りながら流す
         self._send_queue = []
@@ -62,6 +64,10 @@ class InteractiveTerminal(QTextEdit):
     def set_keepalive_status(self, active: bool):
         """キープアライブの状態を設定"""
         self._keepalive_active = active
+
+    def set_command_list_status(self, active: bool):
+        """マクロ（コマンドリスト）が実行中かを設定"""
+        self._command_list_active = active
     
     def set_input_enabled(self, enabled: bool):
         """入力の有効/無効を切り替え"""
@@ -295,6 +301,13 @@ class InteractiveTerminal(QTextEdit):
                     macro_menu.addAction(macro_action)
                 
                 menu.addMenu(macro_menu)
+
+            # 実行中のマクロを止める。これが無いと、誤ったマクロを流し
+            # 始めたときタブを閉じる以外に中断する手段が無い
+            if self._command_list_active:
+                macro_stop_action = QAction("マクロ停止", self)
+                macro_stop_action.triggered.connect(lambda: self.macro_stop_requested.emit())
+                menu.addAction(macro_stop_action)
             
             menu.addSeparator()
         
@@ -439,6 +452,10 @@ class TerminalWidget(QWidget):
     FONT_SIZE_MIN = 6
     FONT_SIZE_MAX = 32
 
+    # 表示文書に残す最大ブロック（行）数。Screen.history（5000 行）より
+    # 多めに取り、画面領域（最大 200 行）を削らない余裕を持たせる
+    MAX_DOCUMENT_BLOCKS = 20000
+
     # タブが閉じられたときのシグナル（機器名を送信）
     tab_closed = pyqtSignal(str)
     # 表示中のタブが変わったことを知らせる（機器名。タブが無ければ空文字）。
@@ -450,6 +467,8 @@ class TerminalWidget(QWidget):
     font_size_change_requested = pyqtSignal(int)
     # マクロ設定画面要求シグナル（機器名）
     macro_settings_requested = pyqtSignal(str)
+    # 実行中のマクロ停止要求シグナル（機器名）
+    macro_stop_requested = pyqtSignal(str)
     # キープアライブ開始要求シグナル（機器名）
     keepalive_start_requested = pyqtSignal(str)
     # キープアライブ停止要求シグナル（機器名）
@@ -514,7 +533,16 @@ class TerminalWidget(QWidget):
         else:
             terminal = QTextEdit()
             terminal.setReadOnly(True)
-        
+
+        # Undo 履歴は持たない。機器の出力を巻き戻す用途は無く（Ctrl+Z は
+        # 機器へ送る）、画面内の上書き更新のたびに undo が積まれて
+        # メモリが単調増加していた（実測: 20 万回の上書きで +70MB）
+        terminal.setUndoRedoEnabled(False)
+        # 文書の行数にも上限を置く。Screen.history の上限は文書へ写した
+        # 後の行には効かず、受信行数のまま増え続けていた。超えた分は
+        # Qt が先頭ブロックから捨てる。画面領域は末尾なので影響しない
+        terminal.document().setMaximumBlockCount(self.MAX_DOCUMENT_BLOCKS)
+
         # フォント設定（_terminal_settings を参照する。設定変更後に作られる
         # タブも同じ外観になるようにするため）
         settings = self._terminal_settings
@@ -635,6 +663,10 @@ class TerminalWidget(QWidget):
                     # 再接続は新しいセッション。前の画面はそのまま記録と
                     # して文書に残し、端末状態 (パーサ・画面) は作り直す
                     self._attach_screen(self._terminals[device_name])
+                    # 再接続待ちも解く。Enter 経由は keyPressEvent が
+                    # 落とすが、接続ボタン・ダブルクリック経由はここしか
+                    # 通らず、接続できても打鍵と貼り付けが捨てられ続けた
+                    self._terminals[device_name].set_reconnect_mode(False)
                     return self._terminals[device_name]
         
         # 接続機器がなく、ホームタブが残っている場合は、ホームタブを再利用
@@ -658,6 +690,9 @@ class TerminalWidget(QWidget):
         # マクロ設定画面要求シグナルを接続
         terminal.macro_settings_requested.connect(
             lambda: self.macro_settings_requested.emit(device_name)
+        )
+        terminal.macro_stop_requested.connect(
+            lambda: self.macro_stop_requested.emit(device_name)
         )
         
         # キープアライブ開始/停止要求シグナルを接続
@@ -1047,9 +1082,15 @@ class TerminalWidget(QWidget):
         if tab_name in self._terminals:
             del self._terminals[tab_name]
 
-        # タブを削除
+        # タブを削除。removeTab はページを親（内部の QStackedWidget）から
+        # 外さないので、閉じたターミナルが文書（受信した全出力）ごと
+        # 非表示のまま残り、閉じるたびに積み上がる。親から外して捨てる
+        widget = self.tab_widget.widget(index)
         self.tab_widget.removeTab(index)
-        
+        if widget is not None:
+            widget.setParent(None)
+            widget.deleteLater()
+
         # すべての接続が閉じられた場合、ホームタブを再作成
         if self.tab_widget.count() == 0:
             welcome_terminal = self._create_terminal()
@@ -1061,6 +1102,50 @@ class TerminalWidget(QWidget):
             )
             self.tab_widget.addTab(welcome_terminal, "ホーム")
     
+    @staticmethod
+    def _default_log_dir() -> str:
+        """保存先ダイアログの初期ディレクトリ（cwd/logs。作れなければ別の場所）
+
+        読み取り専用の場所から起動した、logs という名前のファイルが既に
+        ある、といった理由で cwd/logs を作れないことがある。ここで例外に
+        すると保存先ダイアログが一度も出ず、書ける場所を選ぶ手段が無い。
+        作れないときはホームへ落とす（保存先自体はダイアログで選べる）。
+        """
+        import os
+        logs_dir = os.path.join(os.getcwd(), "logs")
+        try:
+            os.makedirs(logs_dir, exist_ok=True)
+        except OSError:
+            return os.path.expanduser("~")
+        return logs_dir
+
+    def _recording_device_using(self, file_path: str):
+        """file_path を記録先にしている機器名を返す（無ければ None）
+
+        記録中のファイルを別の記録や全ログ保存の保存先に選ぶと、open('w')
+        で記録済みの内容が消え、以降は両者の書き込みが混在する。保存先を
+        決めた直後にここで見て拒否する。パスは絶対化して比べる
+        """
+        import os
+        wanted = os.path.normcase(os.path.abspath(file_path))
+        for device_name, handle in self._log_files.items():
+            name = getattr(handle, "name", None)
+            if not isinstance(name, str):
+                continue
+            if os.path.normcase(os.path.abspath(name)) == wanted:
+                return device_name
+        return None
+
+    def _warn_log_file_in_use(self, title: str, file_path: str, device_name: str):
+        """記録中のファイルが選ばれたことを知らせる"""
+        from PyQt6.QtWidgets import QMessageBox
+        QMessageBox.warning(
+            self,
+            title,
+            f"このファイルは {device_name} のログ記録に使用中です:\n{file_path}\n"
+            "別のファイルを選ぶか、先にそのログ記録を停止してください。"
+        )
+
     def save_current_log(self):
         """現在アクティブなターミナルのログを保存"""
         from PyQt6.QtWidgets import QFileDialog, QMessageBox
@@ -1099,11 +1184,9 @@ class TerminalWidget(QWidget):
             # デフォルトのファイル名を生成（機器名_日時.log）
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             default_filename = f"{tab_name}_{timestamp}.log"
-            
-            # logsフォルダのパスを取得（存在しない場合は作成）
-            logs_dir = os.path.join(os.getcwd(), "logs")
-            os.makedirs(logs_dir, exist_ok=True)
-            
+
+            logs_dir = self._default_log_dir()
+
             # ファイル保存ダイアログを表示
             file_path, _ = QFileDialog.getSaveFileName(
                 self,
@@ -1113,6 +1196,11 @@ class TerminalWidget(QWidget):
             )
             
             if file_path:
+                in_use_by = self._recording_device_using(file_path)
+                if in_use_by is not None:
+                    self._warn_log_file_in_use("ログ保存", file_path, in_use_by)
+                    return
+
                 # プログレスダイアログを表示してログを保存
                 from .dialogs.log_save_dialog import LogSaveProgressDialog
                 
@@ -1159,11 +1247,9 @@ class TerminalWidget(QWidget):
         # デフォルトのファイル名を生成（機器名_日時.log）
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         default_filename = f"{tab_name}_{timestamp}.log"
-        
-        # logsフォルダのパスを取得（存在しない場合は作成）
-        logs_dir = os.path.join(os.getcwd(), "logs")
-        os.makedirs(logs_dir, exist_ok=True)
-        
+
+        logs_dir = self._default_log_dir()
+
         # ファイル保存ダイアログを表示
         file_path, _ = QFileDialog.getSaveFileName(
             self,
@@ -1173,6 +1259,11 @@ class TerminalWidget(QWidget):
         )
         
         if file_path:
+            in_use_by = self._recording_device_using(file_path)
+            if in_use_by is not None:
+                self._warn_log_file_in_use("ログ記録", file_path, in_use_by)
+                return
+
             try:
                 # ファイルを開く
                 log_file = open(file_path, 'w', encoding='utf-8', buffering=1)  # 行バッファリング
@@ -1297,3 +1388,14 @@ class TerminalWidget(QWidget):
         """
         if device_name in self._terminals:
             self._terminals[device_name].set_keepalive_status(active)
+
+    def set_command_list_status(self, device_name: str, active: bool):
+        """
+        指定した機器のマクロ（コマンドリスト）実行状態を設定
+
+        Args:
+            device_name: 機器名
+            active: 実行中かどうか
+        """
+        if device_name in self._terminals:
+            self._terminals[device_name].set_command_list_status(active)

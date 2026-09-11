@@ -16,6 +16,8 @@ class MacroManager(QObject):
     command_output = pyqtSignal(str, str)  # (device_name, output_text)
     macro_finished = pyqtSignal(str)  # (device_name)
     macro_error = pyqtSignal(str, str)  # (device_name, error_message)
+    # コマンドリストの開始・終了（停止・完了・エラーを含む）: (device_name, 実行中か)
+    command_list_state_changed = pyqtSignal(str, bool)
     
     def __init__(self):
         super().__init__()
@@ -130,6 +132,7 @@ class MacroManager(QObject):
         timer = QTimer()
         timer.timeout.connect(lambda: self._execute_next_command(device_name))
         self._command_timers[device_name] = timer
+        self.command_list_state_changed.emit(device_name, True)
         
         # 最初のコマンドを実行
         self._execute_next_command(device_name)
@@ -141,7 +144,8 @@ class MacroManager(QObject):
         Args:
             device_name: 機器名
         """
-        if device_name in self._command_timers:
+        was_active = device_name in self._command_timers
+        if was_active:
             self._command_timers[device_name].stop()
             del self._command_timers[device_name]
         
@@ -149,6 +153,9 @@ class MacroManager(QObject):
             del self._command_lists[device_name]
             del self._command_indices[device_name]
             del self._command_delays[device_name]
+
+        if was_active:
+            self.command_list_state_changed.emit(device_name, False)
     
     def is_command_list_active(self, device_name: str) -> bool:
         """

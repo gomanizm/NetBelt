@@ -321,6 +321,10 @@ class MainWindow(QMainWindow):
             self._on_font_size_wheel)
         self.terminal_widget.macro_execute_requested.connect(self._on_macro_execute_requested)
         self.terminal_widget.macro_settings_requested.connect(self._on_macro_settings_from_context)
+        # 右クリックの「マクロ停止」と、実行状態のメニューへの反映
+        self.terminal_widget.macro_stop_requested.connect(self.macro_manager.stop_command_list)
+        self.macro_manager.command_list_state_changed.connect(
+            self.terminal_widget.set_command_list_status)
         self.terminal_widget.keepalive_start_requested.connect(self._on_keepalive_start_requested)
         self.terminal_widget.keepalive_stop_requested.connect(self._on_keepalive_stop_requested)
         self.terminal_widget.terminal_resized.connect(self._on_terminal_resized)
@@ -668,8 +672,11 @@ class MainWindow(QMainWindow):
         self.connections[device_name] = ssh
         self.device_info[device_name] = device_data  # 再接続用
         
-        # マクロマネージャーにコールバックを登録
-        self.macro_manager.register_send_callback(device_name, ssh.send_command)
+        # マクロマネージャーにコールバックを登録。接続の send_command へ直結
+        # せず、打鍵・貼り付けと同じターミナルの送信キューを通す。直結だと
+        # まだ送り終えていない貼り付けのチャンク間へマクロやキープアライブの
+        # CR が割り込み、途中までの設定行がその場で実行される
+        self.macro_manager.register_send_callback(device_name, terminal._queue_send)
         
         # マクロマネージャーのシグナルをターミナルに接続（初回のみ）
         if device_name not in self.macro_signal_connected:
@@ -739,8 +746,11 @@ class MainWindow(QMainWindow):
         self.connections[device_name] = serial_conn
         self.device_info[device_name] = device_data  # 再接続用
         
-        # マクロマネージャーにコールバックを登録
-        self.macro_manager.register_send_callback(device_name, serial_conn.send_command)
+        # マクロマネージャーにコールバックを登録。接続の send_command へ直結
+        # せず、打鍵・貼り付けと同じターミナルの送信キューを通す。直結だと
+        # まだ送り終えていない貼り付けのチャンク間へマクロやキープアライブの
+        # CR が割り込み、途中までの設定行がその場で実行される
+        self.macro_manager.register_send_callback(device_name, terminal._queue_send)
         
         # マクロマネージャーのシグナルをターミナルに接続（初回のみ）
         if device_name not in self.macro_signal_connected:
@@ -808,8 +818,11 @@ class MainWindow(QMainWindow):
         self.connections[device_name] = telnet
         self.device_info[device_name] = device_data  # 再接続用
         
-        # マクロマネージャーにコールバックを登録
-        self.macro_manager.register_send_callback(device_name, telnet.send_command)
+        # マクロマネージャーにコールバックを登録。接続の send_command へ直結
+        # せず、打鍵・貼り付けと同じターミナルの送信キューを通す。直結だと
+        # まだ送り終えていない貼り付けのチャンク間へマクロやキープアライブの
+        # CR が割り込み、途中までの設定行がその場で実行される
+        self.macro_manager.register_send_callback(device_name, terminal._queue_send)
         
         # マクロマネージャーのシグナルをターミナルに接続（初回のみ）
         if device_name not in self.macro_signal_connected:
