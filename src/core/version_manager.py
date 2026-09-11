@@ -117,6 +117,8 @@ class VersionManager:
             github_token: GitHub Personal Access Token（プライベートリポジトリの場合必須）
         """
         self.github_token = github_token
+        # 受信中の応答。中止の要求が来たら、これを閉じて読み取りを打ち切る
+        self._response = None
         # 更新用ディレクトリを作成
         os.makedirs(self.UPDATE_DIR, exist_ok=True)
     
@@ -304,6 +306,21 @@ class VersionManager:
             print(f"[VersionManager] 予期しないエラー: {e}")
             return {'available': False, 'error': f"更新の確認に失敗しました: {e}"}
     
+    def abort(self) -> None:
+        """受信中の応答を閉じ、読み取りを直ちに終わらせる。
+
+        中止の判定はチャンクの区切りでしか行えないので、相手が黙り込むと
+        読み取りのタイムアウト（60秒）まで戻ってこない。その間スレッドが
+        残り続けるため、ソケット側から打ち切る。別のスレッドから呼ばれる。
+        """
+        response = self._response
+        if response is None:
+            return
+        try:
+            response.close()
+        except Exception as e:
+            print(f"[VersionManager] 受信の中断に失敗: {e}")
+
     @staticmethod
     def _safe_name_part(text) -> str:
         """ファイル名に使える文字だけを残す（版はリリースのタグ由来）。"""
@@ -412,6 +429,7 @@ class VersionManager:
             
             # ダウンロード（リダイレクトに従う）
             response = requests.get(url, headers=headers, stream=True, timeout=60, allow_redirects=True)
+            self._response = response
             
             print(f"[VersionManager] レスポンスステータス: {response.status_code}")
             
@@ -492,6 +510,8 @@ class VersionManager:
             if part_path:
                 self._discard(part_path)
             return None
+        finally:
+            self._response = None
     
     @staticmethod
     def pending_version(zip_path: str) -> Optional[str]:
