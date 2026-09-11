@@ -73,6 +73,24 @@ class SFTPManager(QObject):
             f"転送中のため{what}を実行できません。完了してからやり直してください。")
         return False
 
+    def _fail(self, prefix: str, e: Exception):
+        """操作の失敗を通知する。応答待ちの期限切れなら接続も畳む
+
+        期限で戻ったあとも要求と応答はずれたままなので、同じチャンネルの
+        以後の操作は失敗し続ける。それでも接続中のままだと、操作のたびに
+        期限ぶん画面が固まり、しかも socket.timeout は str が空なので
+        理由の無いエラーだけが並ぶ。使用不能と分かる形にして再接続を促す。
+
+        ロックを持ったまま呼ばない（disconnect がロックを取りにいく）。
+        """
+        if isinstance(e, TimeoutError):   # socket.timeout の別名
+            self.error_occurred.emit(
+                f"{prefix}: 機器が{self.CHANNEL_TIMEOUT_SECONDS:g}秒応答しません。"
+                "SFTP接続を切断しました。接続し直してください")
+            self.disconnect()
+            return
+        self.error_occurred.emit(f"{prefix}: {str(e) or e.__class__.__name__}")
+
     def connect(self, ssh_client: paramiko.SSHClient) -> bool:
         """
         SFTP接続を開始（既存のSSHクライアントを使用）
@@ -202,7 +220,7 @@ class SFTPManager(QObject):
                 self._listing_done.emit(path, file_list)
                 
             except Exception as e:
-                self.error_occurred.emit(f"ディレクトリ一覧取得エラー: {str(e)}")
+                self._fail("ディレクトリ一覧取得エラー", e)
         
         # バックグラウンドスレッドで実行
         threading.Thread(target=list_thread, daemon=True).start()
@@ -403,13 +421,17 @@ class SFTPManager(QObject):
         
         if not self._acquire_for_gui("ディレクトリ作成"):
             return
+        err = None
         try:
             self.sftp_client.mkdir(path)
         except Exception as e:
-            self.error_occurred.emit(f"ディレクトリ作成エラー: {str(e)}")
-            return
+            err = e
         finally:
             self._sftp_lock.release()
+        # 通知はロックを離してから（_fail が切断するときロックを取る）
+        if err is not None:
+            self._fail("ディレクトリ作成エラー", err)
+            return
         self.transfer_complete.emit(f"ディレクトリ作成: {os.path.basename(path)}")
         # ディレクトリ一覧を更新（ロックを離してから）
         self.list_directory(self.current_path)
@@ -428,16 +450,19 @@ class SFTPManager(QObject):
         
         if not self._acquire_for_gui("削除"):
             return
+        err = None
         try:
             if is_dir:
                 self.sftp_client.rmdir(path)
             else:
                 self.sftp_client.remove(path)
         except Exception as e:
-            self.error_occurred.emit(f"削除エラー: {str(e)}")
-            return
+            err = e
         finally:
             self._sftp_lock.release()
+        if err is not None:
+            self._fail("削除エラー", err)
+            return
         self.transfer_complete.emit(f"削除完了: {os.path.basename(path)}")
         # ディレクトリ一覧を更新（ロックを離してから）
         self.list_directory(self.current_path)
@@ -456,13 +481,16 @@ class SFTPManager(QObject):
         
         if not self._acquire_for_gui("名前変更"):
             return
+        err = None
         try:
             self.sftp_client.rename(old_path, new_path)
         except Exception as e:
-            self.error_occurred.emit(f"名前変更エラー: {str(e)}")
-            return
+            err = e
         finally:
             self._sftp_lock.release()
+        if err is not None:
+            self._fail("名前変更エラー", err)
+            return
         self.transfer_complete.emit(f"名前変更完了: {os.path.basename(new_path)}")
         # ディレクトリ一覧を更新（ロックを離してから）
         self.list_directory(self.current_path)
@@ -481,13 +509,16 @@ class SFTPManager(QObject):
         
         if not self._acquire_for_gui("パーミッション変更"):
             return
+        err = None
         try:
             self.sftp_client.chmod(path, mode)
         except Exception as e:
-            self.error_occurred.emit(f"パーミッション変更エラー: {str(e)}")
-            return
+            err = e
         finally:
             self._sftp_lock.release()
+        if err is not None:
+            self._fail("パーミッション変更エラー", err)
+            return
         self.transfer_complete.emit(f"パーミッション変更完了: {os.path.basename(path)}")
         # ディレクトリ一覧を更新（ロックを離してから）
         self.list_directory(self.current_path)
@@ -514,14 +545,17 @@ class SFTPManager(QObject):
         
         if not self._acquire_for_gui("ディレクトリ移動"):
             return
+        err = None
         try:
             # パスを正規化
             normalized_path = self.sftp_client.normalize(path)
         except Exception as e:
-            self.error_occurred.emit(f"ディレクトリ変更エラー: {str(e)}")
-            return
+            err = e
         finally:
             self._sftp_lock.release()
+        if err is not None:
+            self._fail("ディレクトリ変更エラー", err)
+            return
         # ディレクトリ一覧を取得（これによりパスの存在も確認）
         self.list_directory(normalized_path)
     

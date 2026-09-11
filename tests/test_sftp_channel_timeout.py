@@ -129,5 +129,48 @@ class SftpChannelTimeoutTest(unittest.TestCase):
         self.assertTrue(any("ディレクトリ作成エラー" in e for e in errors), errors)
 
 
+    def test_a_timed_out_operation_says_why_and_closes_the_session(self):
+        """期限切れのあと、使えないセッションが「接続中」で残らないこと。
+
+        期限で戻っても要求と応答はずれたままなので、同じチャンネルの以後の
+        操作は失敗し続ける。それでも is_connected が True だと、利用者は操作の
+        たびに期限ぶん固まったうえ、理由の書かれていないエラー（socket.timeout
+        は str が空）を見続けることになり、再接続すべきだと分からない。
+        """
+        from core import sftp_server
+        from core.sftp_manager import SFTPManager
+
+        def slow_mkdir(handler, path, attr):
+            time.sleep(3.0)
+            return sftp_server.SFTP_OK
+
+        with mock.patch.object(sftp_server.SFTPServerHandler, "mkdir", slow_mkdir),              mock.patch.object(SFTPManager, "CHANNEL_TIMEOUT_SECONDS", 1.0,
+                               create=True):
+            port = self._server()
+            manager = SFTPManager()
+            self.assertTrue(manager.connect(self._ssh_client(port)), "SFTP に接続できない")
+            self.addCleanup(manager.disconnect)
+            errors = []
+            manager.error_occurred.connect(errors.append)
+
+            manager.create_directory("/newdir")
+
+            # 理由の書かれたメッセージであること（空の str(e) を貼っただけでない）
+            self.assertTrue(any("応答しません" in e for e in errors), errors)
+            self.assertFalse(
+                manager.is_connected,
+                "使用不能になったセッションが接続中のまま残っている")
+
+            # 以後の操作は、期限ぶん固まらずに未接続として即座に戻る
+            errors.clear()
+            started = time.time()
+            manager.create_directory("/newdir2")
+            elapsed = time.time() - started
+
+        self.assertLess(elapsed, 0.5,
+                        "切断済みのはずが、また期限まで待っている (%.2f 秒)" % elapsed)
+        self.assertEqual(errors, ["SFTP接続がありません"], errors)
+
+
 if __name__ == "__main__":
     unittest.main()
