@@ -30,6 +30,7 @@ class FTPServerManager(QObject):
         super().__init__(parent)
         self._server = None
         self._thread = None
+        self._stop_event = threading.Event()
         self.is_running = False
         self.port = 0
         # (ip, filename, direction) 単位の表示コアレス。機器が1回の copy で複数FTP接続を張っても
@@ -179,29 +180,60 @@ class FTPServerManager(QObject):
             self.error_occurred.emit("FTP起動失敗: %s" % e)
             self._server = None
             return False
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(
+            target=self._serve, args=(self._server, self._stop_event),
+            daemon=True)
         self._thread.start()
         self.is_running = True
         self.started.emit()
         return True
 
-    # 待受スレッドの終了を待つ上限。close_all() 後、serve_forever は
-    # 次に poll(timeout=1.0) から戻った時点で抜けるので、通常は 1 秒以内
+    # ioloop を 1 周させる間隔。停止要求に気づくまでの遅れの上限でもある
+    POLL_INTERVAL_SECONDS = 0.2
+
+    # 待受スレッドの終了を待つ上限。停止要求は 1 周ごとに見るので、
+    # 通常は POLL_INTERVAL_SECONDS 以内に抜ける
     STOP_TIMEOUT_SECONDS = 3.0
+
+    def _serve(self, server, stop_event):
+        """待受スレッド本体。ソケットを閉じるのもこのスレッドで行う。
+
+        serve_forever() に任せて別スレッドから close_all() を呼ぶと、
+        プロセスごと落ちる。pyftpdlib 2.2.0 の Select ioloop は
+        select.select(self._r, ...) に素の list を渡しており、
+        close_all() はその list から fd を remove する。待受スレッドが
+        select の中でその list を走査している最中に別スレッドが remove
+        すると、CPython は縮んだ配列の外を読む（Windows で access
+        violation。全体テストの FTP テスト実行中に実測）。
+
+        そこで ioloop は 1 周ずつ自分で回し、停止要求に気づいたら
+        このスレッドから閉じる。
+        """
+        try:
+            while not stop_event.is_set():
+                if server.ioloop.socket_map:
+                    server.ioloop.loop(self.POLL_INTERVAL_SECONDS,
+                                       blocking=False)
+                else:
+                    # 待受ソケットまで閉じられた（外から close_all された
+                    # など）。空回りせずに停止要求を待つ
+                    stop_event.wait(self.POLL_INTERVAL_SECONDS)
+        finally:
+            try:
+                server.close_all()
+            except Exception:
+                pass
 
     def stop(self):
         thread, self._thread = self._thread, None
-        if self._server:
-            try:
-                self._server.close_all()
-            except Exception:
-                pass
-            self._server = None
-        # スレッドが抜けるまで待ってから戻る。close_all() は socket_map を
-        # 空にするだけで、スレッドは次に poll() から戻るまで ioloop の中に
-        # いる。待たずに戻ると、直後にこのマネージャ（QObject）が破棄された
-        # とき、生き残ったスレッドからの emit が解放済みオブジェクトへ届いて
-        # プロセスごと落ちる（停止直後にパネルやアプリを閉じる操作で起こる）
+        self._stop_event.set()
+        self._server = None
+        # スレッドが抜けるまで待ってから戻る。待たずに戻ると、直後に
+        # このマネージャ（QObject）が破棄されたとき、生き残ったスレッド
+        # からの emit が解放済みオブジェクトへ届いてプロセスごと落ちる
+        # （停止直後にパネルやアプリを閉じる操作で起こる）。ソケットを
+        # 閉じるのもこの join のあいだにスレッド側で終わる
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=self.STOP_TIMEOUT_SECONDS)
         self.is_running = False
