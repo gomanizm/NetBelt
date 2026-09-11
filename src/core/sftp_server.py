@@ -376,7 +376,11 @@ class SFTPServerManager(QObject):
             return
 
         print("[SFTP Server] Stopping server...")
-        self._stop_event.set()
+        # 停止フラグは接続一覧と同じロックの下で立てる。待受ループは
+        # accept 復帰後に同じロックの下で「まだ停止していないか」を見て
+        # から登録するので、どちらが先でも接続は必ずどちらかに閉じられる
+        with self._client_lock:
+            self._stop_event.set()
         self.is_running = False
 
         # サーバーソケットを閉じる
@@ -437,7 +441,17 @@ class SFTPServerManager(QObject):
                 try:
                     # クライアント接続を待つ
                     client_socket, client_addr = self.server_socket.accept()
+                    # 登録と停止判定を同じロックで行う。accept 復帰から登録
+                    # までの間に stop() が一覧を取り終えると、その接続は誰にも
+                    # 閉じられず、停止後にハンドラが起きてバナーを送り、最長
+                    # 20 秒後に破棄済みかもしれないマネージャへ emit する
                     with self._client_lock:
+                        if self._stop_event.is_set():
+                            try:
+                                client_socket.close()
+                            except OSError:
+                                pass
+                            break
                         self._client_sockets.add(client_socket)
 
                     print(f"[SFTP Server] Client connected from {client_addr[0]}:{client_addr[1]}")
