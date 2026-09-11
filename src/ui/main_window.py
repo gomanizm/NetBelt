@@ -922,6 +922,11 @@ class MainWindow(QMainWindow):
             return
         self.status_bar.showMessage(f"{device_name} に接続しました")
         terminal.set_input_enabled(True)  # キー入力を有効化
+        # 再接続待ちを解くのはここ。タブを使い回す再接続（接続ボタン・
+        # ダブルクリック）は create_terminal_tab を通るが、そちらで解くと
+        # 再接続に失敗したときに待ちが戻らず、画面に残る「Enterキーを
+        # 押すと再接続します」の案内どおりに操作できなくなる
+        terminal.set_reconnect_mode(False)
         # グループの自動実行コマンドをGUIスレッドで送信する
         self.run_auto_commands_requested.emit(device_name)
         
