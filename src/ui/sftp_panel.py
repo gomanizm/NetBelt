@@ -659,6 +659,11 @@ class SFTPPanel(QWidget):
         else:
             overwrites_file = (known_is_dir is False
                                or name in self._pending_upload_names)
+        # 上書きを許すのは、利用者が承認したときか、確認しない設定のとき
+        # だけ。それ以外は SFTPManager が送る直前にリモートを確かめる。
+        # ここの判定は「最後に観測した一覧」に基づくので、ダイアログの間に
+        # 別ディレクトリの一覧が届く／初回の一覧が未到着だと既存を見落とす
+        overwrite_granted = not confirm
         if confirm and overwrites_file:
             reply = QMessageBox.question(
                 self,
@@ -669,6 +674,7 @@ class SFTPPanel(QWidget):
             )
             if reply != QMessageBox.StandardButton.Yes:
                 return
+            overwrite_granted = True
         
         # アップロード完了後に sftp_manager が一覧を取り直すが、1回のドロップで
         # 複数送る間は間に合わない。送信中の名前を別に覚えておき、同じドロップ内の
@@ -681,7 +687,11 @@ class SFTPPanel(QWidget):
         # 送り先を明示する。省略すると SFTPManager が呼ばれた時点の
         # current_path を使うので、確認ダイアログの間にディレクトリが
         # 変わっていると別の場所へ置いてしまう
-        manager.upload_file(file_path, self._remote_path(base_path, name))
+        remote = self._remote_path(base_path, name)
+        if overwrite_granted:
+            manager.upload_file(file_path, remote, overwrite=True)
+        else:
+            manager.upload_file(file_path, remote)
     
     def _on_download(self):
         """ダウンロードボタンがクリックされた"""

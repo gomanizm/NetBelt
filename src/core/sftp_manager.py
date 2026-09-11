@@ -207,13 +207,31 @@ class SFTPManager(QObject):
         # バックグラウンドスレッドで実行
         threading.Thread(target=list_thread, daemon=True).start()
     
-    def upload_file(self, local_path: str, remote_path: str = None):
+    def _remote_exists(self, remote_path: str) -> bool:
+        """リモートに remote_path が存在するかを stat で確かめる（ロック内で呼ぶ）
+
+        見つからないときの応答は機器によって異なる（NO_SUCH_FILE 以外を
+        返すものもある）ので、stat の失敗はすべて「無い」と扱う。
+        """
+        try:
+            self.sftp_client.stat(remote_path)
+        except IOError:
+            return False
+        return True
+
+    def upload_file(self, local_path: str, remote_path: str = None,
+                    overwrite: bool = False):
         """
         ファイルをアップロード（バックグラウンド）
         
         Args:
             local_path: ローカルファイルパス
             remote_path: リモートファイルパス（Noneの場合は現在のディレクトリにファイル名のみで保存）
+            overwrite: True なら既存のリモートファイルを置き換える。False の
+                ときは送る直前にリモートを確かめ、既にあれば送らずにエラーで
+                知らせる。パネルの上書き確認は「最後に観測した一覧」で判定
+                しており、一覧が送信先と食い違っていると既存を見落とすため、
+                確認を経ていない送信はここで止める
         """
         if not self.is_connected or not self.sftp_client:
             self.error_occurred.emit("SFTP接続がありません")
@@ -256,6 +274,13 @@ class SFTPManager(QObject):
                     # 待っているあいだに切断されたかもしれない。取得前の
                     # 確認だけでは足りない（起きたら None を触ることになる）。
                     if not self.is_connected or self.sftp_client is None:
+                        return
+                    # 確認を経ていない送信は、送る直前の実際の状態で判定する。
+                    # ロック内なので、先行する転送の結果も見える
+                    if not overwrite and self._remote_exists(remote_path):
+                        self.error_occurred.emit(
+                            f"リモートに '{remote_name}' が既にあります。上書きの確認を"
+                            "経ていないので送りませんでした。一覧を更新してからやり直してください")
                         return
                     self.sftp_client.put(local_path, tmp_remote,
                                          callback=progress_callback)
