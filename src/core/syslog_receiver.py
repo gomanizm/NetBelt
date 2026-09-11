@@ -116,18 +116,54 @@ class SyslogMessage:
         except Exception:
             self.message = message
     
+    @staticmethod
+    def _skip_structured_data(rest: str):
+        """STRUCTURED-DATA を読み飛ばし、その直後の位置を返す（見つからなければ None）。
+
+        SD-ELEMENT は "[" から対応する "]" まで。パラメータ値は引用符で囲まれ、
+        中の "]" や "\"" は "\\" でエスケープされるので、空白で区切ると壊れる。
+        """
+        if rest.startswith("-"):
+            return 1
+        if not rest.startswith("["):
+            return None
+        i = 0
+        while i < len(rest) and rest[i] == "[":
+            i += 1
+            in_quote = False
+            while i < len(rest):
+                ch = rest[i]
+                if ch == "\\" and in_quote:
+                    i += 2
+                    continue
+                if ch == '"':
+                    in_quote = not in_quote
+                elif ch == "]" and not in_quote:
+                    break
+                i += 1
+            else:
+                return None  # 閉じ "]" が無い
+            i += 1
+        return i
+
     def _parse_rfc5424(self, message: str):
         """RFC 5424形式のメッセージをパース"""
         try:
             # VERSION TIMESTAMP HOSTNAME APP-NAME PROCID MSGID STRUCTURED-DATA MSG
-            parts = message.split(None, 7)
-            
+            parts = message.split(None, 6)
+
             if len(parts) >= 7:
                 self.hostname = parts[2] if parts[2] != '-' else self.source_ip
-                self.message = parts[7] if len(parts) > 7 else ""
+                rest = parts[6]
+                end = self._skip_structured_data(rest)
+                if end is None:
+                    # SD が壊れている: 欠落させず残り全体を本文にする
+                    self.message = rest
+                else:
+                    self.message = rest[end:].lstrip(" ")
             else:
                 self.message = message
-        
+
         except Exception:
             self.message = message
 
