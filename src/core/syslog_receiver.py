@@ -311,16 +311,27 @@ class SyslogReceiver(QObject):
         self.tcp_clients.clear()
         print("[Syslog] Server stopped")
 
+    @staticmethod
+    def _decode_bytes(data):
+        """受信バイト列を文字列にする。
+
+        UTF-8 を strict で試し、失敗したら latin-1 に落とす。errors="ignore" だと
+        latin-1 / Shift_JIS 等を吐く機器の非 UTF-8 バイトが本文からも raw からも
+        黙って消え、フォールバックに到達しない。latin-1 は全バイトを 1 対 1 で
+        文字にするので、少なくとも欠落はしない。
+        """
+        try:
+            return data.decode("utf-8")
+        except UnicodeDecodeError:
+            return data.decode("latin-1")
+
     def _run_udp_loop(self, sock, stop_event, listen_port=None):
         """UDP受信ループ"""
         try:
             while not stop_event.is_set():
                 try:
                     data, addr = sock.recvfrom(65535)
-                    try:
-                        message_str = data.decode("utf-8", errors="ignore")
-                    except Exception:
-                        message_str = data.decode("latin-1", errors="ignore")
+                    message_str = self._decode_bytes(data)
                     self.message_received.emit(
                         SyslogMessage(message_str, addr[0], "UDP", listen_port))
                     self.message_count += 1
@@ -411,10 +422,7 @@ class SyslogReceiver(QObject):
                         break
                     while b"\n" in buffer:
                         line, buffer = buffer.split(b"\n", 1)
-                        try:
-                            message_str = line.decode("utf-8", errors="ignore").strip()
-                        except Exception:
-                            message_str = line.decode("latin-1", errors="ignore").strip()
+                        message_str = self._decode_bytes(line).strip()
                         if message_str:
                             self.message_received.emit(
                                 SyslogMessage(message_str, client_ip, "TCP", listen_port))
