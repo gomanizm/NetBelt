@@ -119,8 +119,17 @@ class SftpConnectOffGuiThreadTest(unittest.TestCase):
         w.connections["R1"] = conn
 
         w._on_connection_success("R1", terminal, conn)
-        # SFTP が開く前にタブを閉じる
-        w._on_tab_closed("R1")
+        # 閉じる時点でまだ登録されていないこと。ここで登録済みだと、
+        # このあとの close は「遅れて来たセッションを捨てた」結果ではなく
+        # _on_tab_closed の後始末になり、テストが穴を素通りさせる
+        self.assertNotIn("R1", w.sftp_managers,
+                         "open_sftp の完了を GUI スレッドで待って登録している")
+
+        # SFTP が開く前にタブを閉じる。後始末の経路（_drop_sftp_manager）は
+        # 潰しておき、close が遅延到着の分岐から来たことだけを見る
+        with mock.patch.object(w, "_drop_sftp_manager") as drop:
+            w._on_tab_closed("R1")
+        drop.assert_called_once_with("R1")
         self.assertNotIn("R1", w.connections)
 
         gate.set()

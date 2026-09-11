@@ -263,6 +263,7 @@ class SettingsDialog(QDialog):
         # ディスクへ永続化されてしまう。失敗したら触ったセクションを
         # 保存前の姿へ戻す
         before = self._snapshot()
+        self._restore_failed = False
 
         saved = self.config_manager.set_server_settings("terminal", {
             "background_color": self._background_color,
@@ -288,7 +289,7 @@ class SettingsDialog(QDialog):
             saved = False
 
         if not saved:
-            self._restore(before)
+            self._restore_failed = not self._restore(before)
         return saved
 
     _SECTIONS = ("settings", "update_settings")
@@ -298,18 +299,28 @@ class SettingsDialog(QDialog):
         return copy.deepcopy(
             {key: self.config_manager.config.get(key) for key in self._SECTIONS})
 
-    def _restore(self, before: dict):
-        """控えたセクションをメモリ上の config へ戻す（ディスクは触らない）
+    def _restore(self, before: dict) -> bool:
+        """控えたセクションを保存前の姿へ戻す（メモリとディスクの両方）
 
         一部のセクションだけ書けていても全部戻す。利用者には
         「保存できませんでした」としか伝わらないので、一部だけ効いた
         状態を残さない。
+
+        メモリだけでは足りない。部分失敗では ①失敗前のセクションは既に
+        ディスクへ書かれており、②失敗後に成功した setter が、その時点の
+        メモリ（＝変更後）を config 丸ごと書き出す。戻した内容をもう一度
+        保存してディスクを合わせないと、次の起動で取り消したはずの変更
+        （削除確認の無効化など）が復活する。
+
+        Returns:
+            ディスクも保存前の姿へ戻せたか
         """
         for key, value in before.items():
             if value is None:
                 self.config_manager.config.pop(key, None)
             else:
                 self.config_manager.config[key] = value
+        return bool(self.config_manager.save_config())
 
     def _on_ok(self):
         """OKボタン押下時の処理"""
@@ -317,7 +328,10 @@ class SettingsDialog(QDialog):
             self.accept()
             return
         # 黙って閉じないままだと、OK が効かない理由が利用者に伝わらない
-        QMessageBox.warning(
-            self, "エラー",
-            "設定を保存できませんでした。\n"
-            "設定ファイルに書き込めない可能性があります。")
+        if getattr(self, "_restore_failed", False):
+            message = ("設定を保存できず、元に戻すこともできませんでした。\n"
+                       "設定ファイルに書き込めない可能性があります。")
+        else:
+            message = ("設定を保存できませんでした。\n"
+                       "設定ファイルに書き込めない可能性があります。")
+        QMessageBox.warning(self, "エラー", message)

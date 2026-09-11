@@ -10,10 +10,12 @@
 GroupDialog が「コンソール接続」を予約語として断っているのと同じく、
 登録の入口（ダイアログ）と config への追加・更新の両方で断る。
 """
+import json
 import os
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, "src")
@@ -90,6 +92,58 @@ class ConfigRefusesHomeTest(unittest.TestCase):
     def test_add_device_still_accepts_an_ordinary_name(self):
         cm = self._manager()
         self.assertTrue(cm.add_device("Default", device("SW1")))
+
+
+class ConfigQuarantinesHomeOnLoadTest(unittest.TestCase):
+    """読み込み経路の穴。
+
+    add_device / update_device / DeviceDialog を塞いでも、config.json を
+    手で編集した場合と、この修正より前のバージョンで作られた config に
+    すでに「ホーム」が入っている場合は素通りする。読み込み時に隔離する。
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="netbelt-home-load-")
+        self.path = os.path.join(self.dir, "config.json")
+        home = mock.patch("core.config_manager.app_data_dir",
+                          return_value=Path(tempfile.mkdtemp(prefix="netbelt-testhome-")))
+        home.start()
+        self.addCleanup(home.stop)
+
+    def _write(self, devices):
+        config = {
+            "config_version": "1.0",
+            "groups": [{"name": "Default", "auto_commands": [], "devices": devices}],
+            "global_macros": [],
+            "settings": {},
+            "update_settings": {"check_on_startup": False},
+        }
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump(config, f, ensure_ascii=False)
+
+    def test_a_hand_edited_home_device_is_dropped_on_load(self):
+        from core.config_manager import ConfigManager
+        self._write([device("ホーム"), device("SW1")])
+
+        cm = ConfigManager(config_path=self.path)
+
+        self.assertEqual([d["name"] for d in cm.get_groups()[0]["devices"]], ["SW1"],
+                         "手編集された「ホーム」がそのまま読み込まれている")
+        self.assertIsNone(cm.find_device_group("ホーム"))
+        self.assertIsNone(cm.load_error, "構文エラー扱い（既定設定へ退避）にしてはいけない")
+        self.assertIn("ホーム", cm.load_warning or "", "除外した理由を伝えていない")
+        with open(self.path, encoding="utf-8") as f:
+            self.assertEqual(len(json.load(f)["groups"][0]["devices"]), 2,
+                             "読み込みだけで元ファイルが書き換わった")
+
+    def test_a_config_without_the_reserved_name_raises_no_warning(self):
+        from core.config_manager import ConfigManager
+        self._write([device("SW1")])
+
+        cm = ConfigManager(config_path=self.path)
+
+        self.assertEqual(len(cm.get_groups()[0]["devices"]), 1)
+        self.assertIsNone(cm.load_warning, "正常な config に警告を出している")
 
 
 if __name__ == "__main__":

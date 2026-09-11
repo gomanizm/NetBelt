@@ -898,8 +898,16 @@ class MainWindow(QMainWindow):
             print(f"[Connection] {device_name} の旧接続の後始末に失敗: {e}")
 
     def _on_connection_output(self, device_name: str, text: str, conn=None):
-        """受信出力をターミナルへ流す（置き換え済みの接続からは流さない）"""
-        if not self._is_current_connection(device_name, conn):
+        """受信出力をターミナルへ流す（置き換え済みの接続からは流さない）
+
+        ただし「置き換えられた」と言えるのは、その機器に別の接続が
+        登録されているときだけ。接続クラスは失敗のとき先に
+        error_occurred を出すので、connect_thread の「接続失敗」は
+        _on_connection_error が接続を外した直後に届く。登録が無いのに
+        捨てると、失敗した接続の通知が一切画面に出なくなる。
+        """
+        if (not self._is_current_connection(device_name, conn)
+                and self.connections.get(device_name) is not None):
             return
         self.terminal_widget.append_output(device_name, text)
 

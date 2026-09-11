@@ -180,6 +180,88 @@ class StaleConnectionNotificationTest(unittest.TestCase):
             self._pump(0.2)
             w._on_tab_closed("R")
 
+    def test_a_late_output_from_the_old_thread_does_not_mix_into_the_new_tab(self):
+        """旧接続の出力が新しいタブへ流れないこと。
+
+        ハンドラを直接叩く単体テストは、接続を引数に取る署名になったことしか
+        確かめられない（同一性検査を外しても素通りする）。ここは _connect_ssh
+        が張った配線をそのまま使い、出力経路の挙動そのものを固定する。
+        """
+        from core.ssh_connection import SSHConnection
+        w = self._window()
+        gates = []
+
+        def blocked_connect(conn):
+            gate = threading.Event()
+            gates.append(gate)
+            gate.wait(5)
+            conn.output_received.emit("旧セッションの出力\r\n")
+            return True
+
+        device = {"name": "R", "host": "192.0.2.1", "port": 22,
+                  "protocol": "ssh", "username": "admin", "password": "pw"}
+        appended = []
+        with mock.patch.object(SSHConnection, "connect", blocked_connect), \
+                mock.patch.object(w.terminal_widget, "append_output",
+                                  side_effect=lambda d, t: appended.append((d, t))):
+            w._connect_ssh(device)
+            self._pump(0.1)
+            old = w.connections["R"]
+
+            # 接続中にタブを閉じ、同名で繋ぎ直す
+            w._on_tab_closed("R")
+            w._connect_ssh(device)
+            self._pump(0.1)
+            new = w.connections["R"]
+            self.assertIsNot(new, old)
+
+            # 旧スレッドの出力が遅れて届く
+            gates[0].set()
+            self._pump(0.3)
+            # 切断バナー（show_notice も append_output を通る）は対象外
+            self.assertNotIn(("R", "旧セッションの出力\r\n"), appended,
+                             "旧接続の出力が新しいタブへ流れた")
+
+            # 新しい接続の出力はこれまでどおり流れる
+            new.output_received.emit("新セッションの出力\r\n")
+            self._pump(0.2)
+            self.assertIn(("R", "新セッションの出力\r\n"), appended,
+                          "現在の接続の出力まで捨てている")
+
+            # 後片付け
+            gates[1].set()
+            self._pump(0.2)
+            w._on_tab_closed("R")
+
+    def test_a_failed_connect_still_reaches_the_tab(self):
+        """接続に失敗したら、利用者に見える形で伝わること。
+
+        接続クラスは失敗のとき先に error_occurred を出すので、
+        _on_connection_error が connections から外したあとに connect_thread
+        の「接続失敗」が届く。置き換えられた接続からの通知ではないのに、
+        同一性検査でこれが捨てられていた（実測: append_output 呼び出し 0 件）。
+        """
+        from core.ssh_connection import SSHConnection
+        w = self._window()
+        appended = []
+
+        def failing_connect(conn):
+            conn.error_occurred.emit("接続エラー: timed out")
+            return False
+
+        device = {"name": "R", "host": "192.0.2.1", "port": 22,
+                  "protocol": "ssh", "username": "admin", "password": "pw"}
+        with mock.patch.object(SSHConnection, "connect", failing_connect), \
+                mock.patch.object(w.terminal_widget, "append_output",
+                                  side_effect=lambda d, t: appended.append((d, t))), \
+                mock.patch.object(w.terminal_widget, "show_notice") as notice:
+            w._connect_ssh(device)
+            self._pump(0.5)
+
+        self.assertIn(("R", "\r\n接続失敗\r\n"), appended,
+                      "接続に失敗したのに、タブには何も出ない")
+        self.assertTrue(notice.called, "エラーの内容も伝わっていない")
+
 
 if __name__ == "__main__":
     unittest.main()

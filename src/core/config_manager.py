@@ -235,8 +235,14 @@ class ConfigManager:
         不正な機器だけを除外し、名前の無いグループには表示名を補い、
         グループとして読めない項目は外して、元ファイルはバックアップして
         知らせる。
+
+        予約語（ホームタブと重なる名前）の機器も同じ理由でここで外す。
+        登録の入口（DeviceDialog / add_device / update_device）は別途
+        断っているが、手編集された config や、その検査より前のバージョン
+        で作られた config からは今でも入ってくる。
         """
         removed = 0
+        reserved = 0
         renamed_groups = 0
         dropped_groups = 0
         kept_groups = []
@@ -251,19 +257,30 @@ class ConfigManager:
                 renamed_groups += 1
             devices = group.get("devices")
             if isinstance(devices, list):
-                kept = [d for d in devices if self._is_valid_device(d)]
-                removed += len(devices) - len(kept)
+                kept = []
+                for d in devices:
+                    if not self._is_valid_device(d):
+                        removed += 1
+                    elif is_reserved_device_name(d["name"]):
+                        reserved += 1
+                    else:
+                        kept.append(d)
                 group["devices"] = kept
             kept_groups.append(group)
         if dropped_groups:
             config["groups"] = kept_groups
-        if not (removed or renamed_groups or dropped_groups):
+        if not (removed or reserved or renamed_groups or dropped_groups):
             return
         self._backup_corrupted_config()
         parts = []
+        reasons = []
         if removed:
-            parts.append(f"設定ファイル (config.json) に名前またはホストの無い機器が"
-                         f"{removed}件あり、接続先リストから除外しました。\n"
+            reasons.append(f"名前またはホストの無い機器が{removed}件")
+        if reserved:
+            reasons.append(f"ホームタブと重なる名前（「ホーム」）の機器が{reserved}件")
+        if reasons:
+            parts.append("設定ファイル (config.json) に" + "、".join(reasons) +
+                         "あり、接続先リストから除外しました。\n"
                          "除外した機器は次回の保存時に設定ファイルから消えます。")
         if renamed_groups:
             parts.append(f"設定ファイル (config.json) に名前の無いグループが"
@@ -276,8 +293,9 @@ class ConfigManager:
         if self.backup_path:
             message += f"\n\n元のファイルはバックアップしました:\n  {self.backup_path}"
         self.load_warning = message
-        print(f"[Config] 機器{removed}件を除外、グループ{renamed_groups}件を改名、"
-              f"グループ{dropped_groups}件を除外しました")
+        print(f"[Config] 機器{removed + reserved}件を除外 "
+              f"(name/host 無し={removed}, 予約語={reserved})、"
+              f"グループ{renamed_groups}件を改名、グループ{dropped_groups}件を除外しました")
 
     def _backup_corrupted_config(self) -> None:
         """
