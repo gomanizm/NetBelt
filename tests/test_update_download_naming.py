@@ -189,5 +189,77 @@ class ApplyChecksTheShownVersionTest(unittest.TestCase):
                          "正しい ZIP まで当てられなくなっている: %s" % self.warned)
 
 
+class PendingPicksTheNewestTest(unittest.TestCase):
+    """未適用の ZIP が並んだとき、いちばん新しい版を勧めること。
+
+    版ごとに名前を分けた結果、24 時間以内に2回落とすと UPDATE_DIR に
+    未適用 ZIP が並ぶようになった。_check_pending_updates は
+    get_pending_update_files()（os.listdir 順＝辞書順）の最初の1件で
+    break していたので、9.9.1 と 9.9.2 が並ぶと古い 9.9.1 を勧め、
+    新しい方は掃除されるまで当たらない。
+    """
+
+    def setUp(self):
+        from core.version_manager import VersionManager
+        self.tmp = tempfile.mkdtemp(prefix="netbelt-pending-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        patcher = unittest.mock.patch.object(
+            VersionManager, "UPDATE_DIR", self.tmp)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _place(self, version, body):
+        path = os.path.join(self.tmp, "NetBelt-%s.zip" % version)
+        io.open(path, "wb").write(body)
+        io.open(path + ".sha256", "w").write(hashlib.sha256(body).hexdigest())
+        io.open(path + ".version", "w").write(version)
+        return path
+
+    def _check(self):
+        import types
+
+        from PyQt6.QtWidgets import QMessageBox
+        from ui.main_window import MainWindow
+
+        applied = []
+        asked = []
+
+        def question(parent, title, text, *a, **k):
+            asked.append(text)
+            return QMessageBox.StandardButton.Yes
+
+        me = types.SimpleNamespace(
+            _apply_pending_update=lambda path: applied.append(path))
+        with unittest.mock.patch(
+                "ui.main_window.QMessageBox.question", question):
+            with unittest.mock.patch(
+                    "core.version_manager.running_from_source",
+                    return_value=False):
+                MainWindow._check_pending_updates(me)
+        return applied, asked
+
+    def test_the_newest_of_two_pending_zips_is_offered(self):
+        old_path = self._place("9.9.1", BODY_A)
+        new_path = self._place("9.9.2", BODY_B)
+
+        applied, asked = self._check()
+
+        self.assertEqual(applied, [new_path],
+                         "古い版の ZIP を勧めた（並んだ中の最大を選んでいない）"
+                         ": %s" % asked)
+        self.assertTrue(any("9.9.2" in t for t in asked),
+                        "確認ダイアログが新しい版を示していない: %s" % asked)
+        self.assertTrue(os.path.exists(old_path),
+                        "採用しなかった ZIP を消してしまっている")
+
+    def test_a_single_pending_zip_is_still_offered(self):
+        """1つしか無いときの経路を壊していないこと。"""
+        only = self._place("9.9.1", BODY_A)
+
+        applied, _ = self._check()
+
+        self.assertEqual(applied, [only])
+
+
 if __name__ == "__main__":
     unittest.main()
