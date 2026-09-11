@@ -439,6 +439,10 @@ class TerminalWidget(QWidget):
     FONT_SIZE_MIN = 6
     FONT_SIZE_MAX = 32
 
+    # 表示文書に残す最大ブロック（行）数。Screen.history（5000 行）より
+    # 多めに取り、画面領域（最大 200 行）を削らない余裕を持たせる
+    MAX_DOCUMENT_BLOCKS = 20000
+
     # タブが閉じられたときのシグナル（機器名を送信）
     tab_closed = pyqtSignal(str)
     # 表示中のタブが変わったことを知らせる（機器名。タブが無ければ空文字）。
@@ -514,7 +518,16 @@ class TerminalWidget(QWidget):
         else:
             terminal = QTextEdit()
             terminal.setReadOnly(True)
-        
+
+        # Undo 履歴は持たない。機器の出力を巻き戻す用途は無く（Ctrl+Z は
+        # 機器へ送る）、画面内の上書き更新のたびに undo が積まれて
+        # メモリが単調増加していた（実測: 20 万回の上書きで +70MB）
+        terminal.setUndoRedoEnabled(False)
+        # 文書の行数にも上限を置く。Screen.history の上限は文書へ写した
+        # 後の行には効かず、受信行数のまま増え続けていた。超えた分は
+        # Qt が先頭ブロックから捨てる。画面領域は末尾なので影響しない
+        terminal.document().setMaximumBlockCount(self.MAX_DOCUMENT_BLOCKS)
+
         # フォント設定（_terminal_settings を参照する。設定変更後に作られる
         # タブも同じ外観になるようにするため）
         settings = self._terminal_settings
