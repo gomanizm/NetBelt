@@ -74,11 +74,13 @@ class ConfigManager:
         try:
             with open(self.config_path, 'r', encoding='utf-8') as f:
                 config = json.load(f)
+                # name/host の無い機器とグループは先に整える（UI が KeyError で
+                # 落ちる）。復号も機器が dict であることを前提にしているので、
+                # 隔離はその前に済ませる
+                self._quarantine_invalid_devices(config)
                 # パスワードを復号化
                 self._decrypt_passwords(config)
                 self._notify_undecryptable()
-                # name/host の無い機器は一覧から外す（UI が KeyError で落ちる）
-                self._quarantine_invalid_devices(config)
                 # Defaultグループが存在しない場合は追加（戻り値でフラグを受け取る）
                 need_save = self._ensure_default_group(config)
                 # 一時的にconfigを設定して保存
@@ -217,33 +219,65 @@ class ConfigManager:
                 and isinstance(device.get("name"), str) and bool(device["name"])
                 and isinstance(device.get("host"), str) and bool(device["host"]))
 
+    # name の無いグループに与える表示名。グループごと捨てると中の正常な
+    # 機器まで消えるので、名前だけ補って中身は残す
+    UNNAMED_GROUP_NAME = "(名前なし)"
+
     def _quarantine_invalid_devices(self, config: Dict) -> None:
-        """必須フィールドの無い機器を各グループから外し、警告を記録する。
+        """必須フィールドの無い機器とグループを整えて、警告を記録する。
 
         手編集や他ツールで作られた config.json に {} や {"host": ...} の
         ような機器が混ざると、DeviceTree の構築が KeyError で落ちて
         起動できない。JSON 構文エラーとは違い load_error にもならないので、
         利用者には設定ファイルが原因だと分からなかった。
-        不正な機器だけを除外し、元ファイルはバックアップして知らせる。
+        グループ側も同じで、DeviceTree は group_data["name"] を直接引くため
+        name の無いグループでも同じ KeyError で起動できない。
+        不正な機器だけを除外し、名前の無いグループには表示名を補い、
+        グループとして読めない項目は外して、元ファイルはバックアップして
+        知らせる。
         """
         removed = 0
+        renamed_groups = 0
+        dropped_groups = 0
+        kept_groups = []
         for group in config.get("groups", []):
-            devices = group.get("devices")
-            if not isinstance(devices, list):
+            if not isinstance(group, dict):
+                # 名前も機器も取り出せないので、この項目は諦めるしかない
+                dropped_groups += 1
                 continue
-            kept = [d for d in devices if self._is_valid_device(d)]
-            removed += len(devices) - len(kept)
-            group["devices"] = kept
-        if not removed:
+            name = group.get("name")
+            if not isinstance(name, str) or not name:
+                group["name"] = self.UNNAMED_GROUP_NAME
+                renamed_groups += 1
+            devices = group.get("devices")
+            if isinstance(devices, list):
+                kept = [d for d in devices if self._is_valid_device(d)]
+                removed += len(devices) - len(kept)
+                group["devices"] = kept
+            kept_groups.append(group)
+        if dropped_groups:
+            config["groups"] = kept_groups
+        if not (removed or renamed_groups or dropped_groups):
             return
         self._backup_corrupted_config()
-        message = (f"設定ファイル (config.json) に名前またはホストの無い機器が"
-                   f"{removed}件あり、接続先リストから除外しました。\n"
-                   "除外した機器は次回の保存時に設定ファイルから消えます。")
+        parts = []
+        if removed:
+            parts.append(f"設定ファイル (config.json) に名前またはホストの無い機器が"
+                         f"{removed}件あり、接続先リストから除外しました。\n"
+                         "除外した機器は次回の保存時に設定ファイルから消えます。")
+        if renamed_groups:
+            parts.append(f"設定ファイル (config.json) に名前の無いグループが"
+                         f"{renamed_groups}件あり、"
+                         f"「{self.UNNAMED_GROUP_NAME}」として表示します。")
+        if dropped_groups:
+            parts.append(f"設定ファイル (config.json) にグループとして読めない項目が"
+                         f"{dropped_groups}件あり、除外しました。")
+        message = "\n".join(parts)
         if self.backup_path:
             message += f"\n\n元のファイルはバックアップしました:\n  {self.backup_path}"
         self.load_warning = message
-        print(f"[Config] {removed}件の機器に name/host が無いため除外しました")
+        print(f"[Config] 機器{removed}件を除外、グループ{renamed_groups}件を改名、"
+              f"グループ{dropped_groups}件を除外しました")
 
     def _backup_corrupted_config(self) -> None:
         """

@@ -129,6 +129,12 @@ class TelnetSplitUtf8Test(unittest.TestCase):
         out = self._run([HEAD, TAIL])
         self.assertEqual("".join(out), EXPECTED)
         self.assertNotIn("�", "".join(out))
+        # 受信ごとに、その時点で揃っている分は出すこと。旧実装は復号できる
+        # まで溜め込んでいたので、文字の途中で切れると 1 回目の "abc" まで
+        # 次の受信が来るまで画面に出なかった（機器が黙っていれば出ない）。
+        # 結合結果だけを見ると旧実装でも通ってしまうため、ここで区別する
+        self.assertEqual(out, ["abc", "日def"],
+                         "揃っている分まで次の受信まで保留している: %r" % out)
 
     def test_a_split_after_a_long_line_does_not_hold_back_the_prompt(self):
         """100 バイトを超えた後の分割で、続きのプロンプトが遅れないこと。"""

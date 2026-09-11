@@ -68,6 +68,27 @@ class ServerRejectsUndecryptablePasswordTest(unittest.TestCase):
             if mgr.is_running:
                 mgr.stop()
 
+    def test_anonymous_only_ftp_still_starts_with_a_stale_ciphertext(self):
+        """パスワードが認証に使われない匿名専用の構成は、これまでどおり起動すること。
+
+        FTP は username と password の両方が非空のときだけ add_user() を
+        呼ぶ（匿名専用なら暗号文は誰の資格情報にもならない）。設定に古い
+        暗号文が残っているだけで匿名 FTP が起動しなくなると、いままで
+        動いていた構成の回帰になる。
+        """
+        from core.ftp_server import FTPServerManager
+        mgr = FTPServerManager()
+        self._managers.append(mgr)
+        self.addCleanup(mgr.stop)
+        errors = self._errors(mgr)
+
+        ok = mgr.start(port=0, root_dir=self.root, username="",
+                       password=FOREIGN, anonymous=True)
+
+        self.assertTrue(ok, "匿名専用の構成まで断っている: %s" % errors)
+        self.assertEqual(errors, [])
+
+
     def test_sftp_refuses_to_start_with_a_ciphertext_password(self):
         from core.sftp_server import SFTPServerManager
         mgr = SFTPServerManager()

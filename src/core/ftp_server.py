@@ -68,8 +68,11 @@ class FTPServerManager(QObject):
             return False
         # 復号に失敗した値は "DPAPI:..." の暗号文のまま設定から渡ってくる。
         # それを認証パスワードとして登録すると、暗号文でログインできる一方で
-        # 本来のパスワードは 530 になり、利用者には原因が分からない
-        if PasswordCrypto().is_encrypted(password):
+        # 本来のパスワードは 530 になり、利用者には原因が分からない。
+        # 判定は下の add_user と同じ条件（username と password が両方非空）に
+        # 合わせる。匿名専用の構成ではパスワードは誰の資格情報にもならないので、
+        # 古い暗号文が残っているだけで起動を断ると回帰になる
+        if username and PasswordCrypto().is_encrypted(password):
             self.error_occurred.emit(UNDECRYPTABLE_PASSWORD_MESSAGE)
             return False
         import os
