@@ -7,6 +7,15 @@ from pyftpdlib.authorizers import DummyAuthorizer
 from pyftpdlib.handlers import FTPHandler, DTPHandler
 from pyftpdlib.servers import FTPServer as _PyFTPServer
 
+from .crypto import PasswordCrypto
+
+# 復号できずに暗号文のまま残ったパスワードを渡されたときの通知文。
+# 暗号文そのものは含めない（画面・ログに出さない）。
+UNDECRYPTABLE_PASSWORD_MESSAGE = (
+    "保存されたパスワードを復号できないため、サーバーを起動しません。"
+    "別の Windows アカウント/PC で保存された設定の可能性があります。"
+    "パスワードを入力し直してください")
+
 
 class FTPServerManager(QObject):
     started = pyqtSignal()
@@ -54,6 +63,12 @@ class FTPServerManager(QObject):
               anonymous_write=False):
         if self.is_running:
             self.error_occurred.emit("サーバーは既に実行中です")
+            return False
+        # 復号に失敗した値は "DPAPI:..." の暗号文のまま設定から渡ってくる。
+        # それを認証パスワードとして登録すると、暗号文でログインできる一方で
+        # 本来のパスワードは 530 になり、利用者には原因が分からない
+        if PasswordCrypto().is_encrypted(password):
+            self.error_occurred.emit(UNDECRYPTABLE_PASSWORD_MESSAGE)
             return False
         import os
         os.makedirs(root_dir, exist_ok=True)
