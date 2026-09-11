@@ -37,6 +37,9 @@ class SftpTransferAtomicityTest(unittest.TestCase):
         m.is_connected = True
         m.sftp_client = mock.Mock()
         m.sftp_client.normalize.side_effect = lambda p: p
+        # リモートに同名は無い（stat が失敗する）。upload_file は overwrite を
+        # 明示されない限り、送る直前に stat で既存を確かめるようになった
+        m.sftp_client.stat.side_effect = IOError("No such file")
         # 転送後の一覧更新は動かさない
         m.list_directory = mock.Mock()
         self.errors, self.done = [], []

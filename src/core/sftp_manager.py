@@ -49,6 +49,13 @@ class SFTPManager(QObject):
     # 呼ばれるため、長く待つとアプリが終了できなくなる。
     _DISCONNECT_WAIT_SECONDS = 3.0
 
+    # 共有チャンネルが機器の応答を待つ上限（秒）。None のままだと、機器が
+    # SFTP サブシステムだけ黙ったとき（TCP は生きている）に mkdir や
+    # normalize が無期限に止まり、GUI スレッドから呼ばれるのでアプリ全体が
+    # 固まる。転送中は 1 回の recv/send がこの時間ゼロのまま止まったときに
+    # 限って切れる（データが流れている限り切れない）。
+    CHANNEL_TIMEOUT_SECONDS = 30.0
+
     def _acquire_for_gui(self, what: str) -> bool:
         """GUI スレッドから使うためにロックを取る（取れなければ False）
 
@@ -84,7 +91,11 @@ class SFTPManager(QObject):
             # SSHクライアントからSFTPセッションを取得
             self.ssh_client = ssh_client
             self.sftp_client = ssh_client.open_sftp()
-            
+            # 応答待ちに期限を入れる。ここより後の normalize を含め、
+            # このチャンネル越しの全操作が期限切れで socket.timeout を
+            # 投げるようになり、各操作の except がエラー通知へ変える
+            self.sftp_client.get_channel().settimeout(self.CHANNEL_TIMEOUT_SECONDS)
+
             # ホームディレクトリを取得
             try:
                 self.current_path = self.sftp_client.normalize('.')
@@ -196,13 +207,31 @@ class SFTPManager(QObject):
         # バックグラウンドスレッドで実行
         threading.Thread(target=list_thread, daemon=True).start()
     
-    def upload_file(self, local_path: str, remote_path: str = None):
+    def _remote_exists(self, remote_path: str) -> bool:
+        """リモートに remote_path が存在するかを stat で確かめる（ロック内で呼ぶ）
+
+        見つからないときの応答は機器によって異なる（NO_SUCH_FILE 以外を
+        返すものもある）ので、stat の失敗はすべて「無い」と扱う。
+        """
+        try:
+            self.sftp_client.stat(remote_path)
+        except IOError:
+            return False
+        return True
+
+    def upload_file(self, local_path: str, remote_path: str = None,
+                    overwrite: bool = False):
         """
         ファイルをアップロード（バックグラウンド）
         
         Args:
             local_path: ローカルファイルパス
             remote_path: リモートファイルパス（Noneの場合は現在のディレクトリにファイル名のみで保存）
+            overwrite: True なら既存のリモートファイルを置き換える。False の
+                ときは送る直前にリモートを確かめ、既にあれば送らずにエラーで
+                知らせる。パネルの上書き確認は「最後に観測した一覧」で判定
+                しており、一覧が送信先と食い違っていると既存を見落とすため、
+                確認を経ていない送信はここで止める
         """
         if not self.is_connected or not self.sftp_client:
             self.error_occurred.emit("SFTP接続がありません")
@@ -245,6 +274,13 @@ class SFTPManager(QObject):
                     # 待っているあいだに切断されたかもしれない。取得前の
                     # 確認だけでは足りない（起きたら None を触ることになる）。
                     if not self.is_connected or self.sftp_client is None:
+                        return
+                    # 確認を経ていない送信は、送る直前の実際の状態で判定する。
+                    # ロック内なので、先行する転送の結果も見える
+                    if not overwrite and self._remote_exists(remote_path):
+                        self.error_occurred.emit(
+                            f"リモートに '{remote_name}' が既にあります。上書きの確認を"
+                            "経ていないので送りませんでした。一覧を更新してからやり直してください")
                         return
                     self.sftp_client.put(local_path, tmp_remote,
                                          callback=progress_callback)
@@ -506,12 +542,16 @@ class SFTPManager(QObject):
         モードからディレクトリかどうかを判定
         
         Args:
-            mode: ファイルモード
-            
+            mode: ファイルモード。サーバが permissions を返さなければ None
+
         Returns:
-            bool: ディレクトリの場合True
+            bool: ディレクトリの場合True。モードが不明ならファイル扱い
         """
         import stat
+        # SFTP v3 の permissions は省略可能。None を S_ISDIR に渡すと
+        # TypeError で一覧全体が失敗し、正常な項目まで画面から消える
+        if mode is None:
+            return False
         return stat.S_ISDIR(mode)
     
     @staticmethod
@@ -520,13 +560,18 @@ class SFTPManager(QObject):
         パーミッションを文字列形式に変換（例: -rwxr-xr-x）
         
         Args:
-            mode: ファイルモード
-            
+            mode: ファイルモード。サーバが permissions を返さなければ None
+
         Returns:
-            str: パーミッション文字列
+            str: パーミッション文字列。モードが不明なら None（表示側が
+                「不明」と出す。'---------' にすると権限の無いファイルと
+                区別がつかない）
         """
         import stat
-        
+
+        if mode is None:
+            return None
+
         # ファイルタイプ
         if stat.S_ISDIR(mode):
             perm_str = 'd'
