@@ -170,6 +170,60 @@ class EditingTest(unittest.TestCase):
         feed(s, "\x1b[3P")
         self.assertEqual(len(s.lines[0]), 80)
 
+    def test_ich_on_a_widened_wrapped_row_keeps_the_last_character(self):
+        """折り返し行は広げても埋めないので、桁数より短いことがある。
+
+        そこへ ICH すると、桁に余裕があるのに行末の文字が捨てられていた
+        (4 桁で "ABCDE" → 8 桁へ広げて CUP 1;3 ESC[@ で 'D' が消えた)。
+        押し出すのは行が桁数いっぱいのときだけ。
+        """
+        s = feed(Screen(rows=3, cols=4), "ABCDE")
+        s.set_size(3, 8)
+        feed(s, "\x1b[1;3H\x1b[@")
+        self.assertEqual(s.text()[0], "AB CD")
+        self.assertLessEqual(len(s.lines[0]), 8, "行が桁数を超えて伸びた")
+
+    def test_ich_on_a_full_row_still_pushes_the_last_character_off(self):
+        s = feed(Screen(rows=3, cols=8), "ABCDEFGH\x1b[1;3H\x1b[@")
+        self.assertEqual(s.text()[0], "AB CDEFG")
+        self.assertEqual(len(s.lines[0]), 8)
+
+
+class WrapMarkTest(unittest.TestCase):
+    """折り返しの印は、折り返しで付き、その行への印字・消去で外れる。
+
+    印が残ったまま行が書き直されると、履歴へ押し出された時点で次の
+    行と改行なしに連結される (コピー・ログ保存の行境界が変わる)。
+    EL を伴う書き直しでは外れていたが、CUP + 印字だけの全画面型
+    再描画や ECH では残っていた。
+    """
+
+    def _wrapped_then_rewritten(self, rewrite):
+        s = feed(Screen(rows=4, cols=4), "ABCDE")
+        self.assertTrue(s.wrapped[0], "前提: 折り返しの印が付いていない")
+        return feed(s, rewrite)
+
+    def test_printing_on_the_row_clears_the_mark(self):
+        s = self._wrapped_then_rewritten("\x1b[1;1HPING\x1b[2;1HPONG")
+        self.assertEqual(s.text()[:2], ["PING", "PONG"])
+        self.assertFalse(s.wrapped[0], "書き直した行に折り返しの印が残っている")
+
+    def test_the_rewritten_rows_reach_the_history_as_two_lines(self):
+        s = self._wrapped_then_rewritten("\x1b[1;1HPING\x1b[2;1HPONG")
+        feed(s, "\x1b[4;1H\r\n\r\n")          # 2 行押し出す
+        self.assertEqual([("".join(c[0] for c in line).rstrip(), w)
+                          for line, w in s.take_new_history()],
+                         [("PING", False), ("PONG", False)])
+
+    def test_erase_characters_clears_the_mark(self):
+        s = self._wrapped_then_rewritten("\x1b[1;1H\x1b[4X")
+        self.assertFalse(s.wrapped[0], "ECH した行に折り返しの印が残っている")
+
+    def test_a_rewrite_that_wraps_again_keeps_the_mark(self):
+        s = self._wrapped_then_rewritten("\x1b[1;1HWXYZQ")
+        self.assertEqual(s.text()[:2], ["WXYZ", "Q"])
+        self.assertTrue(s.wrapped[0], "改めて折り返したのに印が無い")
+
 
 class ScrollRegionTest(unittest.TestCase):
     def test_decstbm_confines_the_scroll(self):
@@ -251,6 +305,37 @@ class UnknownSequenceTest(unittest.TestCase):
         self.assertEqual(s.text()[0], "abcdef")
 
 
+class IntermediateByteTest(unittest.TestCase):
+    """中間バイト付きの列は別の命令。最終文字だけで既知命令と取り違えない。
+
+    ESC % c が RIS、ESC[?1049$h が代替画面切替として実行されていた。
+    実在する列でも ESC # 8 (DECALN) が DECRC、ESC * E (G2 指示) が
+    NEL に化けてカーソルがずれる。
+    """
+
+    def test_esc_with_an_intermediate_is_not_ris(self):
+        s = feed(Screen(), "KEEP\x1b%c")
+        self.assertEqual(s.text()[0], "KEEP")
+        self.assertEqual(len(s.history), 0)
+
+    def test_csi_private_mode_with_an_intermediate_is_ignored(self):
+        s = feed(Screen(), "MAIN\x1b[?1049$hALT")
+        self.assertFalse(s.alt_active)
+        self.assertEqual(s.text()[0], "MAINALT")
+
+    def test_decaln_is_not_mistaken_for_decrc(self):
+        s = feed(Screen(), "AB\x1b[2;3H\x1b#8Z")
+        self.assertEqual(s.text()[:2], ["AB", "  Z"])
+
+    def test_a_g2_designation_is_not_mistaken_for_nel(self):
+        s = feed(Screen(), "AB\x1b*EZ")
+        self.assertEqual(s.text()[:2], ["ABZ", ""])
+
+    def test_charset_designation_still_works(self):
+        s = feed(Screen(), "\x1b(0lqk\x1b(Bx")
+        self.assertEqual(s.text()[0], "┌─┐x")
+
+
 class EscDispatchTest(unittest.TestCase):
     def test_save_and_restore_cursor_with_attributes(self):
         s = feed(Screen(), "\x1b[3;3H\x1b[7m\x1b7\x1b[H\x1b[m\x1b8X")
@@ -262,10 +347,34 @@ class EscDispatchTest(unittest.TestCase):
         self.assertEqual(s.text()[:2], ["new", "top"])
 
     def test_full_reset_clears_the_screen_but_not_the_history(self):
+        # RIS (reset / tput reset / 一部機器の起動コンソール) も ED 2 と
+        # 同じく、消す直前に見えていた行を履歴へ送る。旧契約は「押し出し
+        # 済みの 6 行だけ残る」で、画面上の 24 行が記録から消えていた
         s = feed(Screen(), "\r\n".join("l%d" % i for i in range(30)))
         feed(s, "\x1bc")
         self.assertEqual(s.text(), [""] * 24)
-        self.assertEqual(len(s.history), 6)
+        self.assertEqual(len(s.history), 30)
+        record = everything(s)
+        for i in range(30):
+            self.assertIn("l%d" % i, record)
+
+    def test_full_reset_hands_the_wiped_lines_to_the_renderer(self):
+        s = feed(Screen(), "KEEP\x1bc")
+        self.assertEqual([("".join(c[0] for c in line).rstrip(), w)
+                          for line, w in s.take_new_history()],
+                         [("KEEP", False)])
+
+    def test_full_reset_on_the_alt_screen_saves_the_shell_behind_it(self):
+        # vi の中で reset が飛んでも、裏に退避していたシェル画面は
+        # 記録に残る。代替画面の中身は (これまでどおり) 記録しない
+        s = feed(Screen(), "MAIN-A\r\nMAIN-B")
+        feed(s, "\x1b[?1049hALT-ONLY\x1bc")
+        self.assertFalse(s.alt_active)
+        self.assertEqual(s.text(), [""] * 24)
+        record = everything(s)
+        self.assertIn("MAIN-A", record)
+        self.assertIn("MAIN-B", record)
+        self.assertNotIn("ALT-ONLY", record)
 
     def test_line_drawing_characters(self):
         # ESC)0 で G1 に罫線集合を指示し、SO で使い、SI で戻る
