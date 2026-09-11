@@ -64,10 +64,10 @@ class SFTPServerPanel(QWidget):
         self.root_dir_edit = QLineEdit()
         self.root_dir_edit.setText("./sftp_root")
         root_layout.addWidget(self.root_dir_edit)
-        browse_btn = QPushButton("参照")
-        browse_btn.clicked.connect(self._on_browse_directory)
-        browse_btn.setMaximumWidth(60)
-        root_layout.addWidget(browse_btn)
+        self.browse_btn = QPushButton("参照")
+        self.browse_btn.clicked.connect(self._on_browse_directory)
+        self.browse_btn.setMaximumWidth(60)
+        root_layout.addWidget(self.browse_btn)
         settings_layout.addLayout(root_layout, 1, 1)
         
         # ユーザー名
@@ -209,6 +209,9 @@ class SFTPServerPanel(QWidget):
         self.stop_btn.setVisible(True)
         self.port_spin.setEnabled(False)
         self.root_dir_edit.setEnabled(False)
+        # 参照も止める。欄だけ無効にしても setText() は効くので、起動中に
+        # 参照を押すと画面のルートだけが変わり、実公開ルートと食い違う
+        self.browse_btn.setEnabled(False)
         self.username_edit.setEnabled(False)
         self.password_edit.setEnabled(False)
     
@@ -221,6 +224,7 @@ class SFTPServerPanel(QWidget):
         self.stop_btn.setVisible(False)
         self.port_spin.setEnabled(True)
         self.root_dir_edit.setEnabled(True)
+        self.browse_btn.setEnabled(True)
         self.username_edit.setEnabled(True)
         self.password_edit.setEnabled(True)
     

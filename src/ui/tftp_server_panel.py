@@ -52,10 +52,10 @@ class TFTPServerPanel(QWidget):
         self.root_dir_edit = QLineEdit()
         self.root_dir_edit.setText("./tftp_root")
         root_layout.addWidget(self.root_dir_edit)
-        browse_btn = QPushButton("参照")
-        browse_btn.clicked.connect(self._on_browse_directory)
-        browse_btn.setMaximumWidth(60)
-        root_layout.addWidget(browse_btn)
+        self.browse_btn = QPushButton("参照")
+        self.browse_btn.clicked.connect(self._on_browse_directory)
+        self.browse_btn.setMaximumWidth(60)
+        root_layout.addWidget(self.browse_btn)
         settings_layout.addLayout(root_layout, 1, 1)
         settings_layout.addWidget(QLabel("転送許可:"), 2, 0)
         allow_layout = QHBoxLayout()
@@ -68,8 +68,11 @@ class TFTPServerPanel(QWidget):
         settings_layout.addLayout(allow_layout, 2, 1)
         settings_group.setLayout(settings_layout)
         layout.addWidget(settings_group)
-        # 起動中に無効化する入力群
-        self._inputs = [self.port_spin, self.root_dir_edit, self.allow_upload_check, self.allow_download_check]
+        # 起動中に無効化する入力群。参照ボタンも含める。欄だけ無効にしても
+        # setText() は効くので、起動中に参照を押すと画面のルートだけが変わり、
+        # 実際に公開しているルートと食い違う
+        self._inputs = [self.port_spin, self.root_dir_edit, self.browse_btn,
+                        self.allow_upload_check, self.allow_download_check]
         # 制御ボタン
         button_layout = QHBoxLayout()
         self.start_btn = QPushButton("▶ サーバー起動")
