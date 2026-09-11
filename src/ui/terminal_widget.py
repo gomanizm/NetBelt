@@ -1205,6 +1205,25 @@ class TerminalWidget(QWidget):
                 )
                 return
             
+            # 表示文書は MAX_DOCUMENT_BLOCKS 行で頭から切り詰められる。
+            # 保存するのはその toPlainText() なので、切り詰められた分は
+            # 「全ログ保存」でも出てこない。黙って落とさず先に断る
+            blocks = current_widget.document().blockCount()
+            if blocks >= self.MAX_DOCUMENT_BLOCKS:
+                answer = QMessageBox.warning(
+                    self,
+                    "ログ保存",
+                    f"画面に残っているのは直近 {blocks} 行だけです。\n"
+                    "それより古い出力は表示から消えているため、保存されません。\n\n"
+                    "全量が必要なときは「ログ記録」を使ってください。"
+                    "受信のたびにファイルへ書き出すので、表示の上限に影響されません。\n\n"
+                    "残っている分だけを保存しますか？",
+                    QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+                    QMessageBox.StandardButton.Ok
+                )
+                if answer != QMessageBox.StandardButton.Ok:
+                    return
+
             # デフォルトのファイル名を生成（機器名_日時.log）
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             default_filename = f"{tab_name}_{timestamp}.log"
