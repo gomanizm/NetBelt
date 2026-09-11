@@ -3,7 +3,62 @@ MIB解決機能
 
 OIDを人間が読める名前に変換
 """
+import os
+import sys
 from typing import Dict, Optional
+
+
+# MIB 解析器の版。抽出・解決の規則を変えたら上げる。mib_cache.json は
+# この値も鍵にするので、古い解析器が作ったキャッシュがアプリの更新後に
+# そのまま使われることがなくなる。
+MIB_PARSER_VERSION = '2026-09-11.1'
+
+
+def app_dir() -> str:
+    """アプリのディレクトリを返す。
+
+    凍結ビルド（NetBelt.exe）なら exe のあるディレクトリ、開発実行なら
+    リポジトリの直下。mibs/・custom_mibs.json・mib_cache.json は
+    ここを基準に探す。作業ディレクトリ相対で開くと、ショートカットの
+    「作業フォルダー」が違うだけで別の（あるいは存在しない）MIB を読み、
+    同じ OID が別の名前に解決されるうえ、起動したフォルダに
+    mib_cache.json を書き散らす。
+    """
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))))
+
+
+def _app_path(name: str) -> str:
+    """アプリのディレクトリにある name のパスを返す。
+
+    そこに無く、作業ディレクトリにはあるときだけ、これまでどおり作業
+    ディレクトリ側を使う。どちらにも無ければアプリのディレクトリ側。
+    """
+    primary = os.path.join(app_dir(), name)
+    if os.path.exists(primary):
+        return primary
+    fallback = os.path.abspath(name)
+    if os.path.exists(fallback):
+        return fallback
+    return primary
+
+
+def _custom_mibs_fingerprint() -> str:
+    """custom_mibs.json の中身の指紋（無ければ空文字）。
+
+    mibs/ の定義は custom_mibs.json の名前を親にできるので、そちらを
+    直したらキャッシュも作り直す必要がある。mtime ではなく中身を見る。
+    コピーで mtime が保たれたり、同じ秒に書き直したりしても取りこぼさない。
+    """
+    import hashlib
+    path = _app_path('custom_mibs.json')
+    try:
+        with open(path, 'rb') as f:
+            return hashlib.sha1(f.read()).hexdigest()
+    except OSError:
+        return ''
 
 
 class MIBResolver:
@@ -84,9 +139,9 @@ class MIBResolver:
         import json
         import os
         
-        # 1. custom_mibs.jsonを読み込み
-        custom_mib_file = 'custom_mibs.json'
-        
+        # 1. custom_mibs.jsonを読み込み（アプリのディレクトリ基準）
+        custom_mib_file = _app_path('custom_mibs.json')
+
         if os.path.exists(custom_mib_file):
             try:
                 with open(custom_mib_file, 'r', encoding='utf-8') as f:
@@ -104,8 +159,9 @@ class MIBResolver:
             except Exception as e:
                 print(f"[MIBResolver] カスタムMIB読み込みエラー: {str(e)}")
         
-        # 2. mibsディレクトリからMIBファイルを読み込み（キャッシュ使用）
-        mibs_dir = 'mibs'
+        # 2. mibsディレクトリからMIBファイルを読み込み（キャッシュ使用、
+        #    アプリのディレクトリ基準）
+        mibs_dir = _app_path('mibs')
         if os.path.exists(mibs_dir) and os.path.isdir(mibs_dir):
             # キャッシュを使用して高速化
             cached_mibs = self._load_or_update_mib_cache(mibs_dir)
@@ -131,17 +187,25 @@ class MIBResolver:
         import json
         import os
         
-        cache_file = 'mib_cache.json'
+        # キャッシュは読んだ mibs/ の隣（通常はアプリのディレクトリ）に置く。
+        # 作業ディレクトリに書くと起動したフォルダへ散らばる
+        cache_file = os.path.join(os.path.dirname(mibs_dir), 'mib_cache.json')
         cached_mibs = {}
         cache_needs_update = False
+        custom_fingerprint = _custom_mibs_fingerprint()
         
-        # キャッシュファイルの読み込み
+        # キャッシュファイルの読み込み。MIB ファイルの mtime だけを鍵に
+        # すると、custom_mibs.json で親の OID を直しても子が古い親の下に
+        # 残り、解析器を直しても古い結果が使われ続ける（どちらも実測）。
         if os.path.exists(cache_file):
             try:
                 with open(cache_file, 'r', encoding='utf-8') as f:
                     cache_data = json.load(f)
                     cached_files = cache_data.get('files', {})
                     cached_mibs = cache_data.get('mibs', {})
+                if (cache_data.get('parser') != MIB_PARSER_VERSION
+                        or cache_data.get('custom') != custom_fingerprint):
+                    cache_needs_update = True
             except:
                 cached_files = {}
                 cache_needs_update = True
@@ -185,15 +249,17 @@ class MIBResolver:
                 except Exception as e:
                     print(f"[MIBResolver] {filename} エラー: {str(e)}")
 
-            resolved = self._resolve_definitions(all_definitions)
-            cached_mibs = {oid: name for name, oid in resolved.items()}
+            cached_mibs = self._resolve_definitions(all_definitions)
+            resolved_names = set(cached_mibs.values())
             for filename, definitions in per_file.items():
-                got = sum(1 for name, _, _ in definitions if name in resolved)
+                got = sum(1 for d in definitions if d[0] in resolved_names)
                 print(f"[MIBResolver] {filename}: {got}件")
             
             # キャッシュファイルに保存
             try:
                 cache_data = {
+                    'parser': MIB_PARSER_VERSION,
+                    'custom': custom_fingerprint,
                     'files': current_files,
                     'mibs': cached_mibs
                 }
@@ -208,15 +274,38 @@ class MIBResolver:
     # MIB から拾う定義。現代の MIB はモジュールの根を MODULE-IDENTITY で
     # 定義するので、これを見ないと単一ファイルで完結していても根が解決できず、
     # その配下（Trap が実際に運ぶ通知 OID を含む）が丸ごと落ちる。
+    #
+    # 名前と親は mib-2 / my-root のようにハイフンを含む（標準 MIB の親は
+    # ほぼ全部 mib-2）ので [\w-]+ で拾う。\w+ だと mib-2 が名前 '2' になる。
+    #
+    # 定義の本体（型キーワードから ::= まで）は、自分の ::= と、別の
+    # 定義が始まる行を越えない。最短一致の .*? に任せると、右辺が
+    # { 名前 数字 } の形でない（{ x 0 1 } のような複数添字）とき、そこで
+    # 止まれずに次の定義の ::= まで伸びて、隣の OID を黙って奪ったうえ
+    # 隣の定義を消す。IMPORTS の直後に並ぶ MODULE-IDENTITY も
+    # 「名前 MODULE-IDENTITY」に見えるので、同じ理由で根を飲み込む。
+    # 右辺が { 名前 数字 } ちょうどでない定義は、その定義だけ落とす。
+    _MIB_DEFINITION_KEYWORDS = (
+        r'(?:OBJECT\s+IDENTIFIER|OBJECT-TYPE|NOTIFICATION-TYPE'
+        r'|MODULE-IDENTITY|OBJECT-IDENTITY|OBJECT-GROUP|NOTIFICATION-GROUP'
+        r'|MODULE-COMPLIANCE|AGENT-CAPABILITIES|TRAP-TYPE|TEXTUAL-CONVENTION)'
+    )
+    _MIB_DEFINITION_BODY = (
+        r'(?:(?!::=)(?!\n[ \t]*[\w-]+[ \t]+' + _MIB_DEFINITION_KEYWORDS
+        + r'\b).)*?'
+    )
+    _MIB_ASSIGNMENT = r'::=\s*\{\s*([\w-]+)\s+(\d+)\s*\}'
     _MIB_DEFINITION_PATTERNS = (
-        r'(\w+)\s+OBJECT\s+IDENTIFIER\s*::=\s*\{\s*(\w+)\s+(\d+)\s*\}',
+        r'([\w-]+)\s+OBJECT\s+IDENTIFIER\s*' + _MIB_ASSIGNMENT,
         # 型キーワードから ::= までは「コロンを含まない並び」ではない。
         # 実 MIB はほぼ必ず DESCRIPTION を持ち、そこへ RFC 参照や URL を
         # 書くので、[^:]* にすると本文にコロンが出た時点で定義ごと
-        # 取りこぼす。最短一致で次の ::= { 名前 数字 } まで進める。
-        r'(\w+)\s+OBJECT-TYPE\b.*?::=\s*\{\s*(\w+)\s+(\d+)\s*\}',
-        r'(\w+)\s+NOTIFICATION-TYPE\b.*?::=\s*\{\s*(\w+)\s+(\d+)\s*\}',
-        r'(\w+)\s+MODULE-IDENTITY\b.*?::=\s*\{\s*(\w+)\s+(\d+)\s*\}',
+        # 取りこぼす。
+        r'([\w-]+)\s+OBJECT-TYPE\b' + _MIB_DEFINITION_BODY + _MIB_ASSIGNMENT,
+        r'([\w-]+)\s+NOTIFICATION-TYPE\b' + _MIB_DEFINITION_BODY
+        + _MIB_ASSIGNMENT,
+        r'([\w-]+)\s+MODULE-IDENTITY\b' + _MIB_DEFINITION_BODY
+        + _MIB_ASSIGNMENT,
     )
 
     @staticmethod
@@ -261,18 +350,24 @@ class MIBResolver:
                 i += 1
         return ''.join(out)
 
+    # モジュール名。`FOO-MIB DEFINITIONS ::= BEGIN` の FOO-MIB
+    _MIB_MODULE_HEADER = r'^[ \t]*([\w-]+)\s+DEFINITIONS\b'
+
     def _extract_mib_definitions(self, filepath: str) -> list:
         """
-        MIBファイルから (名前, 親の名前, 添字) を抜き出す
+        MIBファイルから (名前, 親の名前, 添字, モジュール名) を抜き出す
 
         ここでは OID へ解決しない。親が別のファイルで定義されていることが
         普通にあるため、解決は全ファイルを読み終えてからまとめて行う。
+
+        モジュール名は `X DEFINITIONS ::= BEGIN` の X。無いファイルは
+        ファイル名をモジュール名の代わりにする（ファイル単位の名前空間）。
 
         Args:
             filepath: MIBファイルのパス
 
         Returns:
-            (名前, 親の名前, 添字) のリスト
+            (名前, 親の名前, 添字, モジュール名) のリスト
         """
         import re
 
@@ -280,13 +375,16 @@ class MIBResolver:
         try:
             with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
                 content = self._blank_comments_and_strings(f.read())
+            header = re.search(self._MIB_MODULE_HEADER, content, re.MULTILINE)
+            module = header.group(1) if header else os.path.basename(filepath)
             for pattern in self._MIB_DEFINITION_PATTERNS:
                 # DOTALL が要る。定義は複数行にまたがるので、`.` が改行を
                 # 拾わないと型キーワードから ::= まで届かない
                 for match in re.finditer(pattern, content,
                                          re.MULTILINE | re.DOTALL):
                     definitions.append(
-                        (match.group(1), match.group(2), match.group(3)))
+                        (match.group(1), match.group(2), match.group(3),
+                         module))
         except Exception as e:
             print(f"[MIBResolver] MIBファイル解析エラー: {str(e)}")
 
@@ -294,36 +392,55 @@ class MIBResolver:
 
     def _resolve_definitions(self, definitions: list) -> dict:
         """
-        (名前, 親の名前, 添字) の並びを OID へ解決する
+        (名前, 親の名前, 添字, モジュール名) の並びを OID へ解決する
 
         親が別のファイルで定義されていることがあるので、解決が進まなく
         なるまで繰り返す。一度で終える（＝読んだ順に解決する）と、親が
         後ろのファイルにある定義が os.listdir() の順しだいで落ちる。
 
+        親は同じモジュールの定義を優先する。名前→OID を全モジュール共通の
+        1 枚にすると、2 つの MIB が同じ名前（例: 両方に shared）を自分の
+        根の下に定義したとき後に書いた方だけが残り、もう一方の子がよその
+        親に付く（実測: 2 つの Trap が互いの enterprise に入れ替わった）。
+        同じモジュールに親の定義があるのにまだ解決していなければ、よその
+        同名を使わずに次の回を待つ。同じモジュールに無い親（IMPORTS）は
+        これまでどおりモジュールをまたいで探す。
+
+        残る制限: 2 つのモジュールが同じ名前を定義し、第三のモジュールが
+        その一方を IMPORTS しているとき、IMPORTS を見ていないのでどちらを
+        指すか決められず、後に解決した方になる。
+
         Args:
-            definitions: (名前, 親の名前, 添字) のリスト
+            definitions: (名前, 親の名前, 添字, モジュール名) のリスト
 
         Returns:
-            解決できた 名前→OID の辞書
+            解決できた OID→名前 の辞書（同名でも別 OID なら両方残る）
         """
         known = dict(self.name_to_oid)
+        declared = {}
+        for name, _, _, module in definitions:
+            declared.setdefault(module, set()).add(name)
+        in_module = {}
         resolved = {}
         pending = list(definitions)
 
         while pending:
             still_pending = []
             progressed = False
-            for name, parent, index in pending:
+            for name, parent, index, module in pending:
                 if parent == 'enterprises':
                     parent_oid = '1.3.6.1.4.1'
+                elif parent in declared[module]:
+                    parent_oid = in_module.get(module, {}).get(parent)
                 else:
                     parent_oid = known.get(parent)
                 if parent_oid is None:
-                    still_pending.append((name, parent, index))
+                    still_pending.append((name, parent, index, module))
                     continue
                 oid = f"{parent_oid}.{index}"
                 known[name] = oid
-                resolved[name] = oid
+                in_module.setdefault(module, {})[name] = oid
+                resolved[oid] = name
                 progressed = True
             if not progressed:
                 # これ以上どれも解決できない（親がどこにも無い）

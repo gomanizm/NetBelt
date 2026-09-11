@@ -53,7 +53,8 @@ class PartialWalkExportTest(unittest.TestCase):
         path = os.path.join(tempfile.mkdtemp(prefix="netbelt-snmp-exp-"),
                             "out." + kind)
         writer = getattr(panel, "_export_results_to_" + kind)
-        writer(path, panel.result_model.get_all_results())
+        writer(path, panel.result_model.get_all_results(),
+               panel._result_host, panel._last_partial_reason)
         with io.open(path, encoding="utf-8") as f:
             return f.read()
 

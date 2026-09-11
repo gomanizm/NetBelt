@@ -639,7 +639,14 @@ class SNMPPanel(QWidget):
     
     def _on_export_clicked(self):
         """GET/WALK 結果をエクスポート（Trap と同じく txt/csv/json）"""
+        # 行・ホスト・途中までの理由は、ダイアログを開く前にまとめて固定し、
+        # 書き出しへ引数で渡す。モーダルダイアログはネストしたイベント
+        # ループで queued シグナルを処理するので、開いている間に次の WALK が
+        # 完走すると self は次の結果に変わる。行だけ先に取ってホストと理由を
+        # 後から self で読むと、前の途中までの行に「完走」と次のホストが付く
         results = self.result_model.get_all_results()
+        host = self._result_host
+        reason = self._last_partial_reason
         if not results:
             QMessageBox.information(self, "情報", "エクスポートするデータがありません。")
             return
@@ -654,11 +661,11 @@ class SNMPPanel(QWidget):
             return
         try:
             if file_path.endswith(".csv"):
-                self._export_results_to_csv(file_path, results)
+                self._export_results_to_csv(file_path, results, host, reason)
             elif file_path.endswith(".json"):
-                self._export_results_to_json(file_path, results)
+                self._export_results_to_json(file_path, results, host, reason)
             else:
-                self._export_results_to_txt(file_path, results)
+                self._export_results_to_txt(file_path, results, host, reason)
             QMessageBox.information(self, "成功", "SNMP結果をエクスポートしました:\n" + file_path)
         except Exception as e:
             QMessageBox.critical(self, "エラー", "エクスポート中にエラーが発生しました:\n" + str(e))
@@ -723,10 +730,14 @@ class SNMPPanel(QWidget):
             return text
         return "'" + text
 
-    def _export_results_to_csv(self, file_path: str, results):
-        """CSV形式で GET/WALK 結果を書き出す"""
+    def _export_results_to_csv(self, file_path: str, results, host: str = "",
+                               reason=None):
+        """CSV形式で GET/WALK 結果を書き出す
+
+        host / reason は呼び出し側が結果と同時に固定した値。ここで self を
+        読むと、ダイアログを開いている間に届いた次の結果のものになる
+        """
         import csv
-        reason = getattr(self, "_last_partial_reason", None)
         with open(file_path, "w", newline="", encoding="utf-8") as f:
             if reason:
                 # 途中までの結果であることを、見出しの前に残す
@@ -736,13 +747,13 @@ class SNMPPanel(QWidget):
             for row in results:
                 writer.writerow([self._csv_safe(cell) for cell in row])
 
-    def _export_results_to_json(self, file_path: str, results):
-        """JSON形式で GET/WALK 結果を書き出す"""
+    def _export_results_to_json(self, file_path: str, results, host: str = "",
+                                reason=None):
+        """JSON形式で GET/WALK 結果を書き出す（host / reason は CSV と同じ）"""
         import json
-        reason = getattr(self, "_last_partial_reason", None)
         data = {
             "exported_at": datetime.now().isoformat(),
-            "host": self._result_host,
+            "host": host,
             "count": len(results),
             # 途中までの結果かどうか。機械で読む側が見落とさないよう明示する
             "complete": reason is None,
@@ -754,14 +765,14 @@ class SNMPPanel(QWidget):
         with open(file_path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
 
-    def _export_results_to_txt(self, file_path: str, results):
-        """テキスト形式で GET/WALK 結果を書き出す"""
+    def _export_results_to_txt(self, file_path: str, results, host: str = "",
+                               reason=None):
+        """テキスト形式で GET/WALK 結果を書き出す（host / reason は CSV と同じ）"""
         with open(file_path, "w", encoding="utf-8") as f:
             f.write("SNMP GET/WALK 結果\n")
             f.write("エクスポート日時: " + datetime.now().strftime("%Y-%m-%d %H:%M:%S") + "\n")
-            f.write("対象ホスト: " + self._result_host + "\n")
+            f.write("対象ホスト: " + host + "\n")
             f.write("件数: " + str(len(results)) + "\n")
-            reason = getattr(self, "_last_partial_reason", None)
             if reason:
                 f.write("注意: 途中まで（%s のため中断。全部ではありません）\n" % reason)
             f.write("=" * 60 + "\n")
