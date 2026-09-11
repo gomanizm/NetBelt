@@ -225,25 +225,43 @@ class ConfigManager:
         起動できない。JSON 構文エラーとは違い load_error にもならないので、
         利用者には設定ファイルが原因だと分からなかった。
         不正な機器だけを除外し、元ファイルはバックアップして知らせる。
+
+        予約語（ホームタブと重なる名前）の機器も同じ理由でここで外す。
+        登録の入口（DeviceDialog / add_device / update_device）は別途
+        断っているが、手編集された config や、その検査より前のバージョン
+        で作られた config からは今でも入ってくる。
         """
         removed = 0
+        reserved = 0
         for group in config.get("groups", []):
             devices = group.get("devices")
             if not isinstance(devices, list):
                 continue
-            kept = [d for d in devices if self._is_valid_device(d)]
-            removed += len(devices) - len(kept)
+            kept = []
+            for d in devices:
+                if not self._is_valid_device(d):
+                    removed += 1
+                elif is_reserved_device_name(d["name"]):
+                    reserved += 1
+                else:
+                    kept.append(d)
             group["devices"] = kept
-        if not removed:
+        if not removed and not reserved:
             return
         self._backup_corrupted_config()
-        message = (f"設定ファイル (config.json) に名前またはホストの無い機器が"
-                   f"{removed}件あり、接続先リストから除外しました。\n"
+        reasons = []
+        if removed:
+            reasons.append(f"名前またはホストの無い機器が{removed}件")
+        if reserved:
+            reasons.append(f"ホームタブと重なる名前（「ホーム」）の機器が{reserved}件")
+        message = ("設定ファイル (config.json) に" + "、".join(reasons) +
+                   "あり、接続先リストから除外しました。\n"
                    "除外した機器は次回の保存時に設定ファイルから消えます。")
         if self.backup_path:
             message += f"\n\n元のファイルはバックアップしました:\n  {self.backup_path}"
         self.load_warning = message
-        print(f"[Config] {removed}件の機器に name/host が無いため除外しました")
+        print(f"[Config] {removed + reserved}件の機器を除外しました "
+              f"(name/host 無し={removed}, 予約語={reserved})")
 
     def _backup_corrupted_config(self) -> None:
         """
