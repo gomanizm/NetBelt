@@ -8,6 +8,12 @@ import sys
 from typing import Dict, Optional
 
 
+# MIB 解析器の版。抽出・解決の規則を変えたら上げる。mib_cache.json は
+# この値も鍵にするので、古い解析器が作ったキャッシュがアプリの更新後に
+# そのまま使われることがなくなる。
+MIB_PARSER_VERSION = '2026-09-11.1'
+
+
 def app_dir() -> str:
     """アプリのディレクトリを返す。
 
@@ -37,6 +43,22 @@ def _app_path(name: str) -> str:
     if os.path.exists(fallback):
         return fallback
     return primary
+
+
+def _custom_mibs_fingerprint() -> str:
+    """custom_mibs.json の中身の指紋（無ければ空文字）。
+
+    mibs/ の定義は custom_mibs.json の名前を親にできるので、そちらを
+    直したらキャッシュも作り直す必要がある。mtime ではなく中身を見る。
+    コピーで mtime が保たれたり、同じ秒に書き直したりしても取りこぼさない。
+    """
+    import hashlib
+    path = _app_path('custom_mibs.json')
+    try:
+        with open(path, 'rb') as f:
+            return hashlib.sha1(f.read()).hexdigest()
+    except OSError:
+        return ''
 
 
 class MIBResolver:
@@ -170,14 +192,20 @@ class MIBResolver:
         cache_file = os.path.join(os.path.dirname(mibs_dir), 'mib_cache.json')
         cached_mibs = {}
         cache_needs_update = False
+        custom_fingerprint = _custom_mibs_fingerprint()
         
-        # キャッシュファイルの読み込み
+        # キャッシュファイルの読み込み。MIB ファイルの mtime だけを鍵に
+        # すると、custom_mibs.json で親の OID を直しても子が古い親の下に
+        # 残り、解析器を直しても古い結果が使われ続ける（どちらも実測）。
         if os.path.exists(cache_file):
             try:
                 with open(cache_file, 'r', encoding='utf-8') as f:
                     cache_data = json.load(f)
                     cached_files = cache_data.get('files', {})
                     cached_mibs = cache_data.get('mibs', {})
+                if (cache_data.get('parser') != MIB_PARSER_VERSION
+                        or cache_data.get('custom') != custom_fingerprint):
+                    cache_needs_update = True
             except:
                 cached_files = {}
                 cache_needs_update = True
@@ -230,6 +258,8 @@ class MIBResolver:
             # キャッシュファイルに保存
             try:
                 cache_data = {
+                    'parser': MIB_PARSER_VERSION,
+                    'custom': custom_fingerprint,
                     'files': current_files,
                     'mibs': cached_mibs
                 }
