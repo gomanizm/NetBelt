@@ -2038,6 +2038,14 @@ for details.
             win._closing = True
             win.close()
         self._detached = {}
+        # ツール→ポートチェッカーは親を持たないトップレベルなので、
+        # 同じ理由でここで閉じないと終了できない
+        pc = getattr(self, "port_checker_window", None)
+        if pc is not None:
+            try:
+                pc.close()
+            except RuntimeError:
+                pass  # 既に破棄済み
 
         # イベントを受け入れて終了
         event.accept()
