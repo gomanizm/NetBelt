@@ -224,6 +224,29 @@ class WrapMarkTest(unittest.TestCase):
         self.assertEqual(s.text()[:2], ["WXYZ", "Q"])
         self.assertTrue(s.wrapped[0], "改めて折り返したのに印が無い")
 
+    def test_a_rewrite_up_to_the_right_edge_keeps_the_mark(self):
+        """右端ちょうどまで書き直しても、次の行へ続くまま。
+
+        readline や vim が折り返した行を CUP + 印字だけで描き直すときの
+        形。印を外すと、次の行 (続き) との間に無いはずの改行が入る。
+        """
+        s = self._wrapped_then_rewritten("\x1b[1;1HWXYZ")
+        self.assertEqual(s.text()[:2], ["WXYZ", "E"])
+        self.assertTrue(s.wrapped[0],
+                        "右端まで書き直した行の折り返しの印が外れた")
+
+    def test_the_rewritten_wrapped_row_reaches_the_history_joined(self):
+        s = self._wrapped_then_rewritten("\x1b[1;1HWXYZ")
+        feed(s, "\x1b[4;1H\r\n\r\n")          # 2 行押し出す
+        self.assertEqual([("".join(c[0] for c in line).rstrip(), w)
+                          for line, w in s.take_new_history()],
+                         [("WXYZ", True), ("E", False)])
+
+    def test_filling_a_row_to_the_edge_does_not_create_a_mark(self):
+        """折り返していない行に、印字だけで印が付いてはいけない。"""
+        s = feed(Screen(rows=4, cols=4), "ABCD\x1b[2;1HPONG")
+        self.assertEqual([s.wrapped[0], s.wrapped[1]], [False, False])
+
 
 class ScrollRegionTest(unittest.TestCase):
     def test_decstbm_confines_the_scroll(self):
