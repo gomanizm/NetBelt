@@ -379,8 +379,24 @@ class SyslogReceiver(QObject):
             except Exception:
                 pass
 
+    # RFC 6587 §3.4.1 octet-counting: "MSG-LEN SP SYSLOG-MSG"。SYSLOG-MSG は
+    # PRI（"<"）で始まるので、改行区切りの行が数字で始まる場合と区別できる
+    _OCTET_COUNT_RE = re.compile(rb"^(\d{1,9}) <")
+
+    def _emit_tcp_line(self, line, client_ip, listen_port):
+        """TCP で切り出した 1 メッセージを配信する（空行は捨てる）"""
+        message_str = self._decode_bytes(line).strip()
+        if message_str:
+            self.message_received.emit(
+                SyslogMessage(message_str, client_ip, "TCP", listen_port))
+            self.message_count += 1
+
     def _handle_tcp_client(self, client_socket, client_ip, stop_event, listen_port=None):
-        """TCPクライアントからのメッセージを処理（改行区切り）"""
+        """TCPクライアントからのメッセージを処理
+
+        RFC 6587 の octet-counting（"<len> <msg>"）と改行区切りの両方を受け付ける。
+        どちらかはバッファ先頭で判定し、混在も許す。
+        """
         try:
             client_socket.settimeout(1.0)
             buffer = b""
@@ -390,24 +406,46 @@ class SyslogReceiver(QObject):
                     if not data:
                         break
                     buffer += data
-                    # いま組み立てている 1 行が上限を超えたら、その相手との
-                    # 接続を切る。黙って切り捨てると障害解析に要る末尾を
-                    # 失うので、切ったことは記録に残す。
-                    #
-                    # 「改行がまだ来ていないとき」に限ると、上限を超えた行が
-                    # 終端の改行ごと 1 回の recv で届いた場合に素通りする。
-                    # 見るのは受信バッファ全体ではなく、次の改行までの長さ。
-                    newline_at = buffer.find(b"\n")
-                    if newline_at == -1:
-                        current_line = len(buffer)
-                    else:
-                        current_line = newline_at
-                        # CRLF の CR は配信前に落とすので中身ではない。
-                        # 数えると、同じ中身の行が LF なら通り CRLF なら
-                        # 切られる
-                        if buffer[newline_at - 1:newline_at] == b"\r":
-                            current_line -= 1
-                    if current_line > self.max_line_bytes:
+                    too_long = False
+                    while buffer and not too_long:
+                        m = self._OCTET_COUNT_RE.match(buffer)
+                        if m:
+                            # octet-counting: 宣言された長さぶんが揃うまで待つ
+                            length = int(m.group(1))
+                            if length > self.max_line_bytes:
+                                too_long = True
+                                break
+                            end = m.end() - 1 + length
+                            if len(buffer) < end:
+                                break
+                            self._emit_tcp_line(buffer[m.end() - 1:end], client_ip, listen_port)
+                            buffer = buffer[end:]
+                            continue
+                        # 改行区切り。いま組み立てている 1 行が上限を超えたら、
+                        # その相手との接続を切る。黙って切り捨てると障害解析に
+                        # 要る末尾を失うので、切ったことは記録に残す。
+                        #
+                        # 「改行がまだ来ていないとき」に限ると、上限を超えた行が
+                        # 終端の改行ごと 1 回の recv で届いた場合に素通りする。
+                        # 見るのは受信バッファ全体ではなく、次の改行までの長さ。
+                        newline_at = buffer.find(b"\n")
+                        if newline_at == -1:
+                            current_line = len(buffer)
+                        else:
+                            current_line = newline_at
+                            # CRLF の CR は配信前に落とすので中身ではない。
+                            # 数えると、同じ中身の行が LF なら通り CRLF なら
+                            # 切られる
+                            if buffer[newline_at - 1:newline_at] == b"\r":
+                                current_line -= 1
+                        if current_line > self.max_line_bytes:
+                            too_long = True
+                            break
+                        if newline_at == -1:
+                            break
+                        line, buffer = buffer.split(b"\n", 1)
+                        self._emit_tcp_line(line, client_ip, listen_port)
+                    if too_long:
                         # 一覧に並ぶので、機器からの行と同じ RFC 3164 の形で
                         # 組み立てる。生の文言のまま渡すと、先頭の語が
                         # 日時やホスト名として食われて読めなくなる。
@@ -420,13 +458,6 @@ class SyslogReceiver(QObject):
                             client_ip, "TCP", listen_port))
                         self.message_count += 1
                         break
-                    while b"\n" in buffer:
-                        line, buffer = buffer.split(b"\n", 1)
-                        message_str = self._decode_bytes(line).strip()
-                        if message_str:
-                            self.message_received.emit(
-                                SyslogMessage(message_str, client_ip, "TCP", listen_port))
-                            self.message_count += 1
                 except socket.timeout:
                     continue
                 except Exception as e:
