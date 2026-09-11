@@ -109,6 +109,11 @@ class SerialConnection(QObject):
 
         Windows の COM ポートは同一プロセス内でも排他なので、閉じずに
         参照だけ捨てると、同じ機器への再接続が Access is denied になる。
+
+        残る制限: 呼び出し元（タブを閉じたときは GUI スレッド）を、
+        読み取りスレッドと送信スレッドの join で最大 2 秒ずつ、合わせて
+        最大約 4 秒止める。join が空振りした場合でも、残った送信スレッドは
+        起動時のポートに束縛されているので、後の接続のポートへは書かない。
         """
         self._should_stop = True
         self._is_connected = False
@@ -120,17 +125,11 @@ class SerialConnection(QObject):
             thread.join(timeout=2)
         self._read_thread = None
 
-        # 接続が存在する場合は閉じる
-        if self.serial_conn and self.serial_conn.is_open:
-            try:
-                self.serial_conn.close()
-            except Exception as e:
-                print(f"切断エラー: {e}")
-
-        self.serial_conn = None
-
-        # 送信スレッドを終わらせる。溜まっている分は捨て、次の接続には
-        # 新しいキューを使う（古い終端印が次の送信を巻き込まないように）
+        # 送信スレッドを先に終わらせる。溜まっている分は捨て、次の接続には
+        # 新しいキューを使う（古い終端印が次の送信を巻き込まないように）。
+        # ポートを閉じるより前に止めるのは、pyserial の write/flush と close
+        # の間に同期が無く、待機中のハンドルを別スレッドから閉じるのが
+        # Win32 では未定義の動作だから
         old_queue = self._send_queue
         self._send_queue = queue.Queue()
         old_queue.put(None)
@@ -139,6 +138,15 @@ class SerialConnection(QObject):
                 and writer is not threading.current_thread()):
             writer.join(timeout=2)
         self._write_thread = None
+
+        # 接続が存在する場合は閉じる
+        if self.serial_conn and self.serial_conn.is_open:
+            try:
+                self.serial_conn.close()
+            except Exception as e:
+                print(f"切断エラー: {e}")
+
+        self.serial_conn = None
 
     def disconnect(self):
         """シリアルポートから切断"""
@@ -209,17 +217,20 @@ class SerialConnection(QObject):
         thread = self._write_thread
         if thread is not None and thread.is_alive():
             return
+        # キューと同じく、書き込み先のポートも起動時の値で束縛する。
+        # self.serial_conn を読み直すと、join が空振りした古いスレッドが
+        # 後の接続のポートへ前の接続の残りを書いてしまう
         self._write_thread = threading.Thread(
-            target=self._write_loop, args=(self._send_queue,), daemon=True)
+            target=self._write_loop, args=(self._send_queue, self.serial_conn),
+            daemon=True)
         self._write_thread.start()
 
-    def _write_loop(self, send_queue):
-        """キューに積まれた送信を順に書く。None で終わる"""
+    def _write_loop(self, send_queue, port):
+        """キューに積まれた送信を、起動時のポートへ順に書く。None で終わる"""
         while True:
             data = send_queue.get()
             if data is None:
                 break
-            port = self.serial_conn
             if self._should_stop or port is None or not port.is_open:
                 continue
             try:

@@ -45,6 +45,36 @@ class _SlowPort:
         self.is_open = False
 
 
+class _BlockingPort:
+    """write がテストの合図まで戻らない疑似ポート。呼ばれた順を記録する。"""
+
+    def __init__(self):
+        self.is_open = True
+        self.in_waiting = 0
+        self.writes = []
+        self.events = []
+        self.in_write = threading.Event()
+        self.release = threading.Event()
+
+    def write(self, data):
+        self.events.append("write-start")
+        self.in_write.set()
+        self.release.wait(5)
+        self.writes.append(bytes(data))
+        self.events.append("write-end")
+        return len(data)
+
+    def flush(self):
+        self.events.append("flush")
+
+    def read(self, n):
+        return b""
+
+    def close(self):
+        self.events.append("close")
+        self.is_open = False
+
+
 class SerialSendOffGuiThreadTest(unittest.TestCase):
     def _conn(self, port):
         from core.serial_connection import SerialConnection
@@ -93,6 +123,51 @@ class SerialSendOffGuiThreadTest(unittest.TestCase):
 
         thread.join(timeout=2)
         self.assertFalse(thread.is_alive(), "後始末で送信スレッドが終わらない")
+
+    def test_dispose_stops_the_writer_before_it_closes_the_port(self):
+        """ポートを閉じるのは、書き込み中の writer が戻ってからにすること。
+
+        pyserial の write/flush と close の間には何の同期も無く、待機中の
+        ハンドルを別スレッドから閉じるのは Win32 では未定義の動作になる。
+        """
+        port = _BlockingPort()
+        conn = self._conn(port)
+        conn.send_command("a")
+        self.assertTrue(port.in_write.wait(3), "送信が始まっていない")
+
+        threading.Timer(0.3, port.release.set).start()
+        conn.dispose()
+
+        self.assertIn("close", port.events, "ポートが閉じられていない")
+        self.assertLess(port.events.index("write-end"), port.events.index("close"),
+                        "書き込みの最中にポートを閉じた: %r" % (port.events,))
+
+    def test_a_stale_writer_does_not_write_to_the_next_connections_port(self):
+        """join が空振りした古い writer が、次の接続のポートへ書かないこと。"""
+        old_port = _BlockingPort()
+        conn = self._conn(old_port)
+        conn.send_command("old1")
+        conn.send_command("old2")
+        self.assertTrue(old_port.in_write.wait(3), "送信が始まっていない")
+
+        # 送信中に後始末が走る。writer は write から戻れないので join は空振りする
+        done = threading.Event()
+        threading.Thread(
+            target=lambda: (conn.dispose(), done.set()), daemon=True).start()
+        self.assertTrue(done.wait(10), "dispose が戻らない")
+
+        # 同じオブジェクトで次の接続を開いた状態にする
+        new_port = _BlockingPort()
+        new_port.release.set()
+        conn.serial_conn = new_port
+        conn._is_connected = True
+        conn._should_stop = False
+
+        old_port.release.set()      # 前の接続の writer が動き出す
+        time.sleep(0.5)
+        self.assertEqual(new_port.writes, [],
+                         "前の接続の残りが新しいポートへ書かれた")
+
 
     def test_sending_when_not_connected_still_reports_an_error(self):
         """従来どおり、未接続の送信はその場でエラーを知らせること。"""
