@@ -3,6 +3,8 @@
 config.json の settings 配下のうち、これまで GUI から編集できなかった項目を扱う。
 保存はこのダイアログ自身が行う（MacroDialog / PresetEditDialog と同じ流儀）。
 """
+import copy
+
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QTabWidget, QWidget,
     QPushButton, QSpinBox, QFontComboBox, QColorDialog, QLabel, QTextEdit,
@@ -254,6 +256,14 @@ class SettingsDialog(QDialog):
         if not self.config_manager:
             return False
 
+        # 各 setter は共有 ConfigManager のメモリ上の値を書き換えてから
+        # ディスクへ書く。書き込みに失敗すると OK は閉じないが、値は
+        # 書き換わったままで SFTP パネルなどはそれを読む。利用者が
+        # キャンセルしても変更が効き、後続の無関係な保存の成功で
+        # ディスクへ永続化されてしまう。失敗したら触ったセクションを
+        # 保存前の姿へ戻す
+        before = self._snapshot()
+
         saved = self.config_manager.set_server_settings("terminal", {
             "background_color": self._background_color,
             "text_color": self._text_color,
@@ -277,7 +287,29 @@ class SettingsDialog(QDialog):
         if self._skip_cleared and not self.config_manager.set_skipped_version(None):
             saved = False
 
+        if not saved:
+            self._restore(before)
         return saved
+
+    _SECTIONS = ("settings", "update_settings")
+
+    def _snapshot(self) -> dict:
+        """save_settings が触る config のセクションを深いコピーで控える"""
+        return copy.deepcopy(
+            {key: self.config_manager.config.get(key) for key in self._SECTIONS})
+
+    def _restore(self, before: dict):
+        """控えたセクションをメモリ上の config へ戻す（ディスクは触らない）
+
+        一部のセクションだけ書けていても全部戻す。利用者には
+        「保存できませんでした」としか伝わらないので、一部だけ効いた
+        状態を残さない。
+        """
+        for key, value in before.items():
+            if value is None:
+                self.config_manager.config.pop(key, None)
+            else:
+                self.config_manager.config[key] = value
 
     def _on_ok(self):
         """OKボタン押下時の処理"""
