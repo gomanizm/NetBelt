@@ -1930,12 +1930,13 @@ for details.
         
         try:
             import subprocess
-            from core.version_manager import updater_command
+            from core.version_manager import updater_command, updater_env
             # リストで渡すと、パスの , や = で引数が途中で切れる
             # （updater_command の説明を参照）
             subprocess.Popen(
                 updater_command(updater_path, zip_path, app_path),
-                creationflags=subprocess.CREATE_NEW_CONSOLE
+                creationflags=subprocess.CREATE_NEW_CONSOLE,
+                env=updater_env()
             )
             
             # アプリケーションを終了

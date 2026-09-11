@@ -60,6 +60,24 @@ def updater_command(updater_path: str, zip_path: str, app_path: str) -> str:
     return '"{}" "{}" "{}"'.format(updater_path, zip_path, app_path)
 
 
+def updater_env() -> dict:
+    """updater.bat へ渡す環境変数を組み立てる
+
+    onefile の exe から更新すると、updater.bat 経由で起動し直すのは
+    同じパスの exe になる。PyInstaller のブートローダは _PYI_ARCHIVE_FILE が
+    自分と同じなら「同一アプリの子プロセス」と見なし、親が終了時に消した
+    _MEIxxxx から python DLL を読もうとする。実測では Python が一度も
+    起動しないまま `Failed to load Python DLL` で落ちた。ブートローダ段階の
+    失敗なので、ログにも excepthook にも何も残らない。
+
+    PYINSTALLER_RESET_ENVIRONMENT=1 を立てると、子は _PYI_* を引き継がず
+    自分用の _MEI を展開し直す。ソース実行では何の影響も無い。
+    """
+    env = dict(os.environ)
+    env['PYINSTALLER_RESET_ENVIRONMENT'] = '1'
+    return env
+
+
 class VersionManager:
     """バージョン管理とアップデート機能を提供するクラス"""
     

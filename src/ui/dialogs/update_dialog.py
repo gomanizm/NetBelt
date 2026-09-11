@@ -11,7 +11,8 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QFont
-from core.version_manager import VersionManager, updater_command
+from core.version_manager import (
+    VersionManager, updater_command, updater_env)
 
 
 class DownloadThread(QThread):
@@ -353,7 +354,8 @@ class UpdateDialog(QDialog):
             # （updater_command の説明を参照）
             subprocess.Popen(
                 updater_command(updater_path, self.downloaded_zip_path, app_path),
-                creationflags=subprocess.CREATE_NEW_CONSOLE
+                creationflags=subprocess.CREATE_NEW_CONSOLE,
+                env=updater_env()
             )
             
             # ダイアログを閉じる
