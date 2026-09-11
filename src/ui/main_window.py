@@ -1970,7 +1970,12 @@ for details.
 
         version_mgr = VersionManager()
         pending_files = version_mgr.get_pending_update_files()
-        
+
+        # 候補を全部見てから、いちばん新しい版を1つだけ勧める。版ごとに
+        # 名前が分かれたので、24時間以内に2回落とすと未適用の ZIP が並ぶ。
+        # os.listdir 順（＝辞書順）の先頭で決めていたときは、並んだ中の
+        # 古い方を勧めていた。
+        best = None  # (版, ZIPのパス, 経過時間)
         for zip_path in pending_files:
             if not os.path.exists(zip_path):
                 continue
@@ -2000,24 +2005,29 @@ for details.
                 print("[Main] 現在のバージョン以下のため無視します: "
                       f"{pending_version}")
                 continue
-            
-            # 適用確認ダイアログ
-            reply = QMessageBox.question(
-                self,
-                "未適用の更新",
-                f"前回ダウンロードした更新 v{pending_version}"
-                f"（{file_age_hours:.0f}時間前）がまだ適用されていません。\n"
-                f"現在のバージョンは v{version_mgr.CURRENT_VERSION} です。\n\n"
-                "今すぐ更新を適用しますか？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No
-            )
-            
-            if reply == QMessageBox.StandardButton.Yes:
-                self._apply_pending_update(zip_path)
-            
-            # 最初の1つだけ処理
-            break
+
+            if best is None or VersionManager.compare_versions(
+                    pending_version, best[0]) > 0:
+                best = (pending_version, zip_path, file_age_hours)
+
+        if best is None:
+            return
+        pending_version, zip_path, file_age_hours = best
+
+        # 適用確認ダイアログ
+        reply = QMessageBox.question(
+            self,
+            "未適用の更新",
+            f"前回ダウンロードした更新 v{pending_version}"
+            f"（{file_age_hours:.0f}時間前）がまだ適用されていません。\n"
+            f"現在のバージョンは v{version_mgr.CURRENT_VERSION} です。\n\n"
+            "今すぐ更新を適用しますか？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+
+        if reply == QMessageBox.StandardButton.Yes:
+            self._apply_pending_update(zip_path)
     
     def _apply_pending_update(self, zip_path: str):
         """未適用の更新を適用"""
