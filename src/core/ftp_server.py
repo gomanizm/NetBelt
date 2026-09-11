@@ -6,6 +6,7 @@ from PyQt6.QtCore import QObject, pyqtSignal
 from pyftpdlib.authorizers import DummyAuthorizer
 from pyftpdlib.handlers import FTPHandler, DTPHandler
 from pyftpdlib.servers import FTPServer as _PyFTPServer
+from pyftpdlib.ioloop import IOLoop as _PyIOLoop
 
 from .crypto import PasswordCrypto
 
@@ -174,7 +175,13 @@ class FTPServerManager(QObject):
             _pyftpd_logger.setLevel(logging.WARNING)
             if not _pyftpd_logger.handlers:
                 _pyftpd_logger.addHandler(logging.NullHandler())
-            self._server = _PyFTPServer(("0.0.0.0", port), _Handler)
+            # ioloop を渡さないと、pyftpdlib はプロセス全体で 1 つの共有
+            # インスタンスを使う。共有すると、片方を停止したときの
+            # close_all() がもう片方の待ち受けソケットまで閉じ、さらに
+            # 2 本の待受スレッドが select() へ渡す同じ list を同時に
+            # 読み書きしてプロセスごと落ちる
+            self._server = _PyFTPServer(("0.0.0.0", port), _Handler,
+                                        ioloop=_PyIOLoop.factory())
             self.port = self._server.address[1]
         except Exception as e:
             self.error_occurred.emit("FTP起動失敗: %s" % e)
