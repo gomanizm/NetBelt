@@ -144,10 +144,20 @@ class LogSaveProgressDialog(QDialog):
     
     def _on_cancel(self):
         """キャンセルボタンクリック時の処理"""
+        self.reject()
+
+    def reject(self):
+        """閉じる前にワーカーを止めて待つ
+
+        キャンセルボタンだけでなく Esc やタイトルバーの × もここへ来る
+        （QDialog は Esc と closeEvent で reject() を呼ぶ）。ここで止めないと
+        進捗表示だけが消えて裏で書き込みが続き、直後にアプリを終了すると
+        途中で切れたファイルが黙って残る。
+        """
         if self.worker and self.worker.isRunning():
             self.worker.cancel()
             self.worker.wait()
-        self.reject()
+        super().reject()
     
     def exec(self) -> bool:
         """
