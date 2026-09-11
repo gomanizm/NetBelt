@@ -57,6 +57,7 @@ class SettingsCancelAfterFailedSaveTest(unittest.TestCase):
         finally:
             cm.save_config = real_save
         warn.assert_called_once()
+        self.last_warning = warn.call_args[0][2]
         self.assertNotEqual(dlg.result(), int(dlg.DialogCode.Accepted))
         dlg.reject()
         return dlg
@@ -111,6 +112,30 @@ class SettingsCancelAfterFailedSaveTest(unittest.TestCase):
         self.assertEqual(cm.get_server_settings("terminal")["font_size"], 11)
         self.assertTrue(cm.get_server_settings("sftp")["confirm_delete"])
         self.assertTrue(cm.get_check_on_startup())
+        # メモリだけでは足りない。失敗前のセクションは既にディスクへ書かれて
+        # おり、失敗後に成功した setter が変更後のメモリを config 丸ごと
+        # 書き出すので、ディスクには取り消した変更が全部残る。
+        disk = self._on_disk(cm)
+        self.assertEqual(disk["settings"]["terminal"]["font_size"], 11,
+                         "失敗前に書けたセクションがディスクに残っている")
+        self.assertTrue(disk["settings"]["sftp"]["confirm_delete"])
+        self.assertTrue(disk["update_settings"]["check_on_startup"],
+                        "失敗後に成功した setter が取り消した値を書き出している")
+        # 次の起動（＝再読み込み）でも戻っていること
+        from core.config_manager import ConfigManager
+        reloaded = ConfigManager(config_path=str(cm.config_path))
+        self.assertTrue(reloaded.get_server_settings("sftp")["confirm_delete"],
+                        "再起動で削除確認が黙って無効に戻っている")
+        self.assertEqual(reloaded.get_server_settings("terminal")["font_size"], 11)
+        self.assertTrue(reloaded.get_check_on_startup())
+        self.assertNotIn("元に戻す", self.last_warning,
+                         "ディスクも戻せたのに戻せなかったと伝えている")
+
+    def test_the_warning_says_when_even_the_rollback_could_not_be_saved(self):
+        """戻した内容もディスクへ書けなかったときは、そう伝えること。"""
+        cm = self._manager()
+        self._fail_ok_then_cancel(cm, mock.Mock(return_value=False))
+        self.assertIn("元に戻す", self.last_warning)
 
     def test_a_successful_save_still_applies_everything(self):
         """保存できたときは、これまでどおり全部効くこと。"""
