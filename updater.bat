@@ -187,6 +187,10 @@ REM 実行ファイルは直接上書きしない。コピーは宛先を先に�
 REM 順に書くので、途中で止まる（コンソールを閉じる・電源断）と旧 exe は
 REM 既に無く、末尾がゼロ埋めの exe だけが残る。一時名で置いてから改名で
 REM 差し替える。同一ボリューム内の改名は途中で止まらない。
+REM 一時名で置くのは exe だけ。同梱の他のファイルは従来どおり xcopy で
+REM 直接上書きするので、下の差し替えが失敗すると旧 exe と新しい同梱
+REM ファイルが混在する。全部を揃えてから入れ替えるには展開先ごと
+REM 差し替える必要があるため、ここでは失敗時にその旨を伝えるに留める。
 if exist "!SOURCE_DIR!\NetBelt.exe" ren "!SOURCE_DIR!\NetBelt.exe" "NetBelt.exe.new"
 
 REM ファイルをコピー（上書き）
@@ -194,6 +198,8 @@ xcopy "!SOURCE_DIR!\*" "!APP_DIR!" /E /I /Y /Q >nul 2>&1
 if errorlevel 1 (
     echo エラー: ファイルのコピーに失敗しました
     echo   アプリがまだ起動したままだと、上書きできません
+    echo   NetBelt.exe は旧版のままですが、同梱の他のファイルは
+    echo   一部またはすべてが新しい版に置き換わっている場合があります。
     del "!APP_DIR!NetBelt.exe.new" 2>nul
     rd /s /q "!TEMP_DIR!" 2>nul
     pause
@@ -205,6 +211,8 @@ REM 肝心の実行ファイルが置かれたかどうかは分からない。
 if not exist "!APP_DIR!NetBelt.exe.new" (
     echo エラー: 更新ファイルに NetBelt.exe が含まれていません
     echo   場所: !SOURCE_DIR!
+    echo   NetBelt.exe は旧版のままですが、同梱の他のファイルは
+    echo   既に新しい版へ置き換わっています。
     rd /s /q "!TEMP_DIR!" 2>nul
     pause
     exit /b 1
@@ -213,6 +221,9 @@ move /y "!APP_DIR!NetBelt.exe.new" "!APP_DIR!NetBelt.exe" >nul 2>&1
 if errorlevel 1 (
     echo エラー: NetBelt.exe を差し替えられませんでした
     echo   アプリがまだ起動したままだと、差し替えられません
+    echo   NetBelt.exe は旧版のままですが、同梱の他のファイルは
+    echo   既に新しい版へ置き換わっています。アプリを終了してから
+    echo   もう一度更新してください。
     del "!APP_DIR!NetBelt.exe.new" 2>nul
     rd /s /q "!TEMP_DIR!" 2>nul
     pause

@@ -121,6 +121,31 @@ class UpdaterExeStagingTest(unittest.TestCase):
         _unlock(handle)
         self.assertEqual(self._read("NetBelt.exe"), "old", out)
 
+    def test_a_failed_exe_swap_says_the_other_files_are_already_new(self):
+        """exe の差し替えに失敗したら、混在状態になったことを伝えること。
+
+        xcopy が置くのは NetBelt.exe.new という別名なので、exe が
+        施錠されていても同梱の他のファイルはそのまま新版へ入れ替わる。
+        その後の改名が失敗したときに「差し替えられませんでした」と
+        だけ出すと、利用者は旧 exe と新しい同梱ファイルが混在した
+        状態に気づかないまま使い続ける。直接上書きしていた頃は
+        xcopy が exe で止まったので、他のファイルは触られなかった。
+        """
+        self._write("zz_notes.txt", "old-notes")
+        handle = _lock_exclusively(os.path.join(self.app_dir, "NetBelt.exe"))
+        self.addCleanup(_unlock, handle)
+
+        code, out = self._run({"NetBelt.exe": "new",
+                               "zz_notes.txt": "new-notes"})
+
+        self.assertNotEqual(code, 0, "差し替えできていないのに成功と報告した\n"
+                            + out)
+        self.assertEqual(self._read("zz_notes.txt"), "new-notes",
+                         "前提が崩れている（他のファイルが入れ替わっていない）:\n"
+                         + out)
+        self.assertIn("他のファイル", out,
+                      "他のファイルだけ新版になったことを伝えていない:\n" + out)
+
     def test_a_successful_update_leaves_no_staging_file(self):
         """成功したら、一時名の exe を置き去りにしないこと。"""
         code, out = self._run({"NetBelt.exe": "new", "README.txt": "r"})
