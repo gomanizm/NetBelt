@@ -24,6 +24,11 @@ from core.terminal.attrs import DEFAULT, apply_sgr
 
 BLANK = (" ", DEFAULT)
 
+# 1 セルへ繋げる幅 0 の文字の数の上限 (基底の文字を含む長さ)。書記素
+# クラスタとして現実的な長さを超えると表示の意味が無く、化けた出力を
+# UTF-8 として読んだときに可視行の 1 セルが伸び続ける
+MAX_CELL_TEXT = 8
+
 # DEC Special Graphics (ESC ( 0 で指示される罫線用文字集合)
 DEC_GRAPHICS = dict(zip(
     "`abcdefghijklmnopqrstuvwxyz{|}~",
@@ -42,6 +47,10 @@ def _cell_width(ch):
     結合文字 (Mn/Me) と書式文字 (Cf: ZWJ・ZWNJ 等) は 0、東アジア幅
     W/F (漢字・かな・絵文字) は 2、それ以外は 1。xterm と同じ数え方。
     """
+    if ch < "\u00ad":
+        # U+00AD (SOFT HYPHEN, Cf) より前は例外なく 1 セル。機器の
+        # 出力はほぼ全部ここで返る (unicodedata を 2 回引かない)
+        return 1
     if unicodedata.category(ch) in ("Mn", "Me", "Cf"):
         return 0
     if unicodedata.east_asian_width(ch) in ("W", "F"):
@@ -246,6 +255,14 @@ class Screen(object):
                 # 全角が右端の 1 セルに収まらない。xterm と同じく右端は
                 # 空けたまま丸ごと次の行へ送る (折り返し無効なら手前に重ねる)
                 if self.autowrap:
+                    # 空けたセルは印字していない。折り返し行は描画側で
+                    # 末尾を刈らずに次の行へ繋ぐので、残すとコピーと
+                    # ログへ空白が 1 つ混ざる
+                    skipped = self.lines[self.cursor_row]
+                    keep = self.cols - 1
+                    if keep < len(skipped) and skipped[keep][0] == "":
+                        keep -= 1       # 右端は全角の後ろ半分。丸ごと落とす
+                    del skipped[keep:]
                     self.cursor_col = 0
                     self._linefeed(from_wrap=True)
                     from_wrap = True
@@ -291,7 +308,7 @@ class Screen(object):
 
         右端で折り返し待ちなら今のセル、そうでなければ 1 つ左のセル。
         そこが全角の継続セルなら、その全角本体へ繋げる。前に文字が無い
-        (行頭) ときは捨てる。
+        (行頭) ときと、セルが MAX_CELL_TEXT まで伸びているときは捨てる。
         """
         line = self.lines[self.cursor_row]
         i = self.cursor_col if self._pending_wrap else self.cursor_col - 1
@@ -300,6 +317,8 @@ class Screen(object):
         if not 0 <= i < len(line):
             return
         text, attr = line[i]
+        if len(text) >= MAX_CELL_TEXT:
+            return                      # 伸びすぎたセルへはもう繋げない
         line[i] = (text + ch, attr)
         self.dirty.add(self.cursor_row)
 
