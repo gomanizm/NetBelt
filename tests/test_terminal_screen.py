@@ -305,6 +305,37 @@ class UnknownSequenceTest(unittest.TestCase):
         self.assertEqual(s.text()[0], "abcdef")
 
 
+class IntermediateByteTest(unittest.TestCase):
+    """中間バイト付きの列は別の命令。最終文字だけで既知命令と取り違えない。
+
+    ESC % c が RIS、ESC[?1049$h が代替画面切替として実行されていた。
+    実在する列でも ESC # 8 (DECALN) が DECRC、ESC * E (G2 指示) が
+    NEL に化けてカーソルがずれる。
+    """
+
+    def test_esc_with_an_intermediate_is_not_ris(self):
+        s = feed(Screen(), "KEEP\x1b%c")
+        self.assertEqual(s.text()[0], "KEEP")
+        self.assertEqual(len(s.history), 0)
+
+    def test_csi_private_mode_with_an_intermediate_is_ignored(self):
+        s = feed(Screen(), "MAIN\x1b[?1049$hALT")
+        self.assertFalse(s.alt_active)
+        self.assertEqual(s.text()[0], "MAINALT")
+
+    def test_decaln_is_not_mistaken_for_decrc(self):
+        s = feed(Screen(), "AB\x1b[2;3H\x1b#8Z")
+        self.assertEqual(s.text()[:2], ["AB", "  Z"])
+
+    def test_a_g2_designation_is_not_mistaken_for_nel(self):
+        s = feed(Screen(), "AB\x1b*EZ")
+        self.assertEqual(s.text()[:2], ["ABZ", ""])
+
+    def test_charset_designation_still_works(self):
+        s = feed(Screen(), "\x1b(0lqk\x1b(Bx")
+        self.assertEqual(s.text()[0], "┌─┐x")
+
+
 class EscDispatchTest(unittest.TestCase):
     def test_save_and_restore_cursor_with_attributes(self):
         s = feed(Screen(), "\x1b[3;3H\x1b[7m\x1b7\x1b[H\x1b[m\x1b8X")

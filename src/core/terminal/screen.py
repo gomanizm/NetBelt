@@ -287,7 +287,9 @@ class Screen(object):
         self.dirty.add(self.cursor_row)
 
     def _csi(self, seq):
-        if seq.private == "?" and seq.final in "hl":
+        # 中間バイト付きは別の命令 (ESC[?1049$h は h/l を持つ実在列が無い)。
+        # 最終文字だけで DECSET/DECRST と取り違えない
+        if seq.private == "?" and not seq.intermediate and seq.final in "hl":
             return self._private_mode(seq)
         if seq.private or seq.intermediate:
             return                      # DECSCUSR 等、表示に関わらない
@@ -358,6 +360,11 @@ class Screen(object):
     def _esc(self, seq):
         if seq.intermediate in ("(", ")"):      # 文字集合の指示
             self._g[seq.intermediate] = seq.final
+        elif seq.intermediate:
+            # ESC # 8 (DECALN)・ESC * E (G2 指示)・ESC % G など、中間
+            # バイト付きは別の命令。最終文字だけで DECRC・NEL・RIS と
+            # 取り違えると、カーソルがずれたり画面が消えたりする
+            return
         elif seq.final == "7":
             self._saved = (self.cursor_row, self.cursor_col, self.attr)
         elif seq.final == "8":
