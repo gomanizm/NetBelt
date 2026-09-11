@@ -1856,6 +1856,13 @@ for details.
     
     def _check_pending_updates(self):
         """未適用の更新ファイルをチェック"""
+        from core.version_manager import running_from_source
+        # ソース実行では配布物を当てられないので、勧めもしない。
+        # 当てるとリポジトリ直下がビルド済みの exe 一式で上書きされ、
+        # ソースは変わらないので次の起動でもまた勧めることになる。
+        if running_from_source():
+            return
+
         version_mgr = VersionManager()
         pending_files = version_mgr.get_pending_update_files()
         
@@ -1911,6 +1918,13 @@ for details.
         """未適用の更新を適用"""
         # updater.batのパスを取得
         import sys
+
+        from core.version_manager import (
+            running_from_source, SOURCE_RUN_MESSAGE)
+        # ソース実行では当てない（_check_pending_updates と同じ理由）
+        if running_from_source():
+            QMessageBox.information(self, "更新", SOURCE_RUN_MESSAGE)
+            return
         
         if getattr(sys, 'frozen', False):
             app_dir = os.path.dirname(sys.executable)

@@ -12,7 +12,8 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QFont
 from core.version_manager import (
-    VersionManager, updater_command, updater_env)
+    VersionManager, updater_command, updater_env, running_from_source,
+    SOURCE_RUN_MESSAGE)
 
 
 class DownloadThread(QThread):
@@ -309,6 +310,12 @@ class UpdateDialog(QDialog):
     
     def _on_apply_clicked(self):
         """更新適用ボタンがクリックされた"""
+        # ソース実行では当てない。配布物はビルド済みの exe 一式で、
+        # 展開先はリポジトリ直下、再起動先は Python 本体になる。
+        if running_from_source():
+            QMessageBox.information(self, "更新", SOURCE_RUN_MESSAGE)
+            return
+
         if not self.downloaded_zip_path or not os.path.exists(self.downloaded_zip_path):
             QMessageBox.warning(
                 self,

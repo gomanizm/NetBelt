@@ -3,6 +3,7 @@
 """
 
 import os
+import sys
 import json
 import tempfile
 import requests
@@ -58,6 +59,22 @@ def updater_command(updater_path: str, zip_path: str, app_path: str) -> str:
                 "フォルダ名を変えるか、新しい ZIP を手で展開してください。\n"
                 "対象: %s" % (" ".join(found), path))
     return '"{}" "{}" "{}"'.format(updater_path, zip_path, app_path)
+
+
+# ソース実行で更新を当てようとしたときに出す案内。
+# 配布 ZIP はビルド済みの exe 一式で、展開先はリポジトリ直下になる。
+SOURCE_RUN_MESSAGE = (
+    "ソースから実行しているため、更新を自動で適用できません。\n\n"
+    "配布物の ZIP はビルド済みの NetBelt.exe 一式で、展開先は\n"
+    "このリポジトリの直下になります。追跡しているファイルが\n"
+    "上書きされ、再起動も Python 本体が開くだけになります。\n\n"
+    "git pull で更新するか、README の手順で ZIP を別のフォルダへ\n"
+    "手で展開してください。")
+
+
+def running_from_source() -> bool:
+    """ソースから動いているか（凍結された exe でないか）を返す。"""
+    return not getattr(sys, 'frozen', False)
 
 
 def updater_env() -> dict:
