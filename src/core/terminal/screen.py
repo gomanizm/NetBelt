@@ -535,7 +535,11 @@ class Screen(object):
             return
         for _ in range(n):
             if insert:
-                line.pop()
+                # 行が桁数いっぱいのときだけ右端を押し出す。折り返し行は
+                # 広げても埋めないので桁数より短いことがあり、そこで
+                # 無条件に pop すると余裕があるのに行末の文字が消える
+                if len(line) >= self.cols:
+                    line.pop()
                 line.insert(self.cursor_col, BLANK)
             else:
                 line.pop(self.cursor_col)

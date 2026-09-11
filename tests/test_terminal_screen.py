@@ -170,6 +170,24 @@ class EditingTest(unittest.TestCase):
         feed(s, "\x1b[3P")
         self.assertEqual(len(s.lines[0]), 80)
 
+    def test_ich_on_a_widened_wrapped_row_keeps_the_last_character(self):
+        """折り返し行は広げても埋めないので、桁数より短いことがある。
+
+        そこへ ICH すると、桁に余裕があるのに行末の文字が捨てられていた
+        (4 桁で "ABCDE" → 8 桁へ広げて CUP 1;3 ESC[@ で 'D' が消えた)。
+        押し出すのは行が桁数いっぱいのときだけ。
+        """
+        s = feed(Screen(rows=3, cols=4), "ABCDE")
+        s.set_size(3, 8)
+        feed(s, "\x1b[1;3H\x1b[@")
+        self.assertEqual(s.text()[0], "AB CD")
+        self.assertLessEqual(len(s.lines[0]), 8, "行が桁数を超えて伸びた")
+
+    def test_ich_on_a_full_row_still_pushes_the_last_character_off(self):
+        s = feed(Screen(rows=3, cols=8), "ABCDEFGH\x1b[1;3H\x1b[@")
+        self.assertEqual(s.text()[0], "AB CDEFG")
+        self.assertEqual(len(s.lines[0]), 8)
+
 
 class WrapMarkTest(unittest.TestCase):
     """折り返しの印は、折り返しで付き、その行への印字・消去で外れる。
