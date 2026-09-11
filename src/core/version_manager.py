@@ -6,6 +6,7 @@ import os
 import sys
 import json
 import tempfile
+import threading
 import requests
 from typing import Optional, Dict, Callable
 from datetime import datetime
@@ -304,6 +305,30 @@ class VersionManager:
             return {'available': False, 'error': f"更新の確認に失敗しました: {e}"}
     
     @staticmethod
+    def _safe_name_part(text) -> str:
+        """ファイル名に使える文字だけを残す（版はリリースのタグ由来）。"""
+        return ''.join(c for c in str(text)
+                       if c.isalnum() or c in ('.', '_', '-'))
+
+    @classmethod
+    def _download_filename(cls, url: str, version: Optional[str] = None) -> str:
+        """ダウンロード先のファイル名を決める。
+
+        GitHub の asset は API 形式の URL（末尾は asset の番号）で取るため、
+        basename からはファイル名が分からず、どの版も同じ
+        NetBelt-update.zip を共有していた。後から来たダウンロードが、
+        別の版を表示しているダイアログの ZIP を静かに置き換えられる。
+        版が分かっているときは版ごとに分ける。
+        """
+        safe = cls._safe_name_part(version) if version else ''
+        if safe:
+            return f"{APP_NAME}-{safe}.zip"
+        filename = os.path.basename(url)
+        if not filename.endswith('.zip'):
+            filename = f"{APP_NAME}-update.zip"
+        return filename
+
+    @staticmethod
     def _discard(path: str) -> None:
         """検証に失敗したダウンロードを残さない。"""
         try:
@@ -366,10 +391,8 @@ class VersionManager:
         # 受信中に例外が出ても書きかけを残さないよう、外側でも掴んでおく
         part_path = None
         try:
-            # ファイル名を生成
-            filename = os.path.basename(url)
-            if not filename.endswith('.zip'):
-                filename = f"{APP_NAME}-update.zip"
+            # ファイル名を生成（版ごとに分ける）
+            filename = self._download_filename(url, version)
             
             zip_path = os.path.join(self.UPDATE_DIR, filename)
             
@@ -399,7 +422,10 @@ class VersionManager:
             
             # 検証を通るまでは .part 名で書く。最終名(.zip)で書くと、中断した
             # 未検証ファイルが「未適用の更新」として拾われ、検証なしで適用できる。
-            part_path = zip_path + '.part'
+            # 名前はダウンロードごとに変える。共有していたときは、同時に
+            # 受信した2つが同じ .part を奪い合って両方とも失敗していた。
+            part_path = '%s.%d-%d.part' % (zip_path, os.getpid(),
+                                           threading.get_ident())
             self._discard(part_path)
             with open(part_path, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=8192):
@@ -438,7 +464,9 @@ class VersionManager:
 
             # 検証を通ったものだけを最終名にする。あわせて検証済みの証として
             # ハッシュを傍らに残し、適用時にもう一度確かめられるようにする。
-            self._discard(zip_path)
+            # os.replace は宛先があっても置き換えるので、先に消さない。
+            # 消してから改名していたときは、その隙に別の受信が失敗すると
+            # 検証済みだった ZIP まで失われた。
             os.replace(part_path, zip_path)
             try:
                 # 版も控える。控えないと、次回起動時に「これは今より新しいか」を

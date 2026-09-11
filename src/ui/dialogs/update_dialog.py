@@ -324,6 +324,23 @@ class UpdateDialog(QDialog):
             )
             return
         
+        # 表示した版と同じものを渡す。ダウンロード先が版ごとに分かれる前は、
+        # 後から来た受信が、先に表示したダイアログの ZIP を置き換えられた。
+        # 適用時は存在確認しかしていなかったので、そのまま別の版が当たる。
+        version_mgr = VersionManager()
+        shown_version = self.update_info.get('version')
+        pending_version = VersionManager.pending_version(
+            self.downloaded_zip_path)
+        if not version_mgr.is_verified_update(self.downloaded_zip_path) or (
+                shown_version and pending_version != shown_version):
+            QMessageBox.warning(
+                self,
+                "エラー",
+                "ダウンロードした更新ファイルが、表示していた内容と\n"
+                "一致しません。もう一度ダウンロードしてください。"
+            )
+            return
+
         # updater.batのパスを取得
         if getattr(sys, 'frozen', False):
             # PyInstallerでビルドされている場合

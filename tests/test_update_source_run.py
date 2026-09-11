@@ -12,8 +12,12 @@ Python コンソールが開く。ソースは変わらないため、次の起�
 凍結された exe では従来どおり適用できること（当て過ぎでないこと）も
 同じ形で確かめる。
 """
+import hashlib
+import io
 import os
+import shutil
 import sys
+import tempfile
 import types
 import unittest
 import unittest.mock
@@ -21,6 +25,20 @@ import unittest.mock
 sys.path.insert(0, "src")
 
 HERE = os.path.abspath(__file__)
+
+def place_verified_zip(directory, version):
+    """検証を通った ZIP 一式（本体・.sha256・.version）を置く。
+
+    適用の直前に「表示した版と同じ、検証を通った ZIP か」を確かめるので、
+    起動経路を試すにはこの3つが揃っている必要がある。
+    """
+    body = b"PK" + version.encode("ascii") * 8
+    path = os.path.join(directory, "NetBelt-%s.zip" % version)
+    io.open(path, "wb").write(body)
+    io.open(path + ".sha256", "w").write(hashlib.sha256(body).hexdigest())
+    io.open(path + ".version", "w").write(version)
+    return path
+
 
 
 class _PopenSpy:
@@ -57,9 +75,11 @@ class SourceRunApplyTest(unittest.TestCase):
 
     def _dialog(self):
         from ui.dialogs.update_dialog import UpdateDialog
+        tmp = tempfile.mkdtemp(prefix="netbelt-source-")
+        self.addCleanup(shutil.rmtree, tmp, True)
         dialog = UpdateDialog(None, {"version": "9.9.9"})
         self.addCleanup(dialog.deleteLater)
-        dialog.downloaded_zip_path = HERE
+        dialog.downloaded_zip_path = place_verified_zip(tmp, "9.9.9")
         return dialog
 
     def test_the_dialog_does_not_launch_the_updater_from_source(self):

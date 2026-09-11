@@ -12,8 +12,12 @@ python DLL を読もうとし、Python が一度も起動しないまま落ち�
 起動経路は2つ（ダイアログの「更新を適用」と、起動時の未適用更新）あり、
 片方だけ直すと再発するので、両方を見る。
 """
+import hashlib
+import io
 import os
+import shutil
 import sys
+import tempfile
 import types
 import unittest
 import unittest.mock
@@ -21,6 +25,20 @@ import unittest.mock
 sys.path.insert(0, "src")
 
 VAR = "PYINSTALLER_RESET_ENVIRONMENT"
+
+def place_verified_zip(directory, version):
+    """検証を通った ZIP 一式（本体・.sha256・.version）を置く。
+
+    適用の直前に「表示した版と同じ、検証を通った ZIP か」を確かめるので、
+    起動経路を試すにはこの3つが揃っている必要がある。
+    """
+    body = b"PK" + version.encode("ascii") * 8
+    path = os.path.join(directory, "NetBelt-%s.zip" % version)
+    io.open(path, "wb").write(body)
+    io.open(path + ".sha256", "w").write(hashlib.sha256(body).hexdigest())
+    io.open(path + ".version", "w").write(version)
+    return path
+
 
 
 class UpdaterEnvTest(unittest.TestCase):
@@ -56,8 +74,9 @@ class RestartEnvironmentTest(unittest.TestCase):
     """2つの起動経路が、どちらも印を立てた環境で updater.bat を呼ぶこと。"""
 
     def setUp(self):
-        # 存在確認を通すためだけに使うので、実在するパスなら何でもよい
-        self.zip_path = os.path.abspath(__file__)
+        self.tmp = tempfile.mkdtemp(prefix="netbelt-restart-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.zip_path = place_verified_zip(self.tmp, "9.9.9")
 
     def test_update_dialog_resets_the_pyinstaller_environment(self):
         from ui.dialogs.update_dialog import UpdateDialog
