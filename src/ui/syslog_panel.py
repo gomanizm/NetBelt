@@ -637,7 +637,7 @@ class SyslogPanel(QWidget):
             source_row = self.proxy_model.mapToSource(index).row()
             msg = self.model.get_message(source_row)
             if msg:
-                lines.append(f"{msg.timestamp} {msg.hostname} [{msg.level}] {msg.message}")
+                lines.append(self._export_line(msg))
         
         QApplication.clipboard().setText("\n".join(lines))
     

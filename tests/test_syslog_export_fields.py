@@ -86,5 +86,17 @@ class SyslogExportFieldsTest(unittest.TestCase):
         self.assertIn("link down", content)
 
 
+    def test_copy_selected_distinguishes_the_two_sources(self):
+        from PyQt6.QtWidgets import QApplication
+        self.panel.table_view.selectAll()
+        self.panel._copy_selected()
+        text = QApplication.clipboard().text()
+        lines = text.splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertIn("192.0.2.1 (UDP/514)", text, "送信元が無い: %r" % text)
+        self.assertIn("192.0.2.2 (TCP/1514)", text, "送信元が無い: %r" % text)
+        self.assertNotEqual(lines[0], lines[1], "別機器の行が同一になっている")
+
+
 if __name__ == "__main__":
     unittest.main()
