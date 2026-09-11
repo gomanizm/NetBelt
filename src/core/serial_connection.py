@@ -1,6 +1,7 @@
 """
 シリアルポート接続クラス
 """
+import codecs
 import serial
 import serial.tools.list_ports
 from PyQt6.QtCore import QObject, pyqtSignal, QThread
@@ -113,36 +114,45 @@ class SerialConnection(QObject):
     def _start_read_thread(self):
         """読み取りスレッドを開始"""
         import threading
-        
-        def read_loop():
-            """データを継続的に読み取る"""
-            while self._is_connected and not self._should_stop:
-                try:
-                    if self.serial_conn and self.serial_conn.is_open and self.serial_conn.in_waiting > 0:
-                        # データを読み取り
-                        data = self.serial_conn.read(self.serial_conn.in_waiting)
-                        
-                        # デコードして出力
-                        try:
-                            text = data.decode('utf-8', errors='replace')
-                            self.output_received.emit(text)
-                        except Exception as e:
-                            self.error_occurred.emit(f"デコードエラー: {str(e)}")
-                    else:
-                        # データがない場合は少し待つ
-                        time.sleep(0.01)
-                        
-                except serial.SerialException as e:
-                    self.error_occurred.emit(f"読み取りエラー: {str(e)}")
-                    self._is_connected = False
-                    break
-                except Exception as e:
-                    self.error_occurred.emit(f"予期しないエラー: {str(e)}")
-                    break
-        
+
         # スレッドを開始
-        thread = threading.Thread(target=read_loop, daemon=True)
+        thread = threading.Thread(target=self._read_loop, daemon=True)
         thread.start()
+
+    def _read_loop(self):
+        """データを継続的に読み取る"""
+        # 受信の切れ目で割れた多バイト文字を、次の受信と繋いで復号する。
+        # in_waiting > 0 で即読むので、9600bps では 3 バイト文字の途中で
+        # 読むことが多く、受信ごとに復号すると日本語が頻繁に化ける
+        decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
+        while self._is_connected and not self._should_stop:
+            try:
+                if self.serial_conn and self.serial_conn.is_open and self.serial_conn.in_waiting > 0:
+                    # データを読み取り
+                    data = self.serial_conn.read(self.serial_conn.in_waiting)
+
+                    # デコードして出力
+                    try:
+                        text = decoder.decode(data)
+                        if text:
+                            self.output_received.emit(text)
+                    except Exception as e:
+                        self.error_occurred.emit(f"デコードエラー: {str(e)}")
+                else:
+                    # データがない場合は少し待つ
+                    time.sleep(0.01)
+
+            except serial.SerialException as e:
+                self.error_occurred.emit(f"読み取りエラー: {str(e)}")
+                self._is_connected = False
+                break
+            except Exception as e:
+                self.error_occurred.emit(f"予期しないエラー: {str(e)}")
+                break
+        # 切れ目で終わった未完の文字を捨てない
+        rest = decoder.decode(b'', final=True)
+        if rest:
+            self.output_received.emit(rest)
     
     def send_command(self, command: str):
         """

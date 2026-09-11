@@ -1,4 +1,5 @@
 """SSH接続管理"""
+import codecs
 import paramiko
 import threading
 import time
@@ -343,17 +344,19 @@ class SSHConnection(QObject):
 
     def _read_output(self):
         """バックグラウンドで出力を読み取る"""
+        # 受信の切れ目で割れた多バイト文字を、次の受信と繋いで復号する。
+        # 受信ごとに復号すると、前半と後半がそれぞれ U+FFFD になり、
+        # 画面にもセッションログにも化けたまま渡る
+        decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
         while not self._stop_reading and self.is_connected:
             try:
                 if self.channel and self.channel.recv_ready():
                     data = self.channel.recv(4096)
                     if data:
-                        try:
-                            text = data.decode('utf-8', errors='replace')
-                            # リアルタイムで出力（バッファリングなし）
+                        text = decoder.decode(data)
+                        # リアルタイムで出力（バッファリングなし）
+                        if text:
                             self.output_received.emit(text)
-                        except UnicodeDecodeError:
-                            pass
                     else:
                         # データがないのにrecv_readyがTrueの場合は接続が閉じられた
                         if self.is_connected:
@@ -374,3 +377,7 @@ class SSHConnection(QObject):
                     self.is_connected = False
                     self.disconnected.emit()
                 break
+        # 切れ目で終わった未完の文字を捨てない
+        rest = decoder.decode(b'', final=True)
+        if rest:
+            self.output_received.emit(rest)

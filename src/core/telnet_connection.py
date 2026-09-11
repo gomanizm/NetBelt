@@ -1,4 +1,5 @@
 """Telnet接続管理"""
+import codecs
 import socket
 import threading
 import time
@@ -137,7 +138,10 @@ class TelnetConnection(QObject):
     
     def _read_output(self):
         """バックグラウンドで出力を読み取る"""
-        buffer = b''      # UTF-8 の途中で切れた分
+        # UTF-8 の途中で切れた分はデコーダの中に残り、次の受信と繋がる。
+        # 溜めて閾値で強制復号すると、先頭バイトだけが化けたうえ、続きの
+        # プロンプトが次に閾値を超えるまで画面に出なかった
+        decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
         pending = b''     # 途中で切れた制御シーケンス（次の受信と繋げる）
 
         while not self._stop_reading and self.is_connected:
@@ -150,23 +154,9 @@ class TelnetConnection(QObject):
                             # pending に残し、次の受信の先頭へ繋ぐ
                             clean, pending = self._process_telnet_commands(
                                 pending + data)
-                            buffer += clean
-
-                            # バッファ内のデータをデコードして送信
-                            if buffer:
-                                try:
-                                    # 完全なUTF-8文字が揃っているか確認
-                                    text = buffer.decode('utf-8')
-                                    self.output_received.emit(text)
-                                    buffer = b''
-                                except UnicodeDecodeError:
-                                    # 不完全なUTF-8シーケンスの場合はバッファに保持
-                                    # 最大バッファサイズチェック（メモリリーク防止）
-                                    if len(buffer) > 100:
-                                        # 強制的にデコード
-                                        text = buffer.decode('utf-8', errors='replace')
-                                        self.output_received.emit(text)
-                                        buffer = b''
+                            text = decoder.decode(clean)
+                            if text:
+                                self.output_received.emit(text)
                         else:
                             # データがない場合は接続が閉じられた
                             if self.is_connected:
@@ -191,7 +181,11 @@ class TelnetConnection(QObject):
                     self.is_connected = False
                     self.disconnected.emit()
                 break
-    
+        # 切れ目で終わった未完の文字を捨てない
+        rest = decoder.decode(b'', final=True)
+        if rest:
+            self.output_received.emit(rest)
+
     # 未完のシーケンスを持ち越す上限。壊れた相手が IAC SB を送り続けて
     # 終端を寄こさない場合に、際限なく溜め込まないようにする。
     # 実際のサブネゴシエーションは数十バイトで収まる。
