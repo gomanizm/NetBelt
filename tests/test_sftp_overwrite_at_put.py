@@ -82,6 +82,85 @@ class SftpManagerRefusesUnconfirmedOverwriteTest(unittest.TestCase):
         self.assertEqual(self.errors, [])
         m.sftp_client.put.assert_called_once()
 
+    def test_a_stat_that_fails_for_another_reason_is_not_read_as_missing(self):
+        """「無い」以外の理由で stat が失敗したら、送らずに理由ごと知らせること。
+
+        stat を権限エラーで返す機器では、失敗を一律「無い」と読むと既存を
+        黙って潰す（実測: stat=PermissionError で put called: True, errs: []）。
+        """
+        m = self._manager()
+        m.sftp_client.stat.side_effect = PermissionError("Permission denied")
+
+        m.upload_file(self.local, "/A/config.cfg")
+
+        self.assertTrue(self._wait(lambda: self.errors or self.done),
+                        "完了もエラーも届かない")
+        m.sftp_client.put.assert_not_called()
+        self.assertEqual(self.done, [], "確認できていないのに完了を通知している")
+        self.assertTrue(any("Permission denied" in e for e in self.errors),
+                        self.errors)
+
+    def test_a_probe_that_times_out_refuses_and_says_so(self):
+        """stat が期限切れでも「無い」とは読まず、理由の書かれた拒否にすること。"""
+        m = self._manager()
+        m.sftp_client.stat.side_effect = TimeoutError()   # socket.timeout は str が空
+
+        m.upload_file(self.local, "/A/config.cfg")
+
+        self.assertTrue(self._wait(lambda: self.errors or self.done),
+                        "完了もエラーも届かない")
+        m.sftp_client.put.assert_not_called()
+        self.assertTrue(any("応答しません" in e for e in self.errors), self.errors)
+
+    def test_a_name_taken_by_a_remote_directory_is_not_an_overwrite(self):
+        """同名がディレクトリなら、専用の文言で断ること。
+
+        一覧を更新しても種別は変わらないので、「一覧を更新してやり直せ」と
+        案内すると利用者は抜けられない。
+        """
+        m = self._manager()
+        attr = mock.Mock()
+        attr.st_mode = 0o040755          # ディレクトリ
+        m.sftp_client.stat.return_value = attr
+
+        m.upload_file(self.local, "/A/adir")
+
+        self.assertTrue(self._wait(lambda: self.errors or self.done),
+                        "完了もエラーも届かない")
+        m.sftp_client.put.assert_not_called()
+        self.assertTrue(any("ディレクトリ" in e for e in self.errors), self.errors)
+        self.assertFalse(any("一覧を更新" in e for e in self.errors),
+                         "更新しても解決しない案内を出している: %s" % self.errors)
+
+    def test_a_missing_file_reported_without_a_message_is_uploaded(self):
+        """FileNotFoundError なら、文面に関係なく「無い」と読んでよい。"""
+        m = self._manager()
+        m.sftp_client.stat.side_effect = FileNotFoundError("gone")
+
+        m.upload_file(self.local, "/A/new.cfg")
+
+        self.assertTrue(self._wait(lambda: self.errors or self.done),
+                        "完了もエラーも届かない")
+        self.assertEqual(self.errors, [])
+        m.sftp_client.put.assert_called_once()
+
+    def test_a_generic_stat_failure_still_counts_as_missing(self):
+        """理由の分からない失敗は「無い」のまま（新しい名前を送れなくしない）。
+
+        見つからないときの応答は機器によって違う。NetBelt 同梱の SFTP サーバ
+        でさえ、無いファイルの stat に SFTP_FAILURE を返す（クライアント側は
+        IOError("Failure")）。ここを締めると初回の送信が全部断られる。
+        """
+        m = self._manager()
+        m.sftp_client.stat.side_effect = IOError("Failure")
+
+        m.upload_file(self.local, "/A/new.cfg")
+
+        self.assertTrue(self._wait(lambda: self.errors or self.done),
+                        "完了もエラーも届かない")
+        self.assertEqual(self.errors, [])
+        m.sftp_client.put.assert_called_once()
+
     def test_a_new_name_is_uploaded_without_confirmation(self):
         m = self._manager()
         m.sftp_client.stat.side_effect = IOError("No such file")
@@ -120,10 +199,19 @@ class SftpPanelPassesConfirmationTest(unittest.TestCase):
         return {"name": name, "is_dir": is_dir, "size": 10, "mode": 0o100644,
                 "permissions": "-rw-r--r--", "mtime": 0}
 
-    @staticmethod
-    def _overwrite_flag(manager):
+    def _overwrite_flag(self, manager):
+        """パネルがマネージャへ渡した上書きの可否を返す。
+
+        キーワードの有無まで見る。kwargs.get の既定値で済ませると、
+        overwrite を渡さない（＝受け手の既定値まかせ）実装でも assertFalse が
+        通ってしまい、修正の前後で結果が変わらない。
+        """
         manager.upload_file.assert_called_once()
-        return manager.upload_file.call_args.kwargs.get("overwrite", False)
+        kwargs = manager.upload_file.call_args.kwargs
+        self.assertIn("overwrite", kwargs,
+                      "upload_file に overwrite が渡されていない: %r"
+                      % (manager.upload_file.call_args,))
+        return kwargs["overwrite"]
 
     def test_3a_listing_of_another_directory_during_the_dialog(self):
         """ダイアログ中に /B の一覧が届いても、/A への送信は確認なしの扱いのまま。"""

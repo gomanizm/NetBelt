@@ -225,17 +225,43 @@ class SFTPManager(QObject):
         # バックグラウンドスレッドで実行
         threading.Thread(target=list_thread, daemon=True).start()
     
-    def _remote_exists(self, remote_path: str) -> bool:
-        """リモートに remote_path が存在するかを stat で確かめる（ロック内で呼ぶ）
+    # _remote_probe が返す、送る直前のリモートの状態
+    _REMOTE_MISSING = "missing"
+    _REMOTE_FILE = "file"
+    _REMOTE_DIR = "dir"
+    _REMOTE_UNSURE = "unsure"
 
-        見つからないときの応答は機器によって異なる（NO_SUCH_FILE 以外を
-        返すものもある）ので、stat の失敗はすべて「無い」と扱う。
+    def _remote_probe(self, remote_path: str):
+        """送る直前のリモートの状態を stat で確かめる（ロック内で呼ぶ）
+
+        stat の失敗を一律「無い」と読むと、既存ファイルの stat を権限エラーで
+        返す機器で、確認を経ていない上書きが黙って通る（実測: stat が
+        PermissionError のとき put が呼ばれ、既存が置き換わった）。「無い」
+        ではないと分かる失敗（権限が無い・期限切れ）は "unsure" にして送らない。
+
+        残る限界: 理由の分からない失敗は、これまでどおり「無い」と読む。
+        見つからないときの応答が機器によって違い、汎用の失敗で返すものが
+        あるため（実測: NetBelt 同梱の SFTP サーバも、無いファイルの stat に
+        SFTP_FAILURE を返す＝クライアント側は IOError("Failure")）。ここを
+        締めると、そうした機器へは新しい名前すら送れなくなる。
+
+        Returns:
+            (状態, 理由): 状態は "missing" / "file" / "dir" / "unsure"。
+            "unsure" は有無を確かめられなかったときで、理由にその説明が入る
         """
         try:
-            self.sftp_client.stat(remote_path)
-        except IOError:
-            return False
-        return True
+            attr = self.sftp_client.stat(remote_path)
+        except PermissionError as e:
+            return self._REMOTE_UNSURE, str(e) or e.__class__.__name__
+        except TimeoutError:   # socket.timeout の別名。str が空なので補う
+            return self._REMOTE_UNSURE, (
+                f"機器が{self.CHANNEL_TIMEOUT_SECONDS:g}秒応答しません")
+        except Exception:
+            return self._REMOTE_MISSING, ""
+        mode = getattr(attr, "st_mode", None)
+        if isinstance(mode, int) and self._is_directory(mode):
+            return self._REMOTE_DIR, ""
+        return self._REMOTE_FILE, ""
 
     def upload_file(self, local_path: str, remote_path: str = None,
                     overwrite: bool = False):
@@ -295,11 +321,29 @@ class SFTPManager(QObject):
                         return
                     # 確認を経ていない送信は、送る直前の実際の状態で判定する。
                     # ロック内なので、先行する転送の結果も見える
-                    if not overwrite and self._remote_exists(remote_path):
-                        self.error_occurred.emit(
-                            f"リモートに '{remote_name}' が既にあります。上書きの確認を"
-                            "経ていないので送りませんでした。一覧を更新してからやり直してください")
-                        return
+                    if not overwrite:
+                        state, why = self._remote_probe(remote_path)
+                        if state == self._REMOTE_DIR:
+                            # 一覧を取り直しても種別は変わらない。やり直し方を
+                            # 案内せず、できないことをそのまま伝える
+                            self.error_occurred.emit(
+                                f"リモートの '{remote_name}' はディレクトリです。"
+                                "ファイルで上書きできません")
+                            return
+                        if state == self._REMOTE_FILE:
+                            self.error_occurred.emit(
+                                f"リモートに '{remote_name}' が既にあります。上書きの確認を"
+                                "経ていないので送りませんでした。一覧を更新してからやり直してください")
+                            return
+                        if state == self._REMOTE_UNSURE:
+                            # 期限切れで確かめられなかった場合、この接続は
+                            # 以後も使えないが、ここはロックの中なので畳めない
+                            # （disconnect が同じロックを取る）。次の操作が
+                            # _fail で切断する
+                            self.error_occurred.emit(
+                                f"リモートに '{remote_name}' があるか確かめられませんでした"
+                                f"（{why}）。上書きになる恐れがあるので送りませんでした")
+                            return
                     self.sftp_client.put(local_path, tmp_remote,
                                          callback=progress_callback)
                     # 全部送れてから最終名へ。posix_rename（OpenSSH 拡張）は
