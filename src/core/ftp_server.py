@@ -17,6 +17,13 @@ UNDECRYPTABLE_PASSWORD_MESSAGE = (
     "別の Windows アカウント/PC で保存された設定の可能性があります。"
     "パスワードを入力し直してください")
 
+# 停止時の join が上限で諦めたとき、ソケットを閉じるのは待受スレッド自身
+# なのでポートは掴まれたままになる。その状態での起動を断る理由の文言。
+PREVIOUS_STOP_INCOMPLETE_MESSAGE = (
+    "前回の停止が完了していません（待受スレッドが終了しておらず、"
+    "ポートが解放されていない可能性があります）。"
+    "しばらく待ってからもう一度お試しください")
+
 
 class FTPServerManager(QObject):
     started = pyqtSignal()
@@ -65,6 +72,12 @@ class FTPServerManager(QObject):
               anonymous_write=False):
         if self.is_running:
             self.error_occurred.emit("サーバーは既に実行中です")
+            return False
+        # 前回の stop() で待受スレッドが抜けきらなかったときは、ソケットを
+        # 閉じるのもそのスレッドなのでポートはまだ掴まれている。bind して
+        # 原因の分からない失敗にする前に、もう一度だけ待つ
+        if not self._await_previous_thread():
+            self.error_occurred.emit(PREVIOUS_STOP_INCOMPLETE_MESSAGE)
             return False
         # 復号に失敗した値は "DPAPI:..." の暗号文のまま設定から渡ってくる。
         # それを認証パスワードとして登録すると、暗号文でログインできる一方で
@@ -232,6 +245,22 @@ class FTPServerManager(QObject):
             except Exception:
                 pass
 
+    def _await_previous_thread(self):
+        """前回の停止で抜けきらなかった待受スレッドを待ち直す。
+
+        停止できたかを返す。閉じる役目が待受スレッド側にあるため、join が
+        上限で諦めた時点ではポートがまだ解放されていない。stop() は参照を
+        残すので、ここでもう一度だけ待ってから起動の可否を決める。
+        """
+        thread, self._thread = self._thread, None
+        if thread is None or thread is threading.current_thread():
+            return True
+        thread.join(timeout=self.STOP_TIMEOUT_SECONDS)
+        if thread.is_alive():
+            self._thread = thread   # 次の機会にまた待てるよう捨てない
+            return False
+        return True
+
     def stop(self):
         thread, self._thread = self._thread, None
         self._stop_event.set()
@@ -243,6 +272,10 @@ class FTPServerManager(QObject):
         # 閉じるのもこの join のあいだにスレッド側で終わる
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=self.STOP_TIMEOUT_SECONDS)
+            if thread.is_alive():
+                # 上限で諦めた＝ソケットはまだ閉じられていない。参照を残し、
+                # 次の start() が bind する前に待ち直せるようにする
+                self._thread = thread
         self.is_running = False
         self._tx.clear()
         self.stopped.emit()
