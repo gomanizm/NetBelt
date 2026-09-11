@@ -42,8 +42,8 @@ def describe_trap_security(trap_data: dict) -> str:
 class SNMPResultTableModel(QAbstractTableModel):
     """SNMP GET/WALK結果テーブルモデル"""
     
-    def __init__(self):
-        super().__init__()
+    def __init__(self, parent=None):
+        super().__init__(parent)
         self.results = []
         self.headers = ["OID", "Type", "Value"]
     
@@ -144,8 +144,9 @@ class SNMPPanel(QWidget):
         self.mib_loaded = False  # MIB読み込み済みフラグ
         self.mib_loading = False  # MIB読み込み中フラグ
         
-        self.result_model = SNMPResultTableModel()
-        self.trap_tree_model = QStandardItemModel()
+        # 親を持たせる（setModel は所有権を取らない。sftp_panel の注記を参照）
+        self.result_model = SNMPResultTableModel(self)
+        self.trap_tree_model = QStandardItemModel(self)
         self.trap_data_list = []  # 完全なTrapデータ（エクスポート用）
         self.max_traps = self._configured_max_traps()
         # WALK が途中で途切れたときの理由。結果より先に届き、結果を

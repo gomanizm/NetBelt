@@ -718,8 +718,14 @@ class SNMPManager(QObject):
         self.worker = SNMPWorker('get', params)
         self.worker.result_ready.connect(self._on_operation_completed)
         self.worker.finished.connect(self._on_worker_finished)
-        self.worker.progress_update.connect(self.progress_update.emit)
-        self.worker.partial_result.connect(self.operation_partial.emit)
+        # 中継は必ずシグナル同士でつなぐ（.emit を渡さない）。
+        # self.<シグナル> は参照のたびに作られるその場限りの
+        # pyqtBoundSignal で、その .emit を渡すと PyQt は受け手が
+        # この QObject だと認識できない。別スレッドから積まれた呼び出しが
+        # キューに残ったままこのオブジェクトが解放されると、次に誰かが
+        # processEvents() した時点で解放済みの C++ を叩いて落ちる（実測）。
+        self.worker.progress_update.connect(self.progress_update)
+        self.worker.partial_result.connect(self.operation_partial)
         self.worker.start()
         
         self.operation_started.emit(f"SNMP GET: {host}")
@@ -747,8 +753,8 @@ class SNMPManager(QObject):
         self.worker = SNMPWorker('walk', params)
         self.worker.result_ready.connect(self._on_operation_completed)
         self.worker.finished.connect(self._on_worker_finished)
-        self.worker.progress_update.connect(self.progress_update.emit)
-        self.worker.partial_result.connect(self.operation_partial.emit)
+        self.worker.progress_update.connect(self.progress_update)
+        self.worker.partial_result.connect(self.operation_partial)
         self.worker.start()
         
         self.operation_started.emit(f"SNMP WALK: {host} - {oid}")
@@ -818,10 +824,16 @@ class SNMPManager(QObject):
         # 停止しても消えずに残骸が増える。通らない環境は fix_firewall() で直す。
         print("[SNMP] ファイアウォール: 自動設定なし（Windowsの許可に委ねます）")
         self.trap_receiver = SNMPTrapReceiver(port, communities, v3_users)
-        self.trap_receiver.trap_received.connect(self.trap_received.emit)
-        self.trap_receiver.error_occurred.connect(self.error_occurred.emit)
-        self.trap_receiver.started.connect(self.trap_receiver_started.emit)
-        self.trap_receiver.stopped.connect(self.trap_receiver_stopped.emit)
+        # 中継は必ずシグナル同士でつなぐ（.emit を渡さない）。
+        # self.<シグナル> は参照のたびに作られるその場限りの
+        # pyqtBoundSignal で、その .emit を渡すと PyQt は受け手が
+        # この QObject だと認識できない。別スレッドから積まれた呼び出しが
+        # キューに残ったままこのオブジェクトが解放されると、次に誰かが
+        # processEvents() した時点で解放済みの C++ を叩いて落ちる（実測）。
+        self.trap_receiver.trap_received.connect(self.trap_received)
+        self.trap_receiver.error_occurred.connect(self.error_occurred)
+        self.trap_receiver.started.connect(self.trap_receiver_started)
+        self.trap_receiver.stopped.connect(self.trap_receiver_stopped)
         # スレッドを起こす前にバインドし、失敗ならここで打ち切る
         if not self.trap_receiver.bind():
             self.trap_receiver = None

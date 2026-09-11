@@ -148,7 +148,10 @@ class SFTPPanel(QWidget):
         self.tree_view.doubleClicked.connect(self._on_item_double_clicked)
         
         # モデル作成
-        self.model = QStandardItemModel()
+        # 親を持たせる。setModel は所有権を取らないので、親が無いと
+        # このパネルの Python 参照が消えた時点でモデルだけ先に回収され、
+        # 生きているビューが解放済みのモデルを指したまま残る
+        self.model = QStandardItemModel(self)
         self.model.setHorizontalHeaderLabels(["名前", "サイズ", "パーミッション", "更新日時"])
         self.tree_view.setModel(self.model)
         

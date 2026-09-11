@@ -93,8 +93,8 @@ class SyslogTableModel(QAbstractTableModel):
         "Debug": QColor(128, 128, 128),      # グレー
     }
     
-    def __init__(self, max_messages: int = 1000):
-        super().__init__()
+    def __init__(self, max_messages: int = 1000, parent=None):
+        super().__init__(parent)
         self.messages = []
         self.max_messages = max_messages
         self.headers = ["タイムスタンプ", "送信元 (プロトコル/ポート)", "レベル", "メッセージ"]
@@ -180,8 +180,8 @@ class SyslogTableModel(QAbstractTableModel):
 class SyslogFilterProxyModel(QSortFilterProxyModel):
     """Syslogメッセージフィルタプロキシモデル"""
     
-    def __init__(self):
-        super().__init__()
+    def __init__(self, parent=None):
+        super().__init__(parent)
         self.enabled_levels = set(SyslogTableModel.LEVEL_COLORS.keys())
         self.hostname_filter = ""
         self.keyword_filter = ""
@@ -242,8 +242,9 @@ class SyslogPanel(QWidget):
         self._load_config()
         
         # モデルの初期化
-        self.model = SyslogTableModel(self.max_messages)
-        self.proxy_model = SyslogFilterProxyModel()
+        # 親を持たせる（setModel / setSourceModel は所有権を取らない）
+        self.model = SyslogTableModel(self.max_messages, self)
+        self.proxy_model = SyslogFilterProxyModel(self)
         self.proxy_model.setSourceModel(self.model)
         
         self._init_ui()
