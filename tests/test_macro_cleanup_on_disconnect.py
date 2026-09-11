@@ -121,5 +121,25 @@ class MacroCleanupOnDisconnectTest(unittest.TestCase):
                          "前の接続で予約した自動コマンドが新しい接続へ送られた: %s" % new_session)
 
 
+    def test_a_disconnect_clears_the_tabs_keepalive_mark(self):
+        """切断でキープアライブが止まったら、タブ側の「動作中」の印も消えること。
+
+        印が残ると、再接続後の右クリックメニューが「キープアライブ停止」を
+        出し続け、一度「停止」を押さないと入れ直せない。
+        """
+        window = self._window()
+        terminal = window.terminal_widget.create_terminal_tab("rtrA")
+        window.connections["rtrA"] = mock.Mock()
+        window.macro_manager.register_send_callback("rtrA", lambda s: None)
+        window._start_keepalive("rtrA", 60)
+        self.assertTrue(terminal._keepalive_active)
+
+        window._on_connection_closed("rtrA")
+
+        self.assertFalse(window.macro_manager.is_keepalive_active("rtrA"))
+        self.assertFalse(terminal._keepalive_active,
+                         "切断後もタブにキープアライブ動作中の印が残っている")
+
+
 if __name__ == "__main__":
     unittest.main()

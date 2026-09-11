@@ -960,6 +960,9 @@ class MainWindow(QMainWindow):
         # 瞬間に残りのコマンドが新しいセッションへ送られる
         try:
             self.macro_manager.cleanup_device(device_name)
+            # タブ側の「キープアライブ動作中」の印も消す。残すと再接続後の
+            # 右クリックメニューが「停止」を出し続け、入れ直せない
+            self.terminal_widget.set_keepalive_status(device_name, False)
         except Exception as e:
             print(f"[Connection] {device_name} のマクロ停止に失敗: {e}")
         try:
