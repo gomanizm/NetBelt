@@ -1953,9 +1953,15 @@ for details.
                 env=updater_env()
             )
             
-            # アプリケーションを終了
+            # アプリケーションを終了する。ここはコンストラクタの中で、
+            # イベントループはまだ始まっていない。Qt の quit() は走って
+            # いるループにしか効かないので、直に呼ぶと何も起きないまま
+            # app.exec() が始まり、アプリは exe を掴んだまま残る。
+            # updater.bat はその exe を上書きできずに失敗する。
+            # ループが始まった直後に効くよう、タイマ経由で予約する。
+            from PyQt6.QtCore import QTimer
             from PyQt6.QtWidgets import QApplication
-            QApplication.quit()
+            QTimer.singleShot(0, QApplication.quit)
         except Exception as e:
             QMessageBox.critical(
                 self,
