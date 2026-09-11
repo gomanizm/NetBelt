@@ -233,8 +233,13 @@ class DeviceDialog(QDialog):
         """入力された機器データを取得"""
         port_text = self.port_edit.text()
         port = int(port_text) if port_text else 0
-        
-        return {
+
+        # 読み込んだ辞書を土台にして、このダイアログで編集できる項目だけを
+        # 上書きする。新しい辞書を組み直すと、ここに欄の無い項目
+        # （機器別マクロ、baudrate、将来足すキー）が OK を押しただけで消え、
+        # _on_device_edit がそのまま config に書き戻す。
+        data = dict(self.device_data)
+        data.update({
             "name": self.name_edit.text().strip(),
             "host": self.host_edit.text().strip(),
             "port": port,
@@ -242,8 +247,9 @@ class DeviceDialog(QDialog):
             "username": self.username_edit.text().strip(),
             "password": self.password_edit.text(),
             "ssh_key": self.ssh_key_edit.text().strip(),
-            "macros": []  # TODO: マクロ機能実装後に対応
-        }
+        })
+        data.setdefault("macros", [])  # TODO: マクロ機能実装後に対応
+        return data
     
     def get_selected_group(self) -> str:
         """選択されたグループ名を取得"""
