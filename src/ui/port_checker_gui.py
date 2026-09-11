@@ -15,6 +15,8 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QFont
 
+from core.sockets import set_exclusive_bind
+
 
 class PortCheckThread(QThread):
     """ポートチェックを別スレッドで実行"""
@@ -40,7 +42,12 @@ class PortCheckThread(QThread):
                 else:  # TCP
                     test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 
-                test_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                # SO_REUSEADDR を立ててはいけない。Windows では占有側も
+                # SO_REUSEADDR を持っていると同じポートへの bind が通り、
+                # 使用中なのに「バインド可能」と出る。排他バインドなら、
+                # 占有側の設定や 127.0.0.1 固定の bind に関係なく 10048 で
+                # 断られる
+                set_exclusive_bind(test_socket)
                 test_socket.bind(('', self.port))
                 
                 if self.protocol == "TCP":
@@ -54,7 +61,10 @@ class PortCheckThread(QThread):
                 else:
                     result += f"  → サーバーアプリケーションを起動できます\n\n"
             except OSError as e:
-                if e.errno == 10048:  # Windows: Address already in use
+                # 10048: Address already in use。10013 (errno 13): 占有側が
+                # SO_REUSEADDR 無しで、こちらが SO_REUSEADDR 付きのときに
+                # 出る「アクセス許可で禁じられた方法」。どちらも使用中
+                if e.errno in (10048, 13) or getattr(e, "winerror", None) in (10048, 10013):
                     result += f"✗ ポート {self.port}/{self.protocol} は既に使用されています\n"
                     result += f"  → 別のプログラムがこのポートを使用中です\n"
                     result += f"  → 下記のプロセス情報を確認してください\n\n"
