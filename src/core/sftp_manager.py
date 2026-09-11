@@ -500,12 +500,16 @@ class SFTPManager(QObject):
         モードからディレクトリかどうかを判定
         
         Args:
-            mode: ファイルモード
-            
+            mode: ファイルモード。サーバが permissions を返さなければ None
+
         Returns:
-            bool: ディレクトリの場合True
+            bool: ディレクトリの場合True。モードが不明ならファイル扱い
         """
         import stat
+        # SFTP v3 の permissions は省略可能。None を S_ISDIR に渡すと
+        # TypeError で一覧全体が失敗し、正常な項目まで画面から消える
+        if mode is None:
+            return False
         return stat.S_ISDIR(mode)
     
     @staticmethod
@@ -514,13 +518,18 @@ class SFTPManager(QObject):
         パーミッションを文字列形式に変換（例: -rwxr-xr-x）
         
         Args:
-            mode: ファイルモード
-            
+            mode: ファイルモード。サーバが permissions を返さなければ None
+
         Returns:
-            str: パーミッション文字列
+            str: パーミッション文字列。モードが不明なら None（表示側が
+                「不明」と出す。'---------' にすると権限の無いファイルと
+                区別がつかない）
         """
         import stat
-        
+
+        if mode is None:
+            return None
+
         # ファイルタイプ
         if stat.S_ISDIR(mode):
             perm_str = 'd'

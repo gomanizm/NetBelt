@@ -409,8 +409,11 @@ class SFTPPanel(QWidget):
             else:
                 size_item = QStandardItem(self._format_size(file_info['size']))
             
-            # パーミッション
-            perm_item = QStandardItem(file_info['permissions'])
+            # パーミッション。サーバが permissions を返さなければ None
+            # （QStandardItem(None) は TypeError になる）
+            perms = file_info['permissions']
+            perm_item = QStandardItem(
+                perms if perms is not None else self.UNKNOWN_TEXT)
             
             # 更新日時。サーバが ATTR_ACMODTIME を返さなければ None、
             # paramiko が符号付き 32bit で読むので負値にもなり得る。
@@ -829,9 +832,13 @@ class SFTPPanel(QWidget):
         if not manager:
             return
 
-        # 現在のパーミッションを8進数で表示
-        current_mode = file_info['mode'] & 0o777
-        current_mode_str = oct(current_mode)[2:]  # '0o755' -> '755'
+        # 現在のパーミッションを8進数で表示。サーバが permissions を
+        # 返さなかった項目は None なので、既定値は空にする
+        if file_info['mode'] is None:
+            current_mode_str = ""
+        else:
+            current_mode = file_info['mode'] & 0o777
+            current_mode_str = oct(current_mode)[2:]  # '0o755' -> '755'
         
         # 新しいパーミッションを入力
         new_mode_str, ok = QInputDialog.getText(
