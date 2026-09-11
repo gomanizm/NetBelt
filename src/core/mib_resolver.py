@@ -244,15 +244,38 @@ class MIBResolver:
     # MIB から拾う定義。現代の MIB はモジュールの根を MODULE-IDENTITY で
     # 定義するので、これを見ないと単一ファイルで完結していても根が解決できず、
     # その配下（Trap が実際に運ぶ通知 OID を含む）が丸ごと落ちる。
+    #
+    # 名前と親は mib-2 / my-root のようにハイフンを含む（標準 MIB の親は
+    # ほぼ全部 mib-2）ので [\w-]+ で拾う。\w+ だと mib-2 が名前 '2' になる。
+    #
+    # 定義の本体（型キーワードから ::= まで）は、自分の ::= と、別の
+    # 定義が始まる行を越えない。最短一致の .*? に任せると、右辺が
+    # { 名前 数字 } の形でない（{ x 0 1 } のような複数添字）とき、そこで
+    # 止まれずに次の定義の ::= まで伸びて、隣の OID を黙って奪ったうえ
+    # 隣の定義を消す。IMPORTS の直後に並ぶ MODULE-IDENTITY も
+    # 「名前 MODULE-IDENTITY」に見えるので、同じ理由で根を飲み込む。
+    # 右辺が { 名前 数字 } ちょうどでない定義は、その定義だけ落とす。
+    _MIB_DEFINITION_KEYWORDS = (
+        r'(?:OBJECT\s+IDENTIFIER|OBJECT-TYPE|NOTIFICATION-TYPE'
+        r'|MODULE-IDENTITY|OBJECT-IDENTITY|OBJECT-GROUP|NOTIFICATION-GROUP'
+        r'|MODULE-COMPLIANCE|AGENT-CAPABILITIES|TRAP-TYPE|TEXTUAL-CONVENTION)'
+    )
+    _MIB_DEFINITION_BODY = (
+        r'(?:(?!::=)(?!\n[ \t]*[\w-]+[ \t]+' + _MIB_DEFINITION_KEYWORDS
+        + r'\b).)*?'
+    )
+    _MIB_ASSIGNMENT = r'::=\s*\{\s*([\w-]+)\s+(\d+)\s*\}'
     _MIB_DEFINITION_PATTERNS = (
-        r'(\w+)\s+OBJECT\s+IDENTIFIER\s*::=\s*\{\s*(\w+)\s+(\d+)\s*\}',
+        r'([\w-]+)\s+OBJECT\s+IDENTIFIER\s*' + _MIB_ASSIGNMENT,
         # 型キーワードから ::= までは「コロンを含まない並び」ではない。
         # 実 MIB はほぼ必ず DESCRIPTION を持ち、そこへ RFC 参照や URL を
         # 書くので、[^:]* にすると本文にコロンが出た時点で定義ごと
-        # 取りこぼす。最短一致で次の ::= { 名前 数字 } まで進める。
-        r'(\w+)\s+OBJECT-TYPE\b.*?::=\s*\{\s*(\w+)\s+(\d+)\s*\}',
-        r'(\w+)\s+NOTIFICATION-TYPE\b.*?::=\s*\{\s*(\w+)\s+(\d+)\s*\}',
-        r'(\w+)\s+MODULE-IDENTITY\b.*?::=\s*\{\s*(\w+)\s+(\d+)\s*\}',
+        # 取りこぼす。
+        r'([\w-]+)\s+OBJECT-TYPE\b' + _MIB_DEFINITION_BODY + _MIB_ASSIGNMENT,
+        r'([\w-]+)\s+NOTIFICATION-TYPE\b' + _MIB_DEFINITION_BODY
+        + _MIB_ASSIGNMENT,
+        r'([\w-]+)\s+MODULE-IDENTITY\b' + _MIB_DEFINITION_BODY
+        + _MIB_ASSIGNMENT,
     )
 
     @staticmethod
