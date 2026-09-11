@@ -45,6 +45,19 @@ def _write_config(path, devices):
         json.dump(config, f, ensure_ascii=False)
 
 
+def _write_groups(path, groups):
+    """groups をそのまま書く（グループ側の形を崩したいテスト用）。"""
+    config = {
+        "config_version": "1.0",
+        "groups": groups,
+        "global_macros": [],
+        "settings": {},
+        "update_settings": {"check_on_startup": False},
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(config, f, ensure_ascii=False)
+
+
 class ConfigManagerQuarantinesInvalidDevicesTest(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp(prefix="netbelt-baddev-")
@@ -71,6 +84,48 @@ class ConfigManagerQuarantinesInvalidDevicesTest(unittest.TestCase):
         with open(self.path, encoding="utf-8") as f:
             self.assertEqual(len(json.load(f)["groups"][0]["devices"]), 5,
                              "読み込みだけで元ファイルが書き換わった")
+
+    def test_a_group_without_a_name_is_given_one_instead_of_crashing(self):
+        """name の無いグループも、機器と同じく起動を止めないこと。
+
+        DeviceTree.load_from_config は group_data["name"] を直接引くので、
+        name の無いグループは機器と同じ KeyError: 'name' で起動を止める。
+        グループを丸ごと捨てると中の正常な機器まで消えるため、表示名だけ
+        補って中身は残す。
+        """
+        from core.config_manager import ConfigManager
+        _write_groups(self.path, [
+            {"name": "Default", "auto_commands": [], "devices": []},
+            {"auto_commands": [], "devices": [VALID]},          # name が無い
+            {"name": "", "devices": []},                        # name が空
+            {"name": 7, "devices": []},                         # name が文字列でない
+        ])
+
+        cm = ConfigManager(config_path=self.path)
+
+        groups = cm.get_groups()
+        self.assertEqual([g["name"] for g in groups],
+                         ["Default", "(名前なし)", "(名前なし)", "(名前なし)"])
+        self.assertEqual(groups[1]["devices"], [VALID], "中の機器まで消えている")
+        self.assertIsNone(cm.load_error)
+        self.assertTrue(cm.load_warning, "警告が記録されていない")
+        self.assertIn("グループ", cm.load_warning)
+
+    def test_an_entry_that_is_not_a_group_at_all_is_dropped(self):
+        """グループとして読めない項目は外すこと（補える名前が無い）。"""
+        from core.config_manager import ConfigManager
+        _write_groups(self.path, [
+            {"name": "Default", "auto_commands": [], "devices": [VALID]},
+            "壊れた項目",
+            None,
+        ])
+
+        cm = ConfigManager(config_path=self.path)
+
+        self.assertEqual([g["name"] for g in cm.get_groups()], ["Default"])
+        self.assertIsNone(cm.load_error)
+        self.assertIn("グループ", cm.load_warning)
+
 
     def test_valid_config_raises_no_warning(self):
         from core.config_manager import ConfigManager
@@ -123,6 +178,26 @@ class MainWindowSurvivesInvalidDevicesTest(unittest.TestCase):
         self.assertEqual(group_item.text(0), "Default")
         self.assertEqual(group_item.childCount(), 1)
         self.assertEqual(group_item.child(0).text(0), "ルータA (192.0.2.1)")
+
+    def test_window_builds_when_a_group_has_no_name(self):
+        """name の無いグループでも起動できること（修正前は KeyError: 'name'）。"""
+        _write_groups(os.path.join(self.dir, "config.json"), [
+            {"name": "Default", "auto_commands": [], "devices": []},
+            {"auto_commands": [], "devices": [VALID]},
+        ])
+        from ui.main_window import MainWindow
+
+        with mock.patch("PyQt6.QtWidgets.QMessageBox.warning") as warning:
+            w = MainWindow()          # 修正前はここで KeyError: 'name'
+        self._windows.append(w)
+
+        self.assertEqual(warning.call_count, 1, warning.call_args_list)
+        self.assertIn("グループ", warning.call_args.args[2])
+        second = w.device_tree.tree.topLevelItem(1)
+        self.assertEqual(second.text(0), "(名前なし)")
+        self.assertEqual(second.childCount(), 1)
+        self.assertEqual(second.child(0).text(0), "ルータA (192.0.2.1)")
+
 
 
 if __name__ == "__main__":
