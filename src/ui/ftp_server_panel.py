@@ -47,9 +47,9 @@ class FTPServerPanel(QWidget):
         root_layout = QHBoxLayout()
         self.root_dir_edit = QLineEdit("./ftp_root")
         root_layout.addWidget(self.root_dir_edit)
-        browse_btn = QPushButton("参照")
-        browse_btn.clicked.connect(self._on_browse_directory); browse_btn.setMaximumWidth(60)
-        root_layout.addWidget(browse_btn)
+        self.browse_btn = QPushButton("参照")
+        self.browse_btn.clicked.connect(self._on_browse_directory); self.browse_btn.setMaximumWidth(60)
+        root_layout.addWidget(self.browse_btn)
         settings_layout.addLayout(root_layout, 1, 1)
         settings_layout.addWidget(QLabel("ユーザー名:"), 2, 0)
         self.username_edit = QLineEdit()
@@ -84,8 +84,10 @@ class FTPServerPanel(QWidget):
         settings_layout.addLayout(passive_layout, 6, 1)
         settings_group.setLayout(settings_layout)
         layout.addWidget(settings_group)
-        # 起動中に無効化する入力群
-        self._inputs = [self.port_spin, self.root_dir_edit, self.username_edit, self.password_edit,
+        # 起動中に無効化する入力群。参照ボタンも含める（欄だけ無効にしても
+        # setText() は効くので、画面のルートと実公開ルートが食い違う）
+        self._inputs = [self.port_spin, self.root_dir_edit, self.browse_btn,
+            self.username_edit, self.password_edit,
             self.anonymous_check, self.anonymous_write_check,
             self.passive_lo_spin, self.passive_hi_spin]
         # 制御ボタン
@@ -291,10 +293,11 @@ class FTPServerPanel(QWidget):
     def _on_fw_allow(self):
         """手動でファイアウォール受信許可を追加（管理者昇格）。3CDaemon方式で通らない環境の復旧用。"""
         self._add_log("ファイアウォール許可を実行します（管理者昇格）...")
-        ok, _msg = self.ftp_server.fix_firewall(
+        ok, msg = self.ftp_server.fix_firewall(
             self.port_spin.value(),
             (self.passive_lo_spin.value(), self.passive_hi_spin.value()))
-        self._add_log("ファイアウォール許可: %s" % ("完了" if ok else "未反映/失敗"))
+        # 「反映待ち」等の理由を潰さず、そのまま見せる
+        self._add_log("ファイアウォール許可: %s (%s)" % ("完了" if ok else "未反映/失敗", msg))
 
     def _add_log(self, message: str):
         """ログにメッセージを追加(自動スクロール付き)"""
