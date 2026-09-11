@@ -34,6 +34,46 @@ class _ServerStopped(Exception):
     """停止要求により転送を打ち切った（タイムアウトとは区別する）"""
 
 
+class _NetasciiDecoder:
+    """netascii（RFC 1350）の受信バイト列を復号する。CR LF → LF、CR NUL → CR。
+
+    CR がブロック境界の末尾に来ることがあるので、対を成す次の 1 バイトが
+    届くまで CR を持ち越す。転送の終わりに残った CR は flush() で書き出す。
+    """
+
+    def __init__(self):
+        self._pending_cr = False
+
+    def feed(self, data):
+        out = bytearray()
+        for b in data:
+            if self._pending_cr:
+                self._pending_cr = False
+                if b == 0x0A:
+                    out.append(0x0A)
+                    continue
+                if b == 0x00:
+                    out.append(0x0D)
+                    continue
+                out.append(0x0D)       # 対を成さない CR はそのまま
+            if b == 0x0D:
+                self._pending_cr = True
+            else:
+                out.append(b)
+        return bytes(out)
+
+    def flush(self):
+        if self._pending_cr:
+            self._pending_cr = False
+            return b"\r"
+        return b""
+
+
+def _netascii_encode(data):
+    """送信用の netascii 変換。LF → CR LF、CR → CR NUL（バイトごとで状態を持たない）。"""
+    return data.replace(b"\r", b"\r\x00").replace(b"\n", b"\r\n")
+
+
 class TFTPServer:
     """低レベル TFTP サーバー（Qt 非依存）。on_event(kind, ip, payload) で通知。
     payload は transfer_started/progress/complete では (filename, total_or_done, ..., direction) のタプル、
@@ -234,6 +274,8 @@ class TFTPServer:
         last_prog = 0.0
         established = False
         f = None
+        # netascii は回線上の CR LF / CR NUL を復号して保存する（octet は素通し）
+        decoder = _NetasciiDecoder() if mode == "netascii" else None
         try:
             retries = 0
             while True:
@@ -274,10 +316,12 @@ class TFTPServer:
                         established = True
                         f = open(target, "wb")
                         self.on_event("transfer_started", addr[0], (filename, total, "upload"))
-                    f.write(chunk)
+                    f.write(decoder.feed(chunk) if decoder else chunk)
                     received += len(chunk)
                     last_ack = struct.pack("!HH", OP_ACK, block)
                     if len(chunk) < blksize:
+                        if decoder:
+                            f.write(decoder.flush())
                         # 最終ブロック。ACK はファイルを閉じてから返す。バッファ付きの
                         # ファイルは close() で最後の書き出しをするので、ディスク満杯や
                         # 共有フォルダの切断はここで初めて分かる。先に ACK を返すと
@@ -385,13 +429,25 @@ class TFTPServer:
                     established = True
                     self.on_event("transfer_started", addr[0], (filename, total, "download"))
                 block = 1
+                # netascii は変換で伸びるので、変換後のバイト列から blksize ずつ
+                # 切り出す（ファイルの読み出し単位でブロックを作ると最終判定が狂う）
+                encode = mode == "netascii"
+                pending = b""
                 while True:
                     if self._stopping:
                         if established:
                             self.on_event("interrupted", addr[0],
                                           (filename, "download"))
                         return
-                    chunk = f.read(blksize)
+                    if encode:
+                        while len(pending) < blksize:
+                            raw = f.read(blksize)
+                            if not raw:
+                                break
+                            pending += _netascii_encode(raw)
+                        chunk, pending = pending[:blksize], pending[blksize:]
+                    else:
+                        chunk = f.read(blksize)
                     try:
                         self._send_and_wait_ack(xs, struct.pack("!HH", OP_DATA, block) + chunk, addr, block)
                     except socket.timeout:
