@@ -2,6 +2,7 @@
 import socket
 import threading
 import re
+import time
 from datetime import datetime
 from PyQt6.QtCore import QObject, pyqtSignal
 from typing import Dict, Optional
@@ -203,6 +204,11 @@ class SyslogReceiver(QObject):
         # 何も送らないアイドル接続を張られるだけで際限なく積み上がる。
         # TFTP の max_workers と同じ考えで、超過分は accept 直後に閉じる。
         self.max_tcp_connections = 64
+        # TCP の無通信タイムアウト（秒）。上限だけでは、1 バイトも送らない
+        # 接続が枠を恒久的に占有し、上限ぶん張られると正規の機器の syslog が
+        # 届かなくなる。最後に受信してからこの時間が過ぎた接続は切る。
+        # 黙っている機器も切られるが、TCP syslog は次に送るときに繋ぎ直す。
+        self.tcp_idle_timeout_seconds = 10 * 60
 
     @property
     def is_running(self):
@@ -444,15 +450,19 @@ class SyslogReceiver(QObject):
 
         RFC 6587 の octet-counting（"<len> <msg>"）と改行区切りの両方を受け付ける。
         どちらかはバッファ先頭で判定し、混在も許す。
+
+        最後に受信してから tcp_idle_timeout_seconds を過ぎた接続は切断する。
         """
         try:
             client_socket.settimeout(1.0)
             buffer = b""
+            last_activity = time.monotonic()
             while not stop_event.is_set():
                 try:
                     data = client_socket.recv(4096)
                     if not data:
                         break
+                    last_activity = time.monotonic()
                     buffer += data
                     too_long = False
                     while buffer and not too_long:
@@ -507,6 +517,12 @@ class SyslogReceiver(QObject):
                         self.message_count += 1
                         break
                 except socket.timeout:
+                    # 無通信のまま上限を過ぎた接続は切って枠を返す
+                    idle = self.tcp_idle_timeout_seconds
+                    if idle and time.monotonic() - last_activity > idle:
+                        print("[Syslog] TCP client idle for %ds, closing: %s"
+                              % (idle, client_ip))
+                        break
                     continue
                 except Exception as e:
                     print("[Syslog] TCP receive error: %s" % e)

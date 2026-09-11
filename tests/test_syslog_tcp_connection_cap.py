@@ -106,5 +106,44 @@ class SyslogTcpConnectionCapTest(unittest.TestCase):
         b.close()
 
 
+    def test_an_idle_connection_does_not_hold_a_slot_forever(self):
+        """1 バイトも送らない接続が、枠を占有し続けないこと。
+
+        上限だけを入れると、アイドル接続を上限ぶん張るだけで正規の機器の
+        syslog が永久に届かなくなる（recv がタイムアウトしても continue
+        するだけで、接続は切れない）。
+        """
+        self.recv.max_tcp_connections = 1
+        self.recv.tcp_idle_timeout_seconds = 1.5
+        self._start()
+        idle = self._client()
+        self.assertTrue(self._wait(lambda: len(self.recv.tcp_clients) >= 1))
+
+        self.assertTrue(self._closed_by_server(idle, seconds=10.0),
+                        "無通信の接続が閉じられない")
+        self.assertTrue(self._wait(
+            lambda: sum(1 for t in self.recv.tcp_clients if t.is_alive()) < 1,
+            seconds=10.0), "枠が返ってこない")
+
+        good = self._client()
+        good.sendall(b"<134>Sep  9 10:00:00 host after idle\n")
+        self.assertTrue(self._wait(lambda: any("after idle" in m.message
+                                               for m in self.seen)),
+                        "アイドル接続が枠を占有したまま")
+
+    def test_a_sending_connection_is_not_dropped_by_the_idle_timeout(self):
+        """送り続けている接続は、無通信タイムアウトで切られないこと。"""
+        self.recv.tcp_idle_timeout_seconds = 2.0
+        self._start()
+        c = self._client()
+        for i in range(4):
+            c.sendall(b"<134>Sep  9 10:00:00 host beat %d\n" % i)
+            time.sleep(0.9)
+        self.assertTrue(self._wait(lambda: sum(1 for m in self.seen
+                                               if "beat" in m.message) == 4),
+                        "送信中の接続が切られている: %r"
+                        % [m.message for m in self.seen])
+
+
 if __name__ == "__main__":
     unittest.main()
