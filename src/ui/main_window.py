@@ -91,6 +91,9 @@ class MainWindow(QMainWindow):
     update_check_error = pyqtSignal(str)
     no_update_available = pyqtSignal()
     run_auto_commands_requested = pyqtSignal(str)  # 接続後の自動実行コマンド要求
+    # SFTP セッションの確立結果をワーカーから GUI スレッドへ運ぶ内部用。
+    # (機器名, SFTPManager, 接続オブジェクト, 成否)
+    _sftp_session_ready = pyqtSignal(str, object, object, bool)
 
     # ターミナルのフォントサイズの上下限（settings.terminal.font_size）。
     # 数値の実体は TerminalWidget 側にあり、ここでは参照するだけにして
@@ -106,6 +109,7 @@ class MainWindow(QMainWindow):
         self.update_check_error.connect(self._show_update_check_error)
         self.no_update_available.connect(self._show_no_update_message)
         self.run_auto_commands_requested.connect(self._run_auto_commands)
+        self._sftp_session_ready.connect(self._on_sftp_session_ready)
         
         # ConfigManager初期化
         self.config_manager = ConfigManager()
@@ -909,37 +913,67 @@ class MainWindow(QMainWindow):
         if device_name in self.connections:
             conn = self.connections[device_name]
             if isinstance(conn, SSHConnection) and conn.client:
-                try:
-                    # SFTPマネージャーを作成して接続
-                    sftp_manager = SFTPManager(self)
-                    
-                    # エラーシグナルを接続してデバッグ
-                    sftp_manager.error_occurred.connect(
-                        lambda err: self._on_sftp_error(device_name, err)
-                    )
-                    
-                    if sftp_manager.connect(conn.client):
-                        self.sftp_managers[device_name] = sftp_manager
-                        # 現在アクティブなタブの場合はSFTPパネルに表示
-                        if self.terminal_widget.get_current_tab_name() == device_name:
-                            self.sftp_panel.set_sftp_manager(
-                                sftp_manager, device_name,
-                                self._describe_target(device_name))
-                            # SFTPパネルを表示
-                            self._select_tool_tab("sftp")
-                        self.status_bar.showMessage(f"{device_name} に接続しました（SFTP有効）")
-                    else:
-                        # SFTP接続失敗 - エラーダイアログは表示せず、ログのみ
-                        print(f"[INFO] SFTP接続失敗: {device_name} - 機器がSFTPをサポートしていない可能性があります")
-                        # ステータスバーは通常の接続メッセージのまま（ユーザーを混乱させない）
-                except Exception as e:
-                    # SFTP接続エラー - エラーダイアログは表示せず、ログのみ
-                    import traceback
-                    print(f"[ERROR] SFTP接続エラー: {device_name}")
-                    print(f"  エラー: {str(e)}")
-                    print(f"  詳細:\n{traceback.format_exc()}")
-                    # ステータスバーは通常の接続メッセージのまま
-    
+                self._start_sftp_session(device_name, conn)
+
+    def _start_sftp_session(self, device_name: str, conn) -> None:
+        """SFTP セッションの確立をワーカースレッドで始める
+
+        open_sftp() は機器が subsystem 要求に答えるまで戻らず、paramiko の
+        読み取りには timeout が無い。GUI スレッドで待つと、その間イベント
+        ループが完全に止まり、接続済みのシェルの受信出力すら画面に出ない。
+        結果は _sftp_session_ready で GUI スレッドへ戻す。
+        """
+        # SFTPマネージャーを作成（親は GUI スレッドのまま）
+        sftp_manager = SFTPManager(self)
+
+        # エラーシグナルを接続してデバッグ
+        sftp_manager.error_occurred.connect(
+            lambda err: self._on_sftp_error(device_name, err)
+        )
+
+        client = conn.client
+
+        def sftp_connect_thread():
+            try:
+                ok = sftp_manager.connect(client)
+            except Exception as e:
+                import traceback
+                print(f"[ERROR] SFTP接続エラー: {device_name}")
+                print(f"  エラー: {str(e)}")
+                print(f"  詳細:\n{traceback.format_exc()}")
+                ok = False
+            self._sftp_session_ready.emit(device_name, sftp_manager, conn, ok)
+
+        import threading
+        threading.Thread(target=sftp_connect_thread, daemon=True).start()
+
+    def _on_sftp_session_ready(self, device_name: str, sftp_manager,
+                               conn, ok: bool) -> None:
+        """SFTP セッションの確立結果を受け取る（GUI スレッド）"""
+        if not self._is_current_connection(device_name, conn):
+            # 待っている間にタブを閉じた／繋ぎ直した。遅れて開いた
+            # セッションは登録せず、機器側に残さないよう閉じる
+            try:
+                sftp_manager.disconnect()
+            except Exception:
+                pass
+            return
+        if not ok:
+            # SFTP接続失敗 - エラーダイアログは表示せず、ログのみ
+            print(f"[INFO] SFTP接続失敗: {device_name} - 機器がSFTPをサポートしていない可能性があります")
+            # ステータスバーは通常の接続メッセージのまま（ユーザーを混乱させない）
+            return
+        self.sftp_managers[device_name] = sftp_manager
+        # 現在アクティブなタブの場合はSFTPパネルに表示
+        if self.terminal_widget.get_current_tab_name() == device_name:
+            self.sftp_panel.set_sftp_manager(
+                sftp_manager, device_name,
+                self._describe_target(device_name))
+            # SFTPパネルを表示
+            self._select_tool_tab("sftp")
+        self.status_bar.showMessage(f"{device_name} に接続しました（SFTP有効）")
+
+
     def _describe_target(self, device_name: str) -> str:
         """機器の接続先（host:port）を返す。分からなければ空文字。
 
