@@ -1044,9 +1044,15 @@ class TerminalWidget(QWidget):
         if tab_name in self._terminals:
             del self._terminals[tab_name]
 
-        # タブを削除
+        # タブを削除。removeTab はページを親（内部の QStackedWidget）から
+        # 外さないので、閉じたターミナルが文書（受信した全出力）ごと
+        # 非表示のまま残り、閉じるたびに積み上がる。親から外して捨てる
+        widget = self.tab_widget.widget(index)
         self.tab_widget.removeTab(index)
-        
+        if widget is not None:
+            widget.setParent(None)
+            widget.deleteLater()
+
         # すべての接続が閉じられた場合、ホームタブを再作成
         if self.tab_widget.count() == 0:
             welcome_terminal = self._create_terminal()
