@@ -543,6 +543,11 @@ class SyslogPanel(QWidget):
             self.model.clear_messages()
             self._update_status()
     
+    @staticmethod
+    def _export_line(msg: SyslogMessage) -> str:
+        """保存用の1行を作る（画面と同じく送信元を含め、機器を区別できるようにする）"""
+        return f"{msg.timestamp} {msg.source_ip} {msg.hostname} [{msg.level}] {msg.message}"
+
     def _export_messages(self):
         """メッセージをエクスポート"""
         filename, _ = QFileDialog.getSaveFileName(
@@ -550,18 +555,20 @@ class SyslogPanel(QWidget):
             f"syslog_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
             "テキストファイル (*.txt);;JSONファイル (*.json);;すべてのファイル (*.*)"
         )
-        
+
         if filename:
             try:
                 messages = self.model.get_all_messages()
                 if filename.endswith('.json'):
-                    # JSON形式でエクスポート
+                    # JSON形式でエクスポート（送信元と受信生データも残す）
                     data = [
                         {
                             "timestamp": msg.timestamp,
+                            "source": msg.source_ip,
                             "hostname": msg.hostname,
                             "level": msg.level,
-                            "message": msg.message
+                            "message": msg.message,
+                            "raw": msg.raw
                         }
                         for msg in messages
                     ]
@@ -571,7 +578,7 @@ class SyslogPanel(QWidget):
                     # テキスト形式でエクスポート
                     with open(filename, 'w', encoding='utf-8') as f:
                         for msg in messages:
-                            f.write(f"{msg.timestamp} {msg.hostname} [{msg.level}] {msg.message}\n")
+                            f.write(self._export_line(msg) + "\n")
                 
                 QMessageBox.information(self, "成功", f"メッセージを {filename} にエクスポートしました。")
             except Exception as e:
@@ -659,8 +666,8 @@ class SyslogPanel(QWidget):
             try:
                 with open(filename, 'w', encoding='utf-8') as f:
                     for msg in messages:
-                        f.write(f"{msg.timestamp} {msg.hostname} [{msg.level}] {msg.message}\n")
-                
+                        f.write(self._export_line(msg) + "\n")
+
                 QMessageBox.information(self, "成功", f"選択行を {filename} に保存しました。")
             except Exception as e:
                 QMessageBox.critical(self, "エラー", f"保存に失敗しました: {e}")
