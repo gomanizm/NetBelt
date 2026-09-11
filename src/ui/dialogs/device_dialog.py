@@ -6,6 +6,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt
 from typing import Dict, List, Optional
+from core.config_manager import is_reserved_device_name
 
 class DeviceDialog(QDialog):
     """機器追加/編集ダイアログ"""
@@ -208,7 +209,17 @@ class DeviceDialog(QDialog):
         if not self.name_edit.text().strip():
             QMessageBox.warning(self, "入力エラー", "機器名を入力してください。")
             return
-        
+
+        # 予約語チェック（GroupDialog の「コンソール接続」と同じ扱い）。
+        # ホームタブはタブ名で見分けているので、同名の機器はタブを閉じられず
+        # ログ保存・記録・マクロ設定も断られる
+        if is_reserved_device_name(self.name_edit.text()):
+            QMessageBox.warning(
+                self, "入力エラー",
+                "「%s」はホームタブの名前と重なるため機器名に使えません。"
+                % self.name_edit.text().strip())
+            return
+
         if not self.host_edit.text().strip():
             QMessageBox.warning(self, "入力エラー", "ホストを入力してください。")
             return

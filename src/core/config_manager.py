@@ -6,6 +6,17 @@ from pathlib import Path
 from typing import Dict, List, Optional
 from .crypto import PasswordCrypto
 
+# 機器名として使えない名前。ターミナルはホームタブをタブ名 "ホーム" で
+# 見分けているので、同名の機器はタブを閉じられず、ログ保存・記録・
+# マクロ設定も「ホームタブ」扱いで断られる。
+RESERVED_DEVICE_NAMES = ("ホーム",)
+
+
+def is_reserved_device_name(name) -> bool:
+    """その名前が機器名として予約されているか（前後の空白は無視）"""
+    return isinstance(name, str) and name.strip() in RESERVED_DEVICE_NAMES
+
+
 def app_data_dir():
     """アプリのデータ保存先 (~/.netbelt) を返す。無ければ作る。
 
@@ -516,6 +527,8 @@ class ConfigManager:
         # auto_commands が送られる
         if self.find_device_group(device_info.get("name", "")) is not None:
             return False
+        if is_reserved_device_name(device_info.get("name", "")):
+            return False
 
         before = list(group["devices"])
         group["devices"].append(device_info)
@@ -561,6 +574,8 @@ class ConfigManager:
         if not source or not target:
             return False
         new_name = device_info.get("name", "")
+        if is_reserved_device_name(new_name):
+            return False
         owner = self.find_device_group(new_name)
         if owner is not None and not (owner == group_name and new_name == old_name):
             return False   # 別の機器の名前
