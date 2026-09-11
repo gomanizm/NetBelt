@@ -203,6 +203,10 @@ class Screen(object):
                 # 折り返し行は埋めていないので、書くときに伸ばす
                 line.extend([BLANK] * (self.cursor_col + 1 - len(line)))
             line[self.cursor_col] = (ch, self.attr)
+            # 折り返しの印は、折り返しで付き、その行への印字で外れる。
+            # 残すと、EL 無しで書き直された行が履歴で次の行と連結される
+            # (右端まで書けば _linefeed(from_wrap=True) が改めて付ける)
+            self.wrapped[self.cursor_row] = False
             self.dirty.add(self.cursor_row)
             if self.cursor_col + 1 < self.cols:
                 self.cursor_col += 1
@@ -544,5 +548,6 @@ class Screen(object):
         for c in range(self.cursor_col,
                        min(len(line), self.cursor_col + n)):
             line[c] = BLANK
+        self.wrapped[self.cursor_row] = False   # 印字と同じ扱い
         self.dirty.add(self.cursor_row)
         self._pending_wrap = False

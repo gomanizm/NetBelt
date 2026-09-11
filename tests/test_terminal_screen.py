@@ -171,6 +171,42 @@ class EditingTest(unittest.TestCase):
         self.assertEqual(len(s.lines[0]), 80)
 
 
+class WrapMarkTest(unittest.TestCase):
+    """折り返しの印は、折り返しで付き、その行への印字・消去で外れる。
+
+    印が残ったまま行が書き直されると、履歴へ押し出された時点で次の
+    行と改行なしに連結される (コピー・ログ保存の行境界が変わる)。
+    EL を伴う書き直しでは外れていたが、CUP + 印字だけの全画面型
+    再描画や ECH では残っていた。
+    """
+
+    def _wrapped_then_rewritten(self, rewrite):
+        s = feed(Screen(rows=4, cols=4), "ABCDE")
+        self.assertTrue(s.wrapped[0], "前提: 折り返しの印が付いていない")
+        return feed(s, rewrite)
+
+    def test_printing_on_the_row_clears_the_mark(self):
+        s = self._wrapped_then_rewritten("\x1b[1;1HPING\x1b[2;1HPONG")
+        self.assertEqual(s.text()[:2], ["PING", "PONG"])
+        self.assertFalse(s.wrapped[0], "書き直した行に折り返しの印が残っている")
+
+    def test_the_rewritten_rows_reach_the_history_as_two_lines(self):
+        s = self._wrapped_then_rewritten("\x1b[1;1HPING\x1b[2;1HPONG")
+        feed(s, "\x1b[4;1H\r\n\r\n")          # 2 行押し出す
+        self.assertEqual([("".join(c[0] for c in line).rstrip(), w)
+                          for line, w in s.take_new_history()],
+                         [("PING", False), ("PONG", False)])
+
+    def test_erase_characters_clears_the_mark(self):
+        s = self._wrapped_then_rewritten("\x1b[1;1H\x1b[4X")
+        self.assertFalse(s.wrapped[0], "ECH した行に折り返しの印が残っている")
+
+    def test_a_rewrite_that_wraps_again_keeps_the_mark(self):
+        s = self._wrapped_then_rewritten("\x1b[1;1HWXYZQ")
+        self.assertEqual(s.text()[:2], ["WXYZ", "Q"])
+        self.assertTrue(s.wrapped[0], "改めて折り返したのに印が無い")
+
+
 class ScrollRegionTest(unittest.TestCase):
     def test_decstbm_confines_the_scroll(self):
         s = Screen()
