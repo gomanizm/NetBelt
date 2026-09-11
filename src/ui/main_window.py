@@ -321,6 +321,10 @@ class MainWindow(QMainWindow):
             self._on_font_size_wheel)
         self.terminal_widget.macro_execute_requested.connect(self._on_macro_execute_requested)
         self.terminal_widget.macro_settings_requested.connect(self._on_macro_settings_from_context)
+        # 右クリックの「マクロ停止」と、実行状態のメニューへの反映
+        self.terminal_widget.macro_stop_requested.connect(self.macro_manager.stop_command_list)
+        self.macro_manager.command_list_state_changed.connect(
+            self.terminal_widget.set_command_list_status)
         self.terminal_widget.keepalive_start_requested.connect(self._on_keepalive_start_requested)
         self.terminal_widget.keepalive_stop_requested.connect(self._on_keepalive_stop_requested)
         self.terminal_widget.terminal_resized.connect(self._on_terminal_resized)

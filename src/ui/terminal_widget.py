@@ -35,6 +35,7 @@ class InteractiveTerminal(QTextEdit):
     reconnect_requested = pyqtSignal()  # 再接続要求シグナル
     macro_execute_requested = pyqtSignal(str)  # マクロ実行要求シグナル（マクロ名）
     macro_settings_requested = pyqtSignal()  # マクロ設定画面要求シグナル
+    macro_stop_requested = pyqtSignal()  # 実行中のマクロ（コマンドリスト）停止要求シグナル
     keepalive_start_requested = pyqtSignal()  # キープアライブ開始要求シグナル
     keepalive_stop_requested = pyqtSignal()  # キープアライブ停止要求シグナル
     # Ctrl+ホイールでのフォントサイズ変更要求（回した向き: +1 / -1）
@@ -54,6 +55,7 @@ class InteractiveTerminal(QTextEdit):
         self._is_recording = False  # ログ記録中フラグ
         self._macro_list = []  # 利用可能なマクロリスト
         self._keepalive_active = False  # キープアライブ動作中フラグ
+        self._command_list_active = False  # マクロ（コマンドリスト）実行中フラグ
         # まだ送り切っていない貼り付け。まとめて送ると GUI が止まるので、
         # 区切りごとにイベントループへ譲りながら流す
         self._send_queue = []
@@ -62,6 +64,10 @@ class InteractiveTerminal(QTextEdit):
     def set_keepalive_status(self, active: bool):
         """キープアライブの状態を設定"""
         self._keepalive_active = active
+
+    def set_command_list_status(self, active: bool):
+        """マクロ（コマンドリスト）が実行中かを設定"""
+        self._command_list_active = active
     
     def set_input_enabled(self, enabled: bool):
         """入力の有効/無効を切り替え"""
@@ -295,6 +301,13 @@ class InteractiveTerminal(QTextEdit):
                     macro_menu.addAction(macro_action)
                 
                 menu.addMenu(macro_menu)
+
+            # 実行中のマクロを止める。これが無いと、誤ったマクロを流し
+            # 始めたときタブを閉じる以外に中断する手段が無い
+            if self._command_list_active:
+                macro_stop_action = QAction("マクロ停止", self)
+                macro_stop_action.triggered.connect(lambda: self.macro_stop_requested.emit())
+                menu.addAction(macro_stop_action)
             
             menu.addSeparator()
         
@@ -454,6 +467,8 @@ class TerminalWidget(QWidget):
     font_size_change_requested = pyqtSignal(int)
     # マクロ設定画面要求シグナル（機器名）
     macro_settings_requested = pyqtSignal(str)
+    # 実行中のマクロ停止要求シグナル（機器名）
+    macro_stop_requested = pyqtSignal(str)
     # キープアライブ開始要求シグナル（機器名）
     keepalive_start_requested = pyqtSignal(str)
     # キープアライブ停止要求シグナル（機器名）
@@ -675,6 +690,9 @@ class TerminalWidget(QWidget):
         # マクロ設定画面要求シグナルを接続
         terminal.macro_settings_requested.connect(
             lambda: self.macro_settings_requested.emit(device_name)
+        )
+        terminal.macro_stop_requested.connect(
+            lambda: self.macro_stop_requested.emit(device_name)
         )
         
         # キープアライブ開始/停止要求シグナルを接続
@@ -1330,3 +1348,14 @@ class TerminalWidget(QWidget):
         """
         if device_name in self._terminals:
             self._terminals[device_name].set_keepalive_status(active)
+
+    def set_command_list_status(self, device_name: str, active: bool):
+        """
+        指定した機器のマクロ（コマンドリスト）実行状態を設定
+
+        Args:
+            device_name: 機器名
+            active: 実行中かどうか
+        """
+        if device_name in self._terminals:
+            self._terminals[device_name].set_command_list_status(active)
