@@ -639,21 +639,27 @@ class SyslogPanel(QWidget):
         if not selected_rows:
             QMessageBox.warning(self, "警告", "保存する行を選択してください。")
             return
-        
+
+        # ダイアログを開いている間に受信で先頭行が押し出されると行番号がずれるので、
+        # 保存対象のメッセージはダイアログを出す前に確定しておく
+        messages = []
+        for index in selected_rows:
+            source_row = self.proxy_model.mapToSource(index).row()
+            msg = self.model.get_message(source_row)
+            if msg:
+                messages.append(msg)
+
         filename, _ = QFileDialog.getSaveFileName(
             self, "選択行を保存",
             f"syslog_selected_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
             "テキストファイル (*.txt);;すべてのファイル (*.*)"
         )
-        
+
         if filename:
             try:
                 with open(filename, 'w', encoding='utf-8') as f:
-                    for index in selected_rows:
-                        source_row = self.proxy_model.mapToSource(index).row()
-                        msg = self.model.get_message(source_row)
-                        if msg:
-                            f.write(f"{msg.timestamp} {msg.hostname} [{msg.level}] {msg.message}\n")
+                    for msg in messages:
+                        f.write(f"{msg.timestamp} {msg.hostname} [{msg.level}] {msg.message}\n")
                 
                 QMessageBox.information(self, "成功", f"選択行を {filename} に保存しました。")
             except Exception as e:
