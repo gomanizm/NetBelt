@@ -312,10 +312,16 @@ class SFTPManager(QObject):
         # 一時名はダウンロードごとに一意にする（同じ保存先へ続けて落とすと、
         # 同じ一時名の取り合いで片方が誤って失敗する）
         import tempfile
-        fd, tmp_local = tempfile.mkstemp(
-            prefix=os.path.basename(local_path) + ".", suffix=".netbelt-part",
-            dir=os.path.dirname(os.path.abspath(local_path)))
-        os.close(fd)
+        try:
+            fd, tmp_local = tempfile.mkstemp(
+                prefix=os.path.basename(local_path) + ".", suffix=".netbelt-part",
+                dir=os.path.dirname(os.path.abspath(local_path)))
+            os.close(fd)
+        except OSError as e:
+            # ここは GUI スレッド。例外を上げるとスロットの外へ抜けるので、
+            # 転送の失敗と同じ経路で知らせる
+            self.error_occurred.emit(f"ダウンロードエラー: {str(e)}")
+            return
 
         def download_thread():
             try:

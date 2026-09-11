@@ -197,5 +197,23 @@ class SftpTransferAtomicityTest(unittest.TestCase):
         m.sftp_client.posix_rename.assert_called_once_with(put_target, "/flash/running.cfg")
 
 
+    def test_a_download_into_a_missing_directory_is_reported_not_raised(self):
+        """保存先に一時ファイルを作れないときは、例外ではなく通知で知らせること。
+
+        download_file は GUI スレッドから呼ばれる。一時ファイルの作成が
+        そこで例外を上げると、転送の失敗ではなくスロットの例外になる。
+        """
+        m = self._manager()
+        local = os.path.join(self.dir, "no-such-dir", "backup.cfg")
+        try:
+            m.download_file("/etc/backup.cfg", local)
+        except OSError as e:
+            self.fail("download_file が例外を上げた: %r" % e)
+
+        self.assertTrue(self._wait(lambda: self.errors), "失敗が通知されない")
+        self.assertIn("ダウンロードエラー", self.errors[0])
+        m.sftp_client.get.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
