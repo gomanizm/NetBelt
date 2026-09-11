@@ -673,8 +673,10 @@ class TerminalWidget(QWidget):
         if len(self._terminals) == 0 and self.tab_widget.count() == 1:
             home_tab = self.tab_widget.widget(0)
             if isinstance(home_tab, QTextEdit) and not isinstance(home_tab, InteractiveTerminal):
-                # ホームタブを削除して新しいインタラクティブターミナルを作成
-                self.tab_widget.removeTab(0)
+                # ホームタブを削除して新しいインタラクティブターミナルを作成。
+                # ページごと捨てないと、接続と切断を繰り返すたびにホーム
+                # タブ用の QTextEdit が非表示のまま 1 個ずつ積み上がる
+                self._discard_page(0)
         
         # 新しいインタラクティブターミナルを作成
         terminal = self._create_terminal(interactive=True)
@@ -1055,6 +1057,23 @@ class TerminalWidget(QWidget):
             terminal.reconnect_requested.connect(lambda: reconnect_callback(device_name))
     
 
+    def _discard_page(self, index: int) -> None:
+        """タブを外し、そのページを親から外して捨てる
+
+        QTabWidget.removeTab はページを内部の QStackedWidget から外さない。
+        残されたページは文書（受信した全出力・ウェルカム文）ごと非表示の
+        まま生き続け、タブを閉じるたび・ホームタブを置き換えるたびに
+        積み上がる。親から外して deleteLater で捨てる。
+
+        Args:
+            index: 外すタブのインデックス
+        """
+        widget = self.tab_widget.widget(index)
+        self.tab_widget.removeTab(index)
+        if widget is not None:
+            widget.setParent(None)
+            widget.deleteLater()
+
     def _close_tab(self, index: int) -> None:
         """
         タブを閉じる
@@ -1082,14 +1101,8 @@ class TerminalWidget(QWidget):
         if tab_name in self._terminals:
             del self._terminals[tab_name]
 
-        # タブを削除。removeTab はページを親（内部の QStackedWidget）から
-        # 外さないので、閉じたターミナルが文書（受信した全出力）ごと
-        # 非表示のまま残り、閉じるたびに積み上がる。親から外して捨てる
-        widget = self.tab_widget.widget(index)
-        self.tab_widget.removeTab(index)
-        if widget is not None:
-            widget.setParent(None)
-            widget.deleteLater()
+        # タブを削除（ページごと捨てる）
+        self._discard_page(index)
 
         # すべての接続が閉じられた場合、ホームタブを再作成
         if self.tab_widget.count() == 0:
