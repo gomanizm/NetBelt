@@ -6,8 +6,9 @@
 = b'B1 show ver\\r\\n' + NUL x18 + b'A3 shutdown\\r\\n...'）。全ログ保存でも
 保存済み内容の上へ A の記録が上書きされた。
 
-記録中のファイル（abspath で比較）が選ばれたら拒否して警告し、
-既存の記録には触れない。
+記録中のファイルが選ばれたら拒否して警告し、既存の記録には触れない。
+同じファイルを指す別表記（8.3 短縮名・ハードリンク・ジャンクション・
+UNC と割り当てドライブ）も、実体で見て同じなら拒否する。
 """
 import os
 import sys
@@ -103,6 +104,61 @@ class LogFileInUseTest(unittest.TestCase):
         self.addCleanup(lambda: w.stop_log_recording("rtrB"))
         self.assertIn("rtrB", w._log_files, "別ファイルなのに記録が始まらない")
         self.assertEqual(self.warning.call_count, 0)
+
+
+    def _refuse_recording_into(self, w, chosen):
+        """rtrB のタブで chosen を記録先に選び、拒否されたことを確かめる。"""
+        before = self._read_target()
+        self.assertIn(b"A1 conf t", before, "前提: rtrA の記録が書けている")
+        w.tab_widget.setCurrentIndex(w.tab_widget.indexOf(w._terminals["rtrB"]))
+        with mock.patch("PyQt6.QtWidgets.QFileDialog.getSaveFileName",
+                        return_value=(chosen, "")):
+            w.start_log_recording()
+
+        self.assertNotIn("rtrB", w._log_files, "使用中のファイルへ記録を始めてしまった")
+        self.assertIn("rtrA", w._log_files, "rtrA の記録が止まっている")
+        self.assertEqual(self.warning.call_count, 1, "利用者に拒否を知らせていない")
+        self.assertEqual(self._read_target(), before, "既存の記録が壊された")
+        w.append_output("rtrA", "A3 shutdown\r\n")
+        self.assertEqual(self._read_target(), before + b"A3 shutdown\r\n",
+                         "拒否後の rtrA の記録が壊れている")
+
+    def test_recording_start_refuses_a_hard_link_to_the_recording(self):
+        """同じ実体を指すハードリンクを選んでも拒否すること。"""
+        w = self._widget_recording_a()
+        alias = os.path.join(self.dir, "alias.log")
+        os.link(self.target, alias)
+        self.assertTrue(os.path.samefile(self.target, alias), "前提: 同じ実体")
+
+        self._refuse_recording_into(w, alias)
+
+    def test_recording_start_refuses_the_8_3_short_name_of_the_recording(self):
+        """8.3 短縮名で同じファイルを選んでも拒否すること。"""
+        import ctypes
+        w = self._widget_recording_a()
+        buf = ctypes.create_unicode_buffer(1024)
+        ctypes.windll.kernel32.GetShortPathNameW(self.target, buf, 1024)
+        short = buf.value
+        if not short or os.path.normcase(short) == os.path.normcase(self.target):
+            self.skipTest("このボリュームでは 8.3 短縮名が無効")
+
+        self._refuse_recording_into(w, short)
+
+    def test_full_log_save_refuses_a_hard_link_to_the_recording(self):
+        """全ログ保存でも、別表記の同じファイルを拒否すること。"""
+        w = self._widget_recording_a()
+        alias = os.path.join(self.dir, "alias2.log")
+        os.link(self.target, alias)
+        before = self._read_target()
+
+        with mock.patch("PyQt6.QtWidgets.QFileDialog.getSaveFileName",
+                        return_value=(alias, "")), \
+                mock.patch("ui.dialogs.log_save_dialog.LogSaveProgressDialog") as dlg:
+            w.save_current_log()
+
+        self.assertEqual(dlg.call_count, 0, "使用中のファイルへ保存を始めてしまった")
+        self.assertEqual(self.warning.call_count, 1, "利用者に拒否を知らせていない")
+        self.assertEqual(self._read_target(), before, "既存の記録が壊された")
 
 
 if __name__ == "__main__":

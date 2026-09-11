@@ -1137,7 +1137,12 @@ class TerminalWidget(QWidget):
 
         記録中のファイルを別の記録や全ログ保存の保存先に選ぶと、open('w')
         で記録済みの内容が消え、以降は両者の書き込みが混在する。保存先を
-        決めた直後にここで見て拒否する。パスは絶対化して比べる
+        決めた直後にここで見て拒否する。
+
+        まず実体で比べる。8.3 短縮名・ハードリンク・ジャンクション・UNC と
+        割り当てドライブなど、同じファイルを指す別表記は文字列比較では
+        一致せず、そのまま素通りしていた。実体を掴めないとき（まだ無い
+        ファイル・アクセスできない）は絶対化した文字列で比べる
         """
         import os
         wanted = os.path.normcase(os.path.abspath(file_path))
@@ -1145,6 +1150,12 @@ class TerminalWidget(QWidget):
             name = getattr(handle, "name", None)
             if not isinstance(name, str):
                 continue
+            try:
+                if os.path.samefile(name, file_path):
+                    return device_name
+                continue
+            except OSError:
+                pass
             if os.path.normcase(os.path.abspath(name)) == wanted:
                 return device_name
         return None
