@@ -652,10 +652,17 @@ class MainWindow(QMainWindow):
         ssh.set_terminal_size(cols, rows)
         
         # シグナル接続
-        ssh.output_received.connect(lambda text: self.terminal_widget.append_output(device_name, text))
-        ssh.connected.connect(lambda: self._on_connection_success(device_name, terminal))
-        ssh.disconnected.connect(lambda: self._on_connection_closed(device_name))
-        ssh.error_occurred.connect(lambda error: self._on_connection_error(device_name, error))
+        # 接続オブジェクトを束縛して渡す。機器名だけで辞書を引くと、
+        # 接続中にタブを閉じて同名で繋ぎ直したあと、旧スレッドの遅れた
+        # 通知（TCP タイムアウトは最大 20〜30 秒後）が新しい接続を捨てる
+        ssh.output_received.connect(
+            lambda text, c=ssh: self._on_connection_output(device_name, text, c))
+        ssh.connected.connect(
+            lambda c=ssh: self._on_connection_success(device_name, terminal, c))
+        ssh.disconnected.connect(
+            lambda c=ssh: self._on_connection_closed(device_name, c))
+        ssh.error_occurred.connect(
+            lambda error, c=ssh: self._on_connection_error(device_name, error, c))
         
         # ターミナルのキー入力をSSHに送信（再接続時の蓄積を防ぐため既存接続を切断）
         try:
@@ -723,10 +730,17 @@ class MainWindow(QMainWindow):
         serial_conn = SerialConnection(port, baudrate, self)
         
         # シグナル接続
-        serial_conn.output_received.connect(lambda text: self.terminal_widget.append_output(device_name, text))
-        serial_conn.connected.connect(lambda: self._on_connection_success(device_name, terminal))
-        serial_conn.disconnected.connect(lambda: self._on_connection_closed(device_name))
-        serial_conn.error_occurred.connect(lambda error: self._on_connection_error(device_name, error))
+        # 接続オブジェクトを束縛して渡す。機器名だけで辞書を引くと、
+        # 接続中にタブを閉じて同名で繋ぎ直したあと、旧スレッドの遅れた
+        # 通知（TCP タイムアウトは最大 20〜30 秒後）が新しい接続を捨てる
+        serial_conn.output_received.connect(
+            lambda text, c=serial_conn: self._on_connection_output(device_name, text, c))
+        serial_conn.connected.connect(
+            lambda c=serial_conn: self._on_connection_success(device_name, terminal, c))
+        serial_conn.disconnected.connect(
+            lambda c=serial_conn: self._on_connection_closed(device_name, c))
+        serial_conn.error_occurred.connect(
+            lambda error, c=serial_conn: self._on_connection_error(device_name, error, c))
         
         # ターミナルのキー入力をシリアルに送信（再接続時の蓄積を防ぐため既存接続を切断）
         try:
@@ -792,10 +806,17 @@ class MainWindow(QMainWindow):
         telnet = TelnetConnection(host, port, username, password, self)
         
         # シグナル接続
-        telnet.output_received.connect(lambda text: self.terminal_widget.append_output(device_name, text))
-        telnet.connected.connect(lambda: self._on_connection_success(device_name, terminal))
-        telnet.disconnected.connect(lambda: self._on_connection_closed(device_name))
-        telnet.error_occurred.connect(lambda error: self._on_connection_error(device_name, error))
+        # 接続オブジェクトを束縛して渡す。機器名だけで辞書を引くと、
+        # 接続中にタブを閉じて同名で繋ぎ直したあと、旧スレッドの遅れた
+        # 通知（TCP タイムアウトは最大 20〜30 秒後）が新しい接続を捨てる
+        telnet.output_received.connect(
+            lambda text, c=telnet: self._on_connection_output(device_name, text, c))
+        telnet.connected.connect(
+            lambda c=telnet: self._on_connection_success(device_name, terminal, c))
+        telnet.disconnected.connect(
+            lambda c=telnet: self._on_connection_closed(device_name, c))
+        telnet.error_occurred.connect(
+            lambda error, c=telnet: self._on_connection_error(device_name, error, c))
         
         # ターミナルのキー入力をTelnetに送信（再接続時の蓄積を防ぐため既存接続を切断）
         try:
@@ -836,8 +857,49 @@ class MainWindow(QMainWindow):
         
         threading.Thread(target=connect_thread, daemon=True).start()
     
-    def _on_connection_success(self, device_name: str, terminal):
+    def _is_current_connection(self, device_name: str, conn) -> bool:
+        """conn がいま device_name に登録されている接続なら True
+
+        conn が None の呼び出し（接続を束縛しない古い経路）は常に現在の
+        ものとして扱う。
+        """
+        return conn is None or self.connections.get(device_name) is conn
+
+    def _discard_stale(self, device_name: str, conn) -> None:
+        """置き換えられた接続からの通知を捨て、その接続の資源を閉じる
+
+        旧スレッドが遅れて成功した場合、Transport スレッドと機器側の
+        セッションが生きたまま誰からも参照されなくなる。閉じておく。
+        """
+        print(f"[Connection] {device_name}: 置き換え済みの接続からの通知を無視します")
+        try:
+            conn.dispose()
+        except Exception as e:
+            print(f"[Connection] {device_name} の旧接続の後始末に失敗: {e}")
+
+    def _on_connection_output(self, device_name: str, text: str, conn=None):
+        """受信出力をターミナルへ流す（置き換え済みの接続からは流さない）"""
+        if not self._is_current_connection(device_name, conn):
+            return
+        self.terminal_widget.append_output(device_name, text)
+
+    def _drop_sftp_manager(self, device_name: str) -> None:
+        """機器の SFTP マネージャを切断して外し、表示中ならパネルも空にする"""
+        if device_name not in self.sftp_managers:
+            return
+        try:
+            self.sftp_managers[device_name].disconnect()
+        except Exception:
+            pass
+        del self.sftp_managers[device_name]
+        if self.sftp_panel.current_device == device_name:
+            self.sftp_panel.clear()
+
+    def _on_connection_success(self, device_name: str, terminal, conn=None):
         """接続成功時の処理（SSH/Telnet/シリアル共通）"""
+        if not self._is_current_connection(device_name, conn):
+            self._discard_stale(device_name, conn)
+            return
         self.status_bar.showMessage(f"{device_name} に接続しました")
         terminal.set_input_enabled(True)  # キー入力を有効化
         # グループの自動実行コマンドをGUIスレッドで送信する
@@ -967,21 +1029,15 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"[Connection] {device_name} の後始末に失敗: {e}")
 
-    def _on_connection_closed(self, device_name: str):
+    def _on_connection_closed(self, device_name: str, conn=None):
         """接続切断時の処理（SSH/シリアル共通）"""
+        if not self._is_current_connection(device_name, conn):
+            self._discard_stale(device_name, conn)
+            return
         self.status_bar.showMessage(f"{device_name} から切断されました")
         
         # SFTP接続を切断
-        if device_name in self.sftp_managers:
-            try:
-                self.sftp_managers[device_name].disconnect()
-            except Exception:
-                pass
-            del self.sftp_managers[device_name]
-            
-            # 現在表示中のSFTPパネルをクリア
-            if self.sftp_panel.current_device == device_name:
-                self.sftp_panel.clear()
+        self._drop_sftp_manager(device_name)
         
         # 接続を閉じてから削除（閉じないとポートを掴んだまま残る）
         self._dispose_connection(device_name)
@@ -998,17 +1054,22 @@ class MainWindow(QMainWindow):
         # 再接続可能な状態にする
         self.terminal_widget.enable_reconnect(device_name, self._reconnect_device)
     
-    def _on_connection_error(self, device_name: str, error: str):
+    def _on_connection_error(self, device_name: str, error: str, conn=None):
         """接続エラー時の処理（SSH/シリアル共通）"""
+        if not self._is_current_connection(device_name, conn):
+            self._discard_stale(device_name, conn)
+            return
         self.status_bar.showMessage(f"{device_name}: エラー - {error}")
         
         # エラーメッセージを表示
         if "送信エラー" in error or "Socket is closed" in error:
             # 送信エラーの場合は切断として扱う
-            self._on_connection_closed(device_name)
+            self._on_connection_closed(device_name, conn)
         else:
             # その他のエラー
             self.terminal_widget.show_notice(device_name, f"\nエラー: {error}\n")
+            # 閉じた client を抱えた SFTP マネージャを残さない
+            self._drop_sftp_manager(device_name)
             self._dispose_connection(device_name)
     
     def _reconnect_device(self, device_name: str):
@@ -1069,16 +1130,7 @@ class MainWindow(QMainWindow):
         self.macro_manager.cleanup_device(device_name)
         
         # SFTP接続を切断
-        if device_name in self.sftp_managers:
-            try:
-                self.sftp_managers[device_name].disconnect()
-            except Exception:
-                pass
-            del self.sftp_managers[device_name]
-            
-            # 現在表示中のSFTPパネルをクリア
-            if self.sftp_panel.current_device == device_name:
-                self.sftp_panel.clear()
+        self._drop_sftp_manager(device_name)
         
         # SSH接続を切断（接続が存在する場合のみ）
         if device_name in self.connections:
