@@ -1004,7 +1004,7 @@ class TrapSecurityDisplayTest(unittest.TestCase):
         fd, path = tempfile.mkstemp(suffix=".csv")
         os.close(fd)
         self.addCleanup(os.unlink, path)
-        panel._export_to_csv(path)
+        panel._export_to_csv(path, panel.trap_data_list)
 
         with open(path, encoding="utf-8", newline="") as f:
             rows = list(csv.reader(f))
@@ -1023,7 +1023,7 @@ class TrapSecurityDisplayTest(unittest.TestCase):
         fd, path = tempfile.mkstemp(suffix=".json")
         os.close(fd)
         self.addCleanup(os.unlink, path)
-        panel._export_to_json(path)
+        panel._export_to_json(path, panel.trap_data_list)
 
         with open(path, encoding="utf-8") as f:
             data = json_module.load(f)
