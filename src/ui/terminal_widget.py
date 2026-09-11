@@ -1068,6 +1068,23 @@ class TerminalWidget(QWidget):
             )
             self.tab_widget.addTab(welcome_terminal, "ホーム")
     
+    @staticmethod
+    def _default_log_dir() -> str:
+        """保存先ダイアログの初期ディレクトリ（cwd/logs。作れなければ別の場所）
+
+        読み取り専用の場所から起動した、logs という名前のファイルが既に
+        ある、といった理由で cwd/logs を作れないことがある。ここで例外に
+        すると保存先ダイアログが一度も出ず、書ける場所を選ぶ手段が無い。
+        作れないときはホームへ落とす（保存先自体はダイアログで選べる）。
+        """
+        import os
+        logs_dir = os.path.join(os.getcwd(), "logs")
+        try:
+            os.makedirs(logs_dir, exist_ok=True)
+        except OSError:
+            return os.path.expanduser("~")
+        return logs_dir
+
     def save_current_log(self):
         """現在アクティブなターミナルのログを保存"""
         from PyQt6.QtWidgets import QFileDialog, QMessageBox
@@ -1106,11 +1123,9 @@ class TerminalWidget(QWidget):
             # デフォルトのファイル名を生成（機器名_日時.log）
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             default_filename = f"{tab_name}_{timestamp}.log"
-            
-            # logsフォルダのパスを取得（存在しない場合は作成）
-            logs_dir = os.path.join(os.getcwd(), "logs")
-            os.makedirs(logs_dir, exist_ok=True)
-            
+
+            logs_dir = self._default_log_dir()
+
             # ファイル保存ダイアログを表示
             file_path, _ = QFileDialog.getSaveFileName(
                 self,
@@ -1166,11 +1181,9 @@ class TerminalWidget(QWidget):
         # デフォルトのファイル名を生成（機器名_日時.log）
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         default_filename = f"{tab_name}_{timestamp}.log"
-        
-        # logsフォルダのパスを取得（存在しない場合は作成）
-        logs_dir = os.path.join(os.getcwd(), "logs")
-        os.makedirs(logs_dir, exist_ok=True)
-        
+
+        logs_dir = self._default_log_dir()
+
         # ファイル保存ダイアログを表示
         file_path, _ = QFileDialog.getSaveFileName(
             self,
