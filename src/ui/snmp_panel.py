@@ -611,13 +611,10 @@ class SNMPPanel(QWidget):
             return
 
         params = self._collect_request_params()
-        # 実行中は要求が受理されない。断られる要求のホストを記録すると、
-        # いま走っている要求の結果に別のホストが付く
-        if self.snmp_manager.is_busy():
-            QMessageBox.warning(self, "エラー", "既に操作が実行中です。")
-            return
-        self._request_host = host
-        self.snmp_manager.snmp_get(host, oids, **params)
+        # 受理された要求のホストだけを記録する。実行中で断られた要求の
+        # ホストまで記録すると、いま走っている要求の結果に別のホストが付く
+        if self.snmp_manager.snmp_get(host, oids, **params):
+            self._request_host = host
         self.status_label.setText("GET実行中...")
     
     def _on_walk_clicked(self):
@@ -635,12 +632,9 @@ class SNMPPanel(QWidget):
             return
 
         params = self._collect_request_params()
-        # 実行中は要求が受理されない（GET と同じ理由）
-        if self.snmp_manager.is_busy():
-            QMessageBox.warning(self, "エラー", "既に操作が実行中です。")
-            return
-        self._request_host = host
-        self.snmp_manager.snmp_walk(host, oid, **params)
+        # 受理された要求のホストだけを記録する（GET と同じ理由）
+        if self.snmp_manager.snmp_walk(host, oid, **params):
+            self._request_host = host
         self.status_label.setText("WALK実行中...")
     
     def _on_export_clicked(self):

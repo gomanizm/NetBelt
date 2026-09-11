@@ -707,7 +707,7 @@ class SNMPManager(QObject):
         """
         if self.worker and self.worker.isRunning():
             self.error_occurred.emit("既に操作が実行中です")
-            return
+            return False
         
         params = {
             'host': host,
@@ -723,6 +723,7 @@ class SNMPManager(QObject):
         self.worker.start()
         
         self.operation_started.emit(f"SNMP GET: {host}")
+        return True   # 受理した（実行中で断った場合は False）
     
     def snmp_walk(self, host: str, oid: str, **kwargs):
         """
@@ -735,7 +736,7 @@ class SNMPManager(QObject):
         """
         if self.worker and self.worker.isRunning():
             self.error_occurred.emit("既に操作が実行中です")
-            return
+            return False
         
         params = {
             'host': host,
@@ -751,6 +752,7 @@ class SNMPManager(QObject):
         self.worker.start()
         
         self.operation_started.emit(f"SNMP WALK: {host} - {oid}")
+        return True   # 受理した（実行中で断った場合は False）
     
     def cancel_operation(self):
         """現在の操作をキャンセル"""
