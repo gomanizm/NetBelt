@@ -171,6 +171,11 @@ class DeviceDialog(QDialog):
         self.ssh_key_btn.setEnabled(is_ssh)
         self.ssh_key_label.setEnabled(is_ssh)
 
+        # console はポート番号を使わない。欄を触れるままにしておくと、文字を
+        # 入れても _on_ok の検査（console は対象外）を通り、保存時の int() で
+        # 落ちる。値は消さない（保存済みの機器を開いただけで変えない）。
+        self.port_edit.setEnabled(protocol != "console")
+
         if protocol == "console":
             self.host_edit.setPlaceholderText("例: COM1 または /dev/ttyUSB0")
 
@@ -231,8 +236,12 @@ class DeviceDialog(QDialog):
     
     def get_device_data(self) -> Dict:
         """入力された機器データを取得"""
-        port_text = self.port_edit.text()
-        port = int(port_text) if port_text else 0
+        # ssh/telnet は _on_ok で整数を確かめている。console は欄を無効に
+        # しているが、値が残っていることはあるので、ここでは決して落とさない
+        try:
+            port = int(self.port_edit.text().strip() or 0)
+        except ValueError:
+            port = 0
 
         # 読み込んだ辞書を土台にして、このダイアログで編集できる項目だけを
         # 上書きする。新しい辞書を組み直すと、ここに欄の無い項目
