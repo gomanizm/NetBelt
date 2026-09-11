@@ -730,8 +730,8 @@ class SNMPPanel(QWidget):
             return text
         return "'" + text
 
-    def _export_results_to_csv(self, file_path: str, results, host: str = "",
-                               reason=None):
+    def _export_results_to_csv(self, file_path: str, results, host: str,
+                               reason):
         """CSV形式で GET/WALK 結果を書き出す
 
         host / reason は呼び出し側が結果と同時に固定した値。ここで self を
@@ -747,8 +747,8 @@ class SNMPPanel(QWidget):
             for row in results:
                 writer.writerow([self._csv_safe(cell) for cell in row])
 
-    def _export_results_to_json(self, file_path: str, results, host: str = "",
-                                reason=None):
+    def _export_results_to_json(self, file_path: str, results, host: str,
+                                reason):
         """JSON形式で GET/WALK 結果を書き出す（host / reason は CSV と同じ）"""
         import json
         data = {
@@ -765,8 +765,8 @@ class SNMPPanel(QWidget):
         with open(file_path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
 
-    def _export_results_to_txt(self, file_path: str, results, host: str = "",
-                               reason=None):
+    def _export_results_to_txt(self, file_path: str, results, host: str,
+                               reason):
         """テキスト形式で GET/WALK 結果を書き出す（host / reason は CSV と同じ）"""
         with open(file_path, "w", encoding="utf-8") as f:
             f.write("SNMP GET/WALK 結果\n")
@@ -910,10 +910,16 @@ class SNMPPanel(QWidget):
     
     def _on_trap_export_clicked(self):
         """Trapログをエクスポート"""
-        if not self.trap_data_list:
+        # 保存する一覧は、ダイアログを開く前に固定して書き出しへ渡す
+        # （GET/WALK 側と同じ理由）。モーダルダイアログはネストした
+        # イベントループで queued シグナルを処理するので、開いている間に
+        # 届いた Trap が「今見えているものを保存した」はずのファイルへ
+        # 入り、max_traps の切り詰めで押した時点の最古の Trap が消える
+        traps = list(self.trap_data_list)
+        if not traps:
             QMessageBox.information(self, "情報", "エクスポートするデータがありません。")
             return
-        
+
         # ファイル保存ダイアログ
         file_path, selected_filter = QFileDialog.getSaveFileName(
             self,
@@ -928,20 +934,24 @@ class SNMPPanel(QWidget):
         try:
             # ファイル拡張子で形式を判定
             if file_path.endswith('.csv'):
-                self._export_to_csv(file_path)
+                self._export_to_csv(file_path, traps)
             elif file_path.endswith('.json'):
-                self._export_to_json(file_path)
+                self._export_to_json(file_path, traps)
             else:  # .txt or other
-                self._export_to_txt(file_path)
+                self._export_to_txt(file_path, traps)
             
             QMessageBox.information(self, "成功", f"Trapログをエクスポートしました:\n{file_path}")
         except Exception as e:
             QMessageBox.critical(self, "エラー", f"エクスポート中にエラーが発生しました:\n{str(e)}")
     
-    def _export_to_csv(self, file_path: str):
-        """CSV形式でエクスポート"""
+    def _export_to_csv(self, file_path: str, traps):
+        """CSV形式で Trap を書き出す
+
+        traps は呼び出し側がダイアログの前に固定した一覧。ここで self を
+        読むと、ダイアログを開いている間に届いた Trap が混ざる
+        """
         import csv
-        
+
         with open(file_path, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             
@@ -949,8 +959,8 @@ class SNMPPanel(QWidget):
             writer.writerow(['時刻', '送信元IP', '送信元ポート', 'セキュリティ',
                              'Trap OID', 'VarBind OID', 'VarBind 値'])
             
-            # データ（新しい順＝trap_data_listの順）
-            for trap in self.trap_data_list:
+            # データ（新しい順＝受け取った一覧の順）
+            for trap in traps:
                 timestamp = trap['timestamp']
                 source_ip = trap['source_ip']
                 source_port = trap.get('source_port', '')
@@ -969,24 +979,24 @@ class SNMPPanel(QWidget):
                     # VarBindsがない場合は1行だけ出力
                     writer.writerow([self._csv_safe(c) for c in head + ['', '']])
     
-    def _export_to_json(self, file_path: str):
-        """JSON形式でエクスポート"""
+    def _export_to_json(self, file_path: str, traps):
+        """JSON形式で Trap を書き出す（traps は CSV と同じ）"""
         with open(file_path, 'w', encoding='utf-8') as f:
-            json.dump(self.trap_data_list, f, indent=2, ensure_ascii=False)
-    
-    def _export_to_txt(self, file_path: str):
-        """テキスト形式でエクスポート（人間が読みやすい形式）"""
+            json.dump(traps, f, indent=2, ensure_ascii=False)
+
+    def _export_to_txt(self, file_path: str, traps):
+        """テキスト形式で Trap を書き出す（traps は CSV と同じ）"""
         resolver = get_resolver()
         
         with open(file_path, 'w', encoding='utf-8') as f:
             f.write("=" * 80 + "\n")
             f.write("SNMP Trap Log\n")
             f.write(f"エクスポート日時: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"総Trap数: {len(self.trap_data_list)}\n")
+            f.write(f"総Trap数: {len(traps)}\n")
             f.write("=" * 80 + "\n\n")
-            
-            # データ（新しい順＝trap_data_listの順）
-            for i, trap in enumerate(self.trap_data_list, 1):
+
+            # データ（新しい順＝受け取った一覧の順）
+            for i, trap in enumerate(traps, 1):
                 timestamp = trap['timestamp']
                 source_ip = trap['source_ip']
                 source_port = trap.get('source_port', '')

@@ -35,7 +35,7 @@ class SNMPExportTest(unittest.TestCase):
     def test_export_csv_roundtrip(self):
         p = self._panel()
         path = os.path.join(tempfile.mkdtemp(), "r.csv")
-        p._export_results_to_csv(path, SAMPLE)
+        p._export_results_to_csv(path, SAMPLE, "", None)
         with open(path, encoding="utf-8", newline="") as f:
             rows = list(csv.reader(f))
         self.assertEqual(rows[0], ["OID", "Type", "Value"])
@@ -45,7 +45,7 @@ class SNMPExportTest(unittest.TestCase):
     def test_export_json_roundtrip(self):
         p = self._panel()
         path = os.path.join(tempfile.mkdtemp(), "r.json")
-        p._export_results_to_json(path, SAMPLE)
+        p._export_results_to_json(path, SAMPLE, "", None)
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
         self.assertEqual(data["count"], len(SAMPLE))
@@ -55,7 +55,7 @@ class SNMPExportTest(unittest.TestCase):
     def test_export_txt_contains_all_rows(self):
         p = self._panel()
         path = os.path.join(tempfile.mkdtemp(), "r.txt")
-        p._export_results_to_txt(path, SAMPLE)
+        p._export_results_to_txt(path, SAMPLE, "", None)
         text = open(path, encoding="utf-8").read()
         for row in SAMPLE:
             self.assertIn(row[0], text)

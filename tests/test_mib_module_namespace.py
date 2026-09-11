@@ -13,7 +13,9 @@ Trap が別ベンダーの名前にデコードされることになる。
 
 残る制限: 2 つのモジュールが同じ名前を定義し、第三のモジュールがその
 一方を IMPORTS しているとき、どちらを指すかは IMPORTS を見ていないので
-決められず、後に解決した方になる。
+決められず、後に解決した方になる（ファイルの並び順と解決の回数しだいで
+変わり、その結果がキャッシュに残る）。ここは _resolve_definitions の
+docstring にも「残る制限」として書いてある。
 """
 import io
 import os
@@ -41,18 +43,31 @@ class MibModuleNamespaceTest(unittest.TestCase):
         from core.mib_resolver import MIBResolver
         return MIBResolver()._load_or_update_mib_cache("mibs")
 
-    def _write_two_modules_sharing_a_name(self, b_root_is_module_identity=False):
+    def _write_two_modules_sharing_a_name(self, b_root_is_module_identity=False,
+                                          a_shared_is_module_identity=False):
         """A-MIB と B-MIB が同じ名前 `shared` を自分の根の下に定義する。
 
         b_root_is_module_identity を立てると B の根を MODULE-IDENTITY に
         する。抽出は型ごとにまとめて行われるので、B の `shared` は根より
         先に並び、最初の回では解決できない。その回に B の Trap が A の
         `shared` に付く、というのが実測された経路。
+
+        a_shared_is_module_identity は同じことを A 側で起こす。A の
+        `shared` を MODULE-IDENTITY（抽出は最後の型）にすると、A の Trap
+        の方が先に並ぶので、最初の回では A の `shared` がまだ無い。
+        モジュールを見ずに名前だけで親を引くと、そこで B の `shared` を
+        掴む。
         """
+        if a_shared_is_module_identity:
+            a_shared = ("shared MODULE-IDENTITY\n"
+                        "    LAST-UPDATED \"202601010000Z\"\n"
+                        "    ::= { aRoot 1 }\n")
+        else:
+            a_shared = "shared OBJECT IDENTIFIER ::= { aRoot 1 }\n"
         self._write("A.my", "A-MIB",
                     "aRoot OBJECT IDENTIFIER ::= { enterprises 1111 }\n"
-                    "shared OBJECT IDENTIFIER ::= { aRoot 1 }\n"
-                    "sharedTrapA NOTIFICATION-TYPE\n"
+                    + a_shared
+                    + "sharedTrapA NOTIFICATION-TYPE\n"
                     "    STATUS current\n"
                     "    ::= { shared 1 }\n")
         if b_root_is_module_identity:
@@ -69,8 +84,15 @@ class MibModuleNamespaceTest(unittest.TestCase):
                     "    ::= { shared 1 }\n")
 
     def test_children_hang_under_their_own_modules_parent(self):
-        """同名の親があっても、子は自分のモジュールの親に付くこと。"""
-        self._write_two_modules_sharing_a_name()
+        """同名の親があっても、子は自分のモジュールの親に付くこと。
+
+        A の `shared` を後の回で解決させて、両方の Trap が入れ替わる形を
+        作る。両モジュールの親が最初の回で解決できる並びだと、名前だけの
+        表でも「直前に書いた自分のモジュールの親」が残っているので偶然
+        正しくなり、モジュールを見ているかどうかを確かめられない。
+        """
+        self._write_two_modules_sharing_a_name(
+            a_shared_is_module_identity=True)
         resolved = self._resolved()
         self.assertEqual(resolved.get("1.3.6.1.4.1.1111.1.1"), "sharedTrapA",
                          "A の Trap が A の下に無い: %s" % resolved)
