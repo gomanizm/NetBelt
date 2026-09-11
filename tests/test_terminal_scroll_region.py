@@ -86,6 +86,34 @@ class ClampingTest(unittest.TestCase):
         self.assertEqual((s.scroll_top, s.scroll_bottom), (0, 23))
 
 
+class ZeroMeansDefaultTest(unittest.TestCase):
+    """DECSTBM の 0 は「既定値」(xterm と同じ)。
+
+    下端に 0 を送ると 0-1 = -1 が 0 へ丸められ、上端 < 下端 を満たさず
+    黙って拒否されていた。直前の狭い範囲がそのまま残り、押し出された
+    行は履歴にも入らない。
+    """
+
+    def test_zero_zero_restores_the_full_screen(self):
+        s = feed(Screen(rows=24, cols=80), "\x1b[2;3r")
+        self.assertEqual((s.scroll_top, s.scroll_bottom), (1, 2))
+        feed(s, "\x1b[0;0r")
+        self.assertEqual((s.scroll_top, s.scroll_bottom), (0, 23),
+                         "ESC[0;0r で全画面へ戻っていない")
+
+    def test_a_zero_bottom_means_the_last_row(self):
+        s = feed(Screen(rows=24, cols=80), "\x1b[2;3r")
+        feed(s, "\x1b[1;0r")
+        self.assertEqual((s.scroll_top, s.scroll_bottom), (0, 23),
+                         "下端 0 が最終行として扱われていない")
+
+    def test_history_resumes_after_a_zero_reset(self):
+        s = feed(Screen(rows=24, cols=80), "\x1b[2;3r\x1b[0;0r")
+        feed(s, lines(30))
+        self.assertGreater(len(s.history), 0,
+                           "全画面へ戻したのに記録が止まったまま")
+
+
 class HistoryFromATopAnchoredRegionTest(unittest.TestCase):
     """上端が画面の先頭なら、押し出された行は記録する。"""
 

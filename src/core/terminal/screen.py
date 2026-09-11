@@ -424,8 +424,11 @@ class Screen(object):
         self._pending_wrap = False
 
     def _set_margins(self, p):
-        top = _param(p, 0, 1) - 1
-        bottom = _param(p, 1, self.rows) - 1
+        # 0 は省略と同じく既定値 (xterm と同じ)。0-1 = -1 を丸めると
+        # 上端は偶然 0 になるが、下端は 0 になって top < bottom を満たさず
+        # 拒否され、直前の狭い範囲が残り続けた
+        top = (_param(p, 0, 1) or 1) - 1
+        bottom = (_param(p, 1, self.rows) or self.rows) - 1
         # xterm は画面からはみ出した指定を丸めて受理する。丸めずに捨てると、
         # 直前に受理した狭い範囲がそのまま残り続ける。ncurses は部分スクロール
         # の最適化で狭い範囲を設定し、最後に csr(0, lines-1) で全画面へ戻すが、
