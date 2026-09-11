@@ -70,8 +70,29 @@ class _NetasciiDecoder:
 
 
 def _netascii_encode(data):
-    """送信用の netascii 変換。LF → CR LF、CR → CR NUL（バイトごとで状態を持たない）。"""
+    """送信用の netascii 変換。LF → CR LF、CR → CR NUL（バイトごとで状態を持たない）。
+
+    ローカルのテキストは LF 改行前提。CRLF 改行のファイルを netascii で
+    送ると回線上は CR NUL CR LF になり、厳密なピアでは改行の手前に CR が
+    1 つ増える（同サーバ経由の往復は無損失）。
+    """
     return data.replace(b"\r", b"\r\x00").replace(b"\n", b"\r\n")
+
+
+def _netascii_size(path):
+    """netascii へ変換したあとのバイト数を数える。
+
+    tsize（RFC 2349）と進捗の分母は「実際に回線へ乗るオクテット数」なので、
+    変換で伸びるぶんを数え直さないと 100% を超える。変換はバイトごとに
+    状態を持たないので、読み出し単位で区切って数えてよい。
+    """
+    size = 0
+    with open(path, "rb") as f:
+        while True:
+            raw = f.read(65536)
+            if not raw:
+                return size
+            size += len(_netascii_encode(raw))
 
 
 class TFTPServer:
@@ -467,17 +488,21 @@ class TFTPServer:
             self.on_event("protocol_error", addr[0],
                           (filename, "要求されたファイルがありません", "download")); return
         neg = self._neg_options(opts)
-        if "tsize" in neg:
-            neg["tsize"] = str(os.path.getsize(target))  # 実サイズを返す
         blksize = int(neg.get("blksize", "512"))
         timeout = self._transfer_timeout(xs, neg)
-        total = os.path.getsize(target)
+        # netascii は変換で伸びるので、変換後のバイト列から blksize ずつ
+        # 切り出す（ファイルの読み出し単位でブロックを作ると最終判定が狂う）。
+        # tsize と進捗の分母も、同じ「回線へ乗るバイト数」で揃える
+        encode = mode == "netascii"
         # transfer_started は確立後（最初の ACK 受領後）に初めて出す。重複RRQの敗者スレッドは
         # 最初の ACK が来ない（機器は勝者の TID にしか ACK しない）ので、何も出さず黙って撤退する。
         sent = 0
         last_prog = 0.0
         established = False
         try:
+            total = _netascii_size(target) if encode else os.path.getsize(target)
+            if "tsize" in neg:
+                neg["tsize"] = str(total)  # 実際に転送するオクテット数を返す
             with open(target, "rb") as f:
                 if neg:
                     try:
@@ -489,9 +514,6 @@ class TFTPServer:
                     established = True
                     self.on_event("transfer_started", addr[0], (filename, total, "download"))
                 block = 1
-                # netascii は変換で伸びるので、変換後のバイト列から blksize ずつ
-                # 切り出す（ファイルの読み出し単位でブロックを作ると最終判定が狂う）
-                encode = mode == "netascii"
                 pending = b""
                 while True:
                     if self._stopping:

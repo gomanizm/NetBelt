@@ -13,6 +13,7 @@ import socket
 import struct
 import sys
 import tempfile
+import time
 import unittest
 
 sys.path.insert(0, "src")
@@ -20,15 +21,21 @@ sys.path.insert(0, "src")
 OP_RRQ, OP_WRQ, OP_DATA, OP_ACK = 1, 2, 3, 4
 
 
-def _req(op, filename, mode):
-    return struct.pack("!H", op) + filename.encode() + b"\x00" + mode + b"\x00"
+def _req(op, filename, mode, opts=None):
+    pkt = struct.pack("!H", op) + filename.encode() + b"\x00" + mode + b"\x00"
+    for k, v in (opts or {}).items():
+        pkt += k.encode() + b"\x00" + str(v).encode() + b"\x00"
+    return pkt
 
 
 class TftpNetasciiTest(unittest.TestCase):
     def setUp(self):
         from core.tftp_server import TFTPServer
         self.root = tempfile.mkdtemp(prefix="netbelt-tftp-na-")
-        self.srv = TFTPServer(port=0, root_dir=self.root)
+        self.events = []
+        self.srv = TFTPServer(port=0, root_dir=self.root,
+                              on_event=lambda kind, ip, payload:
+                              self.events.append((kind, payload)))
         self.srv.start()
         self.addCleanup(self.srv.stop)
         self.port = self.srv.port
@@ -101,6 +108,47 @@ class TftpNetasciiTest(unittest.TestCase):
         with open(os.path.join(self.root, "out.txt"), "wb") as f:
             f.write(b"x\ny\rz")
         self.assertEqual(self._download(b"octet"), b"x\ny\rz")
+
+
+    def _wait_event(self, kind, seconds=5.0):
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            hit = [p for k, p in self.events if k == kind]
+            if hit:
+                return hit[-1]
+            time.sleep(0.02)
+        self.fail("%s が出ていない: %r" % (kind, self.events))
+
+    def test_netascii_oack_tsize_is_the_transferred_size(self):
+        """RFC 2349: tsize は実際に転送されるオクテット数を返すこと。"""
+        body = b"line\n" * 3                # 15 バイト -> netascii で 18 バイト
+        with open(os.path.join(self.root, "out.txt"), "wb") as f:
+            f.write(body)
+        c = self._client()
+        c.sendto(_req(OP_RRQ, "out.txt", b"netascii", {"tsize": "0"}),
+                 ("127.0.0.1", self.port))
+        pkt, srvaddr = c.recvfrom(2048)
+        self.assertEqual(pkt[:2], b"\x00\x06", "OACK が返っていない: %r" % pkt)
+        fields = pkt[2:].split(b"\x00")
+        opts = dict(zip(fields[0::2], fields[1::2]))
+        c.sendto(b"\x00\x04\x00\x00", srvaddr)      # ACK(0)
+        data, srvaddr = c.recvfrom(2048)
+        c.sendto(b"\x00\x04" + data[2:4], srvaddr)
+        self.assertEqual(len(data[4:]), 18, "前提: 変換後は 18 バイト")
+        self.assertEqual(opts.get(b"tsize"), b"18",
+                         "tsize が変換前のサイズのまま: %r" % opts)
+
+    def test_netascii_progress_never_exceeds_its_total(self):
+        """進捗の分母も変換後のバイト数にすること（100% を超えない）。"""
+        body = b"line\n" * 3
+        with open(os.path.join(self.root, "out.txt"), "wb") as f:
+            f.write(body)
+        got = self._download(b"netascii")
+        self.assertEqual(len(got), 18, "前提: 変換後は 18 バイト")
+        filename, done, total, direction = self._wait_event("transfer_complete")
+        self.assertEqual(done, len(got))
+        self.assertEqual(total, len(got),
+                         "進捗の分母が変換前のサイズのまま: %d/%d" % (done, total))
 
 
 if __name__ == "__main__":
