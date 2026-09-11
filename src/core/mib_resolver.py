@@ -3,7 +3,40 @@ MIB解決機能
 
 OIDを人間が読める名前に変換
 """
+import os
+import sys
 from typing import Dict, Optional
+
+
+def app_dir() -> str:
+    """アプリのディレクトリを返す。
+
+    凍結ビルド（NetBelt.exe）なら exe のあるディレクトリ、開発実行なら
+    リポジトリの直下。mibs/・custom_mibs.json・mib_cache.json は
+    ここを基準に探す。作業ディレクトリ相対で開くと、ショートカットの
+    「作業フォルダー」が違うだけで別の（あるいは存在しない）MIB を読み、
+    同じ OID が別の名前に解決されるうえ、起動したフォルダに
+    mib_cache.json を書き散らす。
+    """
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))))
+
+
+def _app_path(name: str) -> str:
+    """アプリのディレクトリにある name のパスを返す。
+
+    そこに無く、作業ディレクトリにはあるときだけ、これまでどおり作業
+    ディレクトリ側を使う。どちらにも無ければアプリのディレクトリ側。
+    """
+    primary = os.path.join(app_dir(), name)
+    if os.path.exists(primary):
+        return primary
+    fallback = os.path.abspath(name)
+    if os.path.exists(fallback):
+        return fallback
+    return primary
 
 
 class MIBResolver:
@@ -84,9 +117,9 @@ class MIBResolver:
         import json
         import os
         
-        # 1. custom_mibs.jsonを読み込み
-        custom_mib_file = 'custom_mibs.json'
-        
+        # 1. custom_mibs.jsonを読み込み（アプリのディレクトリ基準）
+        custom_mib_file = _app_path('custom_mibs.json')
+
         if os.path.exists(custom_mib_file):
             try:
                 with open(custom_mib_file, 'r', encoding='utf-8') as f:
@@ -104,8 +137,9 @@ class MIBResolver:
             except Exception as e:
                 print(f"[MIBResolver] カスタムMIB読み込みエラー: {str(e)}")
         
-        # 2. mibsディレクトリからMIBファイルを読み込み（キャッシュ使用）
-        mibs_dir = 'mibs'
+        # 2. mibsディレクトリからMIBファイルを読み込み（キャッシュ使用、
+        #    アプリのディレクトリ基準）
+        mibs_dir = _app_path('mibs')
         if os.path.exists(mibs_dir) and os.path.isdir(mibs_dir):
             # キャッシュを使用して高速化
             cached_mibs = self._load_or_update_mib_cache(mibs_dir)
@@ -131,7 +165,9 @@ class MIBResolver:
         import json
         import os
         
-        cache_file = 'mib_cache.json'
+        # キャッシュは読んだ mibs/ の隣（通常はアプリのディレクトリ）に置く。
+        # 作業ディレクトリに書くと起動したフォルダへ散らばる
+        cache_file = os.path.join(os.path.dirname(mibs_dir), 'mib_cache.json')
         cached_mibs = {}
         cache_needs_update = False
         
