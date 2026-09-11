@@ -4,10 +4,14 @@
 メイン画面でだけ増える。動きの根拠は ECMA-48 と、標準に無い部分は
 XTerm Control Sequences。
 
-制限: 全角文字も 1 セルとして扱う (桁計算は ASCII 前提。機器 CLI の
-出力は ASCII で、ここが崩れる実害は Linux 側の全角編集のみ)。
+セルの幅は xterm と同じく unicodedata で決める: 東アジア幅 W/F は
+2 セル (2 セル目は文字 "" の継続セル)、結合文字と書式文字 (ZWJ 等) は
+幅 0 で直前のセルの文字列へ繋げる。残る制限: 曖昧幅 (A) は 1 セル、
+絵文字の ZWJ 列や肌色修飾は 1 つの書記素にまとめず幅を足す、幅 0 の
+文字が行頭に来たときは前の行へ繋げず捨てる。
 """
 import collections
+import unicodedata
 
 from core.terminal import parser
 from core.terminal.attrs import DEFAULT, apply_sgr
@@ -24,6 +28,29 @@ def _param(params, i, default):
     if i < len(params) and params[i] is not None:
         return params[i]
     return default
+
+
+def _cell_width(ch):
+    """文字が占めるセル数 (0 / 1 / 2)。
+
+    結合文字 (Mn/Me) と書式文字 (Cf: ZWJ・ZWNJ 等) は 0、東アジア幅
+    W/F (漢字・かな・絵文字) は 2、それ以外は 1。xterm と同じ数え方。
+    """
+    if unicodedata.category(ch) in ("Mn", "Me", "Cf"):
+        return 0
+    if unicodedata.east_asian_width(ch) in ("W", "F"):
+        return 2
+    return 1
+
+
+def _split_wide(line, i):
+    """i 番目が全角の継続セルなら、その全角 (i-1 と i) を空白にする。
+
+    全角の片側だけを書き換える・消すとき、残る半分を消す (xterm と同じ)。
+    """
+    if 0 < i < len(line) and line[i][0] == "":
+        line[i - 1] = BLANK
+        line[i] = BLANK
 
 
 class Screen(object):
@@ -193,26 +220,65 @@ class Screen(object):
         for ch in text:
             if ch == "\x7f":            # DEL は表示しない
                 continue
+            if self._g[self._charset] == "0":
+                ch = DEC_GRAPHICS.get(ch, ch)
+            width = _cell_width(ch)
+            if width == 0:              # 結合文字・ZWJ は桁を進めない
+                self._join_previous(ch)
+                continue
+            if width == 2 and self.cols < 2:
+                continue                # 1 桁の画面に全角は置けない
             if self._pending_wrap:      # 右端の 1 文字あとの折り返し
                 self.cursor_col = 0
                 self._linefeed(from_wrap=True)
-            if self._g[self._charset] == "0":
-                ch = DEC_GRAPHICS.get(ch, ch)
+            if width == 2 and self.cursor_col + 1 >= self.cols:
+                # 全角が右端の 1 セルに収まらない。xterm と同じく右端は
+                # 空けたまま丸ごと次の行へ送る (折り返し無効なら手前に重ねる)
+                if self.autowrap:
+                    self.cursor_col = 0
+                    self._linefeed(from_wrap=True)
+                else:
+                    self.cursor_col = self.cols - 2
             line = self.lines[self.cursor_row]
-            if self.cursor_col >= len(line):
+            end = self.cursor_col + width
+            if end > len(line):
                 # 折り返し行は埋めていないので、書くときに伸ばす
-                line.extend([BLANK] * (self.cursor_col + 1 - len(line)))
+                line.extend([BLANK] * (end - len(line)))
+            # 全角の半分に重ねて書いたら、残る半分は空白になる
+            _split_wide(line, self.cursor_col)
+            _split_wide(line, end)
             line[self.cursor_col] = (ch, self.attr)
+            if width == 2:
+                line[self.cursor_col + 1] = ("", self.attr)     # 継続セル
             # 折り返しの印は、折り返しで付き、その行への印字で外れる。
             # 残すと、EL 無しで書き直された行が履歴で次の行と連結される
             # (右端まで書けば _linefeed(from_wrap=True) が改めて付ける)
             self.wrapped[self.cursor_row] = False
             self.dirty.add(self.cursor_row)
-            if self.cursor_col + 1 < self.cols:
-                self.cursor_col += 1
-            elif self.autowrap:
-                self._pending_wrap = True
-            # autowrap 無効なら右端で上書きを続ける
+            if end < self.cols:
+                self.cursor_col = end
+            else:
+                self.cursor_col = self.cols - 1
+                if self.autowrap:
+                    self._pending_wrap = True
+                # autowrap 無効なら右端で上書きを続ける
+
+    def _join_previous(self, ch):
+        """幅 0 の文字 (結合文字・ZWJ 等) を直前の文字のセルへ繋げる。
+
+        右端で折り返し待ちなら今のセル、そうでなければ 1 つ左のセル。
+        そこが全角の継続セルなら、その全角本体へ繋げる。前に文字が無い
+        (行頭) ときは捨てる。
+        """
+        line = self.lines[self.cursor_row]
+        i = self.cursor_col if self._pending_wrap else self.cursor_col - 1
+        if 0 < i < len(line) and line[i][0] == "":
+            i -= 1
+        if not 0 <= i < len(line):
+            return
+        text, attr = line[i]
+        line[i] = (text + ch, attr)
+        self.dirty.add(self.cursor_row)
 
     def _ctrl(self, ch):
         if ch == "\r":
@@ -508,6 +574,9 @@ class Screen(object):
             rng = range(0, end)
         else:
             rng = range(0, len(line))
+        # 範囲の端が全角の途中なら、その全角は丸ごと消える
+        _split_wide(line, rng.start)
+        _split_wide(line, rng.stop)
         for c in rng:
             line[c] = BLANK
         if mode != 1:               # 行末まで消したら続きは無い
@@ -540,24 +609,30 @@ class Screen(object):
         # 続く行は広げても埋めないため)。そこで詰めても意味が無い
         if self.cursor_col >= len(line):
             return
+        _split_wide(line, self.cursor_col)     # 全角の途中で割らない
         for _ in range(n):
             if insert:
                 # 行が桁数いっぱいのときだけ右端を押し出す。折り返し行は
                 # 広げても埋めないので桁数より短いことがあり、そこで
                 # 無条件に pop すると余裕があるのに行末の文字が消える
                 if len(line) >= self.cols:
-                    line.pop()
+                    if line.pop()[0] == "":     # 全角の半分だけ残さない
+                        line[-1] = BLANK
                 line.insert(self.cursor_col, BLANK)
             else:
                 line.pop(self.cursor_col)
                 line.append(BLANK)
+                if line[self.cursor_col][0] == "":
+                    line[self.cursor_col] = BLANK
         self.dirty.add(self.cursor_row)
         self._pending_wrap = False
 
     def _erase_chars(self, n):
         line = self.lines[self.cursor_row]
-        for c in range(self.cursor_col,
-                       min(len(line), self.cursor_col + n)):
+        rng = range(self.cursor_col, min(len(line), self.cursor_col + n))
+        _split_wide(line, rng.start)            # 全角は丸ごと消える
+        _split_wide(line, rng.stop)
+        for c in rng:
             line[c] = BLANK
         self.wrapped[self.cursor_row] = False   # 印字と同じ扱い
         self.dirty.add(self.cursor_row)

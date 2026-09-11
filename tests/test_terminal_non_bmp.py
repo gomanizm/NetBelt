@@ -97,8 +97,9 @@ class TerminalNonBmpTest(unittest.TestCase):
         w.append_output("dev", EMOJI + "abc")
 
         screen = terminal._screen
-        row = "".join(cell[0] for cell in screen.lines[screen.cursor_row])
-        head = row[:screen.cursor_col]
+        # 絵文字は 2 セル占めるので、桁で文字列を切らずセルで切る
+        cells = screen.lines[screen.cursor_row][:screen.cursor_col]
+        head = "".join(cell[0] for cell in cells)
         # 段落内の位置で見る（文書全体の絶対位置を組み直さずに済む）。
         # Qt が数える単位に合わせて UTF-16 のコード単位で期待値を出す。
         expected = len(head.encode("utf-16-le")) // 2

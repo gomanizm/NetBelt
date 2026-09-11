@@ -912,8 +912,11 @@ class TerminalWidget(QWidget):
             pos = start
             for r in range(screen.cursor_row):
                 pos += _u16(rows[r]) + 1
-            row = rows[screen.cursor_row]
-            pos += _u16(row[:min(screen.cursor_col, len(row))])
+            # 桁ではなくセルで数える。全角は 2 セルで文書上は 1 文字、
+            # 結合文字は 0 セルで文書上は 1 文字ぶん増えるので、文字列を
+            # 桁で切るとキャレットがずれる
+            row = cell_rows[screen.cursor_row][:screen.cursor_col]
+            pos += _u16("".join(cell[0] for cell in row))
             caret = QTextCursor(terminal.document())
             caret.setPosition(pos)
             terminal.setTextCursor(caret)
