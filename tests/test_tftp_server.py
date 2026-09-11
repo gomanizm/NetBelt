@@ -132,7 +132,8 @@ class TftpWrqTest(unittest.TestCase):
         # first recvfrom times out (forces a resend), second returns the correct ACK
         xs.recvfrom.side_effect = [socket.timeout(), (ack, addr)]
         packet = _s.pack("!HH", 3, 7) + b"data"  # OP_DATA=3, block 7
-        srv._send_and_wait_ack(xs, packet, addr, 7)   # must return (not raise)
+        # timeout=0: モックの socket.timeout は即座に返るので、待ち時間 0 秒で「締切到来」とする
+        srv._send_and_wait_ack(xs, packet, addr, 7, timeout=0)   # must return (not raise)
         self.assertEqual(xs.sendto.call_count, 2)     # original send + 1 retransmit
         for c in xs.sendto.call_args_list:
             self.assertEqual(c.args[0], packet)       # same bytes retransmitted (no corruption)
@@ -145,7 +146,7 @@ class TftpWrqTest(unittest.TestCase):
         addr = ("127.0.0.1", 12345)
         xs.recvfrom.side_effect = socket.timeout
         packet = _s.pack("!HH", 3, 7) + b"data"
-        self.assertRaises(socket.timeout, srv._send_and_wait_ack, xs, packet, addr, 7)
+        self.assertRaises(socket.timeout, srv._send_and_wait_ack, xs, packet, addr, 7, 0)
 
     def test_rrq_orphan_no_options_is_silent(self):
         # 重複RRQの敗者スレッド(オプション無し): block1のACKが来ないと started も error も出さず撤退。

@@ -234,7 +234,14 @@ class TFTPServer:
             except ValueError:
                 pass
         if "timeout" in opts:
-            out["timeout"] = opts["timeout"]
+            # RFC 2349: 1〜255 秒の整数だけ受諾する。範囲外・非数値は黙って無視
+            #（OACK に含めなければクライアントは既定値で動く）
+            try:
+                t = int(opts["timeout"])
+            except ValueError:
+                t = 0
+            if 1 <= t <= 255:
+                out["timeout"] = str(t)
         if "tsize" in opts:
             out["tsize"] = opts["tsize"]  # RRQ では実サイズに上書きする
         return out
@@ -263,11 +270,13 @@ class TFTPServer:
             total = 0  # 不正な tsize はハンドラスレッドを落とさず 0 扱い
         neg.pop("tsize", None)  # WRQ の tsize はクライアント宣言。ここでは echo せず簡略化
         blksize = int(neg.get("blksize", "512"))
+        timeout = self._transfer_timeout(xs, neg)
         # transfer_started とファイル生成は「最初の DATA を受けてから」（確立後）に行う。
         # 重複WRQの敗者スレッドは DATA が来ないので、ファイルを作らず黙って撤退する
         #（複数スレッドが同じファイルを truncate し合う競合も防ぐ）。
         first_ack = _oack(neg) if neg else struct.pack("!HH", OP_ACK, 0)
         xs.sendto(first_ack, addr)
+        deadline = time.monotonic() + timeout
         expected = 1
         received = 0
         last_ack = first_ack
@@ -299,14 +308,18 @@ class TFTPServer:
                     if len(data) < 4:
                         continue
                 except socket.timeout:
+                    if time.monotonic() < deadline:
+                        continue  # 合意した timeout まではまだ待つ（停止確認のため小刻みに戻る）
                     retries += 1
                     if retries > self._retries:
                         if not established:
                             return  # DATA が一度も来ない = 孤児。started/error とも出さず撤退
                         raise
                     xs.sendto(last_ack, addr)  # 最後の ACK を再送
+                    deadline = time.monotonic() + timeout
                     continue
                 retries = 0
+                deadline = time.monotonic() + timeout
                 if struct.unpack("!H", data[:2])[0] != OP_DATA:
                     continue
                 block = struct.unpack("!H", data[2:4])[0]
@@ -347,7 +360,7 @@ class TFTPServer:
                     xs.sendto(struct.pack("!HH", OP_ACK, block), addr)  # 重複 DATA へ再 ACK
             self.on_event("transfer_complete", addr[0], (filename, received, total, "upload"))
             # 最終 ACK が落ちたときの再送に応えられるよう、閉じる前に少し待つ
-            self._dally(xs, addr, last_ack, expected, blksize)
+            self._dally(xs, addr, last_ack, expected, blksize, timeout)
         except socket.timeout:
             self.on_event("protocol_error", addr[0],
                           (filename, "アップロードがタイムアウト", "upload"))
@@ -363,15 +376,27 @@ class TFTPServer:
                 f.close()
             xs.close()
 
-    def _dally(self, xs, addr, last_ack, final_block, blksize):
-        """最終 ACK 送信後、_timeout 秒ほど待って再送された最終 DATA へ再 ACK する。
+    def _transfer_timeout(self, xs, neg):
+        """転送で使う待ち時間（秒）を決め、ソケットの待ちを小刻みに設定する。
+
+        OACK で timeout を受諾したらその値、無ければ既定の _timeout。
+        ソケット自体の待ちは最長 1 秒にし、呼び出し側が締切まで recv を
+        繰り返す。こうしないと長い timeout（最大 255 秒）を受諾したときに
+        停止要求へ気づくのがその分遅れ、stop() が転送スレッドを待ちきれない。
+        """
+        timeout = float(neg.get("timeout", self._timeout))
+        xs.settimeout(min(1.0, timeout))
+        return timeout
+
+    def _dally(self, xs, addr, last_ack, final_block, blksize, timeout):
+        """最終 ACK 送信後、timeout 秒ほど待って再送された最終 DATA へ再 ACK する。
 
         RFC 1350 の「最終 ACK を送った側はしばらく待つ」。即座に閉じると、
         最終 ACK が落ちたときの再送に誰も応えず（Windows では ICMP Port
         Unreachable が返る）、ファイルは保存済みなのに機器側だけが失敗と
         判定する。停止要求にすぐ気づけるよう、短い待ちを繰り返す。
         """
-        deadline = time.monotonic() + self._timeout
+        deadline = time.monotonic() + timeout
         while not self._stopping:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -389,20 +414,26 @@ class TFTPServer:
             if op == OP_DATA and block == final_block:
                 xs.sendto(last_ack, addr)
 
-    def _send_and_wait_ack(self, xs, packet, addr, expect_block):
+    def _send_and_wait_ack(self, xs, packet, addr, expect_block, timeout=None):
         """packet を送り、block=expect_block の ACK を待つ。来なければ最大 _retries 回まで再送。
-        古い/重複 ACK は無視。全再送失敗で socket.timeout を送出（呼び出し側が中断処理）。"""
+        古い/重複 ACK は無視。全再送失敗で socket.timeout を送出（呼び出し側が中断処理）。
+        timeout は 1 回の待ち秒数（省略時は既定の _timeout）。"""
+        if timeout is None:
+            timeout = self._timeout
         for attempt in range(self._retries + 1):
             # ここで見ないと、再送を繰り返すあいだ（最大 12 秒）停止に
             # 気づかず、止めたあとも DATA を送り続けることになる。
             if self._stopping:
                 raise _ServerStopped()
             xs.sendto(packet, addr)
+            deadline = time.monotonic() + timeout
             deadline_tries = 0
             while True:
                 try:
                     ack, src = xs.recvfrom(516)
                 except socket.timeout:
+                    if time.monotonic() < deadline and not self._stopping:
+                        continue  # 合意した timeout まではまだ待つ
                     break  # この試行はタイムアウト。外側 for で再送
                 # RFC1350: 相手の TID と一致しない ACK は受理せず、送信元へ通知する
                 if src != addr:
@@ -439,6 +470,7 @@ class TFTPServer:
         if "tsize" in neg:
             neg["tsize"] = str(os.path.getsize(target))  # 実サイズを返す
         blksize = int(neg.get("blksize", "512"))
+        timeout = self._transfer_timeout(xs, neg)
         total = os.path.getsize(target)
         # transfer_started は確立後（最初の ACK 受領後）に初めて出す。重複RRQの敗者スレッドは
         # 最初の ACK が来ない（機器は勝者の TID にしか ACK しない）ので、何も出さず黙って撤退する。
@@ -449,7 +481,7 @@ class TFTPServer:
             with open(target, "rb") as f:
                 if neg:
                     try:
-                        self._send_and_wait_ack(xs, _oack(neg), addr, 0)  # OACKにACK(0)。再送付き
+                        self._send_and_wait_ack(xs, _oack(neg), addr, 0, timeout)  # OACKにACK(0)。再送付き
                     except socket.timeout:
                         return  # 未確立: 重複RRQの孤児。started/error とも出さない
                     except _ServerStopped:
@@ -477,7 +509,7 @@ class TFTPServer:
                     else:
                         chunk = f.read(blksize)
                     try:
-                        self._send_and_wait_ack(xs, struct.pack("!HH", OP_DATA, block) + chunk, addr, block)
+                        self._send_and_wait_ack(xs, struct.pack("!HH", OP_DATA, block) + chunk, addr, block, timeout)
                     except socket.timeout:
                         if not established:
                             return  # block1 の ACK すら来ない = 孤児。黙って撤退
