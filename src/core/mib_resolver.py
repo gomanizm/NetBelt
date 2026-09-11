@@ -11,7 +11,7 @@ from typing import Dict, Optional
 # MIB 解析器の版。抽出・解決の規則を変えたら上げる。mib_cache.json は
 # この値も鍵にするので、古い解析器が作ったキャッシュがアプリの更新後に
 # そのまま使われることがなくなる。
-MIB_PARSER_VERSION = '2026-09-11.1'
+MIB_PARSER_VERSION = '2026-09-12.1'
 
 
 def app_dir() -> str:
@@ -285,14 +285,22 @@ class MIBResolver:
     # 隣の定義を消す。IMPORTS の直後に並ぶ MODULE-IDENTITY も
     # 「名前 MODULE-IDENTITY」に見えるので、同じ理由で根を飲み込む。
     # 右辺が { 名前 数字 } ちょうどでない定義は、その定義だけ落とす。
+    #
+    # ただし「別の定義が始まる行」に節キーワードの行を混ぜてはいけない。
+    # `SYNTAX OBJECT IDENTIFIER` は「名前 OBJECT IDENTIFIER」の形なので、
+    # 素直に書くと OBJECT-TYPE の本体がその行で打ち切られ、snmpTrapOID /
+    # sysObjectID のような標準 MIB の定義が丸ごと抽出から落ちる。節の
+    # キーワード（SYNTAX / WRITE-SYNTAX など）は全部大文字なのに対し、
+    # 定義の名前は ASN.1 の値定義なので大文字だけということはない。
+    # そこで「先頭の語が全部大文字」の行は定義の始まりとみなさない。
     _MIB_DEFINITION_KEYWORDS = (
         r'(?:OBJECT\s+IDENTIFIER|OBJECT-TYPE|NOTIFICATION-TYPE'
         r'|MODULE-IDENTITY|OBJECT-IDENTITY|OBJECT-GROUP|NOTIFICATION-GROUP'
         r'|MODULE-COMPLIANCE|AGENT-CAPABILITIES|TRAP-TYPE|TEXTUAL-CONVENTION)'
     )
     _MIB_DEFINITION_BODY = (
-        r'(?:(?!::=)(?!\n[ \t]*[\w-]+[ \t]+' + _MIB_DEFINITION_KEYWORDS
-        + r'\b).)*?'
+        r'(?:(?!::=)(?!\n[ \t]*(?![A-Z][A-Z0-9-]*[ \t])[\w-]+[ \t]+'
+        + _MIB_DEFINITION_KEYWORDS + r'\b).)*?'
     )
     _MIB_ASSIGNMENT = r'::=\s*\{\s*([\w-]+)\s+(\d+)\s*\}'
     _MIB_DEFINITION_PATTERNS = (

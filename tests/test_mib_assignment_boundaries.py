@@ -126,6 +126,57 @@ class MibAssignmentBoundariesTest(unittest.TestCase):
                          "根が消えている: %s" % resolved)
         self.assertNotIn("IMPORTS", set(resolved.values()))
 
+    def test_an_object_type_with_an_object_identifier_syntax_is_kept(self):
+        """`SYNTAX OBJECT IDENTIFIER` を持つ OBJECT-TYPE が消えないこと。
+
+        「別の定義が始まる行」の判定に節キーワードの行まで含めると、
+        `SYNTAX OBJECT IDENTIFIER` の行が定義の始まりに見えて本体が
+        そこで打ち切られ、その OBJECT-TYPE が丸ごと抽出から落ちる。
+        snmpTrapOID / snmpTrapEnterprise / sysObjectID など標準 MIB に
+        普通にある形なので、Trap の通知 OID が名前にならなくなる。
+        """
+        path = self._write(
+            "S.my",
+            "root OBJECT IDENTIFIER ::= { enterprises 99999 }\n"
+            "snmpTrap OBJECT IDENTIFIER ::= { root 4 }\n"
+            "snmpTrapOID OBJECT-TYPE\n"
+            "    SYNTAX     OBJECT IDENTIFIER\n"
+            "    MAX-ACCESS accessible-for-notify\n"
+            "    STATUS     current\n"
+            "    DESCRIPTION \"The notification currently being sent.\"\n"
+            "    ::= { snmpTrap 1 }\n"
+            "snmpTrapEnterprise OBJECT-TYPE\n"
+            "    SYNTAX     OBJECT IDENTIFIER\n"
+            "    MAX-ACCESS accessible-for-notify\n"
+            "    STATUS     current\n"
+            "    ::= { snmpTrap 3 }\n")
+        extracted = self._extracted(path)
+        self.assertIn(("snmpTrapOID", "snmpTrap", "1"), extracted,
+                      "snmpTrapOID が抽出から消えた: %s" % extracted)
+        self.assertIn(("snmpTrapEnterprise", "snmpTrap", "3"), extracted,
+                      "snmpTrapEnterprise が抽出から消えた: %s" % extracted)
+        resolved = self._resolved()
+        self.assertEqual(resolved.get("1.3.6.1.4.1.99999.4.1"), "snmpTrapOID",
+                         "snmpTrapOID が解決できない: %s" % resolved)
+
+    def test_a_mixed_case_definition_still_stops_the_previous_body(self):
+        """名前が大文字で始まる定義でも、隣の OID を奪われないこと。
+
+        節キーワード（全部大文字）だけを定義の始まりから外す。大文字で
+        始まるだけの名前は定義の始まりとして扱い続ける。
+        """
+        self._write("X.my",
+                    "root OBJECT IDENTIFIER ::= { enterprises 88888 }\n"
+                    "a OBJECT-TYPE\n"
+                    "    SYNTAX INTEGER\n"
+                    "    ::= { root 0 1 }\n"
+                    "Bee OBJECT-TYPE\n"
+                    "    SYNTAX INTEGER\n"
+                    "    ::= { root 2 }\n")
+        resolved = self._resolved()
+        self.assertEqual(resolved.get("1.3.6.1.4.1.88888.2"), "Bee",
+                         "a が Bee の OID を奪っている: %s" % resolved)
+
 
 if __name__ == "__main__":
     unittest.main()
