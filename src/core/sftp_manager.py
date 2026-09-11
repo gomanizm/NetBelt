@@ -386,7 +386,7 @@ class SFTPManager(QObject):
                                 self.sftp_client.remove(tmp_remote)
                     except Exception:
                         pass
-                self.error_occurred.emit(f"アップロードエラー: {str(e)}")
+                self._fail("アップロードエラー", e)
         
         # バックグラウンドスレッドで実行
         threading.Thread(target=upload_thread, daemon=True).start()
@@ -447,7 +447,7 @@ class SFTPManager(QObject):
                     os.remove(tmp_local)
                 except OSError:
                     pass
-                self.error_occurred.emit(f"ダウンロードエラー: {str(e)}")
+                self._fail("ダウンロードエラー", e)
         
         # バックグラウンドスレッドで実行
         threading.Thread(target=download_thread, daemon=True).start()
