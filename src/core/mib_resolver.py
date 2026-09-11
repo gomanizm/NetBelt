@@ -221,10 +221,10 @@ class MIBResolver:
                 except Exception as e:
                     print(f"[MIBResolver] {filename} エラー: {str(e)}")
 
-            resolved = self._resolve_definitions(all_definitions)
-            cached_mibs = {oid: name for name, oid in resolved.items()}
+            cached_mibs = self._resolve_definitions(all_definitions)
+            resolved_names = set(cached_mibs.values())
             for filename, definitions in per_file.items():
-                got = sum(1 for name, _, _ in definitions if name in resolved)
+                got = sum(1 for d in definitions if d[0] in resolved_names)
                 print(f"[MIBResolver] {filename}: {got}件")
             
             # キャッシュファイルに保存
@@ -320,18 +320,24 @@ class MIBResolver:
                 i += 1
         return ''.join(out)
 
+    # モジュール名。`FOO-MIB DEFINITIONS ::= BEGIN` の FOO-MIB
+    _MIB_MODULE_HEADER = r'^[ \t]*([\w-]+)\s+DEFINITIONS\b'
+
     def _extract_mib_definitions(self, filepath: str) -> list:
         """
-        MIBファイルから (名前, 親の名前, 添字) を抜き出す
+        MIBファイルから (名前, 親の名前, 添字, モジュール名) を抜き出す
 
         ここでは OID へ解決しない。親が別のファイルで定義されていることが
         普通にあるため、解決は全ファイルを読み終えてからまとめて行う。
+
+        モジュール名は `X DEFINITIONS ::= BEGIN` の X。無いファイルは
+        ファイル名をモジュール名の代わりにする（ファイル単位の名前空間）。
 
         Args:
             filepath: MIBファイルのパス
 
         Returns:
-            (名前, 親の名前, 添字) のリスト
+            (名前, 親の名前, 添字, モジュール名) のリスト
         """
         import re
 
@@ -339,13 +345,16 @@ class MIBResolver:
         try:
             with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
                 content = self._blank_comments_and_strings(f.read())
+            header = re.search(self._MIB_MODULE_HEADER, content, re.MULTILINE)
+            module = header.group(1) if header else os.path.basename(filepath)
             for pattern in self._MIB_DEFINITION_PATTERNS:
                 # DOTALL が要る。定義は複数行にまたがるので、`.` が改行を
                 # 拾わないと型キーワードから ::= まで届かない
                 for match in re.finditer(pattern, content,
                                          re.MULTILINE | re.DOTALL):
                     definitions.append(
-                        (match.group(1), match.group(2), match.group(3)))
+                        (match.group(1), match.group(2), match.group(3),
+                         module))
         except Exception as e:
             print(f"[MIBResolver] MIBファイル解析エラー: {str(e)}")
 
@@ -353,36 +362,55 @@ class MIBResolver:
 
     def _resolve_definitions(self, definitions: list) -> dict:
         """
-        (名前, 親の名前, 添字) の並びを OID へ解決する
+        (名前, 親の名前, 添字, モジュール名) の並びを OID へ解決する
 
         親が別のファイルで定義されていることがあるので、解決が進まなく
         なるまで繰り返す。一度で終える（＝読んだ順に解決する）と、親が
         後ろのファイルにある定義が os.listdir() の順しだいで落ちる。
 
+        親は同じモジュールの定義を優先する。名前→OID を全モジュール共通の
+        1 枚にすると、2 つの MIB が同じ名前（例: 両方に shared）を自分の
+        根の下に定義したとき後に書いた方だけが残り、もう一方の子がよその
+        親に付く（実測: 2 つの Trap が互いの enterprise に入れ替わった）。
+        同じモジュールに親の定義があるのにまだ解決していなければ、よその
+        同名を使わずに次の回を待つ。同じモジュールに無い親（IMPORTS）は
+        これまでどおりモジュールをまたいで探す。
+
+        残る制限: 2 つのモジュールが同じ名前を定義し、第三のモジュールが
+        その一方を IMPORTS しているとき、IMPORTS を見ていないのでどちらを
+        指すか決められず、後に解決した方になる。
+
         Args:
-            definitions: (名前, 親の名前, 添字) のリスト
+            definitions: (名前, 親の名前, 添字, モジュール名) のリスト
 
         Returns:
-            解決できた 名前→OID の辞書
+            解決できた OID→名前 の辞書（同名でも別 OID なら両方残る）
         """
         known = dict(self.name_to_oid)
+        declared = {}
+        for name, _, _, module in definitions:
+            declared.setdefault(module, set()).add(name)
+        in_module = {}
         resolved = {}
         pending = list(definitions)
 
         while pending:
             still_pending = []
             progressed = False
-            for name, parent, index in pending:
+            for name, parent, index, module in pending:
                 if parent == 'enterprises':
                     parent_oid = '1.3.6.1.4.1'
+                elif parent in declared[module]:
+                    parent_oid = in_module.get(module, {}).get(parent)
                 else:
                     parent_oid = known.get(parent)
                 if parent_oid is None:
-                    still_pending.append((name, parent, index))
+                    still_pending.append((name, parent, index, module))
                     continue
                 oid = f"{parent_oid}.{index}"
                 known[name] = oid
-                resolved[name] = oid
+                in_module.setdefault(module, {})[name] = oid
+                resolved[oid] = name
                 progressed = True
             if not progressed:
                 # これ以上どれも解決できない（親がどこにも無い）
