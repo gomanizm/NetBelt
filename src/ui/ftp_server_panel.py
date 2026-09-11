@@ -293,10 +293,11 @@ class FTPServerPanel(QWidget):
     def _on_fw_allow(self):
         """手動でファイアウォール受信許可を追加（管理者昇格）。3CDaemon方式で通らない環境の復旧用。"""
         self._add_log("ファイアウォール許可を実行します（管理者昇格）...")
-        ok, _msg = self.ftp_server.fix_firewall(
+        ok, msg = self.ftp_server.fix_firewall(
             self.port_spin.value(),
             (self.passive_lo_spin.value(), self.passive_hi_spin.value()))
-        self._add_log("ファイアウォール許可: %s" % ("完了" if ok else "未反映/失敗"))
+        # 「反映待ち」等の理由を潰さず、そのまま見せる
+        self._add_log("ファイアウォール許可: %s (%s)" % ("完了" if ok else "未反映/失敗", msg))
 
     def _add_log(self, message: str):
         """ログにメッセージを追加(自動スクロール付き)"""

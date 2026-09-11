@@ -421,9 +421,10 @@ class SyslogPanel(QWidget):
             self.status_label.setText("受信器がまだ用意されていません")
             return
         self.status_label.setText("ファイアウォール許可を実行します（管理者昇格）...")
-        ok, _msg = self.syslog_receiver.fix_firewall()
+        ok, msg = self.syslog_receiver.fix_firewall()
+        # 「反映待ち」等の理由を潰さず、そのまま見せる
         self.status_label.setText(
-            "ファイアウォール許可: %s" % ("完了" if ok else "未反映/失敗"))
+            "ファイアウォール許可: %s (%s)" % ("完了" if ok else "未反映/失敗", msg))
 
     def _protocol_port(self, proto):
         """指定プロトコルの待受ポート"""

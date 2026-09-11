@@ -1030,9 +1030,10 @@ class SNMPPanel(QWidget):
         if self.snmp_manager is None:
             self.trap_status_label.setText("SNMP マネージャがまだ用意されていません")
             return
-        ok, _msg = self.snmp_manager.fix_firewall(self.trap_port_spinbox.value())
+        ok, msg = self.snmp_manager.fix_firewall(self.trap_port_spinbox.value())
+        # 「反映待ち」等の理由を潰さず、そのまま見せる
         self.trap_status_label.setText(
-            "ファイアウォール許可: %s" % ("完了" if ok else "未反映/失敗"))
+            "ファイアウォール許可: %s (%s)" % ("完了" if ok else "未反映/失敗", msg))
 
     def _on_operation_partial(self, reason: str):
         """WALK が途中で途切れたことを受け取る（結果はこのあと届く）。

@@ -274,8 +274,9 @@ class SFTPServerPanel(QWidget):
         Windows の初回プロンプトを拒否した等で通らない環境はここで直す。
         """
         self._add_log("ファイアウォール許可を実行します（管理者昇格）...")
-        ok, _msg = self.sftp_server.fix_firewall(self.port_spin.value())
-        self._add_log("ファイアウォール許可: %s" % ("完了" if ok else "未反映/失敗"))
+        ok, msg = self.sftp_server.fix_firewall(self.port_spin.value())
+        # 「反映待ち」等の理由を潰さず、そのまま見せる
+        self._add_log("ファイアウォール許可: %s (%s)" % ("完了" if ok else "未反映/失敗", msg))
 
     def _add_log(self, message: str):
         """ログにメッセージを追加"""
