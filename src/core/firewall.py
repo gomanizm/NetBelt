@@ -50,7 +50,18 @@ def _netsh(args):
 _KEY_ENABLED = ("enabled", "有効")
 _KEY_ACTION = ("action", "操作")
 _VAL_YES = ("yes", "はい")
+_VAL_NO = ("no", "いいえ")
 _VAL_ALLOW = ("allow", "許可")
+_VAL_BLOCK = ("block", "ブロック")
+
+
+def _tri(val, true_vals, false_vals):
+    """値を True / False / None（認識語彙に無い＝読めなかった）で返す"""
+    if val in true_vals:
+        return True
+    if val in false_vals:
+        return False
+    return None
 
 
 def _decode_netsh(data):
@@ -71,6 +82,15 @@ def _rule_state(name):
         "present" … 同名の受信ルールはあるが無効またはブロック
         "absent"  … 無い
         "unknown" … 同名ルールはあるが出力を解釈できない（未知のロケール）
+
+    「有効」と「操作」の両方を値まで読めたルールだけを判断材料にする。
+    片方しか読めない（キーは英語と同綴りだが値が未知の語、など）出力を
+    "present" にすると、実際は許可されているのに毎回 UAC で修復を求める。
+
+    制限事項: プロファイル・プロトコル・ローカルポートは見ていない。
+    同名でプロファイル限定・別ポートのルールがあると "ok" と判定する。
+    ルール名にプロトコルとポートを含めているため実運用では一致するが、
+    利用者が手で同名ルールを作り替えた場合は取りこぼす。
     """
     r = _netsh(["advfirewall", "firewall", "show", "rule", "name=" + name, "dir=in"])
     # 存在しない場合 netsh は returncode!=0 で "No rules match..." を返す
@@ -82,8 +102,10 @@ def _rule_state(name):
     enabled = allow = None
     for line in text.splitlines():
         if line.startswith("----"):
-            if enabled and allow:
-                return "ok"
+            if enabled is not None and allow is not None:
+                parsed_any = True
+                if enabled and allow:
+                    return "ok"
             enabled = allow = None
             continue
         key, sep, val = line.partition(":")
@@ -92,13 +114,13 @@ def _rule_state(name):
         key = key.strip().lower()
         val = val.strip().lower()
         if key in _KEY_ENABLED:
-            parsed_any = True
-            enabled = val in _VAL_YES
+            enabled = _tri(val, _VAL_YES, _VAL_NO)
         elif key in _KEY_ACTION:
-            parsed_any = True
-            allow = val in _VAL_ALLOW
-    if enabled and allow:
-        return "ok"
+            allow = _tri(val, _VAL_ALLOW, _VAL_BLOCK)
+    if enabled is not None and allow is not None:
+        parsed_any = True
+        if enabled and allow:
+            return "ok"
     return "present" if parsed_any else "unknown"
 
 
