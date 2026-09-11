@@ -11,6 +11,11 @@ window.isVisible() は exec() の前で True のまま、3 秒たっても exec(
 は回り続けていた。updater.bat は 3 秒後に起動中フォルダへ xcopy する
 ため、ロックされた NetBelt.exe で失敗し、ロックされていないファイル
 だけが先に置き換わる混在が起こりうる。
+
+_apply_pending_update はソース実行では案内を出して何もしない（同じ
+レビューの別の指摘で入った。配布物の ZIP を展開するとリポジトリ直下を
+上書きしてしまうため）。ここで見たいのは終了の経路なので、凍結された
+exe として動いているふりをする。
 """
 import os
 import sys
@@ -46,6 +51,11 @@ class PendingUpdateQuitTest(unittest.TestCase):
         type(self)._windows.append(w)
         return w
 
+    @staticmethod
+    def _as_frozen_build():
+        """凍結された exe として動いているふりをする文脈。"""
+        return mock.patch.object(sys, "frozen", True, create=True)
+
     def _run_event_loop_with_watchdog(self, seconds=2.0):
         """exec() を回し、上限を過ぎたら 42 で抜ける。戻り値と経過秒を返す。"""
         from PyQt6.QtCore import QTimer
@@ -63,7 +73,7 @@ class PendingUpdateQuitTest(unittest.TestCase):
         """
         w = self._window()
         w.show()
-        with mock.patch("subprocess.Popen") as popen:
+        with self._as_frozen_build(), mock.patch("subprocess.Popen") as popen:
             w._apply_pending_update(os.path.join(tempfile.gettempdir(),
                                                  "NetBelt-9.9.9.zip"))
         popen.assert_called_once()
@@ -76,7 +86,7 @@ class PendingUpdateQuitTest(unittest.TestCase):
     def test_a_failed_updater_launch_does_not_quit(self):
         """updater を起動できなかったときは、これまでどおり終了しないこと。"""
         w = self._window()
-        with mock.patch("subprocess.Popen", side_effect=OSError("見つかりません")),              mock.patch("ui.main_window.QMessageBox.critical") as critical:
+        with self._as_frozen_build(),              mock.patch("subprocess.Popen", side_effect=OSError("見つかりません")),              mock.patch("ui.main_window.QMessageBox.critical") as critical:
             w._apply_pending_update(os.path.join(tempfile.gettempdir(),
                                                  "NetBelt-9.9.9.zip"))
         critical.assert_called_once()
