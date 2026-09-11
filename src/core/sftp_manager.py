@@ -49,6 +49,13 @@ class SFTPManager(QObject):
     # 呼ばれるため、長く待つとアプリが終了できなくなる。
     _DISCONNECT_WAIT_SECONDS = 3.0
 
+    # 共有チャンネルが機器の応答を待つ上限（秒）。None のままだと、機器が
+    # SFTP サブシステムだけ黙ったとき（TCP は生きている）に mkdir や
+    # normalize が無期限に止まり、GUI スレッドから呼ばれるのでアプリ全体が
+    # 固まる。転送中は 1 回の recv/send がこの時間ゼロのまま止まったときに
+    # 限って切れる（データが流れている限り切れない）。
+    CHANNEL_TIMEOUT_SECONDS = 30.0
+
     def _acquire_for_gui(self, what: str) -> bool:
         """GUI スレッドから使うためにロックを取る（取れなければ False）
 
@@ -84,7 +91,11 @@ class SFTPManager(QObject):
             # SSHクライアントからSFTPセッションを取得
             self.ssh_client = ssh_client
             self.sftp_client = ssh_client.open_sftp()
-            
+            # 応答待ちに期限を入れる。ここより後の normalize を含め、
+            # このチャンネル越しの全操作が期限切れで socket.timeout を
+            # 投げるようになり、各操作の except がエラー通知へ変える
+            self.sftp_client.get_channel().settimeout(self.CHANNEL_TIMEOUT_SECONDS)
+
             # ホームディレクトリを取得
             try:
                 self.current_path = self.sftp_client.normalize('.')
