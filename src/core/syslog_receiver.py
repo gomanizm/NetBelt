@@ -199,6 +199,10 @@ class SyslogReceiver(QObject):
         # RFC 5424 の 2048 オクテットは「最低これだけは受けよ」であって
         # 上限ではない。実機は長い行を出すので、実用と防御の釣り合いで 64KiB。
         self.max_line_bytes = 64 * 1024
+        # TCP の同時接続数の上限。接続ごとにスレッドとソケットを持つので、
+        # 何も送らないアイドル接続を張られるだけで際限なく積み上がる。
+        # TFTP の max_workers と同じ考えで、超過分は accept 直後に閉じる。
+        self.max_tcp_connections = 64
 
     @property
     def is_running(self):
@@ -389,6 +393,20 @@ class SyslogReceiver(QObject):
             while not stop_event.is_set():
                 try:
                     client_socket, addr = sock.accept()
+                    # 終わった接続のスレッドを外しておく。append するだけだと
+                    # 接続を繰り返すほどリストが単調に増え、stop() まで
+                    # 解放されない。入れ替えでなく in-place で詰めるのは、
+                    # stop() が同じリストを走査しているため。
+                    self.tcp_clients[:] = [
+                        t for t in self.tcp_clients if t.is_alive()]
+                    if len(self.tcp_clients) >= self.max_tcp_connections:
+                        print("[Syslog] TCP client refused (limit %d): %s"
+                              % (self.max_tcp_connections, addr[0]))
+                        try:
+                            client_socket.close()
+                        except Exception:
+                            pass
+                        continue
                     print("[Syslog] TCP client connected: %s" % addr[0])
                     client_thread = threading.Thread(
                         target=self._handle_tcp_client,
@@ -396,12 +414,6 @@ class SyslogReceiver(QObject):
                         daemon=True,
                     )
                     client_thread.start()
-                    # 終わった接続のスレッドを外しておく。append するだけだと
-                    # 接続を繰り返すほどリストが単調に増え、stop() まで
-                    # 解放されない。入れ替えでなく in-place で詰めるのは、
-                    # stop() が同じリストを走査しているため。
-                    self.tcp_clients[:] = [
-                        t for t in self.tcp_clients if t.is_alive()]
                     self.tcp_clients.append(client_thread)
                 except socket.timeout:
                     continue
