@@ -346,6 +346,8 @@ class TFTPServer:
                 else:
                     xs.sendto(struct.pack("!HH", OP_ACK, block), addr)  # 重複 DATA へ再 ACK
             self.on_event("transfer_complete", addr[0], (filename, received, total, "upload"))
+            # 最終 ACK が落ちたときの再送に応えられるよう、閉じる前に少し待つ
+            self._dally(xs, addr, last_ack, expected, blksize)
         except socket.timeout:
             self.on_event("protocol_error", addr[0],
                           (filename, "アップロードがタイムアウト", "upload"))
@@ -360,6 +362,32 @@ class TFTPServer:
             if f:
                 f.close()
             xs.close()
+
+    def _dally(self, xs, addr, last_ack, final_block, blksize):
+        """最終 ACK 送信後、_timeout 秒ほど待って再送された最終 DATA へ再 ACK する。
+
+        RFC 1350 の「最終 ACK を送った側はしばらく待つ」。即座に閉じると、
+        最終 ACK が落ちたときの再送に誰も応えず（Windows では ICMP Port
+        Unreachable が返る）、ファイルは保存済みなのに機器側だけが失敗と
+        判定する。停止要求にすぐ気づけるよう、短い待ちを繰り返す。
+        """
+        deadline = time.monotonic() + self._timeout
+        while not self._stopping:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            xs.settimeout(min(0.2, remaining))
+            try:
+                data, a = xs.recvfrom(blksize + 4)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            if a != addr or len(data) < 4:
+                continue
+            op, block = struct.unpack("!HH", data[:4])
+            if op == OP_DATA and block == final_block:
+                xs.sendto(last_ack, addr)
 
     def _send_and_wait_ack(self, xs, packet, addr, expect_block):
         """packet を送り、block=expect_block の ACK を待つ。来なければ最大 _retries 回まで再送。
