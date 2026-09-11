@@ -635,6 +635,10 @@ class TerminalWidget(QWidget):
                     # 再接続は新しいセッション。前の画面はそのまま記録と
                     # して文書に残し、端末状態 (パーサ・画面) は作り直す
                     self._attach_screen(self._terminals[device_name])
+                    # 再接続待ちも解く。Enter 経由は keyPressEvent が
+                    # 落とすが、接続ボタン・ダブルクリック経由はここしか
+                    # 通らず、接続できても打鍵と貼り付けが捨てられ続けた
+                    self._terminals[device_name].set_reconnect_mode(False)
                     return self._terminals[device_name]
         
         # 接続機器がなく、ホームタブが残っている場合は、ホームタブを再利用
