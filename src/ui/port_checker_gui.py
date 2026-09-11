@@ -18,6 +18,45 @@ from PyQt6.QtGui import QFont
 from core.sockets import set_exclusive_bind
 
 
+def _local_port(local_address: str):
+    """netstat のローカルアドレス列（例 0.0.0.0:135, [::]:135）からポート番号を取り出す。"""
+    _, sep, port = local_address.rpartition(":")
+    if not sep or not port.isdigit():
+        return None
+    return int(port)
+
+
+def select_netstat_lines(output: str, port, protocol: str,
+                         listening_only: bool = False) -> list:
+    """netstat -ano の出力から、条件に合う行だけを返す。
+
+    findstr :{port} のような部分文字列の判定は、80 で 8080 やリモート側の
+    :80 まで拾い、別プロセスを原因として表示してしまう。列に分けて、
+    ローカルアドレス列のポート番号を完全一致で比べる。
+
+    Args:
+        output: netstat -ano の出力全体
+        port: ポート番号。None なら全ポート
+        protocol: 'TCP' または 'UDP'（行頭のプロトコル列と比べる。IPv6 の
+            行も同じ列名なので一緒に拾う）
+        listening_only: True なら TCP の状態列が LISTENING の行だけ。
+            UDP は状態列を持たないのでそのまま
+    """
+    selected = []
+    for line in output.splitlines():
+        parts = line.split()
+        # 列: プロトコル, ローカル, 外部, [状態], PID（UDP は状態列が無い）
+        if len(parts) < 4 or parts[0].upper() != protocol.upper():
+            continue
+        if port is not None and _local_port(parts[1]) != port:
+            continue
+        if listening_only and protocol.upper() == "TCP" and \
+                (len(parts) < 5 or parts[3].upper() != "LISTENING"):
+            continue
+        selected.append(line)
+    return selected
+
+
 class PortCheckThread(QThread):
     """ポートチェックを別スレッドで実行"""
     result_ready = pyqtSignal(str)
@@ -76,22 +115,27 @@ class PortCheckThread(QThread):
             result += "=" * 60 + "\n"
             result += "【ポート使用状況（netstat）】\n"
             result += "=" * 60 + "\n"
+            # Windows netstat コマンド。findstr で絞らず、行を列に分けて
+            # ローカル側のポート番号とプロトコルを完全一致で選ぶ
             try:
-                # Windows netstat コマンド
-                cmd = f"netstat -ano | findstr :{self.port}"
-                output = subprocess.check_output(cmd, shell=True, text=True, 
+                output = subprocess.check_output("netstat -ano", shell=True, text=True, 
                                                stderr=subprocess.STDOUT)
-                result += f"ポート {self.port} を使用している接続:\n\n"
-                result += output + "\n"
+            except subprocess.CalledProcessError:
+                output = ""
+            lines = select_netstat_lines(output, self.port, self.protocol)
+            if not lines:
+                result += f"ポート {self.port}/{self.protocol} を使用している接続は見つかりませんでした\n"
+                result += "→ このポートは現在使用されていません\n\n"
+            else:
+                result += f"ポート {self.port}/{self.protocol} を使用している接続:\n\n"
+                result += "\n".join(lines) + "\n\n"
                 
                 # PIDを抽出してプロセス名を取得
                 pids = set()
-                for line in output.strip().split('\n'):
-                    parts = line.split()
-                    if parts:
-                        pid = parts[-1]
-                        if pid.isdigit():
-                            pids.add(pid)
+                for line in lines:
+                    pid = line.split()[-1]
+                    if pid.isdigit():
+                        pids.add(pid)
                 
                 if pids:
                     result += "\n関連プロセス情報:\n"
@@ -111,9 +155,6 @@ class PortCheckThread(QThread):
                         except subprocess.CalledProcessError:
                             result += f"  PID {pid}: プロセス情報取得失敗\n"
                     result += "\n"
-            except subprocess.CalledProcessError:
-                result += f"ポート {self.port} を使用している接続は見つかりませんでした\n"
-                result += "→ このポートは現在使用されていません\n\n"
         
         # ポートをリスニングしているプロセスを表示
         if self.check_type in ["all", "listening"]:
@@ -121,20 +162,16 @@ class PortCheckThread(QThread):
             result += f"【{self.protocol}リスニングポート一覧】\n"
             result += "=" * 60 + "\n"
             try:
-                if self.protocol == "UDP":
-                    cmd = "netstat -ano -p UDP"
-                else:  # TCP
-                    cmd = "netstat -ano -p TCP"
-                
+                # -p TCP は IPv4 だけなので、全体を取ってプロトコル列で選ぶ
+                cmd = "netstat -ano"
                 output = subprocess.check_output(cmd, shell=True, text=True,
                                                stderr=subprocess.STDOUT)
                 
-                lines = output.strip().split('\n')
-                # ヘッダーをスキップして指定ポートに関連する行を探す
-                relevant_lines = []
-                for line in lines[3:]:  # 最初の3行はヘッダー
-                    if f':{self.port}' in line:
-                        relevant_lines.append(line)
+                # 指定ポートを待ち受けている行を探す。TCP は状態列が
+                # LISTENING のものだけ（ESTABLISHED だけの対は待ち受けではない）
+                relevant_lines = select_netstat_lines(
+                    output, self.port, self.protocol,
+                    listening_only=(self.protocol == "TCP"))
                 
                 if relevant_lines:
                     result += f"{self.protocol}ポート {self.port} を使用している接続:\n\n"
@@ -143,7 +180,7 @@ class PortCheckThread(QThread):
                 else:
                     # すべてのポートを表示（最大20行）
                     result += f"{self.protocol}接続の一覧（最大20件）:\n\n"
-                    for line in lines[3:23]:
+                    for line in select_netstat_lines(output, None, self.protocol)[:20]:
                         result += line + "\n"
                 result += "\n"
             except subprocess.CalledProcessError:
