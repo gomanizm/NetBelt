@@ -688,10 +688,9 @@ class SFTPPanel(QWidget):
         # current_path を使うので、確認ダイアログの間にディレクトリが
         # 変わっていると別の場所へ置いてしまう
         remote = self._remote_path(base_path, name)
-        if overwrite_granted:
-            manager.upload_file(file_path, remote, overwrite=True)
-        else:
-            manager.upload_file(file_path, remote)
+        # 上書きの可否は、許すときも許さないときも必ず明示して渡す。省略すると
+        # 受け手の既定値まかせになり、「渡し忘れ」と「許していない」が区別できない
+        manager.upload_file(file_path, remote, overwrite=overwrite_granted)
     
     def _on_download(self):
         """ダウンロードボタンがクリックされた"""

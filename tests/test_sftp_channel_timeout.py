@@ -9,6 +9,7 @@ SFTP サブシステムだけが応答しなくなる機器では抜けられな
 
 接続直後にチャンネルへ期限を入れ、期限切れはエラー通知で戻す。
 """
+import io
 import os
 import socket
 import sys
@@ -127,6 +128,112 @@ class SftpChannelTimeoutTest(unittest.TestCase):
                         "サーバの停滞 %.1f 秒をそのまま待っている (%.2f 秒)" % (stall, elapsed))
         self.assertTrue(errors, "期限切れがエラーとして通知されていない")
         self.assertTrue(any("ディレクトリ作成エラー" in e for e in errors), errors)
+
+
+    def test_a_timed_out_operation_says_why_and_closes_the_session(self):
+        """期限切れのあと、使えないセッションが「接続中」で残らないこと。
+
+        期限で戻っても要求と応答はずれたままなので、同じチャンネルの以後の
+        操作は失敗し続ける。それでも is_connected が True だと、利用者は操作の
+        たびに期限ぶん固まったうえ、理由の書かれていないエラー（socket.timeout
+        は str が空）を見続けることになり、再接続すべきだと分からない。
+        """
+        from core import sftp_server
+        from core.sftp_manager import SFTPManager
+
+        def slow_mkdir(handler, path, attr):
+            time.sleep(3.0)
+            return sftp_server.SFTP_OK
+
+        with mock.patch.object(sftp_server.SFTPServerHandler, "mkdir", slow_mkdir),              mock.patch.object(SFTPManager, "CHANNEL_TIMEOUT_SECONDS", 1.0,
+                               create=True):
+            port = self._server()
+            manager = SFTPManager()
+            self.assertTrue(manager.connect(self._ssh_client(port)), "SFTP に接続できない")
+            self.addCleanup(manager.disconnect)
+            errors = []
+            manager.error_occurred.connect(errors.append)
+
+            manager.create_directory("/newdir")
+
+            # 理由の書かれたメッセージであること（空の str(e) を貼っただけでない）
+            self.assertTrue(any("応答しません" in e for e in errors), errors)
+            self.assertFalse(
+                manager.is_connected,
+                "使用不能になったセッションが接続中のまま残っている")
+
+            # 以後の操作は、期限ぶん固まらずに未接続として即座に戻る
+            errors.clear()
+            started = time.time()
+            manager.create_directory("/newdir2")
+            elapsed = time.time() - started
+
+        self.assertLess(elapsed, 0.5,
+                        "切断済みのはずが、また期限まで待っている (%.2f 秒)" % elapsed)
+        self.assertEqual(errors, ["SFTP接続がありません"], errors)
+
+
+class SftpTransferTimeoutTest(unittest.TestCase):
+    """転送が期限切れで終わったときも、理由を出して接続を畳むこと。
+
+    put / get の途中で機器が黙ると、チャンネルの期限で socket.timeout に
+    なる。GUI スレッドの操作と同じで、以後この接続は使えないうえ、
+    socket.timeout は str が空なので「アップロードエラー: 」としか出ない。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PyQt6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="netbelt-xfer-timeout-")
+
+    def _manager(self):
+        from core.sftp_manager import SFTPManager
+        m = SFTPManager()
+        m.is_connected = True
+        m.sftp_client = mock.Mock()
+        m.sftp_client.stat.side_effect = FileNotFoundError("gone")  # 送り先は空
+        m.list_directory = mock.Mock()
+        self.errors = []
+        m.error_occurred.connect(self.errors.append)
+        return m
+
+    def _wait(self, predicate, seconds=5.0):
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            self.app.processEvents()
+            if predicate():
+                return True
+            time.sleep(0.02)
+        return False
+
+    def test_an_upload_that_times_out_says_why_and_closes_the_session(self):
+        m = self._manager()
+        local = os.path.join(self.dir, "running.cfg")
+        with io.open(local, "w", encoding="utf-8") as f:
+            f.write("hostname R1")
+        m.sftp_client.put.side_effect = TimeoutError()
+
+        m.upload_file(local, "/flash/running.cfg", overwrite=True)
+
+        self.assertTrue(self._wait(lambda: self.errors), "失敗が通知されない")
+        self.assertTrue(any("応答しません" in e for e in self.errors), self.errors)
+        self.assertTrue(self._wait(lambda: not m.is_connected),
+                        "使用不能になったセッションが接続中のまま残っている")
+
+    def test_a_download_that_times_out_says_why_and_closes_the_session(self):
+        m = self._manager()
+        m.sftp_client.get.side_effect = TimeoutError()
+
+        m.download_file("/flash/running.cfg", os.path.join(self.dir, "got.cfg"))
+
+        self.assertTrue(self._wait(lambda: self.errors), "失敗が通知されない")
+        self.assertTrue(any("応答しません" in e for e in self.errors), self.errors)
+        self.assertTrue(self._wait(lambda: not m.is_connected),
+                        "使用不能になったセッションが接続中のまま残っている")
 
 
 if __name__ == "__main__":
