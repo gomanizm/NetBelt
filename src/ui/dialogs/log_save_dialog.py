@@ -1,6 +1,8 @@
 from PyQt6.QtWidgets import QDialog, QVBoxLayout, QLabel, QProgressBar, QPushButton, QHBoxLayout
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from ui import theme
+import os
+import tempfile
 
 
 class LogSaveWorker(QThread):
@@ -20,29 +22,53 @@ class LogSaveWorker(QThread):
         self._is_cancelled = True
     
     def run(self):
-        """ログ保存を実行"""
+        """ログ保存を実行
+
+        保存先を直接 open('w') すると、キャンセル済みでも 0 バイトに切り詰め、
+        途中キャンセル・途中失敗では新旧どちらでもない部分ファイルが残る
+        （利用者が既存ファイルを保存先に選んだ場合、旧内容が黙って消える）。
+        同じディレクトリの一時ファイルへ書き切ってから os.replace で差し替え、
+        書き切れなかったときは一時ファイルを消して保存先には触れない。
+        """
+        tmp_path = None
         try:
-            # ファイルに書き込み
+            if self._is_cancelled:
+                self.finished.emit(False, "キャンセルされました")
+                return
+
             total_size = len(self.log_text)
             chunk_size = max(1024, total_size // 100)  # 最低1KB、最大100チャンク
-            
-            with open(self.file_path, 'w', encoding='utf-8') as f:
+
+            target = os.path.abspath(self.file_path)
+            fd, tmp_path = tempfile.mkstemp(
+                prefix=os.path.basename(target) + ".", suffix=".tmp",
+                dir=os.path.dirname(target))
+            with open(fd, 'w', encoding='utf-8') as f:
                 for i in range(0, total_size, chunk_size):
                     if self._is_cancelled:
                         self.finished.emit(False, "キャンセルされました")
                         return
-                    
+
                     chunk = self.log_text[i:i + chunk_size]
                     f.write(chunk)
-                    
+
                     # 進行状況を更新
                     progress_percent = min(100, int((i + chunk_size) / total_size * 100))
                     self.progress.emit(progress_percent)
-            
+
+            # 閉じてから差し替える（Windows では開いたままだと置き換えられない）
+            os.replace(tmp_path, target)
+            tmp_path = None
             self.finished.emit(True, "")
-            
+
         except Exception as e:
             self.finished.emit(False, str(e))
+        finally:
+            if tmp_path is not None:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass   # 消せなくても保存先は無傷。残骸は .tmp なので見分けがつく
 
 
 class LogSaveProgressDialog(QDialog):
