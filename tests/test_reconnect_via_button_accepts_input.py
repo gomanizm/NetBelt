@@ -8,7 +8,9 @@ create_terminal_tab はフラグに触れず、接続に成功しても打鍵も
 Enter を押せば解けるが、そのとき「再接続中...」が画面に出て、ステータス
 バーは「既に接続されています」になる。
 
-タブを再利用して新しいセッションを始める時点で、再接続待ちを解く。
+接続できた時点（MainWindow._on_connection_success）で再接続待ちを解く。
+タブの再利用時点では解かない。解いてしまうと、再接続に失敗したときに
+待ちが戻らず、画面に残る案内どおりの Enter が効かなくなる。
 """
 import os
 import sys
@@ -86,8 +88,8 @@ class ReconnectViaButtonTest(unittest.TestCase):
         terminal.keyPressEvent(QKeyEvent(
             QEvent.Type.KeyPress, Qt.Key.Key_A, Qt.KeyboardModifier.NoModifier, ch))
 
-    def test_reusing_the_tab_for_a_new_session_clears_the_reconnect_wait(self):
-        """TerminalWidget 単体: タブの再利用で再接続待ちが解けること。"""
+    def test_the_reconnect_wait_holds_until_the_new_session_is_up(self):
+        """TerminalWidget 単体: 待ちが解けるのは接続できた時点であること。"""
         from ui.terminal_widget import TerminalWidget
         w = TerminalWidget()
         self.addCleanup(w.close)
@@ -98,8 +100,14 @@ class ReconnectViaButtonTest(unittest.TestCase):
 
         w.create_terminal_tab("dev")     # 接続ボタン経由の再接続と同じ経路
 
+        self.assertFalse(terminal.can_send_input(),
+                         "まだ繋がっていないのに再接続待ちが解けている")
+
+        # MainWindow._on_connection_success が接続できた時点で解く
+        terminal.set_reconnect_mode(False)
+
         self.assertTrue(terminal.can_send_input(),
-                        "タブを再利用しても再接続待ちが残っている")
+                        "接続できたのに再接続待ちが残っている")
 
     def test_button_reconnect_delivers_keystrokes_to_the_new_session(self):
         """MainWindow 通し: 接続ボタンで再接続した後の打鍵が機器へ届くこと。"""
