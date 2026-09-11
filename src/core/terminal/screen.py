@@ -372,6 +372,11 @@ class Screen(object):
             self.cursor_col = 0
             self._linefeed()
         elif seq.final == "c":          # RIS。履歴は reset が残す
+            # ED 2 と同じく、消す直前に見えていたメイン画面は履歴へ送る。
+            # 代替画面の裏に退避していたメイン画面も同じ (代替画面の
+            # 中身は記録しない)
+            self._switch_screen(False, with_cursor=False)
+            self._record_screen()
             self.reset()
         # = > \ H などは表示を変えない
 
@@ -453,15 +458,8 @@ class Screen(object):
         wipes_all = (mode >= 2 or
                      (mode == 0 and (self.cursor_row, self.cursor_col)
                       == (0, 0)))
-        if wipes_all and not self.alt_active:
-            last = -1
-            for r in range(self.rows):
-                if any(c != BLANK for c in self.lines[r]):
-                    last = r
-            for r, line in enumerate(self.lines[:last + 1]):
-                self.history.append(line)
-                self._new_history.append((line, self.wrapped[r]))
         if wipes_all:
+            self._record_screen()
             rng = range(0, self.rows)
         elif mode == 0:
             self._erase_line(0)
@@ -474,6 +472,18 @@ class Screen(object):
             self.wrapped[r] = False
         self.dirty.update(rng)
         self._pending_wrap = False
+
+    def _record_screen(self):
+        """画面全体が消える前に、最後の非空行までを履歴へ送る。"""
+        if self.alt_active:
+            return
+        last = -1
+        for r in range(self.rows):
+            if any(c != BLANK for c in self.lines[r]):
+                last = r
+        for r, line in enumerate(self.lines[:last + 1]):
+            self.history.append(line)
+            self._new_history.append((line, self.wrapped[r]))
 
     def _erase_line(self, mode):
         line = self.lines[self.cursor_row]

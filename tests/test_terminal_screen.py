@@ -262,10 +262,34 @@ class EscDispatchTest(unittest.TestCase):
         self.assertEqual(s.text()[:2], ["new", "top"])
 
     def test_full_reset_clears_the_screen_but_not_the_history(self):
+        # RIS (reset / tput reset / 一部機器の起動コンソール) も ED 2 と
+        # 同じく、消す直前に見えていた行を履歴へ送る。旧契約は「押し出し
+        # 済みの 6 行だけ残る」で、画面上の 24 行が記録から消えていた
         s = feed(Screen(), "\r\n".join("l%d" % i for i in range(30)))
         feed(s, "\x1bc")
         self.assertEqual(s.text(), [""] * 24)
-        self.assertEqual(len(s.history), 6)
+        self.assertEqual(len(s.history), 30)
+        record = everything(s)
+        for i in range(30):
+            self.assertIn("l%d" % i, record)
+
+    def test_full_reset_hands_the_wiped_lines_to_the_renderer(self):
+        s = feed(Screen(), "KEEP\x1bc")
+        self.assertEqual([("".join(c[0] for c in line).rstrip(), w)
+                          for line, w in s.take_new_history()],
+                         [("KEEP", False)])
+
+    def test_full_reset_on_the_alt_screen_saves_the_shell_behind_it(self):
+        # vi の中で reset が飛んでも、裏に退避していたシェル画面は
+        # 記録に残る。代替画面の中身は (これまでどおり) 記録しない
+        s = feed(Screen(), "MAIN-A\r\nMAIN-B")
+        feed(s, "\x1b[?1049hALT-ONLY\x1bc")
+        self.assertFalse(s.alt_active)
+        self.assertEqual(s.text(), [""] * 24)
+        record = everything(s)
+        self.assertIn("MAIN-A", record)
+        self.assertIn("MAIN-B", record)
+        self.assertNotIn("ALT-ONLY", record)
 
     def test_line_drawing_characters(self):
         # ESC)0 で G1 に罫線集合を指示し、SO で使い、SI で戻る
