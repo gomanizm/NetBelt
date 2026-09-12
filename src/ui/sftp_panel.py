@@ -845,18 +845,22 @@ class SFTPPanel(QWidget):
             return
 
         # 現在のパーミッションを8進数で表示。サーバが permissions を
-        # 返さなかった項目は None なので、既定値は空にする
+        # 返さなかった項目は None なので、既定値は空にする。
+        # setuid / setgid / sticky を含む 4 桁で出す（& 0o777 で切ると、
+        # 何も書き換えずに OK を押しただけで特殊ビットが落ちる）
         if file_info['mode'] is None:
             current_mode_str = ""
         else:
-            current_mode = file_info['mode'] & 0o777
-            current_mode_str = oct(current_mode)[2:]  # '0o755' -> '755'
-        
+            current_mode = file_info['mode'] & 0o7777
+            current_mode_str = format(current_mode, '04o')  # 0o1777 -> '1777'
+
         # 新しいパーミッションを入力
         new_mode_str, ok = QInputDialog.getText(
             self,
             "パーミッション変更",
-            f"新しいパーミッションを8進数で入力してください:\n（例: 755, 644）",
+            "新しいパーミッションを8進数で入力してください:\n"
+            "（例: 0755, 0644。先頭の桁は setuid/setgid/sticky で、\n"
+            "3桁で入力するとこれらは落ちます）",
             text=current_mode_str
         )
         

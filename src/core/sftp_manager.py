@@ -635,8 +635,13 @@ class SFTPManager(QObject):
     @staticmethod
     def _format_permissions(mode: int) -> str:
         """
-        パーミッションを文字列形式に変換（例: -rwxr-xr-x）
-        
+        パーミッションを文字列形式に変換（例: -rwxr-xr-x、drwxrwxrwt）
+
+        setuid / setgid / sticky は、ls と同じく実行ビットの位置へ
+        s / t（実行ビットが無ければ S / T）として重ねる。9 文字の
+        rwx だけを組み立てると、sticky 付きのディレクトリが普通の 777 に
+        見え、利用者は落としたことに気づけない。
+
         Args:
             mode: ファイルモード。サーバが permissions を返さなければ None
 
@@ -658,19 +663,29 @@ class SFTPManager(QObject):
         else:
             perm_str = '-'
         
-        # オーナー権限
+        def exec_char(executable, special, letter):
+            """実行ビットの桁を ls と同じ 1 文字にする
+
+            特殊ビットが立っていれば letter（実行ビットが無ければ大文字）、
+            立っていなければ従来どおり 'x' / '-'
+            """
+            if special:
+                return letter if executable else letter.upper()
+            return 'x' if executable else '-'
+
+        # オーナー権限（実行の桁に setuid）
         perm_str += 'r' if mode & stat.S_IRUSR else '-'
         perm_str += 'w' if mode & stat.S_IWUSR else '-'
-        perm_str += 'x' if mode & stat.S_IXUSR else '-'
-        
-        # グループ権限
+        perm_str += exec_char(mode & stat.S_IXUSR, mode & stat.S_ISUID, 's')
+
+        # グループ権限（実行の桁に setgid）
         perm_str += 'r' if mode & stat.S_IRGRP else '-'
         perm_str += 'w' if mode & stat.S_IWGRP else '-'
-        perm_str += 'x' if mode & stat.S_IXGRP else '-'
-        
-        # その他権限
+        perm_str += exec_char(mode & stat.S_IXGRP, mode & stat.S_ISGID, 's')
+
+        # その他権限（実行の桁に sticky）
         perm_str += 'r' if mode & stat.S_IROTH else '-'
         perm_str += 'w' if mode & stat.S_IWOTH else '-'
-        perm_str += 'x' if mode & stat.S_IXOTH else '-'
-        
+        perm_str += exec_char(mode & stat.S_IXOTH, mode & stat.S_ISVTX, 't')
+
         return perm_str
