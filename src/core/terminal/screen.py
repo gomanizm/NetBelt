@@ -607,12 +607,18 @@ class Screen(object):
         wipes_all = (mode >= 2 or
                      (mode == 0 and (self.cursor_row, self.cursor_col)
                       == (0, 0)))
-        # ED 1 も最下行の右端から送られれば画面は丸ごと空白に
-        # なる。消える中身は ED 2 と同じなので、同じく履歴へ送る
+        # ED 1 も、カーソルより下に中身が残らなければ画面は丸ごと
+        # 空白になる。最下行の右端に限らず、機器が数行出した直後の
+        # ESC[1J (24x80 で 2 行だけ、など) が該当する。消える中身は
+        # ED 2 と同じなので、同じく履歴へ送る
         # (消し方は下の mode == 1 の枝のまま。行が桁数より長い
         # ことがあり、全画面消去と同じに払うと右に残る分も消える)
-        if wipes_all or (mode == 1 and self.cursor_row == self.rows - 1
-                         and self.cursor_col >= self.cols - 1):
+        blank_after = mode == 1 and not any(
+            c != BLANK
+            for r in range(self.cursor_row, self.rows)
+            for c in self.lines[r][(self.cursor_col + 1)
+                                   if r == self.cursor_row else 0:])
+        if wipes_all or blank_after:
             self._record_screen()
         if wipes_all:
             rng = range(0, self.rows)

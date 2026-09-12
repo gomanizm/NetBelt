@@ -152,6 +152,34 @@ class ErasingTest(unittest.TestCase):
         for want in ("one", "two", "three"):
             self.assertIn(want, record)
 
+    def test_erase_above_with_nothing_below_keeps_the_record(self):
+        # 右端でなくても、カーソルより下に中身が無ければ ED 1 で
+        # 画面は丸ごと空白になる。消える中身は ED 2 と同じ
+        s = feed(Screen(rows=3, cols=10), "one\r\ntwo\r\nthree")
+        feed(s, "\x1b[3;6H\x1b[1J")
+        self.assertEqual(s.text(), ["", "", ""])
+        record = everything(s)
+        for want in ("one", "two", "three"):
+            self.assertIn(want, record)
+
+    def test_erase_above_on_a_fresh_screen_keeps_the_record(self):
+        # 24x80 の既定の画面で 2 行出した直後の ESC[1J。最下行でも
+        # 右端でもないが、消えれば画面には何も残らない
+        s = feed(Screen(), "banner\r\nsecond")
+        feed(s, "\x1b[1J")
+        self.assertEqual([t for t in s.text() if t], [])
+        record = everything(s)
+        for want in ("banner", "second"):
+            self.assertIn(want, record)
+
+    def test_erase_above_leaving_text_below_keeps_the_screen(self):
+        # 下に中身が残るなら画面は消えていない。履歴へ送ると同じ行が
+        # 画面と履歴の両方に二重に残る
+        s = feed(Screen(rows=3, cols=10), "one\r\ntwo\r\nthree")
+        feed(s, "\x1b[1;2H\x1b[1J")
+        self.assertEqual(s.text(), ["  e", "two", "three"])
+        self.assertEqual(list(s.history), [])
+
     def test_erased_cells_are_undressed(self):
         s = feed(Screen(), "\x1b[7mabc\x1b[2K")
         self.assertEqual(s.lines[0][1], (" ", DEFAULT))
