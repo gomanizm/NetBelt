@@ -508,7 +508,12 @@ class Screen(object):
         on = seq.final == "h"
         for mode in seq.params:
             if mode in (1049, 1047, 47):
-                self._switch_screen(on, with_cursor=(mode == 1049))
+                # 代替画面を白紙にするのは 1049 の入場と 1047 の
+                # 退場だけ (XTerm ctlseqs)。47 はどちらでも消さず、
+                # 入り直したときに前の中身がそのまま見える
+                clear = (mode == 1049) if on else (mode == 1047)
+                self._switch_screen(on, with_cursor=(mode == 1049),
+                                    clear=clear)
             elif mode == 7:
                 self.autowrap = on
                 if not on:
@@ -524,7 +529,8 @@ class Screen(object):
                 self.bracketed_paste = on
             # ほかの私用モードは表示に効かないので無視
 
-    def _switch_screen(self, to_alt, with_cursor):
+    def _switch_screen(self, to_alt, with_cursor, clear=True):
+        """代替画面と行き来する。clear は代替画面を白紙にするか。"""
         if to_alt == self.alt_active:
             return
         if to_alt and with_cursor:
@@ -535,15 +541,21 @@ class Screen(object):
         self.wrapped, self._other_wrapped = (
             self._other_wrapped, self.wrapped)
         self.alt_active = to_alt
-        if to_alt:                      # 代替画面は白紙で始まる
-            for r in range(self.rows):
-                self.lines[r] = self._blank_line()
-                self.wrapped[r] = False
-            self._move(0, 0)
-        elif with_cursor and self._saved_main:
-            row, col, attr = self._saved_main
-            self.attr = attr
-            self._move(row, col)
+        if to_alt:
+            if clear:               # 1049 の代替画面は白紙で始まる
+                for r in range(self.rows):
+                    self.lines[r] = self._blank_line()
+                    self.wrapped[r] = False
+                self._move(0, 0)
+        else:
+            if clear:               # 1047 は出るときに代替画面を消す
+                for r in range(self.rows):
+                    self._other[r] = self._blank_line()
+                    self._other_wrapped[r] = False
+            if with_cursor and self._saved_main:
+                row, col, attr = self._saved_main
+                self.attr = attr
+                self._move(row, col)
         self.dirty.update(range(self.rows))
         self._pending_wrap = False
 

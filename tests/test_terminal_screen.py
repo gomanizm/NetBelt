@@ -456,6 +456,21 @@ class AlternateScreenTest(unittest.TestCase):
         s = feed(Screen(), "shell stuff\x1b[?1049h")
         self.assertEqual(s.text(), [""] * 24)
 
+    def test_re_entering_the_alt_screen_with_47_keeps_its_content(self):
+        # 入場で白紙にするのは 1049 だけ (XTerm ctlseqs)。
+        # 47 は裏画面の中身をそのまま見せる
+        s = feed(Screen(), "shell\x1b[?47h\x1b[HALT\x1b[?47l")
+        self.assertEqual(s.text()[0], "shell")
+        feed(s, "\x1b[?47h")
+        self.assertEqual(s.text()[0], "ALT")
+
+    def test_leaving_the_alt_screen_with_1047_clears_it(self):
+        # 1047 は退場のときに代替画面を消すので、次の入場は白紙
+        s = feed(Screen(), "shell\x1b[?1047h\x1b[HALT\x1b[?1047l")
+        self.assertEqual(s.text()[0], "shell")
+        feed(s, "\x1b[?1047h")
+        self.assertEqual(s.text()[0], "")
+
     def test_alt_screen_scrolling_never_reaches_history(self):
         s = feed(Screen(), "\x1b[?1049h")
         feed(s, "\r\n".join("frame%d" % i for i in range(40)))
