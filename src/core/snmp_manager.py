@@ -503,6 +503,10 @@ class SNMPTrapReceiver(QThread):
         ntfrcv はコールバックのアリティを例外ベースで判定し、TypeError が出ると
         「引数の数が違う」とみなして呼び直す。本体で TypeError を漏らすと
         同じ通知が二度処理されるため、ここで握りつぶす。
+
+        制限: 1件ごとにそのまま emit する（間引きは GUI 側の
+        SNMPPanel._trim_traps だけ）。GUI が止まっている間は Qt の
+        キューが上限なしに伸びる。理由と実測値は _trim_traps に書いた。
         """
         try:
             if self._is_weaker_than_registered():
