@@ -319,7 +319,17 @@ class TelnetConnection(QObject):
             # 空にするだけだと、続きを通常データとして画面へ出してしまう。
             print("[Telnet] 未完の制御シーケンスが大きすぎるため破棄しました")
             self._discarding_sb = pending[:2] == bytes([IAC, SB])
-            pending = b''
+            if self._discarding_sb:
+                # 捨てる分の末尾が対の無い IAC なら、それだけは次の受信へ
+                # 持ち越す。ここで捨てると、次の受信が SE で始まった
+                # （終端が切れ目で割れた）ときに終端を見つけられず、
+                # 以後の受信を全部捨て続ける。末尾 1 バイトで判定すると
+                # 本文中の IAC IAC まで持ち越して次の SE を終端と誤認
+                # するので、_find_sb_end の dangling で数える。
+                _, dangling = self._find_sb_end(pending, 2)
+                pending = pending[-dangling:] if dangling else b''
+            else:
+                pending = b''
 
         return bytes(output), pending
     
