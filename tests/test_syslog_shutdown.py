@@ -109,6 +109,39 @@ class SyslogShutdownTest(unittest.TestCase):
                                 "%d 回目の起動に失敗" % (i + 1))
                 r.stop_protocol("UDP")
 
+    def test_stopping_tcp_waits_for_the_client_threads(self):
+        """TCP の停止は、接続中のクライアントスレッドの終了まで待つこと。
+
+        待たずに停止を通知すると、その後でクライアントスレッドが最後の
+        受信を emit し、停止済みのはずの一覧に 1 件増える。
+        """
+        r = self._receiver()
+        port = free_port("TCP")
+        self.assertTrue(r.start_protocol("TCP", port=port))
+
+        c = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.addCleanup(c.close)
+        c.settimeout(5)
+        c.connect(("127.0.0.1", port))
+        c.sendall(b"<14>hello\n")
+
+        deadline = time.time() + 5
+        while time.time() < deadline and not r.tcp_clients:
+            time.sleep(0.02)
+        self.assertTrue(r.tcp_clients, "クライアントスレッドが登録されていない")
+        threads = list(r.tcp_clients)
+
+        alive_at_stopped = []
+        r.stopped.connect(
+            lambda: alive_at_stopped.append([t.is_alive() for t in threads]))
+
+        r.stop_protocol("TCP")
+
+        self.assertEqual(
+            alive_at_stopped, [[False]],
+            "停止を通知した時点でクライアントスレッドがまだ動いている: %s"
+            % alive_at_stopped)
+
     def test_messages_still_arrive_before_the_stop(self):
         """停止経路を変えても、通常の受信は壊れていないこと。"""
         from PyQt6.QtWidgets import QApplication

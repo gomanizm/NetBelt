@@ -340,6 +340,15 @@ class SyslogReceiver(QObject):
             if th.is_alive():
                 print("[Syslog] %s の受信スレッドが終了しません"
                       "（ポートが解放されない可能性があります）" % proto)
+        if proto == "TCP":
+            # 接続中のクライアントスレッドの終了も待つ。待たずに停止を
+            # 通知すると、その後でスレッドが最後の受信を emit し、止めた
+            # はずの一覧へ 1 件追加される。どのスレッドも待受と同じ
+            # stop_event を見ていて、recv のタイムアウト 1 秒以内に抜ける
+            for client in list(self.tcp_clients):
+                if client.is_alive():
+                    client.join(timeout=3)
+            self.tcp_clients[:] = [t for t in self.tcp_clients if t.is_alive()]
         print("[Syslog] %s Server stopped" % proto)
         if not self._servers:
             self.stopped.emit()
@@ -489,6 +498,11 @@ class SyslogReceiver(QObject):
                         newline_at = buffer.find(b"\n")
                         if newline_at == -1:
                             current_line = len(buffer)
+                            # LF がまだ届いていないだけの CRLF も同じ扱いにする。
+                            # 数えると、上限ちょうどの行が、CR と LF の間で
+                            # 受信が切れたときだけ超過と判定されて切られる
+                            if buffer.endswith(b"\r"):
+                                current_line -= 1
                         else:
                             current_line = newline_at
                             # CRLF の CR は配信前に落とすので中身ではない。

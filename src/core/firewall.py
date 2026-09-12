@@ -242,6 +242,16 @@ def ensure_self_program_allow():
             return True, "自exe受信許可を保証: " + name
         # 未昇格: cmd.exe /c 経由で delete(block)+add(allow) を昇格実行（& をシェルに解釈させる）。
         # ShellExecuteW(lpFile="netsh") は netsh を直接起動するため & がシェル区切りにならず add が実行されない。
+        #
+        # cmd.exe は二重引用符の中でも %VAR% を展開するので、置き場所の名前に
+        # 定義済みの環境変数名が %..% の形で含まれていると、delete も add も
+        # 展開後の別パスを対象にする。ルール名だけは一致するため rule_exists は
+        # 真を返し、受信は通らないのに「完了」と表示される。cmd.exe の引数には
+        # % を打ち消す手段が無いので、その場合は自動設定せずに理由を返す
+        # （昇格済みの経路は netsh へ引数のリストで渡すので展開されない）。
+        if "%" in prog:
+            return False, ("実行ファイルのパスに % が含まれるため自exe受信許可を"
+                           "自動設定できません（手動で追加してください）: " + prog)
         import ctypes
         cmd = ('/c netsh advfirewall firewall delete rule name=all dir=in action=block '
                'program="{0}" & netsh advfirewall firewall add rule name="{1}" dir=in '

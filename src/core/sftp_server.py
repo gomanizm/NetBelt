@@ -194,9 +194,30 @@ class SFTPServerHandler(SFTPServerInterface):
             return SFTP_FAILURE
     
     def chattr(self, path, attr):
-        """ファイル属性を変更"""
+        """ファイル属性を変更（SETSTAT）。
+
+        サイズ・日時・パーミッションを要求どおり反映する。以前は st_mode
+        だけを見て、サイズと日時は捨てたまま SFTP_OK を返していたため、
+        truncate や日時保持（sftp -p）がエラーも出ないまま効かなかった。
+
+        制限: uid/gid は Windows で意味を持たないので受け取っても無視する
+        （この用途の SFTP クライアントは所有者を送ってこない）。開いている
+        ハンドルへの FSETSTAT は paramiko の既定のまま「未対応」を返す。
+        """
         try:
             real_path = self._get_real_path(path)
+            if attr.st_size is not None:
+                os.truncate(real_path, attr.st_size)
+            atime = attr.st_atime
+            mtime = attr.st_mtime
+            if atime is not None or mtime is not None:
+                # 片方だけ指定されたら、もう片方は現在の値を保つ
+                current = os.stat(real_path)
+                os.utime(real_path,
+                         (current.st_atime if atime is None else atime,
+                          current.st_mtime if mtime is None else mtime))
+            # 読み取り専用にする要求が先に効くと、同じ要求内の truncate や
+            # utime が通らなくなるので、モードは最後に適用する
             if attr.st_mode is not None:
                 os.chmod(real_path, attr.st_mode)
             return SFTP_OK
