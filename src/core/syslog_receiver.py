@@ -489,6 +489,11 @@ class SyslogReceiver(QObject):
                         newline_at = buffer.find(b"\n")
                         if newline_at == -1:
                             current_line = len(buffer)
+                            # LF がまだ届いていないだけの CRLF も同じ扱いにする。
+                            # 数えると、上限ちょうどの行が、CR と LF の間で
+                            # 受信が切れたときだけ超過と判定されて切られる
+                            if buffer.endswith(b"\r"):
+                                current_line -= 1
                         else:
                             current_line = newline_at
                             # CRLF の CR は配信前に落とすので中身ではない。
