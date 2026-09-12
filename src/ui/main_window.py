@@ -2189,10 +2189,16 @@ for details.
             print("[Main] Stopping Syslog receiver...")
             self.syslog_receiver.stop()
         
-        # SFTPサーバーを停止
-        if hasattr(self, 'sftp_server_panel') and self.sftp_server_panel.sftp_server.is_running:
-            print("[Main] Stopping SFTP server...")
-            self.sftp_server_panel.sftp_server.stop()
+        # SFTPサーバーを停止。is_running では判定しない。あのフラグを
+        # 立てるのは待受ワーカーの先頭で、start() はスレッドを起こした
+        # 直後に戻るため、その隙に閉じると空振りして待受が生き残る。
+        # stop() 自身も同じ理由でスレッドの生死で判定している。
+        # TFTP/FTP は start() の中で is_running を立ててから戻るのでこの隙は無い。
+        if hasattr(self, 'sftp_server_panel'):
+            sftp_thread = self.sftp_server_panel.sftp_server.server_thread
+            if sftp_thread is not None and sftp_thread.is_alive():
+                print("[Main] Stopping SFTP server...")
+                self.sftp_server_panel.sftp_server.stop()
         
         # TFTPサーバーを停止
         if hasattr(self, 'tftp_server_panel') and self.tftp_server_panel.tftp_server.is_running:
