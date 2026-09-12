@@ -30,9 +30,11 @@ class FTPServerManager(QObject):
     stopped = pyqtSignal()
     error_occurred = pyqtSignal(str)
     client_activity = pyqtSignal(str, str)      # ip, message
-    transfer_started = pyqtSignal(str, str, int, str)        # ip, filename, total, direction
-    transfer_progress = pyqtSignal(str, str, int, int, str)  # ip, filename, done, total, direction
-    transfer_complete = pyqtSignal(str, str, int, int, str)  # ip, filename, done, total, direction
+    # サイズは object で渡す。int だと C++ の 32bit int へ丸められ、
+    # 2GiB 超の転送が例外も出さず小さい値や負値として表示される
+    transfer_started = pyqtSignal(str, str, object, str)        # ip, filename, total, direction
+    transfer_progress = pyqtSignal(str, str, object, object, str)  # ip, filename, done, total, direction
+    transfer_complete = pyqtSignal(str, str, object, object, str)  # ip, filename, done, total, direction
 
     def __init__(self, parent=None):
         super().__init__(parent)
