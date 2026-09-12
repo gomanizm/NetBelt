@@ -38,7 +38,8 @@ class SnmpCsvInjectionTest(unittest.TestCase):
         return MainWindow().snmp_panel
 
     def _read(self, path):
-        with open(path, encoding="utf-8", newline="") as f:
+        # CSV は BOM 付き（Excel 対策）。utf-8-sig で読む
+        with open(path, encoding="utf-8-sig", newline="") as f:
             return list(csv.reader(f))
 
     def _path(self, name):

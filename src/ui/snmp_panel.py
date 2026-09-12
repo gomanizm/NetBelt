@@ -739,7 +739,9 @@ class SNMPPanel(QWidget):
         読むと、ダイアログを開いている間に届いた次の結果のものになる
         """
         import csv
-        with open(file_path, "w", newline="", encoding="utf-8") as f:
+        # BOM 付き（utf-8-sig）。日本語版 Excel は BOM の無い UTF-8 の CSV を
+        # cp932 として開くため、見出しも機器から来た日本語も文字化けする
+        with open(file_path, "w", newline="", encoding="utf-8-sig") as f:
             if reason:
                 # 途中までの結果であることを、見出しの前に残す
                 f.write("# 途中まで: %s のため中断。全部ではありません\n" % reason)
@@ -953,7 +955,8 @@ class SNMPPanel(QWidget):
         """
         import csv
 
-        with open(file_path, 'w', newline='', encoding='utf-8') as f:
+        # BOM 付き（utf-8-sig）。理由は _export_results_to_csv と同じ
+        with open(file_path, 'w', newline='', encoding='utf-8-sig') as f:
             writer = csv.writer(f)
             
             # ヘッダー
