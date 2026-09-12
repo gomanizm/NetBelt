@@ -119,5 +119,61 @@ class DisposedObjectsAreReleasedTest(unittest.TestCase):
                          "外した SFTP マネージャがウィンドウの子として残っている")
 
 
+    def _sftp_count(self, w):
+        from core.sftp_manager import SFTPManager
+        return len(w.findChildren(SFTPManager))
+
+    def test_an_unsupported_sftp_session_is_released(self):
+        """SFTP 非対応の機器へ繋いでも、抜け殻を残さないこと。
+
+        SFTPManager は親を MainWindow にして作られ、成功したときだけ
+        sftp_managers に入る。ip scp/sftp を有効にしていない機器では
+        毎回 ok=False で返るので、繋ぐたびに 1 個ずつ積み上がる。
+        """
+        from core.sftp_manager import SFTPManager
+        w = self._window()
+        conn = self._serial(w)
+        w.connections["ルータA"] = conn
+
+        for _ in range(10):
+            w._on_sftp_session_ready(
+                "ルータA", SFTPManager(w), conn, False)
+            self._flush_deferred_deletes()
+
+        self.assertEqual(self._sftp_count(w), 0,
+                         "SFTP 非対応の機器へ繋ぐたびに抜け殻が積み上がっている")
+        self.assertEqual(w.sftp_managers, {})
+
+    def test_a_stale_sftp_session_is_released(self):
+        """待っている間に繋ぎ直したときも、抜け殻を残さないこと。"""
+        from core.sftp_manager import SFTPManager
+        w = self._window()
+        current = self._serial(w)
+        stale = self._serial(w)
+        w.connections["ルータA"] = current
+
+        for _ in range(10):
+            w._on_sftp_session_ready(
+                "ルータA", SFTPManager(w), stale, True)
+            self._flush_deferred_deletes()
+
+        self.assertEqual(self._sftp_count(w), 0,
+                         "古い SFTP セッションの抜け殻が積み上がっている")
+        self.assertEqual(w.sftp_managers, {})
+
+    def test_a_live_sftp_session_is_kept(self):
+        """成功した SFTP セッションまで捨てないこと。"""
+        from core.sftp_manager import SFTPManager
+        w = self._window()
+        conn = self._serial(w)
+        w.connections["ルータA"] = conn
+        mgr = SFTPManager(w)
+
+        w._on_sftp_session_ready("ルータA", mgr, conn, True)
+        self._flush_deferred_deletes()
+
+        self.assertIs(w.sftp_managers["ルータA"], mgr)
+        self.assertEqual(self._sftp_count(w), 1)
+
 if __name__ == "__main__":
     unittest.main()
