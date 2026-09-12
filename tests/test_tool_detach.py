@@ -86,6 +86,60 @@ class ToolDetachTest(unittest.TestCase):
         bar.mouseMoveEvent(move(QPoint(20, 200)))     # 大きく引き剥がす
         self.assertEqual(len(called), 1, "ドラッグでデタッチが呼ばれていない")
 
+    def _bar_with_tabs(self, titles):
+        """並べ替え有りのタブバーと、切り離しの控えを返す。"""
+        from ui.main_window import DetachableTabBar
+        called = []
+        bar = DetachableTabBar(lambda i: called.append(i))
+        for title in titles:
+            bar.addTab(title)
+        bar.setMovable(True)          # 本番と同じく横ドラッグで並べ替えられる
+        bar.resize(300, 30)
+        return bar, called
+
+    @staticmethod
+    def _mouse(kind, pos):
+        from PyQt6.QtCore import QPointF, Qt
+        from PyQt6.QtGui import QMouseEvent
+        from PyQt6.QtCore import QEvent
+        pressed = kind == QEvent.Type.MouseButtonPress
+        return QMouseEvent(
+            kind, QPointF(pos),
+            Qt.MouseButton.LeftButton if pressed else Qt.MouseButton.NoButton,
+            Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+
+    def test_reordering_before_pulling_detaches_the_pressed_tab(self):
+        """横に並べ替えてから引き剥がしても、押しているタブが外れること。
+
+        押した時点の index をそのまま使っていたので、横ドラッグで
+        その位置へ入れ替わってきた別のツールが別ウィンドウになっていた。
+        """
+        from PyQt6.QtCore import QEvent, QPoint
+        bar, called = self._bar_with_tabs(["A", "B", "C"])
+
+        bar.mousePressEvent(self._mouse(QEvent.Type.MouseButtonPress, QPoint(20, 10)))
+        for x in (60, 100, 140):      # 横へドラッグして並べ替える
+            bar.mouseMoveEvent(self._mouse(QEvent.Type.MouseMove, QPoint(x, 10)))
+        self.assertNotEqual([bar.tabText(i) for i in range(bar.count())],
+                            ["A", "B", "C"], "並べ替えが起きていない")
+        bar.mouseMoveEvent(self._mouse(QEvent.Type.MouseMove, QPoint(140, 200)))
+
+        self.assertEqual(len(called), 1, "切り離しが呼ばれていない")
+        self.assertEqual(bar.tabText(called[0]), "A",
+                         "押していないタブが切り離されている")
+
+    def test_a_tab_moving_past_the_pressed_one_does_not_steal_it(self):
+        """押していないタブが動いたときも、押しているタブを見失わないこと。"""
+        from PyQt6.QtCore import QEvent, QPoint
+        bar, called = self._bar_with_tabs(["A", "B", "C"])
+
+        bar.mousePressEvent(self._mouse(QEvent.Type.MouseButtonPress, QPoint(20, 10)))
+        bar.moveTab(2, 0)             # C を A の前へ（押しているのは A）
+        bar.mouseMoveEvent(self._mouse(QEvent.Type.MouseMove, QPoint(20, 200)))
+
+        self.assertEqual(len(called), 1, "切り離しが呼ばれていない")
+        self.assertEqual(bar.tabText(called[0]), "A")
+
     def test_close_detached_window_returns_panel_to_tab(self):
         # 実際にウィンドウを閉じた場合（バツ印）にクラッシュせずタブへ戻ること
         from unittest import mock

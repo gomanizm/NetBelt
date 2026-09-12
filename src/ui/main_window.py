@@ -38,6 +38,24 @@ class DetachableTabBar(QTabBar):
         self._on_detach = on_detach       # 切り離しを実行するコールバック（index を渡す）
         self._press_pos = None
         self._press_index = -1
+        # 横ドラッグの並べ替えに掌んでいる index を追従させる
+        self.tabMoved.connect(self._follow_moved_tab)
+
+    def _follow_moved_tab(self, frm, to):
+        """並べ替えに合わせて _press_index を追従させる。
+
+        movable なタブバーは横ドラッグの途中で moveTab するので、
+        押した時点の index をそのまま使うと、その位置へ入れ替わって
+        きた別のタブを引き離してしまう。
+        """
+        if self._press_index < 0:
+            return
+        if self._press_index == frm:
+            self._press_index = to
+        elif frm < self._press_index <= to:
+            self._press_index -= 1
+        elif to <= self._press_index < frm:
+            self._press_index += 1
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -306,6 +324,7 @@ class MainWindow(QMainWindow):
         self.device_tree = DeviceTree()
         self.device_tree.btn_add.clicked.connect(self._on_add_device)
         self.device_tree.btn_connect.clicked.connect(self._on_connect_button_clicked)
+        self.device_tree.btn_disconnect.clicked.connect(self._on_disconnect_button_clicked)
         # シグナル接続
         self.device_tree.device_connect.connect(self._on_device_connect)
         self.device_tree.device_edit.connect(self._on_device_edit)
@@ -896,6 +915,7 @@ class MainWindow(QMainWindow):
             conn.dispose()
         except Exception as e:
             print(f"[Connection] {device_name} の旧接続の後始末に失敗: {e}")
+        self._release_object(conn)
 
     def _on_connection_output(self, device_name: str, text: str, conn=None):
         """受信出力をターミナルへ流す（置き換え済みの接続からは流さない）
@@ -915,11 +935,12 @@ class MainWindow(QMainWindow):
         """機器の SFTP マネージャを切断して外し、表示中ならパネルも空にする"""
         if device_name not in self.sftp_managers:
             return
+        sftp_mgr = self.sftp_managers.pop(device_name)
         try:
-            self.sftp_managers[device_name].disconnect()
+            sftp_mgr.disconnect()
         except Exception:
             pass
-        del self.sftp_managers[device_name]
+        self._release_object(sftp_mgr)
         if self.sftp_panel.current_device == device_name:
             self.sftp_panel.clear()
 
@@ -1094,6 +1115,24 @@ class MainWindow(QMainWindow):
             conn.dispose()
         except Exception as e:
             print(f"[Connection] {device_name} の後始末に失敗: {e}")
+        self._release_object(conn)
+
+    @staticmethod
+    def _release_object(obj) -> None:
+        """用済みの QObject を MainWindow の子から外す
+
+        接続も SFTPManager も parent=MainWindow で作られるので、閉じて
+        辞書から外しても Qt が参照を持ち続ける。接続・切断を繰り返す
+        ほど抜け殻が積み上がり、閉じても減らない。
+
+        その場で破棄せず deleteLater に渡す。後始末は接続自身の
+        disconnected シグナルの中から呼ばれるので、発行中の
+        オブジェクトをその場で壊すと落ちる。
+        """
+        try:
+            obj.deleteLater()
+        except (AttributeError, RuntimeError):
+            pass  # QObject でない / 既に破棄済み
 
     def _on_connection_closed(self, device_name: str, conn=None):
         """接続切断時の処理（SSH/シリアル共通）"""
@@ -1172,6 +1211,26 @@ class MainWindow(QMainWindow):
         
         # 接続処理を実行（ダブルクリックと同じ処理）
         self._on_connect_requested(device_data)
+
+    def _on_disconnect_button_clicked(self):
+        """
+        「切断」ボタンがクリックされたときの処理
+
+        選択中の機器が接続中なら、タブの × と同じ後始末（マクロ停止・
+        SFTP 切断・接続切断）を行う。タブは閉じないので、そのまま
+        再接続できる。
+        """
+        result = self.device_tree.get_selected_device()
+        if result is None:
+            return
+
+        group_name, device_data = result
+        device_name = device_data.get('name')
+        if device_name not in self.connections:
+            self.status_bar.showMessage(f"{device_name} は接続されていません")
+            return
+
+        self._on_tab_closed(device_name)
     
     def _on_terminal_resized(self, device_name: str, cols: int, rows: int):
         """端末の行数・桁数の変化を機器へ伝える (RFC 4254 6.7)。
@@ -1614,6 +1673,7 @@ class MainWindow(QMainWindow):
         """指定ツールのタブへ切替え、ツールエリアを表示状態にする。"""
         if self.tool_tabs.isHidden():
             self.tool_tabs.setVisible(True)
+        self._restore_tool_area_width()
         idx = self._tab_index.get(key)
         if idx is not None:
             self.tool_tabs.setCurrentIndex(idx)
@@ -1678,10 +1738,33 @@ class MainWindow(QMainWindow):
             return
         self._detach_tool(key)
 
+    # ツールエリアを戻すときの幅。接続先リストと同じで、
+    # 畳んだ状態から出しても 0 のままだと何も見えない
+    TOOL_AREA_WIDTH = 300
+
+    def _restore_tool_area_width(self):
+        """幅 0 まで畳んだツールエリアを既定幅へ戻す（幅があれば何もしない）。"""
+        sizes = self.main_splitter.sizes()
+        if len(sizes) < 3 or sizes[2] >= 40:
+            return
+        spare = max(sizes[1] - self.TOOL_AREA_WIDTH, 100)
+        self.main_splitter.setSizes(
+            sizes[:1] + [spare, self.TOOL_AREA_WIDTH])
+
     def _toggle_tool_area(self):
-        """ツールエリア全体の表示/非表示を切り替える。"""
-        show = self.tool_tabs.isHidden()
+        """ツールエリア全体の表示/非表示を切り替える。
+
+        仕切りを右端まで引いて幅 0 にした状態は、見た目は消えているのに
+        ウィジェットとしては表示中。幅を見ないとまず隠す側へ倒れ、
+        2 回押しても幅 0 のまま戻らない。分割位置は次回起動へ持ち越されるので、
+        そのままだとメニューから戻す手段がなくなる。接続先リストと同じく、
+        幅が無いものは隠れていると見なす。
+        """
+        sizes = self.main_splitter.sizes()
+        show = self.tool_tabs.isHidden() or (len(sizes) > 2 and sizes[2] < 40)
         self.tool_tabs.setVisible(show)
+        if show:
+            self._restore_tool_area_width()
         if hasattr(self, "toggle_tool_area_action"):
             self.toggle_tool_area_action.setChecked(show)
 
@@ -2126,10 +2209,16 @@ for details.
             print("[Main] Stopping Syslog receiver...")
             self.syslog_receiver.stop()
         
-        # SFTPサーバーを停止
-        if hasattr(self, 'sftp_server_panel') and self.sftp_server_panel.sftp_server.is_running:
-            print("[Main] Stopping SFTP server...")
-            self.sftp_server_panel.sftp_server.stop()
+        # SFTPサーバーを停止。is_running では判定しない。あのフラグを
+        # 立てるのは待受ワーカーの先頭で、start() はスレッドを起こした
+        # 直後に戻るため、その隙に閉じると空振りして待受が生き残る。
+        # stop() 自身も同じ理由でスレッドの生死で判定している。
+        # TFTP/FTP は start() の中で is_running を立ててから戻るのでこの隙は無い。
+        if hasattr(self, 'sftp_server_panel'):
+            sftp_thread = self.sftp_server_panel.sftp_server.server_thread
+            if sftp_thread is not None and sftp_thread.is_alive():
+                print("[Main] Stopping SFTP server...")
+                self.sftp_server_panel.sftp_server.stop()
         
         # TFTPサーバーを停止
         if hasattr(self, 'tftp_server_panel') and self.tftp_server_panel.tftp_server.is_running:
