@@ -1635,6 +1635,7 @@ class MainWindow(QMainWindow):
         """指定ツールのタブへ切替え、ツールエリアを表示状態にする。"""
         if self.tool_tabs.isHidden():
             self.tool_tabs.setVisible(True)
+        self._restore_tool_area_width()
         idx = self._tab_index.get(key)
         if idx is not None:
             self.tool_tabs.setCurrentIndex(idx)
@@ -1699,10 +1700,33 @@ class MainWindow(QMainWindow):
             return
         self._detach_tool(key)
 
+    # ツールエリアを戻すときの幅。接続先リストと同じで、
+    # 畳んだ状態から出しても 0 のままだと何も見えない
+    TOOL_AREA_WIDTH = 300
+
+    def _restore_tool_area_width(self):
+        """幅 0 まで畳んだツールエリアを既定幅へ戻す（幅があれば何もしない）。"""
+        sizes = self.main_splitter.sizes()
+        if len(sizes) < 3 or sizes[2] >= 40:
+            return
+        spare = max(sizes[1] - self.TOOL_AREA_WIDTH, 100)
+        self.main_splitter.setSizes(
+            sizes[:1] + [spare, self.TOOL_AREA_WIDTH])
+
     def _toggle_tool_area(self):
-        """ツールエリア全体の表示/非表示を切り替える。"""
-        show = self.tool_tabs.isHidden()
+        """ツールエリア全体の表示/非表示を切り替える。
+
+        仕切りを右端まで引いて幅 0 にした状態は、見た目は消えているのに
+        ウィジェットとしては表示中。幅を見ないとまず隠す側へ倒れ、
+        2 回押しても幅 0 のまま戻らない。分割位置は次回起動へ持ち越されるので、
+        そのままだとメニューから戻す手段がなくなる。接続先リストと同じく、
+        幅が無いものは隠れていると見なす。
+        """
+        sizes = self.main_splitter.sizes()
+        show = self.tool_tabs.isHidden() or (len(sizes) > 2 and sizes[2] < 40)
         self.tool_tabs.setVisible(show)
+        if show:
+            self._restore_tool_area_width()
         if hasattr(self, "toggle_tool_area_action"):
             self.toggle_tool_area_action.setChecked(show)
 
