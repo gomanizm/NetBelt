@@ -7,6 +7,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt
 from typing import Dict, List, Optional
 from core.config_manager import is_reserved_device_name
+from core.crypto import PasswordCrypto
 
 class DeviceDialog(QDialog):
     """機器追加/編集ダイアログ"""
@@ -242,7 +243,29 @@ class DeviceDialog(QDialog):
             except ValueError:
                 QMessageBox.warning(self, "入力エラー", "ポート番号は1-65535の範囲で入力してください。")
                 return
-        
+
+        # 保存側は "DPAPI:" のあとが base64 として妥当かでしか暗号文かを
+        # 見分けられない（core.crypto.is_encrypted）。"DPAPI:cisco123" の
+        # ような平文は「もう暗号化済み」と誤認され、config.json へ平文の
+        # まま書かれ、起動のたびに「復号できませんでした」も出る。別環境で
+        # 作られた暗号文を二重に暗号化しない契約があるので保存側では詰め
+        # られない。せめて黙って通さないことを、ここで担保する。
+        # 触っていない値（別環境の暗号文がそのまま入っている場合を含む）は
+        # 平文で保存されないので、変更されたときだけ問う。
+        password = self.password_edit.text()
+        if (password != self.device_data.get("password", "")
+                and PasswordCrypto().is_encrypted(password)):
+            answer = QMessageBox.question(
+                self, "パスワードの確認",
+                "このパスワードは暗号化済みの値と見分けがつかない形です。\n"
+                "このまま保存すると、設定ファイルに平文で書き出され、\n"
+                "起動のたびに「パスワードを復号できませんでした」と出ます。\n\n"
+                "このまま保存しますか？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+
         self.accept()
     
     def get_device_data(self) -> Dict:
