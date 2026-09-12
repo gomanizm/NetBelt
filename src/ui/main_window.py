@@ -38,6 +38,24 @@ class DetachableTabBar(QTabBar):
         self._on_detach = on_detach       # 切り離しを実行するコールバック（index を渡す）
         self._press_pos = None
         self._press_index = -1
+        # 横ドラッグの並べ替えに掌んでいる index を追従させる
+        self.tabMoved.connect(self._follow_moved_tab)
+
+    def _follow_moved_tab(self, frm, to):
+        """並べ替えに合わせて _press_index を追従させる。
+
+        movable なタブバーは横ドラッグの途中で moveTab するので、
+        押した時点の index をそのまま使うと、その位置へ入れ替わって
+        きた別のタブを引き離してしまう。
+        """
+        if self._press_index < 0:
+            return
+        if self._press_index == frm:
+            self._press_index = to
+        elif frm < self._press_index <= to:
+            self._press_index -= 1
+        elif to <= self._press_index < frm:
+            self._press_index += 1
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
