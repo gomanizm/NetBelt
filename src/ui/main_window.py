@@ -999,7 +999,13 @@ class MainWindow(QMainWindow):
 
     def _on_sftp_session_ready(self, device_name: str, sftp_manager,
                                conn, ok: bool) -> None:
-        """SFTP セッションの確立結果を受け取る（GUI スレッド）"""
+        """SFTP セッションの確立結果を受け取る（GUI スレッド）
+
+        sftp_managers へ入れないまま帰る道では、_start_sftp_session が
+        parent=MainWindow で作った SFTPManager を自分で手放す。辞書から
+        外す側（_drop_sftp_manager）だけでは届かないので、SFTP を有効に
+        していない機器へ繋ぐたびに抜け殻が 1 個ずつ積み上がる。
+        """
         if not self._is_current_connection(device_name, conn):
             # 待っている間にタブを閉じた／繋ぎ直した。遅れて開いた
             # セッションは登録せず、機器側に残さないよう閉じる
@@ -1007,11 +1013,13 @@ class MainWindow(QMainWindow):
                 sftp_manager.disconnect()
             except Exception:
                 pass
+            self._release_object(sftp_manager)
             return
         if not ok:
             # SFTP接続失敗 - エラーダイアログは表示せず、ログのみ
             print(f"[INFO] SFTP接続失敗: {device_name} - 機器がSFTPをサポートしていない可能性があります")
             # ステータスバーは通常の接続メッセージのまま（ユーザーを混乱させない）
+            self._release_object(sftp_manager)
             return
         self.sftp_managers[device_name] = sftp_manager
         # 現在アクティブなタブの場合はSFTPパネルに表示
