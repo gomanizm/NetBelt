@@ -303,6 +303,28 @@ class UpdaterScriptTest(unittest.TestCase):
         self.assertNotIn("更新が完了しました", out,
                          "旧版のままなのに完了と告げている:\n" + out)
 
+    def test_a_leftover_staged_exe_is_not_installed_as_the_update(self):
+        """前回の更新が残した NetBelt.exe.new を、新版として据えないこと。
+
+        更新は新しい exe を NetBelt.exe.new という一時名で置いてから改名する。
+        その間にコンソールを閉じられる・電源が落ちるなどで止まると、
+        インストール先に NetBelt.exe.new が残る。次の更新で「インストール先に
+        NetBelt.exe.new があるか」で判定すると、展開した zip に exe が無くても
+        残骸が条件を満たしてしまい、動いていた exe がその残骸で上書きされる。
+        """
+        self._write(os.path.join(self.app_dir, "NetBelt.exe"), "old")
+        self._write(os.path.join(self.app_dir, "NetBelt.exe.new"),
+                    "stale-garbage")
+        zip_path = self._make_zip({"README.txt": "no exe here"})
+
+        code, out = self._run(zip_path)
+
+        self.assertNotEqual(code, 0, "実行ファイルが無いのに成功と報告した\n" + out)
+        self.assertEqual(self._installed(), "old",
+                         "前回の残骸で動いている exe を上書きした\n" + out)
+        self.assertNotIn("更新が完了しました", out,
+                         "旧版のままなのに完了と告げている:\n" + out)
+
     # --- 自分自身を上書きされても壊れないこと ---------------------------
 
     def _zip_with_a_longer_updater(self):

@@ -277,8 +277,13 @@ class VersionManager:
                     download_name = asset.get('name', '')
                     break
 
-            # 配布物の名前が違うリリース（命名を変える前のもの）を
-            # 切り捨てないよう、見つからないときだけ従来の探し方へ落ちる。
+            # 正規名の資産が無いリリースを黙って切り捨てないための保険。
+            # build-release.yml はこれまでの全リビジョンで上の正規名だけを
+            # 作っており、「昔の命名」のリリースは存在しない。ここへ落ちるのは
+            # 正規の資産が欠けたリリースだけで、そのときは windows を名前に
+            # 含む最初の .zip という弱い選び方に戻る。本体でない ZIP を
+            # 掴んだ場合は、実行ファイルが無いことに updater.bat が気づいて
+            # exit 1 で止める。
             if not download_url:
                 for asset in assets:
                     name = asset.get('name', '').lower()

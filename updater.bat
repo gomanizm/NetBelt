@@ -206,9 +206,13 @@ if errorlevel 1 (
     exit /b 1
 )
 
-REM コピーできたことを確認する。xcopy の戻り値だけでは、
-REM 肝心の実行ファイルが置かれたかどうかは分からない。
-if not exist "!APP_DIR!NetBelt.exe.new" (
+REM 更新に実行ファイルが入っていたかを確かめる。xcopy の戻り値
+REM だけでは分からない。見るのはコピー先ではなくコピー元。上の改名を
+REM 実行できたときだけ NetBelt.exe.new ができるから。コピー先を
+REM 見ると、前回の更新が改名の直前で止まって残した
+REM NetBelt.exe.new が条件を満たし、exe を含まない zip でも
+REM 動いている exe をその残骸で上書きしてしまう。
+if not exist "!SOURCE_DIR!\NetBelt.exe.new" (
     echo エラー: 更新ファイルに NetBelt.exe が含まれていません
     echo   場所: !SOURCE_DIR!
     echo   NetBelt.exe は旧版のままですが、同梱の他のファイルは
