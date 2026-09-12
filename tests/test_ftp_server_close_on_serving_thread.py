@@ -1,20 +1,22 @@
 """FTP サーバの停止が、待受スレッド自身にソケットを閉じさせることを検証する。
 
 stop() は呼び出し元（GUI スレッド）から close_all() を呼んでいた。
-pyftpdlib 2.2.0 の Select ioloop は select.select(self._r, ...) に素の
-list を渡しており、close_all() はその list から fd を remove する。
-待受スレッドが select の中でその list を走査している最中に別スレッドが
-remove すると、CPython は縮んだ配列の外を読む。
-
-実測: 全体テストの tests/test_ftp_server.py::FtpServerTest::
-test_manager_coalesces_multiple_started_same_key の実行中に
-"Windows fatal exception: access violation" が出て、スタックの先頭は
-pyftpdlib/ioloop.py:474 の poll、落ちたのは直前のテストが残した
-serve_forever スレッドだった。アプリでも、FTP サーバを停止する操作は
-GUI スレッドから stop() を呼ぶので同じ経路を踏む。
+pyftpdlib 2.2.0 は、ひとつの ioloop に対する登録・解除はすべて
+その ioloop を poll しているスレッドから行われる前提で書かれている
+（socket_map も fd の一覧も素の dict と list で、ロックが無い）。
+停止だけが別スレッドから入ると、その前提が崩れる。実測でも、停止の
+直後に待受スレッドが WinError 10038（ソケットでないものへの操作）を
+投げていた。
 
 閉じるのは ioloop を回しているスレッド自身に任せる。停止の待ち合わせ
 （上限つき join）は tests/test_ftp_server_stop_joins.py が見ている。
+
+経緯の補足: この形にしたときは、全体テストを落としていた access
+violation の原因がここだと考えていた。実際の原因は別で、
+tests/test_signal_relay_outlives_receiver.py が押さえている。
+select の実行中に別スレッドがその list を縮めても落ちないことは、
+3.8 億回の試行で確かめられている。この形自体は pyftpdlib の前提に
+沿っているので残している。
 """
 import os
 import sys

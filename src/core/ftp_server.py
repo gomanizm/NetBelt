@@ -222,16 +222,22 @@ class FTPServerManager(QObject):
     def _serve(self, server, stop_event):
         """待受スレッド本体。ソケットを閉じるのもこのスレッドで行う。
 
-        serve_forever() に任せて別スレッドから close_all() を呼ぶと、
-        プロセスごと落ちる。pyftpdlib 2.2.0 の Select ioloop は
-        select.select(self._r, ...) に素の list を渡しており、
-        close_all() はその list から fd を remove する。待受スレッドが
-        select の中でその list を走査している最中に別スレッドが remove
-        すると、CPython は縮んだ配列の外を読む（Windows で access
-        violation。全体テストの FTP テスト実行中に実測）。
+        serve_forever() に任せると、停止は別スレッド（GUI スレッド）から
+        close_all() を呼ぶしかない。ioloop を回しているのとは別のスレッドが
+        その ioloop の socket_map と fd の一覧を書き換えることになり、
+        pyftpdlib はそれを想定していない（同じ ioloop に対する登録・解除は
+        すべて poll しているスレッドから行われる前提で書かれている）。
 
         そこで ioloop は 1 周ずつ自分で回し、停止要求に気づいたら
-        このスレッドから閉じる。
+        このスレッドから閉じる。停止までの遅れは 1 周ぶんで済む。
+
+        補足: これを入れた時点では、全体テストを落としていた access
+        violation の原因がここだと考えていた。実際の原因は別（シグナルの
+        中継に .emit を渡していたこと。tests/
+        test_signal_relay_outlives_receiver.py を参照）で、select 実行中に
+        別スレッドがその list を縮めても Python 3.12 / Windows 11 では
+        落ちないことが後の実測で確かめられている。この形自体は
+        pyftpdlib の前提に沿っていて害が無いので残している。
         """
         try:
             while not stop_event.is_set():
