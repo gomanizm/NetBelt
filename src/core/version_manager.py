@@ -266,12 +266,26 @@ class VersionManager:
             download_name = None
             assets = data.get('assets', [])
             
+            # CI が付ける配布物の名前。同じリリースに windows を名前に
+            # 含む別の ZIP が並ぶと、先頭から拾う版はそちらを掴む。
+            # その ZIP 専用の .sha256 まで揃っていれば照合も通ってしまい、
+            # 利用者は本体でないものを「更新」として入れることになる。
+            wanted_zip = f'{APP_NAME}-v{latest_version}-Windows-Portable.zip'.lower()
             for asset in assets:
-                name = asset.get('name', '').lower()
-                if 'windows' in name and name.endswith('.zip'):
+                if asset.get('name', '').lower() == wanted_zip:
                     download_url = asset.get('url')  # APIのURLを使用（プライベートリポジトリ対応）
                     download_name = asset.get('name', '')
                     break
+
+            # 配布物の名前が違うリリース（命名を変える前のもの）を
+            # 切り捨てないよう、見つからないときだけ従来の探し方へ落ちる。
+            if not download_url:
+                for asset in assets:
+                    name = asset.get('name', '').lower()
+                    if 'windows' in name and name.endswith('.zip'):
+                        download_url = asset.get('url')
+                        download_name = asset.get('name', '')
+                        break
             
             # Windows 向けの ZIP が無ければ何も選ばない。以前は「最初の ZIP」へ
             # 落ちていたが、実行可能物でない ZIP を掴む余地を残すだけで、
