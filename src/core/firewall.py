@@ -1,8 +1,11 @@
 """Windows ファイアウォール受信許可の管理
 
-NetBelt の受信サーバ（SNMP Trap / Syslog / SFTP サーバ）を起動する際、
-その受信ポートに対する Windows Defender ファイアウォールの受信許可ルールを追加する。
+NetBelt の受信サーバ（FTP / TFTP / Syslog / SFTP サーバ / SNMP Trap）の
+受信ポートに対する Windows Defender ファイアウォールの受信許可ルールを追加する。
 
+- v1.3.0 以降、待ち受け開始では呼ばない。受信できないときに利用者が
+  各パネルの「ファイアウォールで許可（管理者）」を押したときだけ呼ぶ
+  （tests/test_firewall_policy.py が起動時に触らないことを保証している）。
 - ルール追加には管理者権限が必要なため、未昇格時のみ ShellExecute の "runas" で
   netsh を昇格実行する（対象ポートのルールを初めて作る時だけ UAC が表示される。冪等）。
 - ルールは "NetBelt - <サービス> (<PROTO>/<port>)" という名前で作成する。

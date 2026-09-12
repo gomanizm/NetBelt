@@ -285,6 +285,24 @@ class UpdaterScriptTest(unittest.TestCase):
         self.assertNotEqual(code, 0, "実行ファイルが無いのに成功と報告した\n" + out)
         self.assertIn("NetBelt.exe", out)
 
+    def test_a_zip_without_the_app_fails_even_when_an_old_exe_is_installed(self):
+        """旧 NetBelt.exe が残っていても、実行ファイルの無い zip を成功と言わないこと。
+
+        上の検査はインストール先が空の場合しか見ていない。実際の更新では旧版が
+        必ず置いてあるので、「インストール先に NetBelt.exe があるか」で判定すると、
+        展開した zip に exe が無くても通ってしまう。利用者には「更新が完了しました！」と
+        出る一方で、動くのは旧版のままになる。
+        """
+        self._write(os.path.join(self.app_dir, "NetBelt.exe"), "old")
+        zip_path = self._make_zip({"README.txt": "no exe here"})
+
+        code, out = self._run(zip_path)
+
+        self.assertNotEqual(code, 0, "実行ファイルが無いのに成功と報告した\n" + out)
+        self.assertEqual(self._installed(), "old", out)
+        self.assertNotIn("更新が完了しました", out,
+                         "旧版のままなのに完了と告げている:\n" + out)
+
     # --- 自分自身を上書きされても壊れないこと ---------------------------
 
     def _zip_with_a_longer_updater(self):
