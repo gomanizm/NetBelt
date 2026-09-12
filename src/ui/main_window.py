@@ -1670,10 +1670,15 @@ class MainWindow(QMainWindow):
             pass  # 並び順の復元失敗は無視して既定順で続行
 
     def _select_tool_tab(self, key):
-        """指定ツールのタブへ切替え、ツールエリアを表示状態にする。"""
+        """指定ツールのタブへ切替え、ツールエリアを表示状態にする。
+
+        隠してあっただけなら幅は Qt が覚えているので触らない。
+        触ると利用者が決めた幅を既定幅で潰してしまう。
+        """
         if self.tool_tabs.isHidden():
             self.tool_tabs.setVisible(True)
-        self._restore_tool_area_width()
+        else:
+            self._restore_tool_area_width()
         idx = self._tab_index.get(key)
         if idx is not None:
             self.tool_tabs.setCurrentIndex(idx)
@@ -1759,11 +1764,17 @@ class MainWindow(QMainWindow):
         2 回押しても幅 0 のまま戻らない。分割位置は次回起動へ持ち越されるので、
         そのままだとメニューから戻す手段がなくなる。接続先リストと同じく、
         幅が無いものは隠れていると見なす。
+
+        ただし幅の復元は「表示中で幅 0」のときだけ。隠れている間は
+        QSplitter.sizes() がそのウィジェットに 0 を返すので、区別せずに
+        復元すると、Qt が覚えている幅（利用者が決めた幅）を隠す/戻すの
+        たびに既定幅で上書きしてしまう。
         """
         sizes = self.main_splitter.sizes()
-        show = self.tool_tabs.isHidden() or (len(sizes) > 2 and sizes[2] < 40)
+        was_hidden = self.tool_tabs.isHidden()
+        show = was_hidden or (len(sizes) > 2 and sizes[2] < 40)
         self.tool_tabs.setVisible(show)
-        if show:
+        if show and not was_hidden:
             self._restore_tool_area_width()
         if hasattr(self, "toggle_tool_area_action"):
             self.toggle_tool_area_action.setChecked(show)

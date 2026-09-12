@@ -64,16 +64,52 @@ class ToolAreaHidingTest(unittest.TestCase):
         self.assertGreaterEqual(w.main_splitter.sizes()[2], 100)
         self.assertEqual(w.tool_tabs.currentIndex(), w._tab_index["sftp"])
 
-    def test_coming_back_from_hiding_has_width(self):
-        """隠してから戻したときも、幅があること。"""
-        w = self._window()
-        self._collapse(w)
-        w.tool_tabs.setVisible(False)
+    def _widen(self, w, width=500):
+        """利用者が仕切りを動かして決めた幅、を作る。
 
-        w._toggle_tool_area()
+        QSplitter が幅を覚えるのはレイアウトが走ってからなので、
+        実際の使われ方どおりウィンドウを表示してから動かす。
+        """
+        w.show()
+        # 見えたままだと、他のテストが数えるトップレベルに残る
+        self.addCleanup(w.hide)
+        self.app.processEvents()
+        sizes = w.main_splitter.sizes()
+        w.main_splitter.setSizes(
+            [sizes[0], sizes[1] + sizes[2] - width, width])
+        self.app.processEvents()
+        return w.main_splitter.sizes()
+
+    def test_coming_back_from_hiding_keeps_the_chosen_width(self):
+        """隠して戻したときは、隠す前の幅がそのまま戻ること。
+
+        隠している間 QSplitter.sizes() はそのウィジェットに 0 を返すので、
+        「幅が無い＝畳まれている」の判定をそのまま当てると、Qt が覚えている
+        幅を毎回既定値で上書きしてしまう。
+        """
+        w = self._window()
+        before = self._widen(w)
+
+        w._toggle_tool_area()          # 隠す
+        self.app.processEvents()
+        w._toggle_tool_area()          # 戻す
+        self.app.processEvents()
 
         self.assertFalse(w.tool_tabs.isHidden())
-        self.assertGreaterEqual(w.main_splitter.sizes()[2], 100)
+        self.assertEqual(w.main_splitter.sizes(), before)
+
+    def test_view_menu_on_a_hidden_area_keeps_the_chosen_width(self):
+        """表示メニューからツールを選んで戻すときも、幅を潰さないこと。"""
+        w = self._window()
+        before = self._widen(w)
+        w._toggle_tool_area()          # 隠す
+        self.app.processEvents()
+
+        w._select_tool_tab("sftp")
+        self.app.processEvents()
+
+        self.assertFalse(w.tool_tabs.isHidden())
+        self.assertEqual(w.main_splitter.sizes(), before)
 
     def test_hiding_still_works(self):
         """幅がある状態では、これまでどおり隠す側へ倒れること。"""
