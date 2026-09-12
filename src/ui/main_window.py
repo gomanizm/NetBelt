@@ -915,6 +915,7 @@ class MainWindow(QMainWindow):
             conn.dispose()
         except Exception as e:
             print(f"[Connection] {device_name} の旧接続の後始末に失敗: {e}")
+        self._release_object(conn)
 
     def _on_connection_output(self, device_name: str, text: str, conn=None):
         """受信出力をターミナルへ流す（置き換え済みの接続からは流さない）
@@ -934,11 +935,12 @@ class MainWindow(QMainWindow):
         """機器の SFTP マネージャを切断して外し、表示中ならパネルも空にする"""
         if device_name not in self.sftp_managers:
             return
+        sftp_mgr = self.sftp_managers.pop(device_name)
         try:
-            self.sftp_managers[device_name].disconnect()
+            sftp_mgr.disconnect()
         except Exception:
             pass
-        del self.sftp_managers[device_name]
+        self._release_object(sftp_mgr)
         if self.sftp_panel.current_device == device_name:
             self.sftp_panel.clear()
 
@@ -1113,6 +1115,24 @@ class MainWindow(QMainWindow):
             conn.dispose()
         except Exception as e:
             print(f"[Connection] {device_name} の後始末に失敗: {e}")
+        self._release_object(conn)
+
+    @staticmethod
+    def _release_object(obj) -> None:
+        """用済みの QObject を MainWindow の子から外す
+
+        接続も SFTPManager も parent=MainWindow で作られるので、閉じて
+        辞書から外しても Qt が参照を持ち続ける。接続・切断を繰り返す
+        ほど抜け殻が積み上がり、閉じても減らない。
+
+        その場で破棄せず deleteLater に渡す。後始末は接続自身の
+        disconnected シグナルの中から呼ばれるので、発行中の
+        オブジェクトをその場で壊すと落ちる。
+        """
+        try:
+            obj.deleteLater()
+        except (AttributeError, RuntimeError):
+            pass  # QObject でない / 既に破棄済み
 
     def _on_connection_closed(self, device_name: str, conn=None):
         """接続切断時の処理（SSH/シリアル共通）"""
