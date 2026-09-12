@@ -76,6 +76,43 @@ class TelnetSbEdgeTest(unittest.TestCase):
         self.assertIn(bytes([IAC, WONT, 1]), sent,
                       "再同期できず、交渉に応答していない")
 
+    def test_the_terminator_split_at_the_moment_of_discarding_resynchronises(self):
+        """捨てる受信そのものが IAC で終わっていても再同期すること。
+
+        上限超過で初めて捨てる瞬間だけ、末尾の対の無い IAC も一緒に
+        捨てていた。次の受信が SE で始まると終端が見つからず、
+        以後の受信を全部捨て続ける（復旧は再接続のみ）。
+        """
+        conn, _ = self._conn()
+        out, _ = self._feed(conn,
+                            self._oversized_sb(conn) + bytes([IAC]),
+                            bytes([SE]) + b"Router>")
+        self.assertEqual(out, b"Router>",
+                         "捨てた瞬間の末尾 IAC を失い、再同期できていない")
+
+    def test_negotiation_after_a_terminator_split_at_discarding_is_answered(self):
+        """その場合も、再同期後の DO には WONT を返すこと。"""
+        conn, sent = self._conn()
+        self._feed(conn,
+                   self._oversized_sb(conn) + bytes([IAC]),
+                   bytes([SE]) + bytes([IAC, DO, 1]) + b"Router>")
+        self.assertIn(bytes([IAC, WONT, 1]), sent,
+                      "再同期できず、交渉に応答していない")
+
+    def test_an_escaped_iac_at_the_moment_of_discarding_is_not_carried_over(self):
+        """末尾が IAC IAC（本文中の 0xFF）なら持ち越さないこと。
+
+        末尾 1 バイトだけを見て持ち越すと、次の受信の先頭 SE を終端と
+        誤認し、SB 本文の続きが画面へ漏れる。
+        """
+        conn, _ = self._conn()
+        out, _ = self._feed(conn,
+                            self._oversized_sb(conn) + bytes([IAC, IAC]),
+                            bytes([SE]) + b"LEAK" + bytes([IAC, SE])
+                            + b"Router>")
+        self.assertEqual(out, b"Router>",
+                         "本文の続きが画面へ漏れている: %r" % out)
+
     # --- 2. 本文中のエスケープされた 0xFF ---
 
     def test_an_escaped_iac_inside_the_body_is_not_a_terminator(self):

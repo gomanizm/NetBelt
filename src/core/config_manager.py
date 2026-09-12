@@ -155,6 +155,16 @@ class ConfigManager:
                 if password and not self.crypto.is_encrypted(password):
                     device["password"] = self.crypto.encrypt(password)
 
+        # GitHub トークンも資格情報。UI からは設定できないが、手で置かれた
+        # 平文をディスク（と破損時の backup_*）に残さない。
+        # 暗号化済みを触らない理由は機器側と同じ
+        update_settings = config.get("update_settings")
+        if isinstance(update_settings, dict):
+            token = update_settings.get("github_token")
+            if (isinstance(token, str) and token
+                    and not self.crypto.is_encrypted(token)):
+                update_settings["github_token"] = self.crypto.encrypt(token)
+
         settings = config.get("settings")
         if not isinstance(settings, dict):
             return
@@ -187,6 +197,14 @@ class ConfigManager:
                 if self.crypto.is_encrypted(decrypted):
                     self._undecryptable_count += 1
                 device["password"] = decrypted
+
+        # トークンは件数に数えない。復号できないときの案内は
+        # get_github_token() が出す（文面が機器のパスワードと違う）
+        update_settings = config.get("update_settings")
+        if isinstance(update_settings, dict):
+            token = update_settings.get("github_token")
+            if isinstance(token, str) and token:
+                update_settings["github_token"] = self.crypto.decrypt(token)
 
         settings = config.get("settings")
         if not isinstance(settings, dict):
@@ -584,7 +602,11 @@ class ConfigManager:
         return self.update_update_settings({"last_check": timestamp})
     
     def get_github_token(self) -> Optional[str]:
-        """GitHubトークンを取得（プライベートリポジトリ用）"""
+        """GitHubトークンを取得（プライベートリポジトリ用）
+
+        環境変数 GITHUB_TOKEN が最優先。設定ファイル側の値は
+        機器パスワードと同じく DPAPI で暗号化して保存する。
+        """
         # 環境変数を優先
         import os
         env_token = os.environ.get('GITHUB_TOKEN')
@@ -592,7 +614,18 @@ class ConfigManager:
             return env_token
         
         # 設定ファイルから取得
-        return self.get_update_settings().get("github_token")
+        token = self.get_update_settings().get("github_token")
+        if not isinstance(token, str) or not token:
+            return None
+        if self.crypto.is_encrypted(token):
+            # 別の Windows アカウント/PC で保存された設定。暗号文を
+            # Authorization ヘッダへ載せても 401 になるだけで、
+            # 利用者には原因が分からない
+            print("[Config] GitHubトークンを復号できませんでした。"
+                  "別の Windows アカウント/PC で保存された設定の可能性があります。"
+                  "トークンは再設定してください。")
+            return None
+        return token
     
     def set_github_token(self, token: Optional[str]) -> bool:
         """GitHubトークンを設定"""

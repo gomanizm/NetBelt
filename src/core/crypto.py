@@ -11,6 +11,19 @@ import sys
 # DPAPI形式であることを示す接頭辞（base64本体の前に付与）
 _DPAPI_PREFIX = "DPAPI:"
 
+
+def _is_base64(payload: str) -> bool:
+    """DPAPI 本体として妥当な base64 か（空文字は不正とする）"""
+    if not payload:
+        return False
+    try:
+        # validate=True にしないと base64 以外の文字を黙って読み飛ばし、
+        # 平文でも「妥当」と答えてしまう
+        base64.b64decode(payload, validate=True)
+    except Exception:
+        return False
+    return True
+
 # --- DPAPI (Windows) ---
 _DPAPI_AVAILABLE = False
 if sys.platform == "win32":
@@ -86,7 +99,7 @@ class PasswordCrypto:
         """暗号化されたパスワード(または平文)を復号して返す"""
         if not encrypted_password:
             return ""
-        if encrypted_password.startswith(_DPAPI_PREFIX):
+        if self.is_encrypted(encrypted_password):
             if not _DPAPI_AVAILABLE:
                 # 別環境で作られたDPAPI値は復号できない。そのまま返す(接続は失敗する想定)
                 return encrypted_password
@@ -99,7 +112,20 @@ class PasswordCrypto:
         return encrypted_password
 
     def is_encrypted(self, password: str) -> bool:
-        """パスワードが暗号化済みか判定"""
+        """パスワードが暗号化済みか判定
+
+        接頭辞だけでは足りない。機器へ本当に "DPAPI:" で始まる
+        パスワードを設定していると、平文のまま「暗号化済み」と
+        見なされ、設定ファイルへ平文で書き出される。本体が base64 と
+        して妥当かまで見て、そうでなければ平文として扱う。
+
+        制限: 本体がたまたま base64 として妥当な平文（例 "DPAPI:AAAA"）は
+        今も暗号文と区別できない。復号できたかどうかで判定すると、
+        別環境で作られた復号不能な暗号文を平文とみなして二重に
+        暗号化し、原本を失うため、そちらは採れない。
+        """
         if not password:
             return False
-        return password.startswith(_DPAPI_PREFIX)
+        if not password.startswith(_DPAPI_PREFIX):
+            return False
+        return _is_base64(password[len(_DPAPI_PREFIX):])

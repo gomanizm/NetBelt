@@ -115,6 +115,13 @@ class TelnetConnection(QObject):
         """
         コマンドを送信（キー入力をそのまま送信）
         
+        制限（既知・意図的）: NVT（RFC 854）では CR の後に LF か NUL を
+        付けるが、ここはキー入力をそのまま流すので Enter は CR 単独
+        （0x0d）で出る。Cisco IOS や netkit telnetd は CR 単独で行を
+        確定するため実機では顕在化しない。CR LF へ変換すると、LF を
+        別の改行として扱う機器で Enter のたびに空行が増えるので、
+        実機で確かめられるまで変えない。
+        
         Args:
             command: 送信するコマンド（1文字または制御文字）
         """
@@ -229,6 +236,16 @@ class TelnetConnection(QObject):
         UTF-8 デコードを壊し、応答も返せずに機器が待ち続ける。
         揃っていない分は次の受信まで持ち越す。
 
+        制限（既知・意図的）: オプションは一律に拒否する（DO には
+        WONT、WILL には DONT）。Python の telnetlib と同じ方針で、
+        状態を持たなくても再交渉のループに陥らない。ただし端末側の
+        ローカルエコーも持たないため、RFC 857 どおり DONT ECHO を
+        受けてエコーを止める機器では、入力中の文字が画面に出ない。
+        Cisco IOS や Linux の telnetd はエコーを pty／回線側で行う
+        のでこの条件には当たらない。WILL ECHO へ DO を返す方式に
+        変えるなら、素朴な実装との交渉ループを防ぐ状態管理
+        （RFC 1143 の Q 法）が要る。実機で確かめられるまで変えない。
+
         Args:
             data: 受信データ（前回の持ち越しを先頭に連結したもの）
 
@@ -319,7 +336,17 @@ class TelnetConnection(QObject):
             # 空にするだけだと、続きを通常データとして画面へ出してしまう。
             print("[Telnet] 未完の制御シーケンスが大きすぎるため破棄しました")
             self._discarding_sb = pending[:2] == bytes([IAC, SB])
-            pending = b''
+            if self._discarding_sb:
+                # 捨てる分の末尾が対の無い IAC なら、それだけは次の受信へ
+                # 持ち越す。ここで捨てると、次の受信が SE で始まった
+                # （終端が切れ目で割れた）ときに終端を見つけられず、
+                # 以後の受信を全部捨て続ける。末尾 1 バイトで判定すると
+                # 本文中の IAC IAC まで持ち越して次の SE を終端と誤認
+                # するので、_find_sb_end の dangling で数える。
+                _, dangling = self._find_sb_end(pending, 2)
+                pending = pending[-dangling:] if dangling else b''
+            else:
+                pending = b''
 
         return bytes(output), pending
     
