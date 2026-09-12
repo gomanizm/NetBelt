@@ -2230,9 +2230,10 @@ for details.
             print("[Main] Stopping FTP server...")
             self.ftp_server_panel.ftp_server.stop()
         
-        # SNMP Trap 受信とワーカースレッドを停止
-        # 実行中の QThread を残したまま終了すると、Qt の後片付けで
-        # 解放済みオブジェクトに触れてプロセスが異常終了しうる。
+        # SNMP Trap 受信とワーカースレッドを停止。受信スレッドを
+        # アプリより長生きさせない。中継を connect(signal.emit) で
+        # 書いていたころは、管理側が消えたあとに残った配送が解放済みの
+        # 領域へ届いてプロセスが落ちていた（中継は 47ecbde で直した）。
         if hasattr(self, 'snmp_panel') and hasattr(self.snmp_panel, 'snmp_manager'):
             try:
                 print("[Main] Stopping SNMP threads...")
@@ -2241,7 +2242,9 @@ for details.
             except Exception as e:
                 print(f"[Main] SNMP 停止エラー: {e}")
         # バックグラウンドの MIB 読み込み（QThread）も待つ。起動直後に
-        # 閉じると読み込み中のことがあり、待たずに破棄すると落ちる
+        # 閉じると読み込み中のことがあり、待たないと MIB キャッシュの
+        # 書き出しがプロセス終了で切られる（落ちはしない。詳細は
+        # SNMPPanel.wait_for_background_work）
         if hasattr(self, 'snmp_panel'):
             try:
                 self.snmp_panel.wait_for_background_work()
