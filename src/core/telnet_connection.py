@@ -115,6 +115,13 @@ class TelnetConnection(QObject):
         """
         コマンドを送信（キー入力をそのまま送信）
         
+        制限（既知・意図的）: NVT（RFC 854）では CR の後に LF か NUL を
+        付けるが、ここはキー入力をそのまま流すので Enter は CR 単独
+        （0x0d）で出る。Cisco IOS や netkit telnetd は CR 単独で行を
+        確定するため実機では顕在化しない。CR LF へ変換すると、LF を
+        別の改行として扱う機器で Enter のたびに空行が増えるので、
+        実機で確かめられるまで変えない。
+        
         Args:
             command: 送信するコマンド（1文字または制御文字）
         """
