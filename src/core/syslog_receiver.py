@@ -340,6 +340,15 @@ class SyslogReceiver(QObject):
             if th.is_alive():
                 print("[Syslog] %s の受信スレッドが終了しません"
                       "（ポートが解放されない可能性があります）" % proto)
+        if proto == "TCP":
+            # 接続中のクライアントスレッドの終了も待つ。待たずに停止を
+            # 通知すると、その後でスレッドが最後の受信を emit し、止めた
+            # はずの一覧へ 1 件追加される。どのスレッドも待受と同じ
+            # stop_event を見ていて、recv のタイムアウト 1 秒以内に抜ける
+            for client in list(self.tcp_clients):
+                if client.is_alive():
+                    client.join(timeout=3)
+            self.tcp_clients[:] = [t for t in self.tcp_clients if t.is_alive()]
         print("[Syslog] %s Server stopped" % proto)
         if not self._servers:
             self.stopped.emit()
