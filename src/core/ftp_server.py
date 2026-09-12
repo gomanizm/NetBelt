@@ -35,6 +35,8 @@ class FTPServerManager(QObject):
     transfer_started = pyqtSignal(str, str, object, str)        # ip, filename, total, direction
     transfer_progress = pyqtSignal(str, str, object, object, str)  # ip, filename, done, total, direction
     transfer_complete = pyqtSignal(str, str, object, object, str)  # ip, filename, done, total, direction
+    # 未完了で終わった転送（ABOR・接続断・停止）。TFTP と同じ口
+    transfer_interrupted = pyqtSignal(str, str, str)            # ip, filename, direction
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -60,6 +62,15 @@ class FTPServerManager(QObject):
     def _emit_complete(self, ip, filename, done, total, direction):
         self._tx.pop((ip, filename, direction), None)  # 完了で解放し次の転送は新規行に
         self.transfer_complete.emit(ip, filename, int(done), int(total), direction)
+
+    def _emit_interrupted(self, ip, filename, direction):
+        """未完了で終わった転送（ABOR・接続断・停止）を通知する。
+
+        完了と同じく鍵を解放する。残したままにすると、進行中の表示が
+        そのまま残り、同じファイルの再試行が開始として通知されない。
+        """
+        self._tx.pop((ip, filename, direction), None)
+        self.transfer_interrupted.emit(ip, filename, direction)
 
     # 匿名に与える権限。認証ユーザー用の "elradfmwMT" を使い回すと、
     # 資格情報なしでルート配下を上書き・削除・改名・フォルダ作成できる。
@@ -175,6 +186,12 @@ class FTPServerManager(QObject):
                 try: total = os.path.getsize(file)
                 except OSError: total = 0
                 mgr._emit_complete(self.remote_ip, os.path.basename(file), total, total, "upload")
+            # 未完了で終わったとき（ABOR・データ接続の切断・サーバ停止）。
+            # pyftpdlib が DTP を閉じる際に必ずどちらかを呼ぶ
+            def on_incomplete_file_sent(self, file):
+                mgr._emit_interrupted(self.remote_ip, os.path.basename(file), "download")
+            def on_incomplete_file_received(self, file):
+                mgr._emit_interrupted(self.remote_ip, os.path.basename(file), "upload")
             def on_connect(self):
                 mgr.client_activity.emit(self.remote_ip, "接続")
             def on_disconnect(self):

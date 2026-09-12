@@ -159,6 +159,7 @@ class FTPServerPanel(QWidget):
         self.ftp_server.transfer_started.connect(self._on_tx_started)
         self.ftp_server.transfer_progress.connect(self._on_tx_progress)
         self.ftp_server.transfer_complete.connect(self._on_tx_complete)
+        self.ftp_server.transfer_interrupted.connect(self._on_transfer_interrupted)
 
     def _restore_settings(self):
         """保存済み設定を復元"""
@@ -229,7 +230,22 @@ class FTPServerPanel(QWidget):
         """サーバー停止時の処理"""
         self.status_label.setText("🔴 停止中")
         self.status_label.setStyleSheet("color: #f44336; font-weight: bold; font-size: 14px;")
+        # 進行中のまま残った行を確定させる。放置すると "1%" 等の表示が
+        # 止めたあとも残り続ける
+        for st in self._active.values():
+            self.history.setItem(st["row"], 5, QTableWidgetItem("中断"))
+        self._active.clear()
         self._add_log("サーバー停止")
+
+    def _on_transfer_interrupted(self, ip: str, filename: str, direction: str):
+        """未完了で終わった転送。エラーではないので行だけ確定させる。
+
+        確定させないと、途中の進捗表示のまま残り続ける。ダイアログは出さない。
+        """
+        st = self._active.pop((ip, filename, direction), None)
+        if st is not None:
+            self.history.setItem(st["row"], 5, QTableWidgetItem("中断"))
+        self._add_log("[%s] 転送中断: %s" % (ip, filename))
 
     def _on_activity_event(self, ip: str, msg: str):
         """クライアントアクティビティ通知の処理"""
