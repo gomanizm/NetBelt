@@ -142,6 +142,16 @@ class ErasingTest(unittest.TestCase):
         for i in range(30):
             self.assertIn("l%d" % i, record)
 
+    def test_erase_above_from_the_bottom_right_keeps_the_record(self):
+        # ESC[1J を最下行の右端から送ると画面は丸ごと空白になる。
+        # 消える中身は ED 2 と同じなので、履歴にも同じだけ残る
+        s = feed(Screen(rows=3, cols=10), "one\r\ntwo\r\nthree")
+        feed(s, "\x1b[3;10H\x1b[1J")
+        self.assertEqual(s.text(), ["", "", ""])
+        record = everything(s)
+        for want in ("one", "two", "three"):
+            self.assertIn(want, record)
+
     def test_erased_cells_are_undressed(self):
         s = feed(Screen(), "\x1b[7mabc\x1b[2K")
         self.assertEqual(s.lines[0][1], (" ", DEFAULT))
@@ -326,6 +336,14 @@ class UnknownSequenceTest(unittest.TestCase):
     def test_an_unknown_final_changes_nothing(self):
         s = feed(Screen(), "abc\x1b[999Xdef")
         self.assertEqual(s.text()[0], "abcdef")
+    def test_an_undefined_erase_parameter_changes_nothing(self):
+        # ED に定義があるのは 0-3、EL は 0-2 だけ (XTerm ctlseqs)。
+        # それ以外の値を全消去として扱うと、機器が出した
+        # 行が黙って画面から消える
+        for seq in ("\x1b[4J", "\x1b[9J", "\x1b[3K", "\x1b[9K"):
+            with self.subTest(seq=seq):
+                s = feed(Screen(), "KEEP" + seq)
+                self.assertEqual(s.text()[0], "KEEP")
 
 
 class IntermediateByteTest(unittest.TestCase):
@@ -364,6 +382,17 @@ class EscDispatchTest(unittest.TestCase):
         s = feed(Screen(), "\x1b[3;3H\x1b[7m\x1b7\x1b[H\x1b[m\x1b8X")
         self.assertEqual(s.text()[2], "  X")
         self.assertTrue(s.lines[2][2][1].reverse)
+
+    def test_save_and_restore_cursor_keeps_the_charset(self):
+        # DECSC は位置と属性だけでなく、文字集合の指示も保存
+        # する (VT100/xterm)。復元した後の罫線が ASCII のまま出ていた
+        s = feed(Screen(), "\x1b(0\x1b7\x1b(B\x1b8lqk")
+        self.assertEqual(s.text()[0], "┌─┐")
+
+    def test_save_and_restore_cursor_keeps_the_shift_state(self):
+        # SO で G1 を使っている状態も DECSC/DECRC で行き来する
+        s = feed(Screen(), "\x1b)0\x0e\x1b7\x0f\x1b8lqk")
+        self.assertEqual(s.text()[0], "┌─┐")
 
     def test_reverse_index_at_the_top_scrolls_down(self):
         s = feed(Screen(), "top\x1b[H\x1bMnew")
@@ -437,6 +466,21 @@ class AlternateScreenTest(unittest.TestCase):
     def test_the_alt_screen_starts_blank(self):
         s = feed(Screen(), "shell stuff\x1b[?1049h")
         self.assertEqual(s.text(), [""] * 24)
+
+    def test_re_entering_the_alt_screen_with_47_keeps_its_content(self):
+        # 入場で白紙にするのは 1049 だけ (XTerm ctlseqs)。
+        # 47 は裏画面の中身をそのまま見せる
+        s = feed(Screen(), "shell\x1b[?47h\x1b[HALT\x1b[?47l")
+        self.assertEqual(s.text()[0], "shell")
+        feed(s, "\x1b[?47h")
+        self.assertEqual(s.text()[0], "ALT")
+
+    def test_leaving_the_alt_screen_with_1047_clears_it(self):
+        # 1047 は退場のときに代替画面を消すので、次の入場は白紙
+        s = feed(Screen(), "shell\x1b[?1047h\x1b[HALT\x1b[?1047l")
+        self.assertEqual(s.text()[0], "shell")
+        feed(s, "\x1b[?1047h")
+        self.assertEqual(s.text()[0], "")
 
     def test_alt_screen_scrolling_never_reaches_history(self):
         s = feed(Screen(), "\x1b[?1049h")

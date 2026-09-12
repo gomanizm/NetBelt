@@ -15,6 +15,13 @@ XTerm Control Sequences。
 書き直すと印が外れ、履歴・コピー・ログでは次の行との間に改行が入る。
 ECH も同じく行全体の印を外す。印字が複数回に分かれて届いた場合も、
 右端までの書き直しが途中で切れると印は外れる。
+
+DECOM (ESC[?6h) は保持しない。有効なら CUP・VPA の行番号は
+スクロール範囲の上端から数えるべきだが、ここでは常に画面の
+原点から数える。そのため DECSTBM で範囲を狭めたまま ESC[?6h を
+送る機器では、書き込まれる行が上端の分だけ上へずれる。terminfo に
+対応する capability が無く ncurses 系のアプリは送らないため、対応する
+とカーソル移動・DSR 応答・DECSTBM をまとめて触る割には見合わない。
 """
 import collections
 import unicodedata
@@ -95,7 +102,9 @@ class Screen(object):
         self.scroll_top = 0
         self.scroll_bottom = self.rows - 1
         self._pending_wrap = False
-        self._saved = (0, 0, DEFAULT)       # ESC 7 / ESC 8
+        # ESC 7 / ESC 8。位置・属性に加えて、VT100 と同じく
+        # 文字集合の指示 (G0/G1) と SI/SO の状態も持つ
+        self._saved = (0, 0, DEFAULT, {"(": "B", ")": "B"}, "(")
         self._saved_main = None             # ?1049 用
         self.autowrap = True
         self.cursor_visible = True
@@ -474,10 +483,13 @@ class Screen(object):
             # 取り違えると、カーソルがずれたり画面が消えたりする
             return
         elif seq.final == "7":
-            self._saved = (self.cursor_row, self.cursor_col, self.attr)
+            self._saved = (self.cursor_row, self.cursor_col, self.attr,
+                           dict(self._g), self._charset)
         elif seq.final == "8":
-            row, col, attr = self._saved
+            row, col, attr, g, charset = self._saved
             self.attr = attr
+            self._g = dict(g)
+            self._charset = charset
             self._move(row, col)
         elif seq.final == "D":          # IND
             self._linefeed()
@@ -508,7 +520,12 @@ class Screen(object):
         on = seq.final == "h"
         for mode in seq.params:
             if mode in (1049, 1047, 47):
-                self._switch_screen(on, with_cursor=(mode == 1049))
+                # 代替画面を白紙にするのは 1049 の入場と 1047 の
+                # 退場だけ (XTerm ctlseqs)。47 はどちらでも消さず、
+                # 入り直したときに前の中身がそのまま見える
+                clear = (mode == 1049) if on else (mode == 1047)
+                self._switch_screen(on, with_cursor=(mode == 1049),
+                                    clear=clear)
             elif mode == 7:
                 self.autowrap = on
                 if not on:
@@ -522,9 +539,12 @@ class Screen(object):
                 self.application_cursor_keys = on
             elif mode == 2004:
                 self.bracketed_paste = on
-            # ほかの私用モードは表示に効かないので無視
+            # ほかの私用モードは表示に効かないので無視。
+            # DECOM (?6) だけは表示に効くが保持しない (制限は
+            # このファイル冒頭の docstring)
 
-    def _switch_screen(self, to_alt, with_cursor):
+    def _switch_screen(self, to_alt, with_cursor, clear=True):
+        """代替画面と行き来する。clear は代替画面を白紙にするか。"""
         if to_alt == self.alt_active:
             return
         if to_alt and with_cursor:
@@ -535,15 +555,21 @@ class Screen(object):
         self.wrapped, self._other_wrapped = (
             self._other_wrapped, self.wrapped)
         self.alt_active = to_alt
-        if to_alt:                      # 代替画面は白紙で始まる
-            for r in range(self.rows):
-                self.lines[r] = self._blank_line()
-                self.wrapped[r] = False
-            self._move(0, 0)
-        elif with_cursor and self._saved_main:
-            row, col, attr = self._saved_main
-            self.attr = attr
-            self._move(row, col)
+        if to_alt:
+            if clear:               # 1049 の代替画面は白紙で始まる
+                for r in range(self.rows):
+                    self.lines[r] = self._blank_line()
+                    self.wrapped[r] = False
+                self._move(0, 0)
+        else:
+            if clear:               # 1047 は出るときに代替画面を消す
+                for r in range(self.rows):
+                    self._other[r] = self._blank_line()
+                    self._other_wrapped[r] = False
+            if with_cursor and self._saved_main:
+                row, col, attr = self._saved_main
+                self.attr = attr
+                self._move(row, col)
         self.dirty.update(range(self.rows))
         self._pending_wrap = False
 
@@ -571,14 +597,24 @@ class Screen(object):
             # 触らない。NetBelt はセッションの記録を消さない方針なので
             # 何もしない。画面まで消すと clear -x で表示が飛ぶ
             return
+        if mode not in (0, 1, 2):
+            # ED に定義があるのは 0-3 だけ (XTerm ctlseqs)。未定義の
+            # 値を全消去として扱うと、機器が出した行が黙って消える
+            return
         # 画面全体が消えるとき (clear は ESC[H ESC[J、つまり home からの
         # mode 0 で来る) は、消す前に見えていた中身を履歴へ送る。
         # clear でセッションの記録を失わない、という v1.1.1 の方針
         wipes_all = (mode >= 2 or
                      (mode == 0 and (self.cursor_row, self.cursor_col)
                       == (0, 0)))
-        if wipes_all:
+        # ED 1 も最下行の右端から送られれば画面は丸ごと空白に
+        # なる。消える中身は ED 2 と同じなので、同じく履歴へ送る
+        # (消し方は下の mode == 1 の枝のまま。行が桁数より長い
+        # ことがあり、全画面消去と同じに払うと右に残る分も消える)
+        if wipes_all or (mode == 1 and self.cursor_row == self.rows - 1
+                         and self.cursor_col >= self.cols - 1):
             self._record_screen()
+        if wipes_all:
             rng = range(0, self.rows)
         elif mode == 0:
             self._erase_line(0)
@@ -601,10 +637,15 @@ class Screen(object):
             if any(c != BLANK for c in self.lines[r]):
                 last = r
         for r, line in enumerate(self.lines[:last + 1]):
+            # 呼び出し元が同じ行をその場で消すことがある (ED 1)。
+            # 履歴が巻き添えで空にならないよう写しを渡す
+            line = list(line)
             self.history.append(line)
             self._new_history.append((line, self.wrapped[r]))
 
     def _erase_line(self, mode):
+        if mode not in (0, 1, 2):
+            return                  # EL に定義があるのは 0-2 だけ
         line = self.lines[self.cursor_row]
         # 行の長さは桁数と一致しない。窓を縮めても切らないので長いことが
         # あり、折り返しで続く行は広げても埋めないので短いこともある。
