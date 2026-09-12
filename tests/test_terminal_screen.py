@@ -383,6 +383,17 @@ class EscDispatchTest(unittest.TestCase):
         self.assertEqual(s.text()[2], "  X")
         self.assertTrue(s.lines[2][2][1].reverse)
 
+    def test_save_and_restore_cursor_keeps_the_charset(self):
+        # DECSC は位置と属性だけでなく、文字集合の指示も保存
+        # する (VT100/xterm)。復元した後の罫線が ASCII のまま出ていた
+        s = feed(Screen(), "\x1b(0\x1b7\x1b(B\x1b8lqk")
+        self.assertEqual(s.text()[0], "┌─┐")
+
+    def test_save_and_restore_cursor_keeps_the_shift_state(self):
+        # SO で G1 を使っている状態も DECSC/DECRC で行き来する
+        s = feed(Screen(), "\x1b)0\x0e\x1b7\x0f\x1b8lqk")
+        self.assertEqual(s.text()[0], "┌─┐")
+
     def test_reverse_index_at_the_top_scrolls_down(self):
         s = feed(Screen(), "top\x1b[H\x1bMnew")
         self.assertEqual(s.text()[:2], ["new", "top"])

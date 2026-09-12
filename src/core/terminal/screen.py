@@ -95,7 +95,9 @@ class Screen(object):
         self.scroll_top = 0
         self.scroll_bottom = self.rows - 1
         self._pending_wrap = False
-        self._saved = (0, 0, DEFAULT)       # ESC 7 / ESC 8
+        # ESC 7 / ESC 8。位置・属性に加えて、VT100 と同じく
+        # 文字集合の指示 (G0/G1) と SI/SO の状態も持つ
+        self._saved = (0, 0, DEFAULT, {"(": "B", ")": "B"}, "(")
         self._saved_main = None             # ?1049 用
         self.autowrap = True
         self.cursor_visible = True
@@ -474,10 +476,13 @@ class Screen(object):
             # 取り違えると、カーソルがずれたり画面が消えたりする
             return
         elif seq.final == "7":
-            self._saved = (self.cursor_row, self.cursor_col, self.attr)
+            self._saved = (self.cursor_row, self.cursor_col, self.attr,
+                           dict(self._g), self._charset)
         elif seq.final == "8":
-            row, col, attr = self._saved
+            row, col, attr, g, charset = self._saved
             self.attr = attr
+            self._g = dict(g)
+            self._charset = charset
             self._move(row, col)
         elif seq.final == "D":          # IND
             self._linefeed()
