@@ -306,6 +306,7 @@ class MainWindow(QMainWindow):
         self.device_tree = DeviceTree()
         self.device_tree.btn_add.clicked.connect(self._on_add_device)
         self.device_tree.btn_connect.clicked.connect(self._on_connect_button_clicked)
+        self.device_tree.btn_disconnect.clicked.connect(self._on_disconnect_button_clicked)
         # シグナル接続
         self.device_tree.device_connect.connect(self._on_device_connect)
         self.device_tree.device_edit.connect(self._on_device_edit)
@@ -1172,6 +1173,26 @@ class MainWindow(QMainWindow):
         
         # 接続処理を実行（ダブルクリックと同じ処理）
         self._on_connect_requested(device_data)
+
+    def _on_disconnect_button_clicked(self):
+        """
+        「切断」ボタンがクリックされたときの処理
+
+        選択中の機器が接続中なら、タブの × と同じ後始末（マクロ停止・
+        SFTP 切断・接続切断）を行う。タブは閉じないので、そのまま
+        再接続できる。
+        """
+        result = self.device_tree.get_selected_device()
+        if result is None:
+            return
+
+        group_name, device_data = result
+        device_name = device_data.get('name')
+        if device_name not in self.connections:
+            self.status_bar.showMessage(f"{device_name} は接続されていません")
+            return
+
+        self._on_tab_closed(device_name)
     
     def _on_terminal_resized(self, device_name: str, cols: int, rows: int):
         """端末の行数・桁数の変化を機器へ伝える (RFC 4254 6.7)。
