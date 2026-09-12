@@ -848,7 +848,8 @@ class SNMPPanel(QWidget):
         self.mib_thread.finished_signal.connect(self._on_background_mib_load_finished)
         self.mib_thread.start()
     
-    # MIB 読み込みスレッドの終了を待つ上限（ミリ秒）。通常は数 ms で終わる
+    # MIB 読み込みスレッドの終了を待つ上限（ミリ秒）。mibs/ が空なら
+    # 数 ms で終わるが、ベンダー MIB を入れた初回は秒単位かかる
     MIB_LOADER_WAIT_MS = 5000
 
     def wait_for_background_work(self):
@@ -864,13 +865,20 @@ class SNMPPanel(QWidget):
         無期限に待つと、応答しない MIB を掘っているあいだアプリを
         閉じられなくなるため。
 
-        実測: 読み込みは数ミリ秒で終わる（get_resolver の cold が 0.005 s）
-        ので、5 秒を超えるのは現実的な条件ではない。仮に超えても落ちない。
-        遅延を 5.22〜5.6 秒に伸ばした 13 回の実行はいずれも終了コード 0・
-        stderr 空で、8 秒かかるスレッドを残したまま閉じても
-        "QThread: Destroyed while thread is still running" は出なかった
-        （PyQt6 が実行中の QThread への参照を保持するため、パネルが
-        破棄されてもスレッド側は破棄されない）。
+        実測: mibs/ に MIB を置いていなければ読み込みは数ミリ秒で終わる
+        （get_resolver の cold が 0.012 s）。ただし解析時間は mibs/ の
+        総量にほぼ比例し、ベンダー MIB 一式を入れた初回（キャッシュ無効時）
+        は 22MB・80 ファイルで約 5〜6 秒、44MB・150 ファイルで約 9〜12 秒
+        （合成 MIB での計測）。つまりこの上限は現実に超える。超えるのは
+        初回と、MIB を足したとき・MIB_PARSER_VERSION を上げたときだけで、
+        以後は mib_cache.json が効いて数ミリ秒に戻る。
+
+        超えても落ちない。遅延を 5.22〜5.6 秒に伸ばした 13 回の実行は
+        いずれも終了コード 0・stderr 空で、8 秒かかるスレッドを残した
+        まま閉じても "QThread: Destroyed while thread is still running"
+        は出なかった（PyQt6 が実行中の QThread への参照を保持するため、
+        パネルが破棄されてもスレッド側は破棄されない）。解析の途中で
+        終了してもキャッシュは書かれないだけで、次回また作り直される。
 
         利用者に見える影響は、閉じる操作が最大でこの上限ぶん固まること。
         SNMPManager.cancel_operation も同じだけ待つので、応答しない機器への
