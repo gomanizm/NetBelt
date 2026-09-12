@@ -36,7 +36,8 @@ class SNMPExportTest(unittest.TestCase):
         p = self._panel()
         path = os.path.join(tempfile.mkdtemp(), "r.csv")
         p._export_results_to_csv(path, SAMPLE, "", None)
-        with open(path, encoding="utf-8", newline="") as f:
+        # CSV は BOM 付き（Excel 対策）。utf-8-sig で読む
+        with open(path, encoding="utf-8-sig", newline="") as f:
             rows = list(csv.reader(f))
         self.assertEqual(rows[0], ["OID", "Type", "Value"])
         self.assertEqual(len(rows), len(SAMPLE) + 1)

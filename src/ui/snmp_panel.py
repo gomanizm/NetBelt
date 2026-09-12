@@ -691,6 +691,17 @@ class SNMPPanel(QWidget):
         新しいものを先頭へ挿しているので、余るのは末尾。表示行と保存
         データを同じ数だけ削り、エクスポートの中身と画面が食い違わない
         ようにする。
+
+        制限: 上限が効くのは、GUI が Trap を1件受け取って表示へ入れた
+        後だけ。受信スレッドは1件ごとに完成した dict を queued シグナル
+        で送るので、GUI が止まっている間そのキューは上限と無関係に
+        伸びる（実測: 1件あたり約 2.3 KB、5万件で RSS +116 MB。GUI が
+        処理し終えると解放される）。定常状態では問題にならない。受信側の
+        復号が約 1,670 件/秒、GUI 側の処理が約 2,550 件/秒で、GUI の方が
+        速いため未処理は常に3件以下だった（毎秒 3,000 件を外から送った
+        実測でも同じ）。効くのは終了時の wait などで GUI が数十秒
+        止まっている間だけなので、まとめ配送（deque + QTimer）は
+        入れていない。
         """
         while len(self.trap_data_list) > self.max_traps:
             self.trap_data_list.pop()
@@ -739,7 +750,9 @@ class SNMPPanel(QWidget):
         読むと、ダイアログを開いている間に届いた次の結果のものになる
         """
         import csv
-        with open(file_path, "w", newline="", encoding="utf-8") as f:
+        # BOM 付き（utf-8-sig）。日本語版 Excel は BOM の無い UTF-8 の CSV を
+        # cp932 として開くため、見出しも機器から来た日本語も文字化けする
+        with open(file_path, "w", newline="", encoding="utf-8-sig") as f:
             if reason:
                 # 途中までの結果であることを、見出しの前に残す
                 f.write("# 途中まで: %s のため中断。全部ではありません\n" % reason)
@@ -846,14 +859,24 @@ class SNMPPanel(QWidget):
         finished_signal が解放済みのパネルへ届いて落ちる。起動直後に
         閉じたときに踏む。
 
-        制限: 保証は MIB_LOADER_WAIT_MS まで。期限を過ぎても待ち続けず、
-        読み込み中のまま閉じる処理が進む。無期限に待つと、応答しない
-        MIB を掘っているとアプリを閉じられなくなるため。実測では読み込みは
-        数 ms （get_resolver の cold が 0.005 s）で終わり、5 s 超えは現実的な
-        条件ではない。仮に期限切れしても、PyQt6 は終了時に C++ オブジェクトを
-        破棄しないので QThread のデストラクタは走らず、遅延を 5.22〜5.6 s に
-        伸ばした 13 回の実行でも終了コード 0・stderr 空で、落ちなかった。
-        利用者に見える影響は、閉じる操作が最大でこの期限分固まること。
+        制限: 待ちは MIB_LOADER_WAIT_MS が上限で、戻り値は見ていない。
+        上限を過ぎたら待つのをやめ、読み込み中のまま閉じる処理を続ける。
+        無期限に待つと、応答しない MIB を掘っているあいだアプリを
+        閉じられなくなるため。
+
+        実測: 読み込みは数ミリ秒で終わる（get_resolver の cold が 0.005 s）
+        ので、5 秒を超えるのは現実的な条件ではない。仮に超えても落ちない。
+        遅延を 5.22〜5.6 秒に伸ばした 13 回の実行はいずれも終了コード 0・
+        stderr 空で、8 秒かかるスレッドを残したまま閉じても
+        "QThread: Destroyed while thread is still running" は出なかった
+        （PyQt6 が実行中の QThread への参照を保持するため、パネルが
+        破棄されてもスレッド側は破棄されない）。
+
+        利用者に見える影響は、閉じる操作が最大でこの上限ぶん固まること。
+        SNMPManager.cancel_operation も同じだけ待つので、応答しない機器への
+        GET/WALK（既定で約 6 秒かかり、5 秒の待ちを実際に超える）と
+        MIB 読み込みが重なると最大 10 秒になる。短くするなら待ちではなく、
+        GET/WALK 側のタイムアウトを 5 秒以内へ明示する。
         """
         thread = getattr(self, "mib_thread", None)
         if thread is not None and thread.isRunning():
@@ -962,7 +985,8 @@ class SNMPPanel(QWidget):
         """
         import csv
 
-        with open(file_path, 'w', newline='', encoding='utf-8') as f:
+        # BOM 付き（utf-8-sig）。理由は _export_results_to_csv と同じ
+        with open(file_path, 'w', newline='', encoding='utf-8-sig') as f:
             writer = csv.writer(f)
             
             # ヘッダー

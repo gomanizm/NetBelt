@@ -503,6 +503,10 @@ class SNMPTrapReceiver(QThread):
         ntfrcv はコールバックのアリティを例外ベースで判定し、TypeError が出ると
         「引数の数が違う」とみなして呼び直す。本体で TypeError を漏らすと
         同じ通知が二度処理されるため、ここで握りつぶす。
+
+        制限: 1件ごとにそのまま emit する（間引きは GUI 側の
+        SNMPPanel._trim_traps だけ）。GUI が止まっている間は Qt の
+        キューが上限なしに伸びる。理由と実測値は _trim_traps に書いた。
         """
         try:
             if self._is_weaker_than_registered():
@@ -761,7 +765,14 @@ class SNMPManager(QObject):
         return True   # 受理した（実行中で断った場合は False）
     
     def cancel_operation(self):
-        """現在の操作をキャンセル"""
+        """現在の操作をキャンセル
+
+        制限: 5 秒で待つのをやめ、終わらなかったことは警告を出すだけで
+        呼び出し側へは返さない。応答しない機器への GET/WALK は既定で
+        約 6 秒かかるので、この待ちは実際に超える。超えてもスレッドは
+        self.worker が参照を持ったまま残り、終了処理を続けても実測では
+        異常終了しない（終了コード 0）。
+        """
         if self.worker and self.worker.isRunning():
             self.worker.cancel()
             # タイムアウト無しで待つと、WALK 中はキャンセルフラグを見るまでの間
