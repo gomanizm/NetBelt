@@ -15,6 +15,13 @@ XTerm Control Sequences。
 書き直すと印が外れ、履歴・コピー・ログでは次の行との間に改行が入る。
 ECH も同じく行全体の印を外す。印字が複数回に分かれて届いた場合も、
 右端までの書き直しが途中で切れると印は外れる。
+
+DECOM (ESC[?6h) は保持しない。有効なら CUP・VPA の行番号は
+スクロール範囲の上端から数えるべきだが、ここでは常に画面の
+原点から数える。そのため DECSTBM で範囲を狭めたまま ESC[?6h を
+送る機器では、書き込まれる行が上端の分だけ上へずれる。terminfo に
+対応する capability が無く ncurses 系のアプリは送らないため、対応する
+とカーソル移動・DSR 応答・DECSTBM をまとめて触る割には見合わない。
 """
 import collections
 import unicodedata
@@ -532,7 +539,9 @@ class Screen(object):
                 self.application_cursor_keys = on
             elif mode == 2004:
                 self.bracketed_paste = on
-            # ほかの私用モードは表示に効かないので無視
+            # ほかの私用モードは表示に効かないので無視。
+            # DECOM (?6) だけは表示に効くが保持しない (制限は
+            # このファイル冒頭の docstring)
 
     def _switch_screen(self, to_alt, with_cursor, clear=True):
         """代替画面と行き来する。clear は代替画面を白紙にするか。"""
