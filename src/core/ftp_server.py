@@ -212,9 +212,10 @@ class FTPServerManager(QObject):
                 _pyftpd_logger.addHandler(logging.NullHandler())
             # ioloop を渡さないと、pyftpdlib はプロセス全体で 1 つの共有
             # インスタンスを使う。共有すると、片方を停止したときの
-            # close_all() がもう片方の待ち受けソケットまで閉じ、さらに
-            # 2 本の待受スレッドが select() へ渡す同じ list を同時に
-            # 読み書きしてプロセスごと落ちる
+            # close_all() がもう片方の待ち受けソケットまで閉じる
+            # （実測で、動いている側へログインできなくなった）。
+            # 2 本の待受スレッドが同じ fd の一覧を同時に読み書きする
+            # 状態も、pyftpdlib が想定していない
             self._server = _PyFTPServer(("0.0.0.0", port), _Handler,
                                         ioloop=_PyIOLoop.factory())
             self.port = self._server.address[1]
