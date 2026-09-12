@@ -142,6 +142,16 @@ class ErasingTest(unittest.TestCase):
         for i in range(30):
             self.assertIn("l%d" % i, record)
 
+    def test_erase_above_from_the_bottom_right_keeps_the_record(self):
+        # ESC[1J を最下行の右端から送ると画面は丸ごと空白になる。
+        # 消える中身は ED 2 と同じなので、履歴にも同じだけ残る
+        s = feed(Screen(rows=3, cols=10), "one\r\ntwo\r\nthree")
+        feed(s, "\x1b[3;10H\x1b[1J")
+        self.assertEqual(s.text(), ["", "", ""])
+        record = everything(s)
+        for want in ("one", "two", "three"):
+            self.assertIn(want, record)
+
     def test_erased_cells_are_undressed(self):
         s = feed(Screen(), "\x1b[7mabc\x1b[2K")
         self.assertEqual(s.lines[0][1], (" ", DEFAULT))

@@ -577,8 +577,14 @@ class Screen(object):
         wipes_all = (mode >= 2 or
                      (mode == 0 and (self.cursor_row, self.cursor_col)
                       == (0, 0)))
-        if wipes_all:
+        # ED 1 も最下行の右端から送られれば画面は丸ごと空白に
+        # なる。消える中身は ED 2 と同じなので、同じく履歴へ送る
+        # (消し方は下の mode == 1 の枝のまま。行が桁数より長い
+        # ことがあり、全画面消去と同じに払うと右に残る分も消える)
+        if wipes_all or (mode == 1 and self.cursor_row == self.rows - 1
+                         and self.cursor_col >= self.cols - 1):
             self._record_screen()
+        if wipes_all:
             rng = range(0, self.rows)
         elif mode == 0:
             self._erase_line(0)
@@ -601,6 +607,9 @@ class Screen(object):
             if any(c != BLANK for c in self.lines[r]):
                 last = r
         for r, line in enumerate(self.lines[:last + 1]):
+            # 呼び出し元が同じ行をその場で消すことがある (ED 1)。
+            # 履歴が巻き添えで空にならないよう写しを渡す
+            line = list(line)
             self.history.append(line)
             self._new_history.append((line, self.wrapped[r]))
 
