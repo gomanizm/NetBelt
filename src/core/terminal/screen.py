@@ -571,6 +571,10 @@ class Screen(object):
             # 触らない。NetBelt はセッションの記録を消さない方針なので
             # 何もしない。画面まで消すと clear -x で表示が飛ぶ
             return
+        if mode not in (0, 1, 2):
+            # ED に定義があるのは 0-3 だけ (XTerm ctlseqs)。未定義の
+            # 値を全消去として扱うと、機器が出した行が黙って消える
+            return
         # 画面全体が消えるとき (clear は ESC[H ESC[J、つまり home からの
         # mode 0 で来る) は、消す前に見えていた中身を履歴へ送る。
         # clear でセッションの記録を失わない、という v1.1.1 の方針
@@ -614,6 +618,8 @@ class Screen(object):
             self._new_history.append((line, self.wrapped[r]))
 
     def _erase_line(self, mode):
+        if mode not in (0, 1, 2):
+            return                  # EL に定義があるのは 0-2 だけ
         line = self.lines[self.cursor_row]
         # 行の長さは桁数と一致しない。窓を縮めても切らないので長いことが
         # あり、折り返しで続く行は広げても埋めないので短いこともある。

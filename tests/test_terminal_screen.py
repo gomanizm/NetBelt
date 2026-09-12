@@ -336,6 +336,14 @@ class UnknownSequenceTest(unittest.TestCase):
     def test_an_unknown_final_changes_nothing(self):
         s = feed(Screen(), "abc\x1b[999Xdef")
         self.assertEqual(s.text()[0], "abcdef")
+    def test_an_undefined_erase_parameter_changes_nothing(self):
+        # ED に定義があるのは 0-3、EL は 0-2 だけ (XTerm ctlseqs)。
+        # それ以外の値を全消去として扱うと、機器が出した
+        # 行が黙って画面から消える
+        for seq in ("\x1b[4J", "\x1b[9J", "\x1b[3K", "\x1b[9K"):
+            with self.subTest(seq=seq):
+                s = feed(Screen(), "KEEP" + seq)
+                self.assertEqual(s.text()[0], "KEEP")
 
 
 class IntermediateByteTest(unittest.TestCase):
