@@ -847,6 +847,18 @@ class SNMPPanel(QWidget):
         実行中の QThread の破棄で Qt が abort するか、終わったスレッドの
         finished_signal が解放済みのパネルへ届いて落ちる。起動直後に
         閉じたときに踏む。
+
+        制限: 待ちは MIB_LOADER_WAIT_MS が上限で、戻り値は見ていない。
+        上限を過ぎたら待つのをやめ、終了処理をそのまま続ける。実測では
+        8 秒かかるスレッドを残したまま閉じても終了コードは 0 で、
+        "QThread: Destroyed while thread is still running" も出ない
+        （PyQt6 が実行中の QThread への参照を保持するため、パネルが
+        破棄されてもスレッド側は破棄されない）。利用者に見える影響は
+        「閉じる操作が最大 5 秒固まる」だけ。SNMPManager.cancel_operation
+        も同じだけ待つので、応答しない機器への GET/WALK（既定で約 6 秒
+        かかり、5 秒の待ちを実際に超える）と MIB 読み込みが重なると
+        最大 10 秒になる。短くするなら待ちではなく、GET/WALK 側の
+        タイムアウトを 5 秒以内へ明示する。
         """
         thread = getattr(self, "mib_thread", None)
         if thread is not None and thread.isRunning():

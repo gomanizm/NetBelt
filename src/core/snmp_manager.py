@@ -761,7 +761,14 @@ class SNMPManager(QObject):
         return True   # 受理した（実行中で断った場合は False）
     
     def cancel_operation(self):
-        """現在の操作をキャンセル"""
+        """現在の操作をキャンセル
+
+        制限: 5 秒で待つのをやめ、終わらなかったことは警告を出すだけで
+        呼び出し側へは返さない。応答しない機器への GET/WALK は既定で
+        約 6 秒かかるので、この待ちは実際に超える。超えてもスレッドは
+        self.worker が参照を持ったまま残り、終了処理を続けても実測では
+        異常終了しない（終了コード 0）。
+        """
         if self.worker and self.worker.isRunning():
             self.worker.cancel()
             # タイムアウト無しで待つと、WALK 中はキャンセルフラグを見るまでの間
