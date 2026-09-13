@@ -131,7 +131,12 @@ class DeviceTree(QWidget):
                 'protocol': 'serial',  # 接続プロトコルを明示
                 'port': port_name,
                 'baudrate': baudrate,
-                'description': description
+                'description': description,
+                # config 由来ではなく、その場で検出した項目だという印。
+                # 機器名の一意性検査は config しか見ないので、ここの名前は
+                # 登録機器と同じになりうる。印が無いと、同名の機器が属する
+                # グループの自動実行コマンドがコンソールへ流れる
+                'source': 'autodetect'
             }
             
             # デバイスデータを保存

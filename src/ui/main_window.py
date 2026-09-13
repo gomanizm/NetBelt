@@ -1070,9 +1070,26 @@ class MainWindow(QMainWindow):
                     return group
         return None
 
+    def _is_autodetected_device(self, device_name: str) -> bool:
+        """いま繋いでいるのが、自動検出したCOMポートかを返す
+
+        検出したポートは config に無いので、機器名の一意性検査
+        （find_device_group）にかからず、登録機器と同じ名前になりうる。
+        名前だけで所属グループを引くと、別の機器のグループが見つかる。
+        """
+        device_data = self.device_info.get(device_name)
+        if not isinstance(device_data, dict):
+            return False
+        return device_data.get('source') == 'autodetect'
+
     def _run_auto_commands(self, device_name: str):
         """接続先グループの自動実行コマンドを送信する(GUIスレッドで実行)"""
         if device_name not in self.connections:
+            return
+        # 自動検出したCOMポートは、どのグループにも属さない。名前が同じ
+        # というだけで登録機器のグループを当てると、SSH機器向けのコマンドが
+        # シリアルコンソール（機器の素のCLI）へそのまま流れる
+        if self._is_autodetected_device(device_name):
             return
         group = self._find_group_of_device(device_name)
         if not group:
