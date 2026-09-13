@@ -71,9 +71,27 @@ class LogSaveWorker(QThread):
                     pass   # 消せなくても保存先は無傷。残骸は .tmp なので見分けがつく
 
 
+_abandoned_workers = set()
+
+
+def _abandon_worker(worker):
+    """待ち切れなかったワーカーを、終わるまで保持する
+
+    実行中の QThread への参照が全部消えると C++ 側が破棄され、プロセスごと
+    落ちる。ダイアログを閉じても消えない場所で持っておき、終わったものは
+    次に呼ばれたときに手放す。
+    """
+    for finished in [w for w in _abandoned_workers if w.isFinished()]:
+        _abandoned_workers.discard(finished)
+    _abandoned_workers.add(worker)
+
+
 class LogSaveProgressDialog(QDialog):
     """ログ保存プログレスダイアログ"""
-    
+
+    # ワーカーの停止を待つ上限（ミリ秒）
+    WAIT_TIMEOUT_MS = 2000
+
     def __init__(self, log_text: str, file_path: str, parent=None):
         super().__init__(parent)
         self.log_text = log_text
@@ -153,10 +171,23 @@ class LogSaveProgressDialog(QDialog):
         （QDialog は Esc と closeEvent で reject() を呼ぶ）。ここで止めないと
         進捗表示だけが消えて裏で書き込みが続き、直後にアプリを終了すると
         途中で切れたファイルが黙って残る。
+
+        ただし無期限には待たない。キャンセルの判定はチャンクの切れ目だけ
+        なので、1 回の write が返ってこない保存先（応答しない共有フォルダ
+        など）では wait() も返らず、GUI スレッドごと固まる。待ち切れないときは
+        待つのをやめる。書き込み先は一時ファイルで、保存先へ移すのは書き切った
+        あとの os.replace 1 回だけなので、保存先のファイルは無傷のまま残る。
         """
         if self.worker and self.worker.isRunning():
             self.worker.cancel()
-            self.worker.wait()
+            if not self.worker.wait(self.WAIT_TIMEOUT_MS):
+                # 閉じたダイアログへ通知が届かないよう切り離してから手放す
+                try:
+                    self.worker.progress.disconnect(self._on_progress)
+                    self.worker.finished.disconnect(self._on_finished)
+                except TypeError:
+                    pass    # すでに切れている
+                _abandon_worker(self.worker)
         super().reject()
     
     def exec(self) -> bool:
