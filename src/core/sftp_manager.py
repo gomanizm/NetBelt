@@ -390,6 +390,24 @@ class SFTPManager(QObject):
                             return
                     self.sftp_client.put(local_path, tmp_remote,
                                          callback=progress_callback)
+                    if not overwrite:
+                        # 送る前の確認から転送のあいだに、第三者が同じ名前を
+                        # 作っているかもしれない。posix_rename は既存を上書き
+                        # するので、置き換える直前にもう一度確かめる。
+                        # 限界: この確認と改名のあいだは依然として塞げない
+                        # （SFTP に「無ければ置き換える」原子操作が無く、
+                        # _sftp_lock は同一プロセス内しか直列化しない）。
+                        # ただし窓は転送の全体から stat 1 往復まで縮まる
+                        state, why = self._remote_probe(remote_path)
+                        if state != self._REMOTE_MISSING:
+                            # 転送した内容は捨てない。一時名に残して知らせる
+                            keep_tmp[0] = True
+                            raise IOError(
+                                "転送しているあいだにリモートへ '%s' が作られました。"
+                                "上書きの確認を経ていないので置き換えていません。"
+                                "転送した内容は一時名 %s に残っています"
+                                % (remote_name, tmp_remote)
+                                + ("（%s）" % why if why else ""))
                     # 全部送れてから最終名へ。posix_rename（OpenSSH 拡張）は
                     # 既存を上書きできる。無いサーバでは、まず rename を試し、
                     # 既存があって失敗したときだけ消してからもう一度 rename

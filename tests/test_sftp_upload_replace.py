@@ -101,6 +101,48 @@ class SftpUploadReplaceTest(unittest.TestCase):
         self.assertNotIn(kept, self._removed(m),
                          "前回の試行が残した唯一の完全な写しを消している")
 
+    # --- 転送中に現れた同名 ---
+
+    def _appear_during_put(self, m, mode=0o100644):
+        """put のあいだに第三者が最終名を作った状況を作る。"""
+        attr = mock.Mock()
+        attr.st_mode = mode
+
+        def put_side_effect(local, remote, callback=None):
+            m.sftp_client.stat.side_effect = None
+            m.sftp_client.stat.return_value = attr
+
+        m.sftp_client.put.side_effect = put_side_effect
+        return attr
+
+    def test_a_name_that_appears_during_the_transfer_is_not_replaced(self):
+        """確認を経ていない送信は、転送中に現れた同名を潰さないこと。"""
+        m = self._manager()
+        self._appear_during_put(m)
+
+        m.upload_file(self.local, "/flash/running.cfg")
+
+        self.assertTrue(self._wait(lambda: self.errors or self.done),
+                        "完了もエラーも届かない")
+        self.assertEqual(self.done, [], "確認なしで潰したうえで完了を通知している")
+        m.sftp_client.posix_rename.assert_not_called()
+        m.sftp_client.rename.assert_not_called()
+        tmp = self._put_targets(m)[0]
+        self.assertEqual(self._removed(m), [], "消しにいっている: %s" % self._removed(m))
+        self.assertIn(tmp, self.errors[0],
+                      "機器に残った一時名を知らせていない: %s" % self.errors)
+
+    def test_a_confirmed_upload_still_replaces_a_name_that_appears(self):
+        """上書きを承認済みなら、転送中に現れた同名でもこれまでどおり置き換える。"""
+        m = self._manager()
+        self._appear_during_put(m)
+
+        m.upload_file(self.local, "/flash/running.cfg", overwrite=True)
+
+        self.assertTrue(self._wait(lambda: self.done), "完了しない: %s" % self.errors)
+        m.sftp_client.posix_rename.assert_called_once_with(
+            self._put_targets(m)[0], "/flash/running.cfg")
+
     # --- ルート直下への送信 ---
 
     def test_an_upload_to_the_root_keeps_its_temporary_name_in_the_root(self):
