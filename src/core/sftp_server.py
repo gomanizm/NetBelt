@@ -61,6 +61,13 @@ class SFTPServerHandler(SFTPServerInterface):
         parent_rel, _, leaf = relative.rpartition("/")
         if leaf in ("", ".", ".."):
             raise IOError("Access denied")
+        # ドライブ指定の付いた leaf を拒否する。Windows の os.path.join は
+        # 'C:name' のような「ドライブ相対」を渡されると左側を丸ごと捨てるため、
+        # 公開ルートと別ドライブを指す名前ひとつで閉じ込めが外れる
+        # （そのドライブのカレントディレクトリ直下＝アプリの起動場所に届く）。
+        # コロンを含む名前は Windows では作成できないので、正規の要求では起きない。
+        if os.path.splitdrive(leaf)[0] or os.path.isabs(leaf):
+            raise IOError("Access denied")
         parent_real = self._get_real_path(parent_rel)
         return os.path.join(parent_real, leaf)
 
