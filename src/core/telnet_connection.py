@@ -1,4 +1,5 @@
 """Telnet接続管理"""
+import codecs
 import socket
 import threading
 import time
@@ -114,6 +115,13 @@ class TelnetConnection(QObject):
         """
         コマンドを送信（キー入力をそのまま送信）
         
+        制限（既知・意図的）: NVT（RFC 854）では CR の後に LF か NUL を
+        付けるが、ここはキー入力をそのまま流すので Enter は CR 単独
+        （0x0d）で出る。Cisco IOS や netkit telnetd は CR 単独で行を
+        確定するため実機では顕在化しない。CR LF へ変換すると、LF を
+        別の改行として扱う機器で Enter のたびに空行が増えるので、
+        実機で確かめられるまで変えない。
+        
         Args:
             command: 送信するコマンド（1文字または制御文字）
         """
@@ -137,7 +145,10 @@ class TelnetConnection(QObject):
     
     def _read_output(self):
         """バックグラウンドで出力を読み取る"""
-        buffer = b''      # UTF-8 の途中で切れた分
+        # UTF-8 の途中で切れた分はデコーダの中に残り、次の受信と繋がる。
+        # 溜めて閾値で強制復号すると、先頭バイトだけが化けたうえ、続きの
+        # プロンプトが次に閾値を超えるまで画面に出なかった
+        decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
         pending = b''     # 途中で切れた制御シーケンス（次の受信と繋げる）
 
         while not self._stop_reading and self.is_connected:
@@ -150,23 +161,9 @@ class TelnetConnection(QObject):
                             # pending に残し、次の受信の先頭へ繋ぐ
                             clean, pending = self._process_telnet_commands(
                                 pending + data)
-                            buffer += clean
-
-                            # バッファ内のデータをデコードして送信
-                            if buffer:
-                                try:
-                                    # 完全なUTF-8文字が揃っているか確認
-                                    text = buffer.decode('utf-8')
-                                    self.output_received.emit(text)
-                                    buffer = b''
-                                except UnicodeDecodeError:
-                                    # 不完全なUTF-8シーケンスの場合はバッファに保持
-                                    # 最大バッファサイズチェック（メモリリーク防止）
-                                    if len(buffer) > 100:
-                                        # 強制的にデコード
-                                        text = buffer.decode('utf-8', errors='replace')
-                                        self.output_received.emit(text)
-                                        buffer = b''
+                            text = decoder.decode(clean)
+                            if text:
+                                self.output_received.emit(text)
                         else:
                             # データがない場合は接続が閉じられた
                             if self.is_connected:
@@ -191,7 +188,11 @@ class TelnetConnection(QObject):
                     self.is_connected = False
                     self.disconnected.emit()
                 break
-    
+        # 切れ目で終わった未完の文字を捨てない
+        rest = decoder.decode(b'', final=True)
+        if rest:
+            self.output_received.emit(rest)
+
     # 未完のシーケンスを持ち越す上限。壊れた相手が IAC SB を送り続けて
     # 終端を寄こさない場合に、際限なく溜め込まないようにする。
     # 実際のサブネゴシエーションは数十バイトで収まる。
@@ -234,6 +235,16 @@ class TelnetConnection(QObject):
         捨てたり通常データとして出したりすると、0xFF が画面へ漏れて
         UTF-8 デコードを壊し、応答も返せずに機器が待ち続ける。
         揃っていない分は次の受信まで持ち越す。
+
+        制限（既知・意図的）: オプションは一律に拒否する（DO には
+        WONT、WILL には DONT）。Python の telnetlib と同じ方針で、
+        状態を持たなくても再交渉のループに陥らない。ただし端末側の
+        ローカルエコーも持たないため、RFC 857 どおり DONT ECHO を
+        受けてエコーを止める機器では、入力中の文字が画面に出ない。
+        Cisco IOS や Linux の telnetd はエコーを pty／回線側で行う
+        のでこの条件には当たらない。WILL ECHO へ DO を返す方式に
+        変えるなら、素朴な実装との交渉ループを防ぐ状態管理
+        （RFC 1143 の Q 法）が要る。実機で確かめられるまで変えない。
 
         Args:
             data: 受信データ（前回の持ち越しを先頭に連結したもの）
@@ -325,7 +336,17 @@ class TelnetConnection(QObject):
             # 空にするだけだと、続きを通常データとして画面へ出してしまう。
             print("[Telnet] 未完の制御シーケンスが大きすぎるため破棄しました")
             self._discarding_sb = pending[:2] == bytes([IAC, SB])
-            pending = b''
+            if self._discarding_sb:
+                # 捨てる分の末尾が対の無い IAC なら、それだけは次の受信へ
+                # 持ち越す。ここで捨てると、次の受信が SE で始まった
+                # （終端が切れ目で割れた）ときに終端を見つけられず、
+                # 以後の受信を全部捨て続ける。末尾 1 バイトで判定すると
+                # 本文中の IAC IAC まで持ち越して次の SE を終端と誤認
+                # するので、_find_sb_end の dangling で数える。
+                _, dangling = self._find_sb_end(pending, 2)
+                pending = pending[-dangling:] if dangling else b''
+            else:
+                pending = b''
 
         return bytes(output), pending
     

@@ -17,6 +17,7 @@ v1.1.0 の更新で実際に起きたこと:
 更新は成功しているのに失敗と言われると、利用者は手で戻そうとする。
 嘘の失敗報告は、失敗そのものより害が大きい。
 """
+import hashlib
 import io
 import os
 import shutil
@@ -284,6 +285,46 @@ class UpdaterScriptTest(unittest.TestCase):
         self.assertNotEqual(code, 0, "実行ファイルが無いのに成功と報告した\n" + out)
         self.assertIn("NetBelt.exe", out)
 
+    def test_a_zip_without_the_app_fails_even_when_an_old_exe_is_installed(self):
+        """旧 NetBelt.exe が残っていても、実行ファイルの無い zip を成功と言わないこと。
+
+        上の検査はインストール先が空の場合しか見ていない。実際の更新では旧版が
+        必ず置いてあるので、「インストール先に NetBelt.exe があるか」で判定すると、
+        展開した zip に exe が無くても通ってしまう。利用者には「更新が完了しました！」と
+        出る一方で、動くのは旧版のままになる。
+        """
+        self._write(os.path.join(self.app_dir, "NetBelt.exe"), "old")
+        zip_path = self._make_zip({"README.txt": "no exe here"})
+
+        code, out = self._run(zip_path)
+
+        self.assertNotEqual(code, 0, "実行ファイルが無いのに成功と報告した\n" + out)
+        self.assertEqual(self._installed(), "old", out)
+        self.assertNotIn("更新が完了しました", out,
+                         "旧版のままなのに完了と告げている:\n" + out)
+
+    def test_a_leftover_staged_exe_is_not_installed_as_the_update(self):
+        """前回の更新が残した NetBelt.exe.new を、新版として据えないこと。
+
+        更新は新しい exe を NetBelt.exe.new という一時名で置いてから改名する。
+        その間にコンソールを閉じられる・電源が落ちるなどで止まると、
+        インストール先に NetBelt.exe.new が残る。次の更新で「インストール先に
+        NetBelt.exe.new があるか」で判定すると、展開した zip に exe が無くても
+        残骸が条件を満たしてしまい、動いていた exe がその残骸で上書きされる。
+        """
+        self._write(os.path.join(self.app_dir, "NetBelt.exe"), "old")
+        self._write(os.path.join(self.app_dir, "NetBelt.exe.new"),
+                    "stale-garbage")
+        zip_path = self._make_zip({"README.txt": "no exe here"})
+
+        code, out = self._run(zip_path)
+
+        self.assertNotEqual(code, 0, "実行ファイルが無いのに成功と報告した\n" + out)
+        self.assertEqual(self._installed(), "old",
+                         "前回の残骸で動いている exe を上書きした\n" + out)
+        self.assertNotIn("更新が完了しました", out,
+                         "旧版のままなのに完了と告げている:\n" + out)
+
     # --- 自分自身を上書きされても壊れないこと ---------------------------
 
     def _zip_with_a_longer_updater(self):
@@ -478,7 +519,10 @@ class UpdaterLaunchTest(unittest.TestCase):
             window = MainWindow()
         self.addCleanup(lambda: None)
 
-        with mock.patch("subprocess.Popen") as popen:
+        # 適用は凍結ビルドでしか行わない（ソース実行では、配布物が
+        # リポジトリ直下へ上書きされてしまうので案内だけを出す）
+        with mock.patch("subprocess.Popen") as popen, \
+             mock.patch.object(sys, "frozen", True, create=True):
             window._apply_pending_update(zip_path)
 
         self.assertTrue(popen.called, "updater を起動していない")
@@ -575,10 +619,23 @@ class UpdaterLaunchTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, base, True)
         zip_path = os.path.join(base, "Net,Belt-update.zip")
         io.open(zip_path, "wb").write(b"PK\x03\x04")
+        # 適用は凍結ビルドでしか行わず、直前に「表示した版と同じ、
+        # 検証を通った ZIP か」を確かめる。控えと、インストール先の
+        # 一式（exe と updater.bat）を用意して、その門を通す。
+        io.open(zip_path + ".sha256", "w", encoding="ascii").write(
+            hashlib.sha256(b"PK\x03\x04").hexdigest())
+        io.open(zip_path + ".version", "w", encoding="ascii").write(
+            "9.9.9")
+        exe_path = os.path.join(base, "NetBelt.exe")
+        io.open(exe_path, "wb").write(b"MZ")
+        io.open(os.path.join(base, "updater.bat"), "w",
+                encoding="ascii").write("rem\n")
 
         dialog = self._dialog_with_a_downloaded_zip(zip_path)
         with mock.patch("subprocess.Popen") as popen, \
-             mock.patch("PyQt6.QtWidgets.QApplication.quit"):
+             mock.patch("PyQt6.QtWidgets.QApplication.quit"), \
+             mock.patch.object(sys, "frozen", True, create=True), \
+             mock.patch.object(sys, "executable", exe_path):
             dialog._on_apply_clicked()
 
         self.assertTrue(popen.called, "updater を起動していない")

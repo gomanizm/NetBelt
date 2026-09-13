@@ -6,6 +6,17 @@ from pathlib import Path
 from typing import Dict, List, Optional
 from .crypto import PasswordCrypto
 
+# 機器名として使えない名前。ターミナルはホームタブをタブ名 "ホーム" で
+# 見分けているので、同名の機器はタブを閉じられず、ログ保存・記録・
+# マクロ設定も「ホームタブ」扱いで断られる。
+RESERVED_DEVICE_NAMES = ("ホーム",)
+
+
+def is_reserved_device_name(name) -> bool:
+    """その名前が機器名として予約されているか（前後の空白は無視）"""
+    return isinstance(name, str) and name.strip() in RESERVED_DEVICE_NAMES
+
+
 def app_data_dir():
     """アプリのデータ保存先 (~/.netbelt) を返す。無ければ作る。
 
@@ -41,6 +52,7 @@ class ConfigManager:
         self.config_path = Path(config_path)
         self.crypto = PasswordCrypto()
         self.load_error = None  # 読み込みエラー情報
+        self.load_warning = None  # 読み込めたが一部を除外したときの警告文
         self.backup_path = None  # バックアップファイルパス
         self.config = self._load_config()
     
@@ -62,6 +74,10 @@ class ConfigManager:
         try:
             with open(self.config_path, 'r', encoding='utf-8') as f:
                 config = json.load(f)
+                # name/host の無い機器とグループは先に整える（UI が KeyError で
+                # 落ちる）。復号も機器が dict であることを前提にしているので、
+                # 隔離はその前に済ませる
+                self._quarantine_invalid_devices(config)
                 # パスワードを復号化
                 self._decrypt_passwords(config)
                 self._notify_undecryptable()
@@ -139,6 +155,16 @@ class ConfigManager:
                 if password and not self.crypto.is_encrypted(password):
                     device["password"] = self.crypto.encrypt(password)
 
+        # GitHub トークンも資格情報。UI からは設定できないが、手で置かれた
+        # 平文をディスク（と破損時の backup_*）に残さない。
+        # 暗号化済みを触らない理由は機器側と同じ
+        update_settings = config.get("update_settings")
+        if isinstance(update_settings, dict):
+            token = update_settings.get("github_token")
+            if (isinstance(token, str) and token
+                    and not self.crypto.is_encrypted(token)):
+                update_settings["github_token"] = self.crypto.encrypt(token)
+
         settings = config.get("settings")
         if not isinstance(settings, dict):
             return
@@ -172,6 +198,14 @@ class ConfigManager:
                     self._undecryptable_count += 1
                 device["password"] = decrypted
 
+        # トークンは件数に数えない。復号できないときの案内は
+        # get_github_token() が出す（文面が機器のパスワードと違う）
+        update_settings = config.get("update_settings")
+        if isinstance(update_settings, dict):
+            token = update_settings.get("github_token")
+            if isinstance(token, str) and token:
+                update_settings["github_token"] = self.crypto.decrypt(token)
+
         settings = config.get("settings")
         if not isinstance(settings, dict):
             return
@@ -195,6 +229,91 @@ class ConfigManager:
                   "別の Windows アカウント/PC で保存された設定の可能性があります。"
                   "該当機器のパスワードは再入力してください。"
                   "（設定ファイル内の元の値は保護されており、上書きされません）")
+
+    @staticmethod
+    def _is_valid_device(device) -> bool:
+        """UI が前提にする必須フィールド（name/host が空でない文字列）を持つか。"""
+        return (isinstance(device, dict)
+                and isinstance(device.get("name"), str) and bool(device["name"])
+                and isinstance(device.get("host"), str) and bool(device["host"]))
+
+    # name の無いグループに与える表示名。グループごと捨てると中の正常な
+    # 機器まで消えるので、名前だけ補って中身は残す
+    UNNAMED_GROUP_NAME = "(名前なし)"
+
+    def _quarantine_invalid_devices(self, config: Dict) -> None:
+        """必須フィールドの無い機器とグループを整えて、警告を記録する。
+
+        手編集や他ツールで作られた config.json に {} や {"host": ...} の
+        ような機器が混ざると、DeviceTree の構築が KeyError で落ちて
+        起動できない。JSON 構文エラーとは違い load_error にもならないので、
+        利用者には設定ファイルが原因だと分からなかった。
+        グループ側も同じで、DeviceTree は group_data["name"] を直接引くため
+        name の無いグループでも同じ KeyError で起動できない。
+        不正な機器だけを除外し、名前の無いグループには表示名を補い、
+        グループとして読めない項目は外して、元ファイルはバックアップして
+        知らせる。
+
+        予約語（ホームタブと重なる名前）の機器も同じ理由でここで外す。
+        登録の入口（DeviceDialog / add_device / update_device）は別途
+        断っているが、手編集された config や、その検査より前のバージョン
+        で作られた config からは今でも入ってくる。
+        """
+        removed = 0
+        reserved = 0
+        renamed_groups = 0
+        dropped_groups = 0
+        kept_groups = []
+        for group in config.get("groups", []):
+            if not isinstance(group, dict):
+                # 名前も機器も取り出せないので、この項目は諦めるしかない
+                dropped_groups += 1
+                continue
+            name = group.get("name")
+            if not isinstance(name, str) or not name:
+                group["name"] = self.UNNAMED_GROUP_NAME
+                renamed_groups += 1
+            devices = group.get("devices")
+            if isinstance(devices, list):
+                kept = []
+                for d in devices:
+                    if not self._is_valid_device(d):
+                        removed += 1
+                    elif is_reserved_device_name(d["name"]):
+                        reserved += 1
+                    else:
+                        kept.append(d)
+                group["devices"] = kept
+            kept_groups.append(group)
+        if dropped_groups:
+            config["groups"] = kept_groups
+        if not (removed or reserved or renamed_groups or dropped_groups):
+            return
+        self._backup_corrupted_config()
+        parts = []
+        reasons = []
+        if removed:
+            reasons.append(f"名前またはホストの無い機器が{removed}件")
+        if reserved:
+            reasons.append(f"ホームタブと重なる名前（「ホーム」）の機器が{reserved}件")
+        if reasons:
+            parts.append("設定ファイル (config.json) に" + "、".join(reasons) +
+                         "あり、接続先リストから除外しました。\n"
+                         "除外した機器は次回の保存時に設定ファイルから消えます。")
+        if renamed_groups:
+            parts.append(f"設定ファイル (config.json) に名前の無いグループが"
+                         f"{renamed_groups}件あり、"
+                         f"「{self.UNNAMED_GROUP_NAME}」として表示します。")
+        if dropped_groups:
+            parts.append(f"設定ファイル (config.json) にグループとして読めない項目が"
+                         f"{dropped_groups}件あり、除外しました。")
+        message = "\n".join(parts)
+        if self.backup_path:
+            message += f"\n\n元のファイルはバックアップしました:\n  {self.backup_path}"
+        self.load_warning = message
+        print(f"[Config] 機器{removed + reserved}件を除外 "
+              f"(name/host 無し={removed}, 予約語={reserved})、"
+              f"グループ{renamed_groups}件を改名、グループ{dropped_groups}件を除外しました")
 
     def _backup_corrupted_config(self) -> None:
         """
@@ -483,7 +602,11 @@ class ConfigManager:
         return self.update_update_settings({"last_check": timestamp})
     
     def get_github_token(self) -> Optional[str]:
-        """GitHubトークンを取得（プライベートリポジトリ用）"""
+        """GitHubトークンを取得（プライベートリポジトリ用）
+
+        環境変数 GITHUB_TOKEN が最優先。設定ファイル側の値は
+        機器パスワードと同じく DPAPI で暗号化して保存する。
+        """
         # 環境変数を優先
         import os
         env_token = os.environ.get('GITHUB_TOKEN')
@@ -491,7 +614,18 @@ class ConfigManager:
             return env_token
         
         # 設定ファイルから取得
-        return self.get_update_settings().get("github_token")
+        token = self.get_update_settings().get("github_token")
+        if not isinstance(token, str) or not token:
+            return None
+        if self.crypto.is_encrypted(token):
+            # 別の Windows アカウント/PC で保存された設定。暗号文を
+            # Authorization ヘッダへ載せても 401 になるだけで、
+            # 利用者には原因が分からない
+            print("[Config] GitHubトークンを復号できませんでした。"
+                  "別の Windows アカウント/PC で保存された設定の可能性があります。"
+                  "トークンは再設定してください。")
+            return None
+        return token
     
     def set_github_token(self, token: Optional[str]) -> bool:
         """GitHubトークンを設定"""
@@ -511,18 +645,80 @@ class ConfigManager:
         group = self.get_group(group_name)
         if not group:
             return False
-        
+        # 機器名は全グループを通して一意。接続の管理も所属グループの検索も
+        # 名前だけで行うので、別グループに同名があると、先に見つかった方の
+        # auto_commands が送られる
+        if self.find_device_group(device_info.get("name", "")) is not None:
+            return False
+        if is_reserved_device_name(device_info.get("name", "")):
+            return False
+
+        before = list(group["devices"])
         group["devices"].append(device_info)
-        return self.save_config()
-    
+        if self.save_config():
+            return True
+        group["devices"][:] = before   # 保存できなかったらメモリも戻す
+        return False
+
     def remove_device(self, group_name: str, device_name: str) -> bool:
         """機器を削除"""
         group = self.get_group(group_name)
         if not group:
             return False
-        
+
+        before = list(group["devices"])
         group["devices"] = [d for d in group["devices"] if d["name"] != device_name]
-        return self.save_config()
+        if self.save_config():
+            return True
+        # 保存できなかったのにメモリから消したままだと、次の無関係な保存で
+        # 機器がディスクから消える
+        group["devices"] = before
+        return False
+
+    def find_device_group(self, device_name: str) -> Optional[str]:
+        """その名前の機器が属するグループ名を返す（無ければ None）"""
+        for group in self.get_groups():
+            for device in group.get("devices", []):
+                if device.get("name") == device_name:
+                    return group["name"]
+        return None
+
+    def update_device(self, group_name: str, old_name: str,
+                      new_group_name: str, device_info: Dict) -> bool:
+        """機器を差し替える（改名・グループ移動を含む）。保存は 1 回。
+
+        remove_device → add_device の 2 段階にすると、間の状態がディスクに
+        残ったり、片方の保存だけ失敗して機器が消えたり新旧 2 件になったり
+        する。差し替えをメモリ上で組んでから 1 回だけ保存し、失敗したら
+        メモリも元に戻す。
+        """
+        source = self.get_group(group_name)
+        target = self.get_group(new_group_name)
+        if not source or not target:
+            return False
+        new_name = device_info.get("name", "")
+        if is_reserved_device_name(new_name):
+            return False
+        owner = self.find_device_group(new_name)
+        if owner is not None and not (owner == group_name and new_name == old_name):
+            return False   # 別の機器の名前
+        index = next((i for i, d in enumerate(source["devices"])
+                      if d.get("name") == old_name), None)
+        if index is None:
+            return False
+
+        source_before = list(source["devices"])
+        target_before = list(target["devices"])
+        if source is target:
+            source["devices"][index] = device_info
+        else:
+            del source["devices"][index]
+            target["devices"].append(device_info)
+        if self.save_config():
+            return True
+        source["devices"][:] = source_before
+        target["devices"][:] = target_before
+        return False
     
     def get_global_macros(self) -> List[Dict]:
         """全体共通マクロ一覧を取得"""
@@ -699,6 +895,9 @@ class ConfigManager:
                 return False
         
         # デバイスを移動元から削除
+        # 保存に失敗したら戻せるよう、両方の一覧を控える（update_device と同じ）
+        source_before = list(source_group["devices"])
+        target_before = list(target_group["devices"])
         source_group["devices"].remove(device_to_move)
         
         # デバイスを移動先に追加
@@ -706,6 +905,11 @@ class ConfigManager:
         
         # 設定を保存
         result = self.save_config()
+        if not result:
+            # 保存できなかったのに移動したままだと、次の無関係な保存で
+            # ディスク側だけが移動した状態になる
+            source_group["devices"][:] = source_before
+            target_group["devices"][:] = target_before
         if result:
             print(f"[INFO] デバイス '{device_name}' を '{source_group_name}' から '{target_group_name}' に移動しました")
         

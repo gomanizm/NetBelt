@@ -2,6 +2,7 @@
 import socket
 import threading
 import re
+import time
 from datetime import datetime
 from PyQt6.QtCore import QObject, pyqtSignal
 from typing import Dict, Optional
@@ -116,18 +117,54 @@ class SyslogMessage:
         except Exception:
             self.message = message
     
+    @staticmethod
+    def _skip_structured_data(rest: str):
+        """STRUCTURED-DATA を読み飛ばし、その直後の位置を返す（見つからなければ None）。
+
+        SD-ELEMENT は "[" から対応する "]" まで。パラメータ値は引用符で囲まれ、
+        中の "]" や "\"" は "\\" でエスケープされるので、空白で区切ると壊れる。
+        """
+        if rest.startswith("-"):
+            return 1
+        if not rest.startswith("["):
+            return None
+        i = 0
+        while i < len(rest) and rest[i] == "[":
+            i += 1
+            in_quote = False
+            while i < len(rest):
+                ch = rest[i]
+                if ch == "\\" and in_quote:
+                    i += 2
+                    continue
+                if ch == '"':
+                    in_quote = not in_quote
+                elif ch == "]" and not in_quote:
+                    break
+                i += 1
+            else:
+                return None  # 閉じ "]" が無い
+            i += 1
+        return i
+
     def _parse_rfc5424(self, message: str):
         """RFC 5424形式のメッセージをパース"""
         try:
             # VERSION TIMESTAMP HOSTNAME APP-NAME PROCID MSGID STRUCTURED-DATA MSG
-            parts = message.split(None, 7)
-            
+            parts = message.split(None, 6)
+
             if len(parts) >= 7:
                 self.hostname = parts[2] if parts[2] != '-' else self.source_ip
-                self.message = parts[7] if len(parts) > 7 else ""
+                rest = parts[6]
+                end = self._skip_structured_data(rest)
+                if end is None:
+                    # SD が壊れている: 欠落させず残り全体を本文にする
+                    self.message = rest
+                else:
+                    self.message = rest[end:].lstrip(" ")
             else:
                 self.message = message
-        
+
         except Exception:
             self.message = message
 
@@ -163,6 +200,15 @@ class SyslogReceiver(QObject):
         # RFC 5424 の 2048 オクテットは「最低これだけは受けよ」であって
         # 上限ではない。実機は長い行を出すので、実用と防御の釣り合いで 64KiB。
         self.max_line_bytes = 64 * 1024
+        # TCP の同時接続数の上限。接続ごとにスレッドとソケットを持つので、
+        # 何も送らないアイドル接続を張られるだけで際限なく積み上がる。
+        # TFTP の max_workers と同じ考えで、超過分は accept 直後に閉じる。
+        self.max_tcp_connections = 64
+        # TCP の無通信タイムアウト（秒）。上限だけでは、1 バイトも送らない
+        # 接続が枠を恒久的に占有し、上限ぶん張られると正規の機器の syslog が
+        # 届かなくなる。最後に受信してからこの時間が過ぎた接続は切る。
+        # 黙っている機器も切られるが、TCP syslog は次に送るときに繋ぎ直す。
+        self.tcp_idle_timeout_seconds = 10 * 60
 
     @property
     def is_running(self):
@@ -294,6 +340,15 @@ class SyslogReceiver(QObject):
             if th.is_alive():
                 print("[Syslog] %s の受信スレッドが終了しません"
                       "（ポートが解放されない可能性があります）" % proto)
+        if proto == "TCP":
+            # 接続中のクライアントスレッドの終了も待つ。待たずに停止を
+            # 通知すると、その後でスレッドが最後の受信を emit し、止めた
+            # はずの一覧へ 1 件追加される。どのスレッドも待受と同じ
+            # stop_event を見ていて、recv のタイムアウト 1 秒以内に抜ける
+            for client in list(self.tcp_clients):
+                if client.is_alive():
+                    client.join(timeout=3)
+            self.tcp_clients[:] = [t for t in self.tcp_clients if t.is_alive()]
         print("[Syslog] %s Server stopped" % proto)
         if not self._servers:
             self.stopped.emit()
@@ -311,16 +366,27 @@ class SyslogReceiver(QObject):
         self.tcp_clients.clear()
         print("[Syslog] Server stopped")
 
+    @staticmethod
+    def _decode_bytes(data):
+        """受信バイト列を文字列にする。
+
+        UTF-8 を strict で試し、失敗したら latin-1 に落とす。errors="ignore" だと
+        latin-1 / Shift_JIS 等を吐く機器の非 UTF-8 バイトが本文からも raw からも
+        黙って消え、フォールバックに到達しない。latin-1 は全バイトを 1 対 1 で
+        文字にするので、少なくとも欠落はしない。
+        """
+        try:
+            return data.decode("utf-8")
+        except UnicodeDecodeError:
+            return data.decode("latin-1")
+
     def _run_udp_loop(self, sock, stop_event, listen_port=None):
         """UDP受信ループ"""
         try:
             while not stop_event.is_set():
                 try:
                     data, addr = sock.recvfrom(65535)
-                    try:
-                        message_str = data.decode("utf-8", errors="ignore")
-                    except Exception:
-                        message_str = data.decode("latin-1", errors="ignore")
+                    message_str = self._decode_bytes(data)
                     self.message_received.emit(
                         SyslogMessage(message_str, addr[0], "UDP", listen_port))
                     self.message_count += 1
@@ -342,6 +408,20 @@ class SyslogReceiver(QObject):
             while not stop_event.is_set():
                 try:
                     client_socket, addr = sock.accept()
+                    # 終わった接続のスレッドを外しておく。append するだけだと
+                    # 接続を繰り返すほどリストが単調に増え、stop() まで
+                    # 解放されない。入れ替えでなく in-place で詰めるのは、
+                    # stop() が同じリストを走査しているため。
+                    self.tcp_clients[:] = [
+                        t for t in self.tcp_clients if t.is_alive()]
+                    if len(self.tcp_clients) >= self.max_tcp_connections:
+                        print("[Syslog] TCP client refused (limit %d): %s"
+                              % (self.max_tcp_connections, addr[0]))
+                        try:
+                            client_socket.close()
+                        except Exception:
+                            pass
+                        continue
                     print("[Syslog] TCP client connected: %s" % addr[0])
                     client_thread = threading.Thread(
                         target=self._handle_tcp_client,
@@ -349,12 +429,6 @@ class SyslogReceiver(QObject):
                         daemon=True,
                     )
                     client_thread.start()
-                    # 終わった接続のスレッドを外しておく。append するだけだと
-                    # 接続を繰り返すほどリストが単調に増え、stop() まで
-                    # 解放されない。入れ替えでなく in-place で詰めるのは、
-                    # stop() が同じリストを走査しているため。
-                    self.tcp_clients[:] = [
-                        t for t in self.tcp_clients if t.is_alive()]
                     self.tcp_clients.append(client_thread)
                 except socket.timeout:
                     continue
@@ -368,35 +442,82 @@ class SyslogReceiver(QObject):
             except Exception:
                 pass
 
+    # RFC 6587 §3.4.1 octet-counting: "MSG-LEN SP SYSLOG-MSG"。SYSLOG-MSG は
+    # PRI（"<"）で始まるので、改行区切りの行が数字で始まる場合と区別できる
+    _OCTET_COUNT_RE = re.compile(rb"^(\d{1,9}) <")
+
+    def _emit_tcp_line(self, line, client_ip, listen_port):
+        """TCP で切り出した 1 メッセージを配信する（空行は捨てる）"""
+        message_str = self._decode_bytes(line).strip()
+        if message_str:
+            self.message_received.emit(
+                SyslogMessage(message_str, client_ip, "TCP", listen_port))
+            self.message_count += 1
+
     def _handle_tcp_client(self, client_socket, client_ip, stop_event, listen_port=None):
-        """TCPクライアントからのメッセージを処理（改行区切り）"""
+        """TCPクライアントからのメッセージを処理
+
+        RFC 6587 の octet-counting（"<len> <msg>"）と改行区切りの両方を受け付ける。
+        どちらかはバッファ先頭で判定し、混在も許す。
+
+        最後に受信してから tcp_idle_timeout_seconds を過ぎた接続は切断する。
+        """
         try:
             client_socket.settimeout(1.0)
             buffer = b""
+            last_activity = time.monotonic()
             while not stop_event.is_set():
                 try:
                     data = client_socket.recv(4096)
                     if not data:
                         break
+                    last_activity = time.monotonic()
                     buffer += data
-                    # いま組み立てている 1 行が上限を超えたら、その相手との
-                    # 接続を切る。黙って切り捨てると障害解析に要る末尾を
-                    # 失うので、切ったことは記録に残す。
-                    #
-                    # 「改行がまだ来ていないとき」に限ると、上限を超えた行が
-                    # 終端の改行ごと 1 回の recv で届いた場合に素通りする。
-                    # 見るのは受信バッファ全体ではなく、次の改行までの長さ。
-                    newline_at = buffer.find(b"\n")
-                    if newline_at == -1:
-                        current_line = len(buffer)
-                    else:
-                        current_line = newline_at
-                        # CRLF の CR は配信前に落とすので中身ではない。
-                        # 数えると、同じ中身の行が LF なら通り CRLF なら
-                        # 切られる
-                        if buffer[newline_at - 1:newline_at] == b"\r":
-                            current_line -= 1
-                    if current_line > self.max_line_bytes:
+                    too_long = False
+                    while buffer and not too_long:
+                        m = self._OCTET_COUNT_RE.match(buffer)
+                        if m:
+                            # octet-counting: 宣言された長さぶんが揃うまで待つ
+                            length = int(m.group(1))
+                            if length > self.max_line_bytes:
+                                too_long = True
+                                break
+                            end = m.end() - 1 + length
+                            if len(buffer) < end:
+                                break
+                            self._emit_tcp_line(buffer[m.end() - 1:end], client_ip, listen_port)
+                            buffer = buffer[end:]
+                            continue
+                        # 改行区切り。いま組み立てている 1 行が上限を超えたら、
+                        # その相手との接続を切る。黙って切り捨てると障害解析に
+                        # 要る末尾を失うので、切ったことは記録に残す。
+                        #
+                        # 「改行がまだ来ていないとき」に限ると、上限を超えた行が
+                        # 終端の改行ごと 1 回の recv で届いた場合に素通りする。
+                        # 見るのは受信バッファ全体ではなく、次の改行までの長さ。
+                        newline_at = buffer.find(b"\n")
+                        if newline_at == -1:
+                            current_line = len(buffer)
+                            # LF がまだ届いていないだけの CRLF も同じ扱いにする。
+                            # 数えると、上限ちょうどの行が、CR と LF の間で
+                            # 受信が切れたときだけ超過と判定されて切られる
+                            if buffer.endswith(b"\r"):
+                                current_line -= 1
+                        else:
+                            current_line = newline_at
+                            # CRLF の CR は配信前に落とすので中身ではない。
+                            # 数えると、同じ中身の行が LF なら通り CRLF なら
+                            # 切られる
+                            if buffer[newline_at - 1:newline_at] == b"\r":
+                                current_line -= 1
+                        if current_line > self.max_line_bytes:
+                            too_long = True
+                            break
+                        if newline_at == -1:
+                            break
+                        line, buffer = buffer.split(b"\n", 1)
+                        self._emit_tcp_line(line, client_ip, listen_port)
+                    if too_long:
                         # 一覧に並ぶので、機器からの行と同じ RFC 3164 の形で
                         # 組み立てる。生の文言のまま渡すと、先頭の語が
                         # 日時やホスト名として食われて読めなくなる。
@@ -409,17 +530,13 @@ class SyslogReceiver(QObject):
                             client_ip, "TCP", listen_port))
                         self.message_count += 1
                         break
-                    while b"\n" in buffer:
-                        line, buffer = buffer.split(b"\n", 1)
-                        try:
-                            message_str = line.decode("utf-8", errors="ignore").strip()
-                        except Exception:
-                            message_str = line.decode("latin-1", errors="ignore").strip()
-                        if message_str:
-                            self.message_received.emit(
-                                SyslogMessage(message_str, client_ip, "TCP", listen_port))
-                            self.message_count += 1
                 except socket.timeout:
+                    # 無通信のまま上限を過ぎた接続は切って枠を返す
+                    idle = self.tcp_idle_timeout_seconds
+                    if idle and time.monotonic() - last_activity > idle:
+                        print("[Syslog] TCP client idle for %ds, closing: %s"
+                              % (idle, client_ip))
+                        break
                     continue
                 except Exception as e:
                     print("[Syslog] TCP receive error: %s" % e)

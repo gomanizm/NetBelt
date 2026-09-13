@@ -38,7 +38,8 @@ class SnmpCsvInjectionTest(unittest.TestCase):
         return MainWindow().snmp_panel
 
     def _read(self, path):
-        with open(path, encoding="utf-8", newline="") as f:
+        # CSV は BOM 付き（Excel 対策）。utf-8-sig で読む
+        with open(path, encoding="utf-8-sig", newline="") as f:
             return list(csv.reader(f))
 
     def _path(self, name):
@@ -62,7 +63,7 @@ class SnmpCsvInjectionTest(unittest.TestCase):
         panel.trap_data_list = [self._trap(DANGEROUS)]
         path = self._path("traps.csv")
 
-        panel._export_to_csv(path)
+        panel._export_to_csv(path, panel.trap_data_list)
 
         cells = [c for row in self._read(path) for c in row]
         self.assertNotIn(DANGEROUS, cells,
@@ -73,7 +74,7 @@ class SnmpCsvInjectionTest(unittest.TestCase):
         panel.trap_data_list = [self._trap("ok", oid=DANGEROUS)]
         path = self._path("traps_oid.csv")
 
-        panel._export_to_csv(path)
+        panel._export_to_csv(path, panel.trap_data_list)
 
         cells = [c for row in self._read(path) for c in row]
         self.assertNotIn(DANGEROUS, cells,
@@ -84,7 +85,7 @@ class SnmpCsvInjectionTest(unittest.TestCase):
         path = self._path("walk.csv")
 
         panel._export_results_to_csv(
-            path, [["1.3.6.1.2.1.1.5.0", "OctetString", DANGEROUS]])
+            path, [["1.3.6.1.2.1.1.5.0", "OctetString", DANGEROUS]], "", None)
 
         cells = [c for row in self._read(path) for c in row]
         self.assertNotIn(DANGEROUS, cells,
@@ -96,7 +97,7 @@ class SnmpCsvInjectionTest(unittest.TestCase):
         path = self._path("walk_readable.csv")
 
         panel._export_results_to_csv(
-            path, [["1.3.6.1.2.1.1.5.0", "OctetString", DANGEROUS]])
+            path, [["1.3.6.1.2.1.1.5.0", "OctetString", DANGEROUS]], "", None)
 
         text = open(path, encoding="utf-8").read()
         self.assertIn("calc.exe", text, "元の値が失われている")
@@ -108,7 +109,7 @@ class SnmpCsvInjectionTest(unittest.TestCase):
         path = self._path("plain.csv")
 
         panel._export_results_to_csv(
-            path, [["1.3.6.1.2.1.1.5.0", "OctetString", "router01"]])
+            path, [["1.3.6.1.2.1.1.5.0", "OctetString", "router01"]], "", None)
 
         self.assertEqual(self._read(path)[1],
                          ["1.3.6.1.2.1.1.5.0", "OctetString", "router01"])
@@ -119,7 +120,7 @@ class SnmpCsvInjectionTest(unittest.TestCase):
         path = self._path("negative.csv")
 
         panel._export_results_to_csv(
-            path, [["1.3.6.1.2.1.2.2.1.1", "Integer", "-1"]])
+            path, [["1.3.6.1.2.1.2.2.1.1", "Integer", "-1"]], "", None)
 
         self.assertEqual(self._read(path)[1][2], "-1",
                          "負の数まで文字列にしている")
@@ -136,7 +137,7 @@ class SnmpCsvInjectionTest(unittest.TestCase):
             with self.subTest(value=value):
                 path = self._path("num_%s.csv" % abs(hash(value)))
                 panel._export_results_to_csv(
-                    path, [["1.3.6.1.2.1.1.5.0", "Integer", value]])
+                    path, [["1.3.6.1.2.1.1.5.0", "Integer", value]], "", None)
                 self.assertNotEqual(
                     self._read(path)[1][2], value,
                     "表計算が数式として読む値をそのまま書いている")
@@ -151,7 +152,7 @@ class SnmpCsvInjectionTest(unittest.TestCase):
         path = self._path("space.csv")
 
         panel._export_results_to_csv(
-            path, [["1.3.6.1.2.1.1.5.0", "OctetString", smuggled]])
+            path, [["1.3.6.1.2.1.1.5.0", "OctetString", smuggled]], "", None)
 
         self.assertNotEqual(self._read(path)[1][2], smuggled,
                             "空白を前置しただけで素通りしている")
@@ -163,14 +164,14 @@ class SnmpCsvInjectionTest(unittest.TestCase):
             with self.subTest(value=value):
                 path = self._path("plain_%s.csv" % abs(hash(value)))
                 panel._export_results_to_csv(
-                    path, [["1.3.6.1.2.1.2.2.1.1", "Integer", value]])
+                    path, [["1.3.6.1.2.1.2.2.1.1", "Integer", value]], "", None)
                 self.assertEqual(self._read(path)[1][2], value,
                                  "普通の数値まで文字列にしている")
 
     def test_the_header_row_is_unchanged(self):
         panel = self._panel()
         path = self._path("header.csv")
-        panel._export_results_to_csv(path, [])
+        panel._export_results_to_csv(path, [], "", None)
         self.assertEqual(self._read(path)[0], ["OID", "Type", "Value"])
 
 

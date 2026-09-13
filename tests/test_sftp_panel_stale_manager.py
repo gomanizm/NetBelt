@@ -236,8 +236,10 @@ class SftpPanelStaleManagerTest(unittest.TestCase):
                                side_effect=choose_then_move_away):
             panel._on_upload()
 
+        # overwrite は許さない側で必ず明示される（パネルの契約）
         manager.upload_file.assert_called_once_with("C:/tmp/new.cfg",
-                                                      "/etc/new.cfg")
+                                                      "/etc/new.cfg",
+                                                      overwrite=False)
 
     # --- 3. 何も起きなければ、これまでどおり動くこと ---
 
@@ -251,7 +253,8 @@ class SftpPanelStaleManagerTest(unittest.TestCase):
             panel._on_upload()
 
         manager.upload_file.assert_called_once_with("C:/tmp/new.cfg",
-                                                      "/new.cfg")
+                                                      "/new.cfg",
+                                                      overwrite=False)
 
     def test_delete_still_happens_when_nothing_changed(self):
         """接続が変わらなければ、これまでどおり削除すること。"""

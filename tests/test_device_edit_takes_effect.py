@@ -58,9 +58,7 @@ class DeviceEditReachesReconnectTest(unittest.TestCase):
              mock.patch.object(window, "_load_devices"), \
              mock.patch.object(window.config_manager, "get_groups",
                                return_value=[{"name": "Default"}]), \
-             mock.patch.object(window.config_manager, "remove_device",
-                               return_value=True), \
-             mock.patch.object(window.config_manager, "add_device",
+             mock.patch.object(window.config_manager, "update_device",
                                return_value=True):
             dialog.exec.return_value = QDialog.DialogCode.Accepted
             window._on_device_edit("Default", old)

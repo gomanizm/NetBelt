@@ -65,7 +65,8 @@ class SendQueueOnDisconnectTest(unittest.TestCase):
         terminal.send_text("y" * (terminal.SEND_CHUNK * 3))
         w.enable_reconnect("dev", lambda name: None)
 
-        # 再接続: 同じタブを再利用し、待ちを解除する
+        # 再接続: 同じタブを再利用し、繋がったところで待ちが解ける
+        # （解くのは MainWindow._on_connection_success）
         w.create_terminal_tab("dev")
         terminal.set_reconnect_mode(False)
         after = []
@@ -81,7 +82,7 @@ class SendQueueOnDisconnectTest(unittest.TestCase):
         terminal.send_text("z" * (terminal.SEND_CHUNK * 2))
         w.enable_reconnect("dev", lambda name: None)
         w.create_terminal_tab("dev")
-        terminal.set_reconnect_mode(False)
+        terminal.set_reconnect_mode(False)   # 接続成功で待ちが解ける
         self._pump()
         del sent[:]
 

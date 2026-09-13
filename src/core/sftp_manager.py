@@ -49,6 +49,13 @@ class SFTPManager(QObject):
     # 呼ばれるため、長く待つとアプリが終了できなくなる。
     _DISCONNECT_WAIT_SECONDS = 3.0
 
+    # 共有チャンネルが機器の応答を待つ上限（秒）。None のままだと、機器が
+    # SFTP サブシステムだけ黙ったとき（TCP は生きている）に mkdir や
+    # normalize が無期限に止まり、GUI スレッドから呼ばれるのでアプリ全体が
+    # 固まる。転送中は 1 回の recv/send がこの時間ゼロのまま止まったときに
+    # 限って切れる（データが流れている限り切れない）。
+    CHANNEL_TIMEOUT_SECONDS = 30.0
+
     def _acquire_for_gui(self, what: str) -> bool:
         """GUI スレッドから使うためにロックを取る（取れなければ False）
 
@@ -65,6 +72,24 @@ class SFTPManager(QObject):
         self.error_occurred.emit(
             f"転送中のため{what}を実行できません。完了してからやり直してください。")
         return False
+
+    def _fail(self, prefix: str, e: Exception):
+        """操作の失敗を通知する。応答待ちの期限切れなら接続も畳む
+
+        期限で戻ったあとも要求と応答はずれたままなので、同じチャンネルの
+        以後の操作は失敗し続ける。それでも接続中のままだと、操作のたびに
+        期限ぶん画面が固まり、しかも socket.timeout は str が空なので
+        理由の無いエラーだけが並ぶ。使用不能と分かる形にして再接続を促す。
+
+        ロックを持ったまま呼ばない（disconnect がロックを取りにいく）。
+        """
+        if isinstance(e, TimeoutError):   # socket.timeout の別名
+            self.error_occurred.emit(
+                f"{prefix}: 機器が{self.CHANNEL_TIMEOUT_SECONDS:g}秒応答しません。"
+                "SFTP接続を切断しました。接続し直してください")
+            self.disconnect()
+            return
+        self.error_occurred.emit(f"{prefix}: {str(e) or e.__class__.__name__}")
 
     def connect(self, ssh_client: paramiko.SSHClient) -> bool:
         """
@@ -84,7 +109,11 @@ class SFTPManager(QObject):
             # SSHクライアントからSFTPセッションを取得
             self.ssh_client = ssh_client
             self.sftp_client = ssh_client.open_sftp()
-            
+            # 応答待ちに期限を入れる。ここより後の normalize を含め、
+            # このチャンネル越しの全操作が期限切れで socket.timeout を
+            # 投げるようになり、各操作の except がエラー通知へ変える
+            self.sftp_client.get_channel().settimeout(self.CHANNEL_TIMEOUT_SECONDS)
+
             # ホームディレクトリを取得
             try:
                 self.current_path = self.sftp_client.normalize('.')
@@ -191,18 +220,79 @@ class SFTPManager(QObject):
                 self._listing_done.emit(path, file_list)
                 
             except Exception as e:
-                self.error_occurred.emit(f"ディレクトリ一覧取得エラー: {str(e)}")
+                self._fail("ディレクトリ一覧取得エラー", e)
         
         # バックグラウンドスレッドで実行
         threading.Thread(target=list_thread, daemon=True).start()
     
-    def upload_file(self, local_path: str, remote_path: str = None):
+    # _remote_probe が返す、送る直前のリモートの状態
+    _REMOTE_MISSING = "missing"
+    _REMOTE_FILE = "file"
+    _REMOTE_DIR = "dir"
+    _REMOTE_UNSURE = "unsure"
+
+    def _remote_probe(self, remote_path: str):
+        """送る直前のリモートの状態を stat で確かめる（ロック内で呼ぶ）
+
+        stat の失敗を一律「無い」と読むと、既存ファイルの stat を権限エラーで
+        返す機器で、確認を経ていない上書きが黙って通る（実測: stat が
+        PermissionError のとき put が呼ばれ、既存が置き換わった）。「無い」
+        ではないと分かる失敗（権限が無い・期限切れ）は "unsure" にして送らない。
+
+        残る限界: 理由の分からない失敗は、これまでどおり「無い」と読む。
+        見つからないときの応答が機器によって違い、汎用の失敗で返すものが
+        あるため（実測: NetBelt 同梱の SFTP サーバも、無いファイルの stat に
+        SFTP_FAILURE を返す＝クライアント側は IOError("Failure")）。ここを
+        締めると、そうした機器へは新しい名前すら送れなくなる。
+
+        Returns:
+            (状態, 理由): 状態は "missing" / "file" / "dir" / "unsure"。
+            "unsure" は有無を確かめられなかったときで、理由にその説明が入る
+        """
+        try:
+            attr = self.sftp_client.stat(remote_path)
+        except PermissionError as e:
+            return self._REMOTE_UNSURE, str(e) or e.__class__.__name__
+        except TimeoutError:   # socket.timeout の別名。str が空なので補う
+            return self._REMOTE_UNSURE, (
+                f"機器が{self.CHANNEL_TIMEOUT_SECONDS:g}秒応答しません")
+        except Exception:
+            return self._REMOTE_MISSING, ""
+        mode = getattr(attr, "st_mode", None)
+        if isinstance(mode, int) and self._is_directory(mode):
+            return self._REMOTE_DIR, ""
+        return self._REMOTE_FILE, ""
+
+    def upload_file(self, local_path: str, remote_path: str = None,
+                    overwrite: bool = False):
         """
         ファイルをアップロード（バックグラウンド）
         
         Args:
             local_path: ローカルファイルパス
             remote_path: リモートファイルパス（Noneの場合は現在のディレクトリにファイル名のみで保存）
+            overwrite: True なら既存のリモートファイルを置き換える。False の
+                ときは送る直前にリモートを確かめ、既にあれば送らずにエラーで
+                知らせる。パネルの上書き確認は「最後に観測した一覧」で判定
+                しており、一覧が送信先と食い違っていると既存を見落とすため、
+                確認を経ていない送信はここで止める
+
+        限界: 呼ばれた順に送られる保証は無い。1 件ごとにスレッドを起こし、
+        そのスレッドが _sftp_lock を取った順で転送するので、順番を決めるのは
+        呼び出し順ではなく OS のスケジューリングと Python のロック
+        （threading.Lock は FIFO ではない）である。同じ remote_path へ
+        続けて送ると、後から呼んだ方が先に書かれ、古い方が最後に残ることが
+        あり得る。しかも完了通知は両方とも「アップロード完了」なので、
+        利用者は見分けられない。
+
+        実測では自然な連続投入 30 回すべてで呼び出し順どおりに書かれ、
+        逆転させるにはロック取得前のローカル側 stat を 2 件目の転送完了まで
+        止める必要があった。加えて既定の confirm_overwrite=True では 2 件目に
+        上書き確認ダイアログが出るため、その間に 1 件目がロックを取り、順序は
+        固定される。順番を本当に保証するには、接続ごとに queue.Queue と単一の
+        ワーカースレッドを置いて転送要求を FIFO で処理する作りへ変える必要が
+        あり、一覧・ダウンロード・削除も同じロックを共有しているので影響が
+        広い。現状はこの限界として残す。
         """
         if not self.is_connected or not self.sftp_client:
             self.error_occurred.emit("SFTP接続がありません")
@@ -217,6 +307,17 @@ class SFTPManager(QObject):
             filename = os.path.basename(local_path)
             remote_path = f"{self.current_path}/{filename}"
         
+        # リモートも最終名へ直接書かない。put() は先にリモートを切り詰めるので、
+        # 切断や容量不足で機器側に途中までの設定ファイルが本来の名前で残る。
+        # 同じディレクトリの一時名へ送り、成功してから置き換える
+        remote_dir, _, remote_name = remote_path.rpartition("/")
+        # スラッシュを含まない相対名なら、一時名も相対のまま（ルート直下に
+        # しない。OpenSSH 系の機器はルートに書けないことが多い）
+        tmp_remote = (remote_dir + "/" if remote_dir else "") + ".%s.netbelt-part" % remote_name
+        # 最終名を消したあとで置き換えに失敗した場合は、一時名が唯一の完全な
+        # 写しになるので消さない
+        keep_tmp = [False]
+
         def upload_thread():
             try:
                 # ファイルサイズを取得
@@ -235,8 +336,54 @@ class SFTPManager(QObject):
                     # 確認だけでは足りない（起きたら None を触ることになる）。
                     if not self.is_connected or self.sftp_client is None:
                         return
-                    self.sftp_client.put(local_path, remote_path,
+                    # 確認を経ていない送信は、送る直前の実際の状態で判定する。
+                    # ロック内なので、先行する転送の結果も見える
+                    if not overwrite:
+                        state, why = self._remote_probe(remote_path)
+                        if state == self._REMOTE_DIR:
+                            # 一覧を取り直しても種別は変わらない。やり直し方を
+                            # 案内せず、できないことをそのまま伝える
+                            self.error_occurred.emit(
+                                f"リモートの '{remote_name}' はディレクトリです。"
+                                "ファイルで上書きできません")
+                            return
+                        if state == self._REMOTE_FILE:
+                            self.error_occurred.emit(
+                                f"リモートに '{remote_name}' が既にあります。上書きの確認を"
+                                "経ていないので送りませんでした。一覧を更新してからやり直してください")
+                            return
+                        if state == self._REMOTE_UNSURE:
+                            # 期限切れで確かめられなかった場合、この接続は
+                            # 以後も使えないが、ここはロックの中なので畳めない
+                            # （disconnect が同じロックを取る）。次の操作が
+                            # _fail で切断する
+                            self.error_occurred.emit(
+                                f"リモートに '{remote_name}' があるか確かめられませんでした"
+                                f"（{why}）。上書きになる恐れがあるので送りませんでした")
+                            return
+                    self.sftp_client.put(local_path, tmp_remote,
                                          callback=progress_callback)
+                    # 全部送れてから最終名へ。posix_rename（OpenSSH 拡張）は
+                    # 既存を上書きできる。無いサーバでは、まず rename を試し、
+                    # 既存があって失敗したときだけ消してからもう一度 rename
+                    # する（先に消すと、rename に失敗した瞬間に元が消える）
+                    try:
+                        self.sftp_client.posix_rename(tmp_remote, remote_path)
+                    except (AttributeError, IOError):
+                        try:
+                            self.sftp_client.rename(tmp_remote, remote_path)
+                        except IOError:
+                            try:
+                                self.sftp_client.remove(remote_path)
+                            except IOError:
+                                pass
+                            try:
+                                self.sftp_client.rename(tmp_remote, remote_path)
+                            except IOError as e:
+                                keep_tmp[0] = True
+                                raise IOError(
+                                    "最終名への置き換えに失敗しました。転送済みの内容は"
+                                    "機器の一時名 %s に残っています: %s" % (tmp_remote, e))
                 
                 # 完了通知
                 self.transfer_complete.emit(f"アップロード完了: {os.path.basename(local_path)}")
@@ -245,7 +392,18 @@ class SFTPManager(QObject):
                 self.list_directory(self.current_path)
                 
             except Exception as e:
-                self.error_occurred.emit(f"アップロードエラー: {str(e)}")
+                # 送りかけの一時ファイルを機器に残さない（できる範囲で。切断後は
+                # 消せず、機器側に .<名前>.netbelt-part が残る）。最終名のファイル
+                # には触っていない。置き換えの途中で失敗した場合は、一時名が唯一の
+                # 完全な写しなので消さない
+                if not keep_tmp[0]:
+                    try:
+                        with self._sftp_lock:
+                            if self.is_connected and self.sftp_client is not None:
+                                self.sftp_client.remove(tmp_remote)
+                    except Exception:
+                        pass
+                self._fail("アップロードエラー", e)
         
         # バックグラウンドスレッドで実行
         threading.Thread(target=upload_thread, daemon=True).start()
@@ -262,6 +420,24 @@ class SFTPManager(QObject):
             self.error_occurred.emit("SFTP接続がありません")
             return
         
+        # 最終の保存先へ直接書かない。paramiko の get() はリモートを読む前に
+        # ローカルを 'wb' で開くので、リモート側で消えていただけでも既存の
+        # 正常なバックアップが 0 バイトになり、途中で切れれば部分ファイルが
+        # 本来の名前で残る。同じディレクトリの一時名へ落として置き換える
+        # 一時名はダウンロードごとに一意にする（同じ保存先へ続けて落とすと、
+        # 同じ一時名の取り合いで片方が誤って失敗する）
+        import tempfile
+        try:
+            fd, tmp_local = tempfile.mkstemp(
+                prefix=os.path.basename(local_path) + ".", suffix=".netbelt-part",
+                dir=os.path.dirname(os.path.abspath(local_path)))
+            os.close(fd)
+        except OSError as e:
+            # ここは GUI スレッド。例外を上げるとスロットの外へ抜けるので、
+            # 転送の失敗と同じ経路で知らせる
+            self.error_occurred.emit(f"ダウンロードエラー: {str(e)}")
+            return
+
         def download_thread():
             try:
                 # ダウンロード実行
@@ -274,14 +450,21 @@ class SFTPManager(QObject):
                     # 確認だけでは足りない（起きたら None を触ることになる）。
                     if not self.is_connected or self.sftp_client is None:
                         return
-                    self.sftp_client.get(remote_path, local_path,
+                    self.sftp_client.get(remote_path, tmp_local,
                                          callback=progress_callback)
                 
+                # 全部落とせてから最終名へ（同じディレクトリなので原子的）
+                os.replace(tmp_local, local_path)
                 # 完了通知
                 self.transfer_complete.emit(f"ダウンロード完了: {os.path.basename(remote_path)}")
                 
             except Exception as e:
-                self.error_occurred.emit(f"ダウンロードエラー: {str(e)}")
+                # 失敗した転送の残骸を消す。既存の保存先には触っていない
+                try:
+                    os.remove(tmp_local)
+                except OSError:
+                    pass
+                self._fail("ダウンロードエラー", e)
         
         # バックグラウンドスレッドで実行
         threading.Thread(target=download_thread, daemon=True).start()
@@ -299,13 +482,17 @@ class SFTPManager(QObject):
         
         if not self._acquire_for_gui("ディレクトリ作成"):
             return
+        err = None
         try:
             self.sftp_client.mkdir(path)
         except Exception as e:
-            self.error_occurred.emit(f"ディレクトリ作成エラー: {str(e)}")
-            return
+            err = e
         finally:
             self._sftp_lock.release()
+        # 通知はロックを離してから（_fail が切断するときロックを取る）
+        if err is not None:
+            self._fail("ディレクトリ作成エラー", err)
+            return
         self.transfer_complete.emit(f"ディレクトリ作成: {os.path.basename(path)}")
         # ディレクトリ一覧を更新（ロックを離してから）
         self.list_directory(self.current_path)
@@ -324,16 +511,19 @@ class SFTPManager(QObject):
         
         if not self._acquire_for_gui("削除"):
             return
+        err = None
         try:
             if is_dir:
                 self.sftp_client.rmdir(path)
             else:
                 self.sftp_client.remove(path)
         except Exception as e:
-            self.error_occurred.emit(f"削除エラー: {str(e)}")
-            return
+            err = e
         finally:
             self._sftp_lock.release()
+        if err is not None:
+            self._fail("削除エラー", err)
+            return
         self.transfer_complete.emit(f"削除完了: {os.path.basename(path)}")
         # ディレクトリ一覧を更新（ロックを離してから）
         self.list_directory(self.current_path)
@@ -352,13 +542,16 @@ class SFTPManager(QObject):
         
         if not self._acquire_for_gui("名前変更"):
             return
+        err = None
         try:
             self.sftp_client.rename(old_path, new_path)
         except Exception as e:
-            self.error_occurred.emit(f"名前変更エラー: {str(e)}")
-            return
+            err = e
         finally:
             self._sftp_lock.release()
+        if err is not None:
+            self._fail("名前変更エラー", err)
+            return
         self.transfer_complete.emit(f"名前変更完了: {os.path.basename(new_path)}")
         # ディレクトリ一覧を更新（ロックを離してから）
         self.list_directory(self.current_path)
@@ -377,13 +570,16 @@ class SFTPManager(QObject):
         
         if not self._acquire_for_gui("パーミッション変更"):
             return
+        err = None
         try:
             self.sftp_client.chmod(path, mode)
         except Exception as e:
-            self.error_occurred.emit(f"パーミッション変更エラー: {str(e)}")
-            return
+            err = e
         finally:
             self._sftp_lock.release()
+        if err is not None:
+            self._fail("パーミッション変更エラー", err)
+            return
         self.transfer_complete.emit(f"パーミッション変更完了: {os.path.basename(path)}")
         # ディレクトリ一覧を更新（ロックを離してから）
         self.list_directory(self.current_path)
@@ -410,14 +606,17 @@ class SFTPManager(QObject):
         
         if not self._acquire_for_gui("ディレクトリ移動"):
             return
+        err = None
         try:
             # パスを正規化
             normalized_path = self.sftp_client.normalize(path)
         except Exception as e:
-            self.error_occurred.emit(f"ディレクトリ変更エラー: {str(e)}")
-            return
+            err = e
         finally:
             self._sftp_lock.release()
+        if err is not None:
+            self._fail("ディレクトリ変更エラー", err)
+            return
         # ディレクトリ一覧を取得（これによりパスの存在も確認）
         self.list_directory(normalized_path)
     
@@ -438,27 +637,41 @@ class SFTPManager(QObject):
         モードからディレクトリかどうかを判定
         
         Args:
-            mode: ファイルモード
-            
+            mode: ファイルモード。サーバが permissions を返さなければ None
+
         Returns:
-            bool: ディレクトリの場合True
+            bool: ディレクトリの場合True。モードが不明ならファイル扱い
         """
         import stat
+        # SFTP v3 の permissions は省略可能。None を S_ISDIR に渡すと
+        # TypeError で一覧全体が失敗し、正常な項目まで画面から消える
+        if mode is None:
+            return False
         return stat.S_ISDIR(mode)
     
     @staticmethod
     def _format_permissions(mode: int) -> str:
         """
-        パーミッションを文字列形式に変換（例: -rwxr-xr-x）
-        
+        パーミッションを文字列形式に変換（例: -rwxr-xr-x、drwxrwxrwt）
+
+        setuid / setgid / sticky は、ls と同じく実行ビットの位置へ
+        s / t（実行ビットが無ければ S / T）として重ねる。9 文字の
+        rwx だけを組み立てると、sticky 付きのディレクトリが普通の 777 に
+        見え、利用者は落としたことに気づけない。
+
         Args:
-            mode: ファイルモード
-            
+            mode: ファイルモード。サーバが permissions を返さなければ None
+
         Returns:
-            str: パーミッション文字列
+            str: パーミッション文字列。モードが不明なら None（表示側が
+                「不明」と出す。'---------' にすると権限の無いファイルと
+                区別がつかない）
         """
         import stat
-        
+
+        if mode is None:
+            return None
+
         # ファイルタイプ
         if stat.S_ISDIR(mode):
             perm_str = 'd'
@@ -467,19 +680,29 @@ class SFTPManager(QObject):
         else:
             perm_str = '-'
         
-        # オーナー権限
+        def exec_char(executable, special, letter):
+            """実行ビットの桁を ls と同じ 1 文字にする
+
+            特殊ビットが立っていれば letter（実行ビットが無ければ大文字）、
+            立っていなければ従来どおり 'x' / '-'
+            """
+            if special:
+                return letter if executable else letter.upper()
+            return 'x' if executable else '-'
+
+        # オーナー権限（実行の桁に setuid）
         perm_str += 'r' if mode & stat.S_IRUSR else '-'
         perm_str += 'w' if mode & stat.S_IWUSR else '-'
-        perm_str += 'x' if mode & stat.S_IXUSR else '-'
-        
-        # グループ権限
+        perm_str += exec_char(mode & stat.S_IXUSR, mode & stat.S_ISUID, 's')
+
+        # グループ権限（実行の桁に setgid）
         perm_str += 'r' if mode & stat.S_IRGRP else '-'
         perm_str += 'w' if mode & stat.S_IWGRP else '-'
-        perm_str += 'x' if mode & stat.S_IXGRP else '-'
-        
-        # その他権限
+        perm_str += exec_char(mode & stat.S_IXGRP, mode & stat.S_ISGID, 's')
+
+        # その他権限（実行の桁に sticky）
         perm_str += 'r' if mode & stat.S_IROTH else '-'
         perm_str += 'w' if mode & stat.S_IWOTH else '-'
-        perm_str += 'x' if mode & stat.S_IXOTH else '-'
-        
+        perm_str += exec_char(mode & stat.S_IXOTH, mode & stat.S_ISVTX, 't')
+
         return perm_str

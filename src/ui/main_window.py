@@ -38,6 +38,24 @@ class DetachableTabBar(QTabBar):
         self._on_detach = on_detach       # 切り離しを実行するコールバック（index を渡す）
         self._press_pos = None
         self._press_index = -1
+        # 横ドラッグの並べ替えに掌んでいる index を追従させる
+        self.tabMoved.connect(self._follow_moved_tab)
+
+    def _follow_moved_tab(self, frm, to):
+        """並べ替えに合わせて _press_index を追従させる。
+
+        movable なタブバーは横ドラッグの途中で moveTab するので、
+        押した時点の index をそのまま使うと、その位置へ入れ替わって
+        きた別のタブを引き離してしまう。
+        """
+        if self._press_index < 0:
+            return
+        if self._press_index == frm:
+            self._press_index = to
+        elif frm < self._press_index <= to:
+            self._press_index -= 1
+        elif to <= self._press_index < frm:
+            self._press_index += 1
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -91,6 +109,9 @@ class MainWindow(QMainWindow):
     update_check_error = pyqtSignal(str)
     no_update_available = pyqtSignal()
     run_auto_commands_requested = pyqtSignal(str)  # 接続後の自動実行コマンド要求
+    # SFTP セッションの確立結果をワーカーから GUI スレッドへ運ぶ内部用。
+    # (機器名, SFTPManager, 接続オブジェクト, 成否)
+    _sftp_session_ready = pyqtSignal(str, object, object, bool)
 
     # ターミナルのフォントサイズの上下限（settings.terminal.font_size）。
     # 数値の実体は TerminalWidget 側にあり、ここでは参照するだけにして
@@ -106,6 +127,7 @@ class MainWindow(QMainWindow):
         self.update_check_error.connect(self._show_update_check_error)
         self.no_update_available.connect(self._show_no_update_message)
         self.run_auto_commands_requested.connect(self._run_auto_commands)
+        self._sftp_session_ready.connect(self._on_sftp_session_ready)
         
         # ConfigManager初期化
         self.config_manager = ConfigManager()
@@ -113,6 +135,9 @@ class MainWindow(QMainWindow):
         # 設定ファイル読み込みエラーをチェック
         if self.config_manager.load_error:
             self._show_config_load_error()
+        if self.config_manager.load_warning:
+            QMessageBox.warning(self, "設定ファイルの警告",
+                                self.config_manager.load_warning)
         
         # MacroManager初期化
         self.macro_manager = MacroManager()
@@ -299,6 +324,7 @@ class MainWindow(QMainWindow):
         self.device_tree = DeviceTree()
         self.device_tree.btn_add.clicked.connect(self._on_add_device)
         self.device_tree.btn_connect.clicked.connect(self._on_connect_button_clicked)
+        self.device_tree.btn_disconnect.clicked.connect(self._on_disconnect_button_clicked)
         # シグナル接続
         self.device_tree.device_connect.connect(self._on_device_connect)
         self.device_tree.device_edit.connect(self._on_device_edit)
@@ -321,6 +347,10 @@ class MainWindow(QMainWindow):
             self._on_font_size_wheel)
         self.terminal_widget.macro_execute_requested.connect(self._on_macro_execute_requested)
         self.terminal_widget.macro_settings_requested.connect(self._on_macro_settings_from_context)
+        # 右クリックの「マクロ停止」と、実行状態のメニューへの反映
+        self.terminal_widget.macro_stop_requested.connect(self.macro_manager.stop_command_list)
+        self.macro_manager.command_list_state_changed.connect(
+            self.terminal_widget.set_command_list_status)
         self.terminal_widget.keepalive_start_requested.connect(self._on_keepalive_start_requested)
         self.terminal_widget.keepalive_stop_requested.connect(self._on_keepalive_stop_requested)
         self.terminal_widget.terminal_resized.connect(self._on_terminal_resized)
@@ -422,7 +452,17 @@ class MainWindow(QMainWindow):
             # 機器データ取得
             device_data = dialog.get_device_data()
             group_name = dialog.get_selected_group()
-            
+
+            # 機器名は全グループを通して一意。同名があると、接続や自動コマンドの
+            # 所属判定が先に見つかった方を選び、別の機器へコマンドが飛ぶ
+            owner = self.config_manager.find_device_group(device_data.get("name", ""))
+            if owner is not None:
+                QMessageBox.warning(
+                    self, "機器名の重複",
+                    "機器名 '%s' は既にグループ '%s' で使われています。\n"
+                    "別の名前を付けてください。" % (device_data.get("name", ""), owner))
+                return
+
             # 設定に追加
             if self.config_manager.add_device(group_name, device_data):
                 # ツリーを再読み込み
@@ -466,14 +506,21 @@ class MainWindow(QMainWindow):
             new_device_data = dialog.get_device_data()
             new_group_name = dialog.get_selected_group()
             old_device_name = device_data["name"]
-            
-            # 古い機器を削除
-            if not self.config_manager.remove_device(group_name, old_device_name):
-                QMessageBox.warning(self, "エラー", "機器の削除に失敗しました。")
+            new_name = new_device_data.get("name", "")
+
+            # 改名先が別の機器の名前なら断る（名前は全グループを通して一意）
+            owner = self.config_manager.find_device_group(new_name)
+            if owner is not None and not (owner == group_name and new_name == old_device_name):
+                QMessageBox.warning(
+                    self, "機器名の重複",
+                    "機器名 '%s' は既にグループ '%s' で使われています。\n"
+                    "別の名前を付けてください。" % (new_name, owner))
                 return
-            
-            # 新しい機器を追加
-            if self.config_manager.add_device(new_group_name, new_device_data):
+
+            # 差し替えは 1 回の保存で行う。削除→追加の 2 段階だと、片方の
+            # 保存だけ失敗したときに機器が消えたり新旧 2 件になったりする
+            if self.config_manager.update_device(group_name, old_device_name,
+                                                 new_group_name, new_device_data):
                 # 開いているタブの再接続は device_info の写しを見る。
                 # ここを更新しないと編集内容が届かず、古い接続情報のまま
                 # 繋がり続ける（存在しない鍵を指定しても、以前の鍵で
@@ -485,9 +532,7 @@ class MainWindow(QMainWindow):
                 self._load_devices()
                 self.status_bar.showMessage(f"機器 '{new_device_data['name']}' を更新しました")
             else:
-                # 失敗した場合は古い機器を復元
-                self.config_manager.add_device(group_name, device_data)
-                QMessageBox.warning(self, "エラー", "機器の更新に失敗しました。")
+                QMessageBox.warning(self, "エラー", "機器の更新に失敗しました。設定は変更されていません。")
     
     def _on_device_delete(self, group_name: str, device_name: str):
         """
@@ -544,7 +589,16 @@ class MainWindow(QMainWindow):
             # 機器データを取得
             new_device_data = dialog.get_device_data()
             new_group_name = dialog.get_selected_group()
-            
+
+            # 複製でも名前の重複は理由を示して断る（追加・編集と同じ）
+            owner = self.config_manager.find_device_group(new_device_data.get("name", ""))
+            if owner is not None:
+                QMessageBox.warning(
+                    self, "機器名の重複",
+                    "機器名 '%s' は既にグループ '%s' で使われています。\n"
+                    "別の名前を付けてください。" % (new_device_data.get("name", ""), owner))
+                return
+
             # 設定に追加
             if self.config_manager.add_device(new_group_name, new_device_data):
                 # ツリーを再読み込み
@@ -628,10 +682,17 @@ class MainWindow(QMainWindow):
         ssh.set_terminal_size(cols, rows)
         
         # シグナル接続
-        ssh.output_received.connect(lambda text: self.terminal_widget.append_output(device_name, text))
-        ssh.connected.connect(lambda: self._on_connection_success(device_name, terminal))
-        ssh.disconnected.connect(lambda: self._on_connection_closed(device_name))
-        ssh.error_occurred.connect(lambda error: self._on_connection_error(device_name, error))
+        # 接続オブジェクトを束縛して渡す。機器名だけで辞書を引くと、
+        # 接続中にタブを閉じて同名で繋ぎ直したあと、旧スレッドの遅れた
+        # 通知（TCP タイムアウトは最大 20〜30 秒後）が新しい接続を捨てる
+        ssh.output_received.connect(
+            lambda text, c=ssh: self._on_connection_output(device_name, text, c))
+        ssh.connected.connect(
+            lambda c=ssh: self._on_connection_success(device_name, terminal, c))
+        ssh.disconnected.connect(
+            lambda c=ssh: self._on_connection_closed(device_name, c))
+        ssh.error_occurred.connect(
+            lambda error, c=ssh: self._on_connection_error(device_name, error, c))
         
         # ターミナルのキー入力をSSHに送信（再接続時の蓄積を防ぐため既存接続を切断）
         try:
@@ -644,8 +705,11 @@ class MainWindow(QMainWindow):
         self.connections[device_name] = ssh
         self.device_info[device_name] = device_data  # 再接続用
         
-        # マクロマネージャーにコールバックを登録
-        self.macro_manager.register_send_callback(device_name, ssh.send_command)
+        # マクロマネージャーにコールバックを登録。接続の send_command へ直結
+        # せず、打鍵・貼り付けと同じターミナルの送信キューを通す。直結だと
+        # まだ送り終えていない貼り付けのチャンク間へマクロやキープアライブの
+        # CR が割り込み、途中までの設定行がその場で実行される
+        self.macro_manager.register_send_callback(device_name, terminal._queue_send)
         
         # マクロマネージャーのシグナルをターミナルに接続（初回のみ）
         if device_name not in self.macro_signal_connected:
@@ -699,10 +763,17 @@ class MainWindow(QMainWindow):
         serial_conn = SerialConnection(port, baudrate, self)
         
         # シグナル接続
-        serial_conn.output_received.connect(lambda text: self.terminal_widget.append_output(device_name, text))
-        serial_conn.connected.connect(lambda: self._on_connection_success(device_name, terminal))
-        serial_conn.disconnected.connect(lambda: self._on_connection_closed(device_name))
-        serial_conn.error_occurred.connect(lambda error: self._on_connection_error(device_name, error))
+        # 接続オブジェクトを束縛して渡す。機器名だけで辞書を引くと、
+        # 接続中にタブを閉じて同名で繋ぎ直したあと、旧スレッドの遅れた
+        # 通知（TCP タイムアウトは最大 20〜30 秒後）が新しい接続を捨てる
+        serial_conn.output_received.connect(
+            lambda text, c=serial_conn: self._on_connection_output(device_name, text, c))
+        serial_conn.connected.connect(
+            lambda c=serial_conn: self._on_connection_success(device_name, terminal, c))
+        serial_conn.disconnected.connect(
+            lambda c=serial_conn: self._on_connection_closed(device_name, c))
+        serial_conn.error_occurred.connect(
+            lambda error, c=serial_conn: self._on_connection_error(device_name, error, c))
         
         # ターミナルのキー入力をシリアルに送信（再接続時の蓄積を防ぐため既存接続を切断）
         try:
@@ -715,8 +786,11 @@ class MainWindow(QMainWindow):
         self.connections[device_name] = serial_conn
         self.device_info[device_name] = device_data  # 再接続用
         
-        # マクロマネージャーにコールバックを登録
-        self.macro_manager.register_send_callback(device_name, serial_conn.send_command)
+        # マクロマネージャーにコールバックを登録。接続の send_command へ直結
+        # せず、打鍵・貼り付けと同じターミナルの送信キューを通す。直結だと
+        # まだ送り終えていない貼り付けのチャンク間へマクロやキープアライブの
+        # CR が割り込み、途中までの設定行がその場で実行される
+        self.macro_manager.register_send_callback(device_name, terminal._queue_send)
         
         # マクロマネージャーのシグナルをターミナルに接続（初回のみ）
         if device_name not in self.macro_signal_connected:
@@ -768,10 +842,17 @@ class MainWindow(QMainWindow):
         telnet = TelnetConnection(host, port, username, password, self)
         
         # シグナル接続
-        telnet.output_received.connect(lambda text: self.terminal_widget.append_output(device_name, text))
-        telnet.connected.connect(lambda: self._on_connection_success(device_name, terminal))
-        telnet.disconnected.connect(lambda: self._on_connection_closed(device_name))
-        telnet.error_occurred.connect(lambda error: self._on_connection_error(device_name, error))
+        # 接続オブジェクトを束縛して渡す。機器名だけで辞書を引くと、
+        # 接続中にタブを閉じて同名で繋ぎ直したあと、旧スレッドの遅れた
+        # 通知（TCP タイムアウトは最大 20〜30 秒後）が新しい接続を捨てる
+        telnet.output_received.connect(
+            lambda text, c=telnet: self._on_connection_output(device_name, text, c))
+        telnet.connected.connect(
+            lambda c=telnet: self._on_connection_success(device_name, terminal, c))
+        telnet.disconnected.connect(
+            lambda c=telnet: self._on_connection_closed(device_name, c))
+        telnet.error_occurred.connect(
+            lambda error, c=telnet: self._on_connection_error(device_name, error, c))
         
         # ターミナルのキー入力をTelnetに送信（再接続時の蓄積を防ぐため既存接続を切断）
         try:
@@ -784,8 +865,11 @@ class MainWindow(QMainWindow):
         self.connections[device_name] = telnet
         self.device_info[device_name] = device_data  # 再接続用
         
-        # マクロマネージャーにコールバックを登録
-        self.macro_manager.register_send_callback(device_name, telnet.send_command)
+        # マクロマネージャーにコールバックを登録。接続の send_command へ直結
+        # せず、打鍵・貼り付けと同じターミナルの送信キューを通す。直結だと
+        # まだ送り終えていない貼り付けのチャンク間へマクロやキープアライブの
+        # CR が割り込み、途中までの設定行がその場で実行される
+        self.macro_manager.register_send_callback(device_name, terminal._queue_send)
         
         # マクロマネージャーのシグナルをターミナルに接続（初回のみ）
         if device_name not in self.macro_signal_connected:
@@ -812,10 +896,66 @@ class MainWindow(QMainWindow):
         
         threading.Thread(target=connect_thread, daemon=True).start()
     
-    def _on_connection_success(self, device_name: str, terminal):
+    def _is_current_connection(self, device_name: str, conn) -> bool:
+        """conn がいま device_name に登録されている接続なら True
+
+        conn が None の呼び出し（接続を束縛しない古い経路）は常に現在の
+        ものとして扱う。
+        """
+        return conn is None or self.connections.get(device_name) is conn
+
+    def _discard_stale(self, device_name: str, conn) -> None:
+        """置き換えられた接続からの通知を捨て、その接続の資源を閉じる
+
+        旧スレッドが遅れて成功した場合、Transport スレッドと機器側の
+        セッションが生きたまま誰からも参照されなくなる。閉じておく。
+        """
+        print(f"[Connection] {device_name}: 置き換え済みの接続からの通知を無視します")
+        try:
+            conn.dispose()
+        except Exception as e:
+            print(f"[Connection] {device_name} の旧接続の後始末に失敗: {e}")
+        self._release_object(conn)
+
+    def _on_connection_output(self, device_name: str, text: str, conn=None):
+        """受信出力をターミナルへ流す（置き換え済みの接続からは流さない）
+
+        ただし「置き換えられた」と言えるのは、その機器に別の接続が
+        登録されているときだけ。接続クラスは失敗のとき先に
+        error_occurred を出すので、connect_thread の「接続失敗」は
+        _on_connection_error が接続を外した直後に届く。登録が無いのに
+        捨てると、失敗した接続の通知が一切画面に出なくなる。
+        """
+        if (not self._is_current_connection(device_name, conn)
+                and self.connections.get(device_name) is not None):
+            return
+        self.terminal_widget.append_output(device_name, text)
+
+    def _drop_sftp_manager(self, device_name: str) -> None:
+        """機器の SFTP マネージャを切断して外し、表示中ならパネルも空にする"""
+        if device_name not in self.sftp_managers:
+            return
+        sftp_mgr = self.sftp_managers.pop(device_name)
+        try:
+            sftp_mgr.disconnect()
+        except Exception:
+            pass
+        self._release_object(sftp_mgr)
+        if self.sftp_panel.current_device == device_name:
+            self.sftp_panel.clear()
+
+    def _on_connection_success(self, device_name: str, terminal, conn=None):
         """接続成功時の処理（SSH/Telnet/シリアル共通）"""
+        if not self._is_current_connection(device_name, conn):
+            self._discard_stale(device_name, conn)
+            return
         self.status_bar.showMessage(f"{device_name} に接続しました")
         terminal.set_input_enabled(True)  # キー入力を有効化
+        # 再接続待ちを解くのはここ。タブを使い回す再接続（接続ボタン・
+        # ダブルクリック）は create_terminal_tab を通るが、そちらで解くと
+        # 再接続に失敗したときに待ちが戻らず、画面に残る「Enterキーを
+        # 押すと再接続します」の案内どおりに操作できなくなる
+        terminal.set_reconnect_mode(False)
         # グループの自動実行コマンドをGUIスレッドで送信する
         self.run_auto_commands_requested.emit(device_name)
         
@@ -823,37 +963,75 @@ class MainWindow(QMainWindow):
         if device_name in self.connections:
             conn = self.connections[device_name]
             if isinstance(conn, SSHConnection) and conn.client:
-                try:
-                    # SFTPマネージャーを作成して接続
-                    sftp_manager = SFTPManager(self)
-                    
-                    # エラーシグナルを接続してデバッグ
-                    sftp_manager.error_occurred.connect(
-                        lambda err: self._on_sftp_error(device_name, err)
-                    )
-                    
-                    if sftp_manager.connect(conn.client):
-                        self.sftp_managers[device_name] = sftp_manager
-                        # 現在アクティブなタブの場合はSFTPパネルに表示
-                        if self.terminal_widget.get_current_tab_name() == device_name:
-                            self.sftp_panel.set_sftp_manager(
-                                sftp_manager, device_name,
-                                self._describe_target(device_name))
-                            # SFTPパネルを表示
-                            self._select_tool_tab("sftp")
-                        self.status_bar.showMessage(f"{device_name} に接続しました（SFTP有効）")
-                    else:
-                        # SFTP接続失敗 - エラーダイアログは表示せず、ログのみ
-                        print(f"[INFO] SFTP接続失敗: {device_name} - 機器がSFTPをサポートしていない可能性があります")
-                        # ステータスバーは通常の接続メッセージのまま（ユーザーを混乱させない）
-                except Exception as e:
-                    # SFTP接続エラー - エラーダイアログは表示せず、ログのみ
-                    import traceback
-                    print(f"[ERROR] SFTP接続エラー: {device_name}")
-                    print(f"  エラー: {str(e)}")
-                    print(f"  詳細:\n{traceback.format_exc()}")
-                    # ステータスバーは通常の接続メッセージのまま
-    
+                self._start_sftp_session(device_name, conn)
+
+    def _start_sftp_session(self, device_name: str, conn) -> None:
+        """SFTP セッションの確立をワーカースレッドで始める
+
+        open_sftp() は機器が subsystem 要求に答えるまで戻らず、paramiko の
+        読み取りには timeout が無い。GUI スレッドで待つと、その間イベント
+        ループが完全に止まり、接続済みのシェルの受信出力すら画面に出ない。
+        結果は _sftp_session_ready で GUI スレッドへ戻す。
+        """
+        # SFTPマネージャーを作成（親は GUI スレッドのまま）
+        sftp_manager = SFTPManager(self)
+
+        # エラーシグナルを接続してデバッグ
+        sftp_manager.error_occurred.connect(
+            lambda err: self._on_sftp_error(device_name, err)
+        )
+
+        client = conn.client
+
+        def sftp_connect_thread():
+            try:
+                ok = sftp_manager.connect(client)
+            except Exception as e:
+                import traceback
+                print(f"[ERROR] SFTP接続エラー: {device_name}")
+                print(f"  エラー: {str(e)}")
+                print(f"  詳細:\n{traceback.format_exc()}")
+                ok = False
+            self._sftp_session_ready.emit(device_name, sftp_manager, conn, ok)
+
+        import threading
+        threading.Thread(target=sftp_connect_thread, daemon=True).start()
+
+    def _on_sftp_session_ready(self, device_name: str, sftp_manager,
+                               conn, ok: bool) -> None:
+        """SFTP セッションの確立結果を受け取る（GUI スレッド）
+
+        sftp_managers へ入れないまま帰る道では、_start_sftp_session が
+        parent=MainWindow で作った SFTPManager を自分で手放す。辞書から
+        外す側（_drop_sftp_manager）だけでは届かないので、SFTP を有効に
+        していない機器へ繋ぐたびに抜け殻が 1 個ずつ積み上がる。
+        """
+        if not self._is_current_connection(device_name, conn):
+            # 待っている間にタブを閉じた／繋ぎ直した。遅れて開いた
+            # セッションは登録せず、機器側に残さないよう閉じる
+            try:
+                sftp_manager.disconnect()
+            except Exception:
+                pass
+            self._release_object(sftp_manager)
+            return
+        if not ok:
+            # SFTP接続失敗 - エラーダイアログは表示せず、ログのみ
+            print(f"[INFO] SFTP接続失敗: {device_name} - 機器がSFTPをサポートしていない可能性があります")
+            # ステータスバーは通常の接続メッセージのまま（ユーザーを混乱させない）
+            self._release_object(sftp_manager)
+            return
+        self.sftp_managers[device_name] = sftp_manager
+        # 現在アクティブなタブの場合はSFTPパネルに表示
+        if self.terminal_widget.get_current_tab_name() == device_name:
+            self.sftp_panel.set_sftp_manager(
+                sftp_manager, device_name,
+                self._describe_target(device_name))
+            # SFTPパネルを表示
+            self._select_tool_tab("sftp")
+        self.status_bar.showMessage(f"{device_name} に接続しました（SFTP有効）")
+
+
     def _describe_target(self, device_name: str) -> str:
         """機器の接続先（host:port）を返す。分からなければ空文字。
 
@@ -903,11 +1081,16 @@ class MainWindow(QMainWindow):
         if not commands:
             return
         from PyQt6.QtCore import QTimer
-        # シェルのプロンプトが出るまで少し待ってから送信する
-        QTimer.singleShot(
-            800,
-            lambda: self.macro_manager.start_command_list(device_name, list(commands), 1000)
-        )
+        # シェルのプロンプトが出るまで少し待ってから送信する。待っている間に
+        # 切断・再接続されていたら始めない（同名の新しい接続へ前の接続向けの
+        # コマンドを送ることになる）。接続オブジェクトの同一性で見る
+        conn = self.connections.get(device_name)
+
+        def start_if_still_this_session():
+            if self.connections.get(device_name) is conn:
+                self.macro_manager.start_command_list(device_name, list(commands), 1000)
+
+        QTimer.singleShot(800, start_if_still_this_session)
         self.status_bar.showMessage(f"{device_name}: 自動実行コマンドを送信します...")
 
     def _dispose_connection(self, device_name: str):
@@ -926,26 +1109,48 @@ class MainWindow(QMainWindow):
         conn = self.connections.pop(device_name, None)
         if conn is None:
             return
+        # この接続宛てのマクロ（コマンドリスト・キープアライブ・送信先）も
+        # ここで止める。残すと切断中もインデックスが進み、同名で再接続した
+        # 瞬間に残りのコマンドが新しいセッションへ送られる
+        try:
+            self.macro_manager.cleanup_device(device_name)
+            # タブ側の「キープアライブ動作中」の印も消す。残すと再接続後の
+            # 右クリックメニューが「停止」を出し続け、入れ直せない
+            self.terminal_widget.set_keepalive_status(device_name, False)
+        except Exception as e:
+            print(f"[Connection] {device_name} のマクロ停止に失敗: {e}")
         try:
             conn.dispose()
         except Exception as e:
             print(f"[Connection] {device_name} の後始末に失敗: {e}")
+        self._release_object(conn)
 
-    def _on_connection_closed(self, device_name: str):
+    @staticmethod
+    def _release_object(obj) -> None:
+        """用済みの QObject を MainWindow の子から外す
+
+        接続も SFTPManager も parent=MainWindow で作られるので、閉じて
+        辞書から外しても Qt が参照を持ち続ける。接続・切断を繰り返す
+        ほど抜け殻が積み上がり、閉じても減らない。
+
+        その場で破棄せず deleteLater に渡す。後始末は接続自身の
+        disconnected シグナルの中から呼ばれるので、発行中の
+        オブジェクトをその場で壊すと落ちる。
+        """
+        try:
+            obj.deleteLater()
+        except (AttributeError, RuntimeError):
+            pass  # QObject でない / 既に破棄済み
+
+    def _on_connection_closed(self, device_name: str, conn=None):
         """接続切断時の処理（SSH/シリアル共通）"""
+        if not self._is_current_connection(device_name, conn):
+            self._discard_stale(device_name, conn)
+            return
         self.status_bar.showMessage(f"{device_name} から切断されました")
         
         # SFTP接続を切断
-        if device_name in self.sftp_managers:
-            try:
-                self.sftp_managers[device_name].disconnect()
-            except Exception:
-                pass
-            del self.sftp_managers[device_name]
-            
-            # 現在表示中のSFTPパネルをクリア
-            if self.sftp_panel.current_device == device_name:
-                self.sftp_panel.clear()
+        self._drop_sftp_manager(device_name)
         
         # 接続を閉じてから削除（閉じないとポートを掴んだまま残る）
         self._dispose_connection(device_name)
@@ -962,17 +1167,22 @@ class MainWindow(QMainWindow):
         # 再接続可能な状態にする
         self.terminal_widget.enable_reconnect(device_name, self._reconnect_device)
     
-    def _on_connection_error(self, device_name: str, error: str):
+    def _on_connection_error(self, device_name: str, error: str, conn=None):
         """接続エラー時の処理（SSH/シリアル共通）"""
+        if not self._is_current_connection(device_name, conn):
+            self._discard_stale(device_name, conn)
+            return
         self.status_bar.showMessage(f"{device_name}: エラー - {error}")
         
         # エラーメッセージを表示
         if "送信エラー" in error or "Socket is closed" in error:
             # 送信エラーの場合は切断として扱う
-            self._on_connection_closed(device_name)
+            self._on_connection_closed(device_name, conn)
         else:
             # その他のエラー
             self.terminal_widget.show_notice(device_name, f"\nエラー: {error}\n")
+            # 閉じた client を抱えた SFTP マネージャを残さない
+            self._drop_sftp_manager(device_name)
             self._dispose_connection(device_name)
     
     def _reconnect_device(self, device_name: str):
@@ -1009,6 +1219,26 @@ class MainWindow(QMainWindow):
         
         # 接続処理を実行（ダブルクリックと同じ処理）
         self._on_connect_requested(device_data)
+
+    def _on_disconnect_button_clicked(self):
+        """
+        「切断」ボタンがクリックされたときの処理
+
+        選択中の機器が接続中なら、タブの × と同じ後始末（マクロ停止・
+        SFTP 切断・接続切断）を行う。タブは閉じないので、そのまま
+        再接続できる。
+        """
+        result = self.device_tree.get_selected_device()
+        if result is None:
+            return
+
+        group_name, device_data = result
+        device_name = device_data.get('name')
+        if device_name not in self.connections:
+            self.status_bar.showMessage(f"{device_name} は接続されていません")
+            return
+
+        self._on_tab_closed(device_name)
     
     def _on_terminal_resized(self, device_name: str, cols: int, rows: int):
         """端末の行数・桁数の変化を機器へ伝える (RFC 4254 6.7)。
@@ -1033,16 +1263,7 @@ class MainWindow(QMainWindow):
         self.macro_manager.cleanup_device(device_name)
         
         # SFTP接続を切断
-        if device_name in self.sftp_managers:
-            try:
-                self.sftp_managers[device_name].disconnect()
-            except Exception:
-                pass
-            del self.sftp_managers[device_name]
-            
-            # 現在表示中のSFTPパネルをクリア
-            if self.sftp_panel.current_device == device_name:
-                self.sftp_panel.clear()
+        self._drop_sftp_manager(device_name)
         
         # SSH接続を切断（接続が存在する場合のみ）
         if device_name in self.connections:
@@ -1457,9 +1678,15 @@ class MainWindow(QMainWindow):
             pass  # 並び順の復元失敗は無視して既定順で続行
 
     def _select_tool_tab(self, key):
-        """指定ツールのタブへ切替え、ツールエリアを表示状態にする。"""
+        """指定ツールのタブへ切替え、ツールエリアを表示状態にする。
+
+        隠してあっただけなら幅は Qt が覚えているので触らない。
+        触ると利用者が決めた幅を既定幅で潰してしまう。
+        """
         if self.tool_tabs.isHidden():
             self.tool_tabs.setVisible(True)
+        else:
+            self._restore_tool_area_width()
         idx = self._tab_index.get(key)
         if idx is not None:
             self.tool_tabs.setCurrentIndex(idx)
@@ -1524,10 +1751,39 @@ class MainWindow(QMainWindow):
             return
         self._detach_tool(key)
 
+    # ツールエリアを戻すときの幅。接続先リストと同じで、
+    # 畳んだ状態から出しても 0 のままだと何も見えない
+    TOOL_AREA_WIDTH = 300
+
+    def _restore_tool_area_width(self):
+        """幅 0 まで畳んだツールエリアを既定幅へ戻す（幅があれば何もしない）。"""
+        sizes = self.main_splitter.sizes()
+        if len(sizes) < 3 or sizes[2] >= 40:
+            return
+        spare = max(sizes[1] - self.TOOL_AREA_WIDTH, 100)
+        self.main_splitter.setSizes(
+            sizes[:1] + [spare, self.TOOL_AREA_WIDTH])
+
     def _toggle_tool_area(self):
-        """ツールエリア全体の表示/非表示を切り替える。"""
-        show = self.tool_tabs.isHidden()
+        """ツールエリア全体の表示/非表示を切り替える。
+
+        仕切りを右端まで引いて幅 0 にした状態は、見た目は消えているのに
+        ウィジェットとしては表示中。幅を見ないとまず隠す側へ倒れ、
+        2 回押しても幅 0 のまま戻らない。分割位置は次回起動へ持ち越されるので、
+        そのままだとメニューから戻す手段がなくなる。接続先リストと同じく、
+        幅が無いものは隠れていると見なす。
+
+        ただし幅の復元は「表示中で幅 0」のときだけ。隠れている間は
+        QSplitter.sizes() がそのウィジェットに 0 を返すので、区別せずに
+        復元すると、Qt が覚えている幅（利用者が決めた幅）を隠す/戻すの
+        たびに既定幅で上書きしてしまう。
+        """
+        sizes = self.main_splitter.sizes()
+        was_hidden = self.tool_tabs.isHidden()
+        show = was_hidden or (len(sizes) > 2 and sizes[2] < 40)
         self.tool_tabs.setVisible(show)
+        if show and not was_hidden:
+            self._restore_tool_area_width()
         if hasattr(self, "toggle_tool_area_action"):
             self.toggle_tool_area_action.setChecked(show)
 
@@ -1820,9 +2076,21 @@ for details.
     
     def _check_pending_updates(self):
         """未適用の更新ファイルをチェック"""
+        from core.version_manager import running_from_source
+        # ソース実行では配布物を当てられないので、勧めもしない。
+        # 当てるとリポジトリ直下がビルド済みの exe 一式で上書きされ、
+        # ソースは変わらないので次の起動でもまた勧めることになる。
+        if running_from_source():
+            return
+
         version_mgr = VersionManager()
         pending_files = version_mgr.get_pending_update_files()
-        
+
+        # 候補を全部見てから、いちばん新しい版を1つだけ勧める。版ごとに
+        # 名前が分かれたので、24時間以内に2回落とすと未適用の ZIP が並ぶ。
+        # os.listdir 順（＝辞書順）の先頭で決めていたときは、並んだ中の
+        # 古い方を勧めていた。
+        best = None  # (版, ZIPのパス, 経過時間)
         for zip_path in pending_files:
             if not os.path.exists(zip_path):
                 continue
@@ -1833,7 +2101,7 @@ for details.
                 print(f"[Main] 検証されていない更新ファイルのため無視します: {zip_path}")
                 continue
             
-            # ファイルの年齢を確認
+            # 落としてからどれだけ経ったかを見る
             file_age_hours = (datetime.now().timestamp() - os.path.getmtime(zip_path)) / 3600
             
             if file_age_hours > 24:
@@ -1852,29 +2120,41 @@ for details.
                 print("[Main] 現在のバージョン以下のため無視します: "
                       f"{pending_version}")
                 continue
-            
-            # 適用確認ダイアログ
-            reply = QMessageBox.question(
-                self,
-                "未適用の更新",
-                f"前回ダウンロードした更新 v{pending_version}"
-                f"（{file_age_hours:.0f}時間前）がまだ適用されていません。\n"
-                f"現在のバージョンは v{version_mgr.CURRENT_VERSION} です。\n\n"
-                "今すぐ更新を適用しますか？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No
-            )
-            
-            if reply == QMessageBox.StandardButton.Yes:
-                self._apply_pending_update(zip_path)
-            
-            # 最初の1つだけ処理
-            break
+
+            if best is None or VersionManager.compare_versions(
+                    pending_version, best[0]) > 0:
+                best = (pending_version, zip_path, file_age_hours)
+
+        if best is None:
+            return
+        pending_version, zip_path, file_age_hours = best
+
+        # 適用確認ダイアログ
+        reply = QMessageBox.question(
+            self,
+            "未適用の更新",
+            f"前回ダウンロードした更新 v{pending_version}"
+            f"（{file_age_hours:.0f}時間前）がまだ適用されていません。\n"
+            f"現在のバージョンは v{version_mgr.CURRENT_VERSION} です。\n\n"
+            "今すぐ更新を適用しますか？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+
+        if reply == QMessageBox.StandardButton.Yes:
+            self._apply_pending_update(zip_path)
     
     def _apply_pending_update(self, zip_path: str):
         """未適用の更新を適用"""
         # updater.batのパスを取得
         import sys
+
+        from core.version_manager import (
+            running_from_source, SOURCE_RUN_MESSAGE)
+        # ソース実行では当てない（_check_pending_updates と同じ理由）
+        if running_from_source():
+            QMessageBox.information(self, "更新", SOURCE_RUN_MESSAGE)
+            return
         
         if getattr(sys, 'frozen', False):
             app_dir = os.path.dirname(sys.executable)
@@ -1894,17 +2174,24 @@ for details.
         
         try:
             import subprocess
-            from core.version_manager import updater_command
+            from core.version_manager import updater_command, updater_env
             # リストで渡すと、パスの , や = で引数が途中で切れる
             # （updater_command の説明を参照）
             subprocess.Popen(
                 updater_command(updater_path, zip_path, app_path),
-                creationflags=subprocess.CREATE_NEW_CONSOLE
+                creationflags=subprocess.CREATE_NEW_CONSOLE,
+                env=updater_env()
             )
             
-            # アプリケーションを終了
+            # アプリケーションを終了する。ここは MainWindow.__init__
+            # （起動時の未適用更新）から呼ばれることがあり、その時点では
+            # app.exec() がまだ始まっていない。イベントループが回って
+            # いないときの quit() は何もしないので、直接呼ぶと updater
+            # だけ起動してアプリは表示され続ける（updater.bat は 3 秒後に
+            # ロック中の NetBelt.exe へ上書きを試みる）。singleShot(0) で
+            # 予約すれば、exec() に入った直後に処理される
             from PyQt6.QtWidgets import QApplication
-            QApplication.quit()
+            QTimer.singleShot(0, QApplication.quit)
         except Exception as e:
             QMessageBox.critical(
                 self,
@@ -1941,10 +2228,16 @@ for details.
             print("[Main] Stopping Syslog receiver...")
             self.syslog_receiver.stop()
         
-        # SFTPサーバーを停止
-        if hasattr(self, 'sftp_server_panel') and self.sftp_server_panel.sftp_server.is_running:
-            print("[Main] Stopping SFTP server...")
-            self.sftp_server_panel.sftp_server.stop()
+        # SFTPサーバーを停止。is_running では判定しない。あのフラグを
+        # 立てるのは待受ワーカーの先頭で、start() はスレッドを起こした
+        # 直後に戻るため、その隙に閉じると空振りして待受が生き残る。
+        # stop() 自身も同じ理由でスレッドの生死で判定している。
+        # TFTP/FTP は start() の中で is_running を立ててから戻るのでこの隙は無い。
+        if hasattr(self, 'sftp_server_panel'):
+            sftp_thread = self.sftp_server_panel.sftp_server.server_thread
+            if sftp_thread is not None and sftp_thread.is_alive():
+                print("[Main] Stopping SFTP server...")
+                self.sftp_server_panel.sftp_server.stop()
         
         # TFTPサーバーを停止
         if hasattr(self, 'tftp_server_panel') and self.tftp_server_panel.tftp_server.is_running:
@@ -1956,9 +2249,10 @@ for details.
             print("[Main] Stopping FTP server...")
             self.ftp_server_panel.ftp_server.stop()
         
-        # SNMP Trap 受信とワーカースレッドを停止
-        # 実行中の QThread を残したまま終了すると、Qt の後片付けで
-        # 解放済みオブジェクトに触れてプロセスが異常終了しうる。
+        # SNMP Trap 受信とワーカースレッドを停止。受信スレッドを
+        # アプリより長生きさせない。中継を connect(signal.emit) で
+        # 書いていたころは、管理側が消えたあとに残った配送が解放済みの
+        # 領域へ届いてプロセスが落ちていた（中継は 47ecbde で直した）。
         if hasattr(self, 'snmp_panel') and hasattr(self.snmp_panel, 'snmp_manager'):
             try:
                 print("[Main] Stopping SNMP threads...")
@@ -1967,7 +2261,9 @@ for details.
             except Exception as e:
                 print(f"[Main] SNMP 停止エラー: {e}")
         # バックグラウンドの MIB 読み込み（QThread）も待つ。起動直後に
-        # 閉じると読み込み中のことがあり、待たずに破棄すると落ちる
+        # 閉じると読み込み中のことがあり、待たないと MIB キャッシュの
+        # 書き出しがプロセス終了で切られる（落ちはしない。詳細は
+        # SNMPPanel.wait_for_background_work）
         if hasattr(self, 'snmp_panel'):
             try:
                 self.snmp_panel.wait_for_background_work()
@@ -2002,6 +2298,14 @@ for details.
             win._closing = True
             win.close()
         self._detached = {}
+        # ツール→ポートチェッカーは親を持たないトップレベルなので、
+        # 同じ理由でここで閉じないと終了できない
+        pc = getattr(self, "port_checker_window", None)
+        if pc is not None:
+            try:
+                pc.close()
+            except RuntimeError:
+                pass  # 既に破棄済み
 
         # イベントを受け入れて終了
         event.accept()

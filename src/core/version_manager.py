@@ -3,8 +3,10 @@
 """
 
 import os
+import sys
 import json
 import tempfile
+import threading
 import requests
 from typing import Optional, Dict, Callable
 from datetime import datetime
@@ -60,6 +62,40 @@ def updater_command(updater_path: str, zip_path: str, app_path: str) -> str:
     return '"{}" "{}" "{}"'.format(updater_path, zip_path, app_path)
 
 
+# ソース実行で更新を当てようとしたときに出す案内。
+# 配布 ZIP はビルド済みの exe 一式で、展開先はリポジトリ直下になる。
+SOURCE_RUN_MESSAGE = (
+    "ソースから実行しているため、更新を自動で適用できません。\n\n"
+    "配布物の ZIP はビルド済みの NetBelt.exe 一式で、展開先は\n"
+    "このリポジトリの直下になります。追跡しているファイルが\n"
+    "上書きされ、再起動も Python 本体が開くだけになります。\n\n"
+    "git pull で更新するか、README の手順で ZIP を別のフォルダへ\n"
+    "手で展開してください。")
+
+
+def running_from_source() -> bool:
+    """ソースから動いているか（凍結された exe でないか）を返す。"""
+    return not getattr(sys, 'frozen', False)
+
+
+def updater_env() -> dict:
+    """updater.bat へ渡す環境変数を組み立てる
+
+    onefile の exe から更新すると、updater.bat 経由で起動し直すのは
+    同じパスの exe になる。PyInstaller のブートローダは _PYI_ARCHIVE_FILE が
+    自分と同じなら「同一アプリの子プロセス」と見なし、親が終了時に消した
+    _MEIxxxx から python DLL を読もうとする。実測では Python が一度も
+    起動しないまま `Failed to load Python DLL` で落ちた。ブートローダ段階の
+    失敗なので、ログにも excepthook にも何も残らない。
+
+    PYINSTALLER_RESET_ENVIRONMENT=1 を立てると、子は _PYI_* を引き継がず
+    自分用の _MEI を展開し直す。ソース実行では何の影響も無い。
+    """
+    env = dict(os.environ)
+    env['PYINSTALLER_RESET_ENVIRONMENT'] = '1'
+    return env
+
+
 class VersionManager:
     """バージョン管理とアップデート機能を提供するクラス"""
     
@@ -81,6 +117,8 @@ class VersionManager:
             github_token: GitHub Personal Access Token（プライベートリポジトリの場合必須）
         """
         self.github_token = github_token
+        # 受信中の応答。中止の要求が来たら、これを閉じて読み取りを打ち切る
+        self._response = None
         # 更新用ディレクトリを作成
         os.makedirs(self.UPDATE_DIR, exist_ok=True)
     
@@ -228,12 +266,31 @@ class VersionManager:
             download_name = None
             assets = data.get('assets', [])
             
+            # CI が付ける配布物の名前。同じリリースに windows を名前に
+            # 含む別の ZIP が並ぶと、先頭から拾う版はそちらを掴む。
+            # その ZIP 専用の .sha256 まで揃っていれば照合も通ってしまい、
+            # 利用者は本体でないものを「更新」として入れることになる。
+            wanted_zip = f'{APP_NAME}-v{latest_version}-Windows-Portable.zip'.lower()
             for asset in assets:
-                name = asset.get('name', '').lower()
-                if 'windows' in name and name.endswith('.zip'):
+                if asset.get('name', '').lower() == wanted_zip:
                     download_url = asset.get('url')  # APIのURLを使用（プライベートリポジトリ対応）
                     download_name = asset.get('name', '')
                     break
+
+            # 正規名の資産が無いリリースを黙って切り捨てないための保険。
+            # build-release.yml はこれまでの全リビジョンで上の正規名だけを
+            # 作っており、「昔の命名」のリリースは存在しない。ここへ落ちるのは
+            # 正規の資産が欠けたリリースだけで、そのときは windows を名前に
+            # 含む最初の .zip という弱い選び方に戻る。本体でない ZIP を
+            # 掴んだ場合は、実行ファイルが無いことに updater.bat が気づいて
+            # exit 1 で止める。
+            if not download_url:
+                for asset in assets:
+                    name = asset.get('name', '').lower()
+                    if 'windows' in name and name.endswith('.zip'):
+                        download_url = asset.get('url')
+                        download_name = asset.get('name', '')
+                        break
             
             # Windows 向けの ZIP が無ければ何も選ばない。以前は「最初の ZIP」へ
             # 落ちていたが、実行可能物でない ZIP を掴む余地を残すだけで、
@@ -268,6 +325,45 @@ class VersionManager:
             print(f"[VersionManager] 予期しないエラー: {e}")
             return {'available': False, 'error': f"更新の確認に失敗しました: {e}"}
     
+    def abort(self) -> None:
+        """受信中の応答を閉じ、読み取りを直ちに終わらせる。
+
+        中止の判定はチャンクの区切りでしか行えないので、相手が黙り込むと
+        読み取りのタイムアウト（60秒）まで戻ってこない。その間スレッドが
+        残り続けるため、ソケット側から打ち切る。別のスレッドから呼ばれる。
+        """
+        response = self._response
+        if response is None:
+            return
+        try:
+            response.close()
+        except Exception as e:
+            print(f"[VersionManager] 受信の中断に失敗: {e}")
+
+    @staticmethod
+    def _safe_name_part(text) -> str:
+        """ファイル名に使える文字だけを残す（版はリリースのタグ由来）。"""
+        return ''.join(c for c in str(text)
+                       if c.isalnum() or c in ('.', '_', '-'))
+
+    @classmethod
+    def _download_filename(cls, url: str, version: Optional[str] = None) -> str:
+        """ダウンロード先のファイル名を決める。
+
+        GitHub の asset は API 形式の URL（末尾は asset の番号）で取るため、
+        basename からはファイル名が分からず、どの版も同じ
+        NetBelt-update.zip を共有していた。後から来たダウンロードが、
+        別の版を表示しているダイアログの ZIP を静かに置き換えられる。
+        版が分かっているときは版ごとに分ける。
+        """
+        safe = cls._safe_name_part(version) if version else ''
+        if safe:
+            return f"{APP_NAME}-{safe}.zip"
+        filename = os.path.basename(url)
+        if not filename.endswith('.zip'):
+            filename = f"{APP_NAME}-update.zip"
+        return filename
+
     @staticmethod
     def _discard(path: str) -> None:
         """検証に失敗したダウンロードを残さない。"""
@@ -331,10 +427,8 @@ class VersionManager:
         # 受信中に例外が出ても書きかけを残さないよう、外側でも掴んでおく
         part_path = None
         try:
-            # ファイル名を生成
-            filename = os.path.basename(url)
-            if not filename.endswith('.zip'):
-                filename = f"{APP_NAME}-update.zip"
+            # ファイル名を生成（版ごとに分ける）
+            filename = self._download_filename(url, version)
             
             zip_path = os.path.join(self.UPDATE_DIR, filename)
             
@@ -354,6 +448,7 @@ class VersionManager:
             
             # ダウンロード（リダイレクトに従う）
             response = requests.get(url, headers=headers, stream=True, timeout=60, allow_redirects=True)
+            self._response = response
             
             print(f"[VersionManager] レスポンスステータス: {response.status_code}")
             
@@ -364,7 +459,10 @@ class VersionManager:
             
             # 検証を通るまでは .part 名で書く。最終名(.zip)で書くと、中断した
             # 未検証ファイルが「未適用の更新」として拾われ、検証なしで適用できる。
-            part_path = zip_path + '.part'
+            # 名前はダウンロードごとに変える。共有していたときは、同時に
+            # 受信した2つが同じ .part を奪い合って両方とも失敗していた。
+            part_path = '%s.%d-%d.part' % (zip_path, os.getpid(),
+                                           threading.get_ident())
             self._discard(part_path)
             with open(part_path, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=8192):
@@ -403,7 +501,9 @@ class VersionManager:
 
             # 検証を通ったものだけを最終名にする。あわせて検証済みの証として
             # ハッシュを傍らに残し、適用時にもう一度確かめられるようにする。
-            self._discard(zip_path)
+            # os.replace は宛先があっても置き換えるので、先に消さない。
+            # 消してから改名していたときは、その隙に別の受信が失敗すると
+            # 検証済みだった ZIP まで失われた。
             os.replace(part_path, zip_path)
             try:
                 # 版も控える。控えないと、次回起動時に「これは今より新しいか」を
@@ -429,6 +529,8 @@ class VersionManager:
             if part_path:
                 self._discard(part_path)
             return None
+        finally:
+            self._response = None
     
     @staticmethod
     def pending_version(zip_path: str) -> Optional[str]:

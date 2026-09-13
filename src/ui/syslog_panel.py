@@ -93,8 +93,8 @@ class SyslogTableModel(QAbstractTableModel):
         "Debug": QColor(128, 128, 128),      # グレー
     }
     
-    def __init__(self, max_messages: int = 1000):
-        super().__init__()
+    def __init__(self, max_messages: int = 1000, parent=None):
+        super().__init__(parent)
         self.messages = []
         self.max_messages = max_messages
         self.headers = ["タイムスタンプ", "送信元 (プロトコル/ポート)", "レベル", "メッセージ"]
@@ -180,8 +180,8 @@ class SyslogTableModel(QAbstractTableModel):
 class SyslogFilterProxyModel(QSortFilterProxyModel):
     """Syslogメッセージフィルタプロキシモデル"""
     
-    def __init__(self):
-        super().__init__()
+    def __init__(self, parent=None):
+        super().__init__(parent)
         self.enabled_levels = set(SyslogTableModel.LEVEL_COLORS.keys())
         self.hostname_filter = ""
         self.keyword_filter = ""
@@ -242,8 +242,9 @@ class SyslogPanel(QWidget):
         self._load_config()
         
         # モデルの初期化
-        self.model = SyslogTableModel(self.max_messages)
-        self.proxy_model = SyslogFilterProxyModel()
+        # 親を持たせる（setModel / setSourceModel は所有権を取らない）
+        self.model = SyslogTableModel(self.max_messages, self)
+        self.proxy_model = SyslogFilterProxyModel(self)
         self.proxy_model.setSourceModel(self.model)
         
         self._init_ui()
@@ -421,9 +422,10 @@ class SyslogPanel(QWidget):
             self.status_label.setText("受信器がまだ用意されていません")
             return
         self.status_label.setText("ファイアウォール許可を実行します（管理者昇格）...")
-        ok, _msg = self.syslog_receiver.fix_firewall()
+        ok, msg = self.syslog_receiver.fix_firewall()
+        # 「反映待ち」等の理由を潰さず、そのまま見せる
         self.status_label.setText(
-            "ファイアウォール許可: %s" % ("完了" if ok else "未反映/失敗"))
+            "ファイアウォール許可: %s (%s)" % ("完了" if ok else "未反映/失敗", msg))
 
     def _protocol_port(self, proto):
         """指定プロトコルの待受ポート"""
@@ -543,6 +545,11 @@ class SyslogPanel(QWidget):
             self.model.clear_messages()
             self._update_status()
     
+    @staticmethod
+    def _export_line(msg: SyslogMessage) -> str:
+        """保存用の1行を作る（画面と同じく送信元を含め、機器を区別できるようにする）"""
+        return f"{msg.timestamp} {msg.source_ip} {msg.hostname} [{msg.level}] {msg.message}"
+
     def _export_messages(self):
         """メッセージをエクスポート"""
         filename, _ = QFileDialog.getSaveFileName(
@@ -550,18 +557,20 @@ class SyslogPanel(QWidget):
             f"syslog_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
             "テキストファイル (*.txt);;JSONファイル (*.json);;すべてのファイル (*.*)"
         )
-        
+
         if filename:
             try:
                 messages = self.model.get_all_messages()
                 if filename.endswith('.json'):
-                    # JSON形式でエクスポート
+                    # JSON形式でエクスポート（送信元と受信生データも残す）
                     data = [
                         {
                             "timestamp": msg.timestamp,
+                            "source": msg.source_ip,
                             "hostname": msg.hostname,
                             "level": msg.level,
-                            "message": msg.message
+                            "message": msg.message,
+                            "raw": msg.raw
                         }
                         for msg in messages
                     ]
@@ -571,7 +580,7 @@ class SyslogPanel(QWidget):
                     # テキスト形式でエクスポート
                     with open(filename, 'w', encoding='utf-8') as f:
                         for msg in messages:
-                            f.write(f"{msg.timestamp} {msg.hostname} [{msg.level}] {msg.message}\n")
+                            f.write(self._export_line(msg) + "\n")
                 
                 QMessageBox.information(self, "成功", f"メッセージを {filename} にエクスポートしました。")
             except Exception as e:
@@ -629,7 +638,7 @@ class SyslogPanel(QWidget):
             source_row = self.proxy_model.mapToSource(index).row()
             msg = self.model.get_message(source_row)
             if msg:
-                lines.append(f"{msg.timestamp} {msg.hostname} [{msg.level}] {msg.message}")
+                lines.append(self._export_line(msg))
         
         QApplication.clipboard().setText("\n".join(lines))
     
@@ -639,22 +648,28 @@ class SyslogPanel(QWidget):
         if not selected_rows:
             QMessageBox.warning(self, "警告", "保存する行を選択してください。")
             return
-        
+
+        # ダイアログを開いている間に受信で先頭行が押し出されると行番号がずれるので、
+        # 保存対象のメッセージはダイアログを出す前に確定しておく
+        messages = []
+        for index in selected_rows:
+            source_row = self.proxy_model.mapToSource(index).row()
+            msg = self.model.get_message(source_row)
+            if msg:
+                messages.append(msg)
+
         filename, _ = QFileDialog.getSaveFileName(
             self, "選択行を保存",
             f"syslog_selected_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
             "テキストファイル (*.txt);;すべてのファイル (*.*)"
         )
-        
+
         if filename:
             try:
                 with open(filename, 'w', encoding='utf-8') as f:
-                    for index in selected_rows:
-                        source_row = self.proxy_model.mapToSource(index).row()
-                        msg = self.model.get_message(source_row)
-                        if msg:
-                            f.write(f"{msg.timestamp} {msg.hostname} [{msg.level}] {msg.message}\n")
-                
+                    for msg in messages:
+                        f.write(self._export_line(msg) + "\n")
+
                 QMessageBox.information(self, "成功", f"選択行を {filename} に保存しました。")
             except Exception as e:
                 QMessageBox.critical(self, "エラー", f"保存に失敗しました: {e}")

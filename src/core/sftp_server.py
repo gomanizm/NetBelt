@@ -7,6 +7,8 @@ from paramiko import ServerInterface, SFTPServerInterface, SFTPServer, SFTPAttri
 from PyQt6.QtCore import QObject, pyqtSignal
 import stat as stat_module
 from .sockets import set_exclusive_bind
+from .crypto import PasswordCrypto
+from .ftp_server import UNDECRYPTABLE_PASSWORD_MESSAGE
 
 
 class SFTPServerHandler(SFTPServerInterface):
@@ -34,11 +36,33 @@ class SFTPServerHandler(SFTPServerInterface):
         root_real = os.path.realpath(self.root_dir)
         real_path = os.path.realpath(os.path.join(root_real, relative))
 
-        # セキュリティチェック: ルートディレクトリ外へのアクセスを防ぐ
-        if real_path != root_real and not real_path.startswith(root_real + os.sep):
+        # セキュリティチェック: ルートディレクトリ外へのアクセスを防ぐ。
+        # 接頭辞は join(root, '') で作る。root がドライブ直下（'D:\\'）だと
+        # realpath が区切りで終わるので、単純に os.sep を足すと 'D:\\\\' に
+        # なり、直下のあらゆるパスが外側と判定されてしまう。
+        if real_path != root_real and not real_path.startswith(os.path.join(root_real, "")):
             raise IOError("Access denied")
 
         return real_path
+
+    def _get_link_path(self, path):
+        """削除・改名の対象パスを返す（最終要素はリンクを解決しない）。
+
+        _get_real_path は最終要素まで realpath で解決するので、ルート内の
+        alias → target というリンクに対して「alias を消す」と target 自体を
+        消してしまう。閉じ込めの判定は親ディレクトリを解決して行い、
+        最終要素はその名前のまま扱う。リンクを通ってルートの外へ出る
+        パス（escape/secret.txt）は親が外側に解決されるので、これまで
+        どおり拒否される。
+        """
+        relative = path.replace("\\", "/").strip("/")
+        if not relative:
+            raise IOError("Access denied")
+        parent_rel, _, leaf = relative.rpartition("/")
+        if leaf in ("", ".", ".."):
+            raise IOError("Access denied")
+        parent_real = self._get_real_path(parent_rel)
+        return os.path.join(parent_real, leaf)
 
     def list_folder(self, path):
         """ディレクトリ一覧を返す"""
@@ -132,8 +156,8 @@ class SFTPServerHandler(SFTPServerInterface):
     def remove(self, path):
         """ファイルを削除"""
         try:
-            real_path = self._get_real_path(path)
-            os.remove(real_path)
+            # リンクの先ではなくリンク自体を消す
+            os.remove(self._get_link_path(path))
             return SFTP_OK
         except Exception as e:
             print(f"[SFTP Server] remove error: {e}")
@@ -142,9 +166,8 @@ class SFTPServerHandler(SFTPServerInterface):
     def rename(self, oldpath, newpath):
         """ファイル/ディレクトリ名を変更"""
         try:
-            real_oldpath = self._get_real_path(oldpath)
-            real_newpath = self._get_real_path(newpath)
-            os.rename(real_oldpath, real_newpath)
+            # リンクの先ではなくリンク自体を改名する
+            os.rename(self._get_link_path(oldpath), self._get_link_path(newpath))
             return SFTP_OK
         except Exception as e:
             print(f"[SFTP Server] rename error: {e}")
@@ -163,17 +186,38 @@ class SFTPServerHandler(SFTPServerInterface):
     def rmdir(self, path):
         """ディレクトリを削除"""
         try:
-            real_path = self._get_real_path(path)
-            os.rmdir(real_path)
+            # リンクの先ではなくリンク自体を外す（ジャンクションは rmdir で外れる）
+            os.rmdir(self._get_link_path(path))
             return SFTP_OK
         except Exception as e:
             print(f"[SFTP Server] rmdir error: {e}")
             return SFTP_FAILURE
     
     def chattr(self, path, attr):
-        """ファイル属性を変更"""
+        """ファイル属性を変更（SETSTAT）。
+
+        サイズ・日時・パーミッションを要求どおり反映する。以前は st_mode
+        だけを見て、サイズと日時は捨てたまま SFTP_OK を返していたため、
+        truncate や日時保持（sftp -p）がエラーも出ないまま効かなかった。
+
+        制限: uid/gid は Windows で意味を持たないので受け取っても無視する
+        （この用途の SFTP クライアントは所有者を送ってこない）。開いている
+        ハンドルへの FSETSTAT は paramiko の既定のまま「未対応」を返す。
+        """
         try:
             real_path = self._get_real_path(path)
+            if attr.st_size is not None:
+                os.truncate(real_path, attr.st_size)
+            atime = attr.st_atime
+            mtime = attr.st_mtime
+            if atime is not None or mtime is not None:
+                # 片方だけ指定されたら、もう片方は現在の値を保つ
+                current = os.stat(real_path)
+                os.utime(real_path,
+                         (current.st_atime if atime is None else atime,
+                          current.st_mtime if mtime is None else mtime))
+            # 読み取り専用にする要求が先に効くと、同じ要求内の truncate や
+            # utime が通らなくなるので、モードは最後に適用する
             if attr.st_mode is not None:
                 os.chmod(real_path, attr.st_mode)
             return SFTP_OK
@@ -273,6 +317,10 @@ class SFTPServerManager(QObject):
         if not username or not password:
             self.error_occurred.emit("ユーザー名とパスワードを指定してください")
             return False
+        # 復号できなかった暗号文をそのまま認証パスワードにしない（FTP と同じ）
+        if PasswordCrypto().is_encrypted(password):
+            self.error_occurred.emit(UNDECRYPTABLE_PASSWORD_MESSAGE)
+            return False
         
         self.port = port
         self.root_dir = os.path.abspath(root_dir)
@@ -355,7 +403,11 @@ class SFTPServerManager(QObject):
             return
 
         print("[SFTP Server] Stopping server...")
-        self._stop_event.set()
+        # 停止フラグは接続一覧と同じロックの下で立てる。待受ループは
+        # accept 復帰後に同じロックの下で「まだ停止していないか」を見て
+        # から登録するので、どちらが先でも接続は必ずどちらかに閉じられる
+        with self._client_lock:
+            self._stop_event.set()
         self.is_running = False
 
         # サーバーソケットを閉じる
@@ -369,9 +421,15 @@ class SFTPServerManager(QObject):
         # （start_server）やチャネル待ち（accept(timeout=20)）で止まって
         # いることがあり、join だけだと 1 本につき 1 秒固まったうえに
         # スレッドが残り、あとで client_disconnected を破棄済みの
-        # マネージャへ emit して落ちる。閉じればどちらもすぐ抜ける
+        # マネージャへ emit して落ちる。閉じればどちらもすぐ抜ける。
+        # ソケット一覧とスレッド一覧は同じロックの下で取る。待受ループが
+        # 両方を 1 回のロックで登録するので、「_client_sockets に居る接続は
+        # 必ず client_threads にも居る」が保たれる。join はロックの外で
+        # 行う（ハンドラの後始末が同じロックを取るため）
         with self._client_lock:
             sockets = list(self._client_sockets)
+            clients = list(self.client_threads)
+            self.client_threads.clear()
         for sock in sockets:
             try:
                 sock.shutdown(socket.SHUT_RDWR)
@@ -383,11 +441,9 @@ class SFTPServerManager(QObject):
                 pass
 
         # クライアント接続の終了を待つ
-        for client in self.client_threads:
+        for client in clients:
             if client.is_alive():
                 client.join(timeout=1)
-
-        self.client_threads.clear()
         # 待受スレッド自身も待つ。待たずに戻ると、直後にこのマネージャ
         # （QObject）が破棄されたとき、まだ走っているスレッドからの emit が
         # 解放済みオブジェクトへ届く（FTP と同じ構造）
@@ -416,25 +472,34 @@ class SFTPServerManager(QObject):
                 try:
                     # クライアント接続を待つ
                     client_socket, client_addr = self.server_socket.accept()
+                    # 停止判定・ソケット登録・ハンドラの起動とスレッド一覧への
+                    # 追加を、すべて同じロックの下で済ませる。どこかで一度でも
+                    # ロックを離すと、その隙間に stop() が入った接続は誰にも
+                    # 閉じられず join もされず、ハンドラが停止後に起きて
+                    # 破棄済みかもしれないマネージャへ emit する
                     with self._client_lock:
+                        if self._stop_event.is_set():
+                            try:
+                                client_socket.close()
+                            except OSError:
+                                pass
+                            break
                         self._client_sockets.add(client_socket)
+                        client_thread = threading.Thread(
+                            target=self._handle_client,
+                            args=(client_socket, client_addr),
+                            daemon=True
+                        )
+                        client_thread.start()
+                        # 終わったスレッドを外してから足す（Syslog と同じ）。
+                        # 外さないとサーバを止めるまで単調に増える。stop() が
+                        # 同じリストを走査するので、差し替えずその場で入れ替える
+                        self.client_threads[:] = [t for t in self.client_threads
+                                                  if t.is_alive()]
+                        self.client_threads.append(client_thread)
 
                     print(f"[SFTP Server] Client connected from {client_addr[0]}:{client_addr[1]}")
                     self.client_connected.emit(client_addr[0])
-                    
-                    # クライアントハンドラスレッドを起動
-                    client_thread = threading.Thread(
-                        target=self._handle_client,
-                        args=(client_socket, client_addr),
-                        daemon=True
-                    )
-                    client_thread.start()
-                    # 終わったスレッドを外してから足す（Syslog と同じ）。
-                    # 外さないとサーバを止めるまで単調に増える。stop() が
-                    # 同じリストを走査するので、差し替えずその場で入れ替える
-                    self.client_threads[:] = [t for t in self.client_threads
-                                              if t.is_alive()]
-                    self.client_threads.append(client_thread)
                     
                 except socket.timeout:
                     # タイムアウトは正常（停止チェックのため）

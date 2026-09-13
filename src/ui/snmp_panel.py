@@ -42,8 +42,8 @@ def describe_trap_security(trap_data: dict) -> str:
 class SNMPResultTableModel(QAbstractTableModel):
     """SNMP GET/WALK結果テーブルモデル"""
     
-    def __init__(self):
-        super().__init__()
+    def __init__(self, parent=None):
+        super().__init__(parent)
         self.results = []
         self.headers = ["OID", "Type", "Value"]
     
@@ -144,8 +144,9 @@ class SNMPPanel(QWidget):
         self.mib_loaded = False  # MIB読み込み済みフラグ
         self.mib_loading = False  # MIB読み込み中フラグ
         
-        self.result_model = SNMPResultTableModel()
-        self.trap_tree_model = QStandardItemModel()
+        # 親を持たせる（setModel は所有権を取らない。sftp_panel の注記を参照）
+        self.result_model = SNMPResultTableModel(self)
+        self.trap_tree_model = QStandardItemModel(self)
         self.trap_data_list = []  # 完全なTrapデータ（エクスポート用）
         self.max_traps = self._configured_max_traps()
         # WALK が途中で途切れたときの理由。結果より先に届き、結果を
@@ -154,6 +155,10 @@ class SNMPPanel(QWidget):
         # 直近の結果が途中までだった理由。書き出しに添えるため、次の完走か
         # クリアまで持ち続ける
         self._last_partial_reason = None
+        # 要求を出した時点のホストと、いま表の結果を取得したホスト。書き出しは
+        # 後者を使う。保存時の入力欄を使うと、A の結果が B の記録になる
+        self._request_host = ""
+        self._result_host = ""
         
         self._init_ui()
         
@@ -607,7 +612,10 @@ class SNMPPanel(QWidget):
             return
 
         params = self._collect_request_params()
-        self.snmp_manager.snmp_get(host, oids, **params)
+        # 受理された要求のホストだけを記録する。実行中で断られた要求の
+        # ホストまで記録すると、いま走っている要求の結果に別のホストが付く
+        if self.snmp_manager.snmp_get(host, oids, **params):
+            self._request_host = host
         self.status_label.setText("GET実行中...")
     
     def _on_walk_clicked(self):
@@ -625,12 +633,21 @@ class SNMPPanel(QWidget):
             return
 
         params = self._collect_request_params()
-        self.snmp_manager.snmp_walk(host, oid, **params)
+        # 受理された要求のホストだけを記録する（GET と同じ理由）
+        if self.snmp_manager.snmp_walk(host, oid, **params):
+            self._request_host = host
         self.status_label.setText("WALK実行中...")
     
     def _on_export_clicked(self):
         """GET/WALK 結果をエクスポート（Trap と同じく txt/csv/json）"""
+        # 行・ホスト・途中までの理由は、ダイアログを開く前にまとめて固定し、
+        # 書き出しへ引数で渡す。モーダルダイアログはネストしたイベント
+        # ループで queued シグナルを処理するので、開いている間に次の WALK が
+        # 完走すると self は次の結果に変わる。行だけ先に取ってホストと理由を
+        # 後から self で読むと、前の途中までの行に「完走」と次のホストが付く
         results = self.result_model.get_all_results()
+        host = self._result_host
+        reason = self._last_partial_reason
         if not results:
             QMessageBox.information(self, "情報", "エクスポートするデータがありません。")
             return
@@ -645,11 +662,11 @@ class SNMPPanel(QWidget):
             return
         try:
             if file_path.endswith(".csv"):
-                self._export_results_to_csv(file_path, results)
+                self._export_results_to_csv(file_path, results, host, reason)
             elif file_path.endswith(".json"):
-                self._export_results_to_json(file_path, results)
+                self._export_results_to_json(file_path, results, host, reason)
             else:
-                self._export_results_to_txt(file_path, results)
+                self._export_results_to_txt(file_path, results, host, reason)
             QMessageBox.information(self, "成功", "SNMP結果をエクスポートしました:\n" + file_path)
         except Exception as e:
             QMessageBox.critical(self, "エラー", "エクスポート中にエラーが発生しました:\n" + str(e))
@@ -674,6 +691,17 @@ class SNMPPanel(QWidget):
         新しいものを先頭へ挿しているので、余るのは末尾。表示行と保存
         データを同じ数だけ削り、エクスポートの中身と画面が食い違わない
         ようにする。
+
+        制限: 上限が効くのは、GUI が Trap を1件受け取って表示へ入れた
+        後だけ。受信スレッドは1件ごとに完成した dict を queued シグナル
+        で送るので、GUI が止まっている間そのキューは上限と無関係に
+        伸びる（実測: 1件あたり約 2.3 KB、5万件で RSS +116 MB。GUI が
+        処理し終えると解放される）。定常状態では問題にならない。受信側の
+        復号が約 1,670 件/秒、GUI 側の処理が約 2,550 件/秒で、GUI の方が
+        速いため未処理は常に3件以下だった（毎秒 3,000 件を外から送った
+        実測でも同じ）。効くのは終了時の wait などで GUI が数十秒
+        止まっている間だけなので、まとめ配送（deque + QTimer）は
+        入れていない。
         """
         while len(self.trap_data_list) > self.max_traps:
             self.trap_data_list.pop()
@@ -714,11 +742,17 @@ class SNMPPanel(QWidget):
             return text
         return "'" + text
 
-    def _export_results_to_csv(self, file_path: str, results):
-        """CSV形式で GET/WALK 結果を書き出す"""
+    def _export_results_to_csv(self, file_path: str, results, host: str,
+                               reason):
+        """CSV形式で GET/WALK 結果を書き出す
+
+        host / reason は呼び出し側が結果と同時に固定した値。ここで self を
+        読むと、ダイアログを開いている間に届いた次の結果のものになる
+        """
         import csv
-        reason = getattr(self, "_last_partial_reason", None)
-        with open(file_path, "w", newline="", encoding="utf-8") as f:
+        # BOM 付き（utf-8-sig）。日本語版 Excel は BOM の無い UTF-8 の CSV を
+        # cp932 として開くため、見出しも機器から来た日本語も文字化けする
+        with open(file_path, "w", newline="", encoding="utf-8-sig") as f:
             if reason:
                 # 途中までの結果であることを、見出しの前に残す
                 f.write("# 途中まで: %s のため中断。全部ではありません\n" % reason)
@@ -727,13 +761,13 @@ class SNMPPanel(QWidget):
             for row in results:
                 writer.writerow([self._csv_safe(cell) for cell in row])
 
-    def _export_results_to_json(self, file_path: str, results):
-        """JSON形式で GET/WALK 結果を書き出す"""
+    def _export_results_to_json(self, file_path: str, results, host: str,
+                                reason):
+        """JSON形式で GET/WALK 結果を書き出す（host / reason は CSV と同じ）"""
         import json
-        reason = getattr(self, "_last_partial_reason", None)
         data = {
             "exported_at": datetime.now().isoformat(),
-            "host": self.host_edit.text(),
+            "host": host,
             "count": len(results),
             # 途中までの結果かどうか。機械で読む側が見落とさないよう明示する
             "complete": reason is None,
@@ -745,14 +779,14 @@ class SNMPPanel(QWidget):
         with open(file_path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
 
-    def _export_results_to_txt(self, file_path: str, results):
-        """テキスト形式で GET/WALK 結果を書き出す"""
+    def _export_results_to_txt(self, file_path: str, results, host: str,
+                               reason):
+        """テキスト形式で GET/WALK 結果を書き出す（host / reason は CSV と同じ）"""
         with open(file_path, "w", encoding="utf-8") as f:
             f.write("SNMP GET/WALK 結果\n")
             f.write("エクスポート日時: " + datetime.now().strftime("%Y-%m-%d %H:%M:%S") + "\n")
-            f.write("対象ホスト: " + self.host_edit.text() + "\n")
+            f.write("対象ホスト: " + host + "\n")
             f.write("件数: " + str(len(results)) + "\n")
-            reason = getattr(self, "_last_partial_reason", None)
             if reason:
                 f.write("注意: 途中まで（%s のため中断。全部ではありません）\n" % reason)
             f.write("=" * 60 + "\n")
@@ -814,16 +848,71 @@ class SNMPPanel(QWidget):
         self.mib_thread.finished_signal.connect(self._on_background_mib_load_finished)
         self.mib_thread.start()
     
-    # MIB 読み込みスレッドの終了を待つ上限（ミリ秒）。通常は数 ms で終わる
+    # MIB 読み込みスレッドの終了を待つ上限（ミリ秒）。mibs/ が空なら
+    # 数 ms で終わるが、ベンダー MIB を入れた初回は秒単位かかる
     MIB_LOADER_WAIT_MS = 5000
 
     def wait_for_background_work(self):
         """バックグラウンドの MIB 読み込みが終わるのを待つ。
 
-        ウィンドウを閉じるときに呼ぶ。待たずにパネルが破棄されると、
-        実行中の QThread の破棄で Qt が abort するか、終わったスレッドの
-        finished_signal が解放済みのパネルへ届いて落ちる。起動直後に
-        閉じたときに踏む。
+        ウィンドウを閉じるときに呼ぶ。起動直後に閉じると読み込みが
+        まだ走っていることがあり、待たないとプロセスの終了が先に来て
+        読み込みが途中で切られる（実測: 待ちを外すと app.exec() が戻って
+        から 1.01 秒でプロセスが終わり、6 秒かかる読み込みの後半は
+        走らなかった）。読み込みの最後は mib_resolver が mib_cache.json を
+        open('w') で書き直す処理で、一時ファイル経由ではないので、そこで
+        切られれば書きかけのキャッシュが残る。読む側は except で握って
+        作り直すため落ちはせず、次の起動で MIB を解析し直すだけになる。
+        待ちが実際に買っているのはここまで。
+
+        取り消し: ここには以前「待たずにパネルが破棄されると、実行中の
+        QThread の破棄で Qt が abort するか、終わったスレッドの
+        finished_signal が解放済みのパネルへ届いて落ちる」と書いてあったが、
+        再現しないので落とした。実測（いずれも offscreen）:
+          - 待ちを空実装にして MainWindow を閉じ、del して gc しても、
+            実行中の QThread は破棄されない。3 周とも終了コード 0・
+            stderr 空（PyQt6 が実行中の QThread への参照を保つ）。
+          - main() と同じく app.exec() を回し、6 秒かかる読み込みを残した
+            まま終了しても、待つ／待たないの両方で 3 回とも終了コード 0、
+            "QThread: Destroyed while thread is still running" も無し。
+          - 受け手の C++ 側を消してから finished_signal を出しても、PyQt が
+            接続を外すのでスロットは呼ばれない。加えて
+            _on_background_mib_load_finished はフラグ 2 つと print だけで、
+            ウィジェットには触れない。
+        テストスイートを落としていた間欠 segfault の本当の原因は、
+        SNMPManager が connect(signal.emit) でシグナルを中継していたこと
+        だった（47ecbde）。
+
+        制限: 待ちは MIB_LOADER_WAIT_MS が上限で、戻り値は見ていない。
+        上限を過ぎたら待つのをやめ、読み込み中のまま閉じる処理を続ける。
+        無期限に待つと、応答しない MIB を掘っているあいだアプリを
+        閉じられなくなるため。
+
+        実測: mibs/ に MIB を置いていなければ読み込みは数ミリ秒で終わる
+        （get_resolver の cold が 0.012 s）。ただし解析時間は mibs/ の
+        総量にほぼ比例し、ベンダー MIB 一式を入れた初回（キャッシュ無効時）
+        は 22MB・80 ファイルで約 5〜6 秒、44MB・150 ファイルで約 9〜12 秒
+        （合成 MIB での計測）。つまりこの上限は現実に超える。超えるのは
+        初回と、MIB を足したとき・MIB_PARSER_VERSION を上げたときだけで、
+        以後は mib_cache.json が効いて数ミリ秒に戻る。
+
+        超えても落ちない。遅延を 5.22〜5.6 秒に伸ばした 13 回の実行は
+        いずれも終了コード 0・stderr 空で、8 秒かかるスレッドを残した
+        まま閉じても "QThread: Destroyed while thread is still running"
+        は出なかった（PyQt6 が実行中の QThread への参照を保持するため、
+        パネルが破棄されてもスレッド側は破棄されない）。解析の途中で
+        終了してもキャッシュは書かれないだけで、次回また作り直される。
+
+        利用者に見える影響は、閉じる操作が最大でこの上限ぶん固まること。
+        SNMPManager.cancel_operation も同じだけ待つので、応答しない機器への
+        GET/WALK（既定で約 6 秒かかり、5 秒の待ちを実際に超える。閉じた
+        ポートへの GET が実測 6.09 秒）と MIB 読み込みが重なると最大
+        10 秒になる。短くする手は 2 つある。GET/WALK 側のタイムアウトを
+        5 秒以内へ明示するか、上限値（ここと cancel_operation の 5000）を
+        下げるか。上限を超えても異常終了しないことは上のとおり測ってある
+        ので、後者も安全に取れる。5000 のままにしているのは、通常の
+        読み込みは数ミリ秒で終わって固まりが見えず、遅い機器のときだけ
+        効くこの値を、実機での計測なしに動かしたくないため。
         """
         thread = getattr(self, "mib_thread", None)
         if thread is not None and thread.isRunning():
@@ -890,10 +979,16 @@ class SNMPPanel(QWidget):
     
     def _on_trap_export_clicked(self):
         """Trapログをエクスポート"""
-        if not self.trap_data_list:
+        # 保存する一覧は、ダイアログを開く前に固定して書き出しへ渡す
+        # （GET/WALK 側と同じ理由）。モーダルダイアログはネストした
+        # イベントループで queued シグナルを処理するので、開いている間に
+        # 届いた Trap が「今見えているものを保存した」はずのファイルへ
+        # 入り、max_traps の切り詰めで押した時点の最古の Trap が消える
+        traps = list(self.trap_data_list)
+        if not traps:
             QMessageBox.information(self, "情報", "エクスポートするデータがありません。")
             return
-        
+
         # ファイル保存ダイアログ
         file_path, selected_filter = QFileDialog.getSaveFileName(
             self,
@@ -908,29 +1003,34 @@ class SNMPPanel(QWidget):
         try:
             # ファイル拡張子で形式を判定
             if file_path.endswith('.csv'):
-                self._export_to_csv(file_path)
+                self._export_to_csv(file_path, traps)
             elif file_path.endswith('.json'):
-                self._export_to_json(file_path)
+                self._export_to_json(file_path, traps)
             else:  # .txt or other
-                self._export_to_txt(file_path)
+                self._export_to_txt(file_path, traps)
             
             QMessageBox.information(self, "成功", f"Trapログをエクスポートしました:\n{file_path}")
         except Exception as e:
             QMessageBox.critical(self, "エラー", f"エクスポート中にエラーが発生しました:\n{str(e)}")
     
-    def _export_to_csv(self, file_path: str):
-        """CSV形式でエクスポート"""
+    def _export_to_csv(self, file_path: str, traps):
+        """CSV形式で Trap を書き出す
+
+        traps は呼び出し側がダイアログの前に固定した一覧。ここで self を
+        読むと、ダイアログを開いている間に届いた Trap が混ざる
+        """
         import csv
-        
-        with open(file_path, 'w', newline='', encoding='utf-8') as f:
+
+        # BOM 付き（utf-8-sig）。理由は _export_results_to_csv と同じ
+        with open(file_path, 'w', newline='', encoding='utf-8-sig') as f:
             writer = csv.writer(f)
             
             # ヘッダー
             writer.writerow(['時刻', '送信元IP', '送信元ポート', 'セキュリティ',
                              'Trap OID', 'VarBind OID', 'VarBind 値'])
             
-            # データ（新しい順＝trap_data_listの順）
-            for trap in self.trap_data_list:
+            # データ（新しい順＝受け取った一覧の順）
+            for trap in traps:
                 timestamp = trap['timestamp']
                 source_ip = trap['source_ip']
                 source_port = trap.get('source_port', '')
@@ -949,24 +1049,24 @@ class SNMPPanel(QWidget):
                     # VarBindsがない場合は1行だけ出力
                     writer.writerow([self._csv_safe(c) for c in head + ['', '']])
     
-    def _export_to_json(self, file_path: str):
-        """JSON形式でエクスポート"""
+    def _export_to_json(self, file_path: str, traps):
+        """JSON形式で Trap を書き出す（traps は CSV と同じ）"""
         with open(file_path, 'w', encoding='utf-8') as f:
-            json.dump(self.trap_data_list, f, indent=2, ensure_ascii=False)
-    
-    def _export_to_txt(self, file_path: str):
-        """テキスト形式でエクスポート（人間が読みやすい形式）"""
+            json.dump(traps, f, indent=2, ensure_ascii=False)
+
+    def _export_to_txt(self, file_path: str, traps):
+        """テキスト形式で Trap を書き出す（traps は CSV と同じ）"""
         resolver = get_resolver()
         
         with open(file_path, 'w', encoding='utf-8') as f:
             f.write("=" * 80 + "\n")
             f.write("SNMP Trap Log\n")
             f.write(f"エクスポート日時: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"総Trap数: {len(self.trap_data_list)}\n")
+            f.write(f"総Trap数: {len(traps)}\n")
             f.write("=" * 80 + "\n\n")
-            
-            # データ（新しい順＝trap_data_listの順）
-            for i, trap in enumerate(self.trap_data_list, 1):
+
+            # データ（新しい順＝受け取った一覧の順）
+            for i, trap in enumerate(traps, 1):
                 timestamp = trap['timestamp']
                 source_ip = trap['source_ip']
                 source_port = trap.get('source_port', '')
@@ -1021,9 +1121,10 @@ class SNMPPanel(QWidget):
         if self.snmp_manager is None:
             self.trap_status_label.setText("SNMP マネージャがまだ用意されていません")
             return
-        ok, _msg = self.snmp_manager.fix_firewall(self.trap_port_spinbox.value())
+        ok, msg = self.snmp_manager.fix_firewall(self.trap_port_spinbox.value())
+        # 「反映待ち」等の理由を潰さず、そのまま見せる
         self.trap_status_label.setText(
-            "ファイアウォール許可: %s" % ("完了" if ok else "未反映/失敗"))
+            "ファイアウォール許可: %s (%s)" % ("完了" if ok else "未反映/失敗", msg))
 
     def _on_operation_partial(self, reason: str):
         """WALK が途中で途切れたことを受け取る（結果はこのあと届く）。
@@ -1036,6 +1137,8 @@ class SNMPPanel(QWidget):
     def _on_operation_completed(self, success: bool, result):
         if success:
             self.result_model.set_results(result)
+            # 表の結果がどのホストのものかを、要求時の値で固定する
+            self._result_host = self._request_host
             # 直前に「途中で切れた」と知らされていれば、そう書く。
             # 一度使ったら忘れる（次の完走に持ち越さない）
             reason = getattr(self, "_partial_reason", None)

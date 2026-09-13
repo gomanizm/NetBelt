@@ -44,17 +44,51 @@ rem by byte offset, so a script replaced while it runs carries on at a
 rem meaningless position in the new file: fragments of lines get executed
 rem and the whole sequence can run again. From TEMP the install folder is
 rem only ever written to, never read from.
-set "TMPRUNNER=%TEMP%\NetBeltUpdater_%RANDOM%.bat"
+rem One folder per run, claimed with md. cmd seeds %RANDOM% from the
+rem clock, so two updaters started in the same moment draw the same
+rem numbers: they would share both the copy below and the folder the
+rem ZIP is unpacked into, and whichever finished first would delete
+rem the other one's files out from under it. md fails when the name
+rem is already taken, which is what makes the claim exclusive; a
+rem leftover from an earlier run only costs one more try.
+set "TRY=0"
+:claim
+set /a TRY+=1
+set "WORK_DIR=%TEMP%\NetBeltUpdate_!TRY!_!RANDOM!"
+md "!WORK_DIR!" 2>nul
+if not errorlevel 1 goto :claimed
+if !TRY! lss 20 goto :claim
+goto :nowork
+
+:claimed
+set "TMPRUNNER=!WORK_DIR!\updater.bat"
 copy /y "!SELF!" "!TMPRUNNER!" >nul 2>&1
 rem No falling back to running in place. The update overwrites every file
 rem in the install folder, this script included, so running from there is
 rem the very fault the copy exists to avoid. Stop instead.
 if not exist "!TMPRUNNER!" goto :nocopy
-rem Deliberately one line: nothing may be read from this file after the
-rem child has replaced it.
-cmd /d /c ""!TMPRUNNER!" "!A1!" "!A2!" --utf8 "!HOME_DIR!"" & set "RC=!errorlevel!" & del "!TMPRUNNER!" >nul 2>&1 & exit /b !RC!
+rem Deliberately one line. The child unpacks the new release over the
+rem install folder, this file included, so by the time it returns this
+rem script has been replaced on disk. cmd reads a batch line by line
+rem from the file, so anything written below would be read out of the
+rem new contents instead. Measured three times: with the launch, the
+rem exit code, the cleanup and the exit joined by &, the tail runs and
+rem the exit code survives; split across lines, nothing after the child
+rem runs at all, which would leak the work folder in TEMP.
+rem (An earlier comment here claimed the opposite. It was wrong: the
+rem experiment behind it never replaced the parent file.)
+cmd /d /c ""!TMPRUNNER!" "!A1!" "!A2!" --utf8 "!HOME_DIR!" "!WORK_DIR!"" & set "RC=!errorlevel!" & rd /s /q "!WORK_DIR!" >nul 2>&1 & exit /b !RC!
+
+:nowork
+echo ERROR: could not create a work folder in TEMP.
+echo   Twenty names were tried, so TEMP is most likely full, read-only
+echo   or missing. The update has not been applied. Fix TEMP, or
+echo   extract the new ZIP over this folder by hand.
+pause
+exit /b 1
 
 :nocopy
+rd /s /q "!WORK_DIR!" 2>nul
 echo ERROR: could not copy the updater to TEMP.
 echo   The update has not been applied. Free some space in TEMP, or
 echo   extract the new ZIP over this folder by hand.
@@ -78,6 +112,8 @@ REM 引数:
 REM   %1 = ダウンロードしたZIPファイルのパス
 REM   %2 = アプリケーション実行ファイルのパス
 REM   %3 = --utf8（コードページ設定後の再入を示す内部用）
+REM   %4 = インストール先（内部用。TEMP の写しでは %~dp0 が使えない）
+REM   %5 = 親が確保した作業フォルダ（内部用。展開先の親になる）
 REM ================================================================
 
 echo ================================================
@@ -104,7 +140,15 @@ REM インストール先。TEMP の写しから走るので %~dp0 は当てに�
 REM 呼び出し元が第4引数で渡してくる（手で直接実行されたときだけ %~dp0）。
 set "APP_DIR=%~dp0"
 if not "%~4"=="" set "APP_DIR=%~4\"
+REM 展開先。親が確保した専用フォルダの中に置く。%RANDOM% で名前を
+REM 作ると、同じ瞬間に始まった別の更新と同じ名前になる（cmd は
+REM %RANDOM% をプロセス開始時の時計で種付けするため）。
+REM ここへ来るのは第3引数が --utf8 のときだけで、それを渡すのは
+REM 上の再入だけ。つまり第5引数は必ず付く。下の既定値は、切り分けの
+REM ために --utf8 を手で渡して直接叩いたときにしか使われない。
+REM その道では名前の重複を防げないので、常用しないこと。
 set "TEMP_DIR=%TEMP%\NetBeltUpdate_%RANDOM%"
+if not "%~5"=="" set "TEMP_DIR=%~5\zip"
 
 echo [1/6] 更新情報
 echo   ZIPファイル: !ZIP_FILE!
@@ -156,13 +200,14 @@ echo   展開完了
 echo.
 
 REM 古いバックアップを削除（7日以上前のもの）
+REM 消すのは、このスクリプトが付けた名前（backup_netbelt_*）だけ。利用者が
+REM 隣に置いた backup_* は機器コンフィグの退避先かもしれず、取り返しが
+REM つかない。判定はディレクトリ自身の日付で行う。以前は forfiles /d を
+REM 中身に対して使っていたため「7日以上前のファイルが1つでもある」で成立し、
+REM 当日のファイルを含むディレクトリごと消していた。
 echo [5/6] ファイルを更新中...
-for /d %%d in ("!APP_DIR!backup_*") do (
-    forfiles /p "%%d" /d -7 >nul 2>&1
-    if not errorlevel 1 (
-        rd /s /q "%%d" 2>nul
-    )
-)
+set "BK_PARENT=!APP_DIR:~0,-1!"
+forfiles /p "!BK_PARENT!" /m "backup_netbelt_*" /d -7 /c "cmd /c if @isdir==TRUE rd /s /q @path" >nul 2>&1
 
 REM 展開されたファイルを確認（ルートに直接あるか、サブフォルダか）
 if exist "!TEMP_DIR!\NetBelt.exe" (
@@ -182,18 +227,56 @@ if exist "!TEMP_DIR!\NetBelt.exe" (
 echo   コピー元: !SOURCE_DIR!
 echo   コピー先: !APP_DIR!
 
+REM 実行ファイルは直接上書きしない。コピーは宛先を先に切り詰めてから
+REM 順に書くので、途中で止まる（コンソールを閉じる・電源断）と旧 exe は
+REM 既に無く、末尾がゼロ埋めの exe だけが残る。一時名で置いてから改名で
+REM 差し替える。同一ボリューム内の改名は途中で止まらない。
+REM 一時名で置くのは exe だけ。同梱の他のファイルは従来どおり xcopy で
+REM 直接上書きするので、下の差し替えが失敗すると旧 exe と新しい同梱
+REM ファイルが混在する。全部を揃えてから入れ替えるには展開先ごと
+REM 差し替える必要があるため、ここでは失敗時にその旨を伝えるに留める。
+if exist "!SOURCE_DIR!\NetBelt.exe" ren "!SOURCE_DIR!\NetBelt.exe" "NetBelt.exe.new"
+
 REM ファイルをコピー（上書き）
 xcopy "!SOURCE_DIR!\*" "!APP_DIR!" /E /I /Y /Q >nul 2>&1
 if errorlevel 1 (
     echo エラー: ファイルのコピーに失敗しました
     echo   アプリがまだ起動したままだと、上書きできません
+    echo   NetBelt.exe は旧版のままですが、同梱の他のファイルは
+    echo   一部またはすべてが新しい版に置き換わっている場合があります。
+    del "!APP_DIR!NetBelt.exe.new" 2>nul
     rd /s /q "!TEMP_DIR!" 2>nul
     pause
     exit /b 1
 )
 
-REM コピーできたことを確認する。xcopy の戻り値だけでは、
-REM 肝心の実行ファイルが置かれたかどうかは分からない。
+REM 更新に実行ファイルが入っていたかを確かめる。xcopy の戻り値
+REM だけでは分からない。見るのはコピー先ではなくコピー元。上の改名を
+REM 実行できたときだけ NetBelt.exe.new ができるから。コピー先を
+REM 見ると、前回の更新が改名の直前で止まって残した
+REM NetBelt.exe.new が条件を満たし、exe を含まない zip でも
+REM 動いている exe をその残骸で上書きしてしまう。
+if not exist "!SOURCE_DIR!\NetBelt.exe.new" (
+    echo エラー: 更新ファイルに NetBelt.exe が含まれていません
+    echo   場所: !SOURCE_DIR!
+    echo   NetBelt.exe は旧版のままですが、同梱の他のファイルは
+    echo   既に新しい版へ置き換わっています。
+    rd /s /q "!TEMP_DIR!" 2>nul
+    pause
+    exit /b 1
+)
+move /y "!APP_DIR!NetBelt.exe.new" "!APP_DIR!NetBelt.exe" >nul 2>&1
+if errorlevel 1 (
+    echo エラー: NetBelt.exe を差し替えられませんでした
+    echo   アプリがまだ起動したままだと、差し替えられません
+    echo   NetBelt.exe は旧版のままですが、同梱の他のファイルは
+    echo   既に新しい版へ置き換わっています。アプリを終了してから
+    echo   もう一度更新してください。
+    del "!APP_DIR!NetBelt.exe.new" 2>nul
+    rd /s /q "!TEMP_DIR!" 2>nul
+    pause
+    exit /b 1
+)
 if not exist "!APP_DIR!NetBelt.exe" (
     echo エラー: 更新後の NetBelt.exe が見つかりません
     echo   場所: !APP_DIR!
