@@ -583,9 +583,28 @@ class SyslogPanel(QWidget):
             self._update_status()
     
     @staticmethod
-    def _export_line(msg: SyslogMessage) -> str:
+    def _escape_for_export(text: str) -> str:
+        """保存・コピー時に1件が1行へ収まるよう、改行・復帰・タブを表記へ置き換える
+
+        本文やホスト名の改行をそのまま書くと、続きの行が別機器の独立した記録に
+        見える。認証なしで届く 1 件の Syslog に「別日時 別IP 別ホスト
+        [Emergency] 偽の記録」を仕込めば、保存した証跡へ任意の記録を混ぜられる
+        （画面のテーブルでは 1 行のままなので突き合わせても気づけない）。
+        バックスラッシュ自身も置き換えないと、元から \\n と書かれていた本文と
+        改行由来の表記を区別できない。
+        """
+        return (str(text)
+                .replace("\\", "\\\\")
+                .replace("\r", "\\r")
+                .replace("\n", "\\n")
+                .replace("\t", "\\t"))
+
+    @classmethod
+    def _export_line(cls, msg: SyslogMessage) -> str:
         """保存用の1行を作る（画面と同じく送信元を含め、機器を区別できるようにする）"""
-        return f"{msg.timestamp} {msg.source_ip} {msg.hostname} [{msg.level}] {msg.message}"
+        hostname = cls._escape_for_export(msg.hostname)
+        message = cls._escape_for_export(msg.message)
+        return f"{msg.timestamp} {msg.source_ip} {hostname} [{msg.level}] {message}"
 
     def _export_messages(self):
         """メッセージをエクスポート"""
