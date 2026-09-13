@@ -10,6 +10,43 @@ from PyQt6.QtCore import Qt, QAbstractTableModel, QModelIndex, QSortFilterProxyM
 from PyQt6.QtGui import QColor, QBrush, QAction, QStandardItemModel, QStandardItem
 from datetime import datetime
 import json
+import os
+import tempfile
+
+
+def _write_text_file_atomically(filename, write_body):
+    """保存先を壊さずにテキストを書き出す
+
+    保存先を直接 open('w') すると、その時点で旧内容は失われ、書き込み中の
+    失敗（満杯・共有切断・USB 取り外し）では新旧どちらでもない部分ファイルが
+    残る。利用者が既存ファイルを保存先に選んで上書きを承諾した場合、
+    旧内容が黙って消えることになる。
+    同じディレクトリの一時ファイルへ書き切ってから os.replace で差し替え、
+    書き切れなかったときは一時ファイルを消して保存先には触れない。
+    （全ログ保存 ui/dialogs/log_save_dialog.py と同じ作法）
+
+    Args:
+        filename: 保存先のパス
+        write_body: 開いたファイルオブジェクトを受け取って中身を書く関数
+    """
+    tmp_path = None
+    try:
+        target = os.path.abspath(filename)
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=os.path.basename(target) + ".", suffix=".tmp",
+            dir=os.path.dirname(target))
+        with open(fd, 'w', encoding='utf-8') as f:
+            write_body(f)
+
+        # 閉じてから差し替える（Windows では開いたままだと置き換えられない）
+        os.replace(tmp_path, target)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass   # 消せなくても保存先は無傷。残骸は .tmp なので見分けがつく
 
 
 class CheckableComboBox(QComboBox):
@@ -574,14 +611,17 @@ class SyslogPanel(QWidget):
                         }
                         for msg in messages
                     ]
-                    with open(filename, 'w', encoding='utf-8') as f:
-                        json.dump(data, f, ensure_ascii=False, indent=2)
+                    _write_text_file_atomically(
+                        filename,
+                        lambda f: json.dump(data, f, ensure_ascii=False, indent=2))
                 else:
                     # テキスト形式でエクスポート
-                    with open(filename, 'w', encoding='utf-8') as f:
+                    def write_lines(f):
                         for msg in messages:
                             f.write(self._export_line(msg) + "\n")
-                
+
+                    _write_text_file_atomically(filename, write_lines)
+
                 QMessageBox.information(self, "成功", f"メッセージを {filename} にエクスポートしました。")
             except Exception as e:
                 QMessageBox.critical(self, "エラー", f"エクスポートに失敗しました: {e}")
@@ -666,9 +706,11 @@ class SyslogPanel(QWidget):
 
         if filename:
             try:
-                with open(filename, 'w', encoding='utf-8') as f:
+                def write_lines(f):
                     for msg in messages:
                         f.write(self._export_line(msg) + "\n")
+
+                _write_text_file_atomically(filename, write_lines)
 
                 QMessageBox.information(self, "成功", f"選択行を {filename} に保存しました。")
             except Exception as e:
