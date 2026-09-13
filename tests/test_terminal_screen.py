@@ -768,5 +768,48 @@ class CiscoOnTheScreenModelTest(unittest.TestCase):
                 self.fail("%d バイト目で切ると画面が変わる" % cut)
 
 
+class RecordGapTest(unittest.TestCase):
+    """画面から消えた行が記録に残らない経路の検証。"""
+
+    def test_erase_above_on_a_wide_character_keeps_the_record(self):
+        # カーソルが全角の前半桁にあると、ED 1 はその全角の継続セル
+        # まで払うので画面は丸ごと空白になる。消える中身は ED 2 と
+        # 同じなので、履歴にも同じだけ残る
+        s = feed(Screen(rows=3, cols=10), "あい")
+        feed(s, "\x1b[1;3H\x1b[1J")
+        self.assertEqual(s.text(), ["", "", ""])
+        self.assertIn("あい", everything(s))
+
+    def test_deleting_the_top_line_of_the_screen_keeps_the_record(self):
+        # 画面先頭の DL は上へ押し出す動きで、SU (CSI S) と同じ。
+        # 消えた行は履歴へ送る
+        s = feed(Screen(rows=3, cols=10), "one\r\ntwo\r\nthree")
+        feed(s, "\x1b[1;1H\x1b[M")
+        self.assertEqual(s.text(), ["two", "three", ""])
+        self.assertIn("one", everything(s))
+
+    def test_deleting_a_line_below_the_top_is_not_recorded(self):
+        # カーソルより上の行は画面に残る。ここで記録すると同じ行が
+        # 画面と履歴の両方に二重に出る
+        s = feed(Screen(rows=3, cols=10), "one\r\ntwo\r\nthree")
+        feed(s, "\x1b[2;1H\x1b[M")
+        self.assertEqual(s.text(), ["one", "three", ""])
+        self.assertEqual(len(s.history), 0)
+
+    def test_deleting_the_top_line_of_a_scroll_region_is_not_recorded(self):
+        # スクロール範囲の上端が画面の先頭でないときは、押し出された
+        # 行は画面上に残っている (_scroll_up と同じ条件)
+        s = feed(Screen(rows=4, cols=10), "one\r\ntwo\r\nthree\r\nfour")
+        feed(s, "\x1b[2;4r\x1b[2;1H\x1b[M")
+        self.assertEqual(s.text(), ["one", "three", "four", ""])
+        self.assertEqual(len(s.history), 0)
+
+    def test_deleting_the_top_line_of_the_alt_screen_is_not_recorded(self):
+        # 代替画面の中身は記録しない方針 (vi 等はアプリが描き直す)
+        s = feed(Screen(rows=3, cols=10), "\x1b[?1049halt\r\nnext")
+        feed(s, "\x1b[1;1H\x1b[M")
+        self.assertEqual(len(s.history), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
