@@ -1020,6 +1020,8 @@ class TerminalWidget(QWidget):
         """
         from PyQt6.QtWidgets import QMessageBox
 
+        from core import log_recording
+        log_recording.stop(device_name)
         handle = self._log_files.pop(device_name, None)
         if handle is not None:
             try:
@@ -1139,26 +1141,11 @@ class TerminalWidget(QWidget):
         で記録済みの内容が消え、以降は両者の書き込みが混在する。保存先を
         決めた直後にここで見て拒否する。
 
-        まず実体で比べる。8.3 短縮名・ハードリンク・ジャンクション・UNC と
-        割り当てドライブなど、同じファイルを指す別表記は文字列比較では
-        一致せず、そのまま素通りしていた。実体を掴めないとき（まだ無い
-        ファイル・アクセスできない）は絶対化した文字列で比べる
+        判定そのものは core.log_recording に置いてある。端末以外の画面
+        （SNMP のエクスポートなど）も同じ判定を使う必要があるため。
         """
-        import os
-        wanted = os.path.normcase(os.path.abspath(file_path))
-        for device_name, handle in self._log_files.items():
-            name = getattr(handle, "name", None)
-            if not isinstance(name, str):
-                continue
-            try:
-                if os.path.samefile(name, file_path):
-                    return device_name
-                continue
-            except OSError:
-                pass
-            if os.path.normcase(os.path.abspath(name)) == wanted:
-                return device_name
-        return None
+        from core import log_recording
+        return log_recording.device_using(file_path)
 
     def _warn_log_file_in_use(self, title: str, file_path: str, device_name: str):
         """記録中のファイルが選ばれたことを知らせる"""
@@ -1311,6 +1298,8 @@ class TerminalWidget(QWidget):
                 # ファイルを開く
                 log_file = open(file_path, 'w', encoding='utf-8', buffering=1)  # 行バッファリング
                 self._log_files[tab_name] = log_file
+                from core import log_recording
+                log_recording.start(tab_name, file_path)
                 
                 # ターミナルの記録フラグを設定
                 if isinstance(current_widget, InteractiveTerminal):
@@ -1369,7 +1358,9 @@ class TerminalWidget(QWidget):
             try:
                 self._log_files[tab_name].close()
                 del self._log_files[tab_name]
-                
+                from core import log_recording
+                log_recording.stop(tab_name)
+
                 # ターミナルの記録フラグをクリア
                 if isinstance(current_widget, InteractiveTerminal):
                     current_widget._is_recording = False

@@ -638,6 +638,24 @@ class SNMPPanel(QWidget):
             self._request_host = host
         self.status_label.setText("WALK実行中...")
     
+    def _refuse_if_recording(self, title: str, file_path: str) -> bool:
+        """保存先が端末のログ記録に使われていたら断る（断ったら True）
+
+        書き出しは保存先を open('w') で開く。記録中のファイルを選ばれると
+        記録済みの内容が消え、端末は開いたままのハンドルで自分のオフセット
+        から書き続けるので、双方のファイルが壊れる。
+        """
+        from core import log_recording
+        device_name = log_recording.device_using(file_path)
+        if device_name is None:
+            return False
+        QMessageBox.warning(
+            self, title,
+            "このファイルは %s のログ記録に使用中です:\n%s\n"
+            "別のファイルを選ぶか、先にそのログ記録を停止してください。"
+            % (device_name, file_path))
+        return True
+
     def _on_export_clicked(self):
         """GET/WALK 結果をエクスポート（Trap と同じく txt/csv/json）"""
         # 行・ホスト・途中までの理由は、ダイアログを開く前にまとめて固定し、
@@ -659,6 +677,8 @@ class SNMPPanel(QWidget):
             "テキストファイル (*.txt);;CSVファイル (*.csv);;JSONファイル (*.json)"
         )
         if not file_path:
+            return
+        if self._refuse_if_recording("SNMP結果をエクスポート", file_path):
             return
         try:
             if file_path.endswith(".csv"):
@@ -999,7 +1019,10 @@ class SNMPPanel(QWidget):
         
         if not file_path:
             return
-        
+
+        if self._refuse_if_recording("Trapログをエクスポート", file_path):
+            return
+
         try:
             # ファイル拡張子で形式を判定
             if file_path.endswith('.csv'):
