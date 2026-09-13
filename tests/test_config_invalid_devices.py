@@ -105,7 +105,7 @@ class ConfigManagerQuarantinesInvalidDevicesTest(unittest.TestCase):
 
         groups = cm.get_groups()
         self.assertEqual([g["name"] for g in groups],
-                         ["Default", "(名前なし)", "(名前なし)", "(名前なし)"])
+                         ["Default", "(名前なし)", "(名前なし) 2", "(名前なし) 3"])
         self.assertEqual(groups[1]["devices"], [VALID], "中の機器まで消えている")
         self.assertIsNone(cm.load_error)
         self.assertTrue(cm.load_warning, "警告が記録されていない")

@@ -241,6 +241,21 @@ class ConfigManager:
     # 機器まで消えるので、名前だけ補って中身は残す
     UNNAMED_GROUP_NAME = "(名前なし)"
 
+    def _unused_group_name(self, used_names) -> str:
+        """まだ使われていない「(名前なし)」系の表示名を返す。
+
+        同名のグループを作ってはいけない。グループは名前で指すため、
+        get_group() は先頭の 1 件を返すのに remove_group() は同名を
+        すべて消す。同じ補完名が並ぶと、空のグループを消したつもりで
+        同名の別グループの機器まで消える。
+        """
+        name = self.UNNAMED_GROUP_NAME
+        number = 1
+        while name in used_names:
+            number += 1
+            name = f"{self.UNNAMED_GROUP_NAME} {number}"
+        return name
+
     def _quarantine_invalid_devices(self, config: Dict) -> None:
         """必須フィールドの無い機器とグループを整えて、警告を記録する。
 
@@ -265,6 +280,9 @@ class ConfigManager:
         dropped_groups = 0
         emptied_groups = 0
         kept_groups = []
+        # 手で付けられた名前とも衝突させない
+        used_names = {g["name"] for g in config.get("groups", [])
+                      if isinstance(g, dict) and isinstance(g.get("name"), str)}
         for group in config.get("groups", []):
             if not isinstance(group, dict):
                 # 名前も機器も取り出せないので、この項目は諦めるしかない
@@ -272,7 +290,8 @@ class ConfigManager:
                 continue
             name = group.get("name")
             if not isinstance(name, str) or not name:
-                group["name"] = self.UNNAMED_GROUP_NAME
+                group["name"] = self._unused_group_name(used_names)
+                used_names.add(group["name"])
                 renamed_groups += 1
             devices = group.get("devices")
             if isinstance(devices, list):
@@ -490,8 +509,14 @@ class ConfigManager:
         Returns:
             削除成功時True、失敗時False
         """
+        # 消すのは get_group() が返すのと同じ 1 件だけ。同名のグループが
+        # あるとき全部消すと、UI が「機器が含まれていません」と確認した
+        # グループを消したつもりで、同名の別グループの機器まで消える
         groups = self.config.get("groups", [])
-        self.config["groups"] = [g for g in groups if g["name"] != group_name]
+        for index, group in enumerate(groups):
+            if group.get("name") == group_name:
+                del groups[index]
+                break
         return self.save_config()
     
     def rename_group(self, old_name: str, new_name: str) -> bool:
