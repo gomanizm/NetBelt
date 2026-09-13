@@ -408,9 +408,12 @@ class InteractiveTerminal(QTextEdit):
             return
         
         if key == Qt.Key.Key_Return or key == Qt.Key.Key_Enter:
-            # 再接続モードの場合は再接続シグナルを発行
+            # 再接続モードの場合は再接続シグナルを発行。
+            # ここで待ちを解かない。解くのは接続に成功した時点
+            # （MainWindow._on_connection_success）。先に解くと、再接続に
+            # 失敗したときに待ちが戻らず、画面に残る「Enterキーを押すと
+            # 再接続します」の案内どおりに操作できなくなる
             if self._reconnect_mode:
-                self._reconnect_mode = False
                 self.reconnect_requested.emit()
                 return
             # 通常モードの場合はSSHに送信

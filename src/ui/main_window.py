@@ -1233,6 +1233,13 @@ class MainWindow(QMainWindow):
             # 閉じた client を抱えた SFTP マネージャを残さない
             self._drop_sftp_manager(device_name)
             self._dispose_connection(device_name)
+            # 切断時（_on_connection_closed）と同じく再接続待ちへ戻す。
+            # ここを抜かすと、Enter で始めた再接続が失敗したあと誰も待ちを
+            # 張り直さず、画面に残る案内どおりに Enter を押しても何も
+            # 起きない。機器の再起動中など、再接続の失敗は普通に起きる
+            self.terminal_widget.show_notice(
+                device_name, "\nEnterキーを押すと再接続します\n\n")
+            self.terminal_widget.enable_reconnect(device_name, self._reconnect_device)
     
     def _reconnect_device(self, device_name: str):
         """
