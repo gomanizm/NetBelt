@@ -67,11 +67,16 @@ rem No falling back to running in place. The update overwrites every file
 rem in the install folder, this script included, so running from there is
 rem the very fault the copy exists to avoid. Stop instead.
 if not exist "!TMPRUNNER!" goto :nocopy
-rem One line so the work folder goes away on every path out. Note that
-rem cmd reopens this file by path before each line no matter how the
-rem lines are joined, so putting it on one line is not what makes the
-rem removal safe; owning the folder is. Nothing is left in TEMP for the
-rem next run to collide with.
+rem Deliberately one line. The child unpacks the new release over the
+rem install folder, this file included, so by the time it returns this
+rem script has been replaced on disk. cmd reads a batch line by line
+rem from the file, so anything written below would be read out of the
+rem new contents instead. Measured three times: with the launch, the
+rem exit code, the cleanup and the exit joined by &, the tail runs and
+rem the exit code survives; split across lines, nothing after the child
+rem runs at all, which would leak the work folder in TEMP.
+rem (An earlier comment here claimed the opposite. It was wrong: the
+rem experiment behind it never replaced the parent file.)
 cmd /d /c ""!TMPRUNNER!" "!A1!" "!A2!" --utf8 "!HOME_DIR!" "!WORK_DIR!"" & set "RC=!errorlevel!" & rd /s /q "!WORK_DIR!" >nul 2>&1 & exit /b !RC!
 
 :nowork
