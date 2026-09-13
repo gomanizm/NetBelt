@@ -361,12 +361,18 @@ class PresetEditDialog(QDialog):
             return
         
         if self.is_new:
-            # 新規作成
-            if self.config_manager.add_global_macro(name, commands, description):
+            # 新規作成。add_global_macro は重複でも保存失敗でも False を返すので、
+            # 重複はここで先に確かめる（保存失敗を名前のせいだと伝えない）
+            if self.config_manager.get_macro_by_name(name):
+                QMessageBox.warning(self, "エラー", f"プリセット '{name}' は既に存在します。")
+            elif self.config_manager.add_global_macro(name, commands, description):
                 QMessageBox.information(self, "成功", f"プリセット '{name}' を作成しました。")
                 self.accept()
             else:
-                QMessageBox.warning(self, "エラー", f"プリセット '{name}' は既に存在します。")
+                QMessageBox.warning(
+                    self, "エラー",
+                    f"プリセット '{name}' を保存できませんでした。\n"
+                    "設定ファイル (config.json) に書き込めるか確認してください。")
         else:
             # 更新
             if self.config_manager.update_global_macro(name, commands, description):

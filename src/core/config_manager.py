@@ -787,8 +787,14 @@ class ConfigManager:
         if "global_macros" not in self.config:
             self.config["global_macros"] = []
         
-        self.config["global_macros"].append(new_macro)
-        return self.save_config()
+        macros = self.config["global_macros"]
+        macros.append(new_macro)
+        if self.save_config():
+            return True
+        # 保存できなかったのにメモリへ残すと、次の無関係な保存で
+        # 追加できなかったはずのコマンド列がディスクに確定する
+        macros.pop()
+        return False
     
     def get_macro_by_name(self, macro_name: str) -> Optional[Dict]:
         """
@@ -821,9 +827,15 @@ class ConfigManager:
         if not macro:
             return False
         
+        before = dict(macro)
         macro["commands"] = commands
         macro["description"] = description
-        return self.save_config()
+        if self.save_config():
+            return True
+        # 保存できなかった編集を残さない（add_device と同じ）
+        macro.clear()
+        macro.update(before)
+        return False
     
     def remove_global_macro(self, macro_name: str) -> bool:
         """
@@ -839,8 +851,14 @@ class ConfigManager:
             return False
         
         macros = self.config["global_macros"]
+        before = list(macros)
         self.config["global_macros"] = [m for m in macros if m.get("name") != macro_name]
-        return self.save_config()
+        if self.save_config():
+            return True
+        # 保存できなかったのにメモリから消すと、次の無関係な保存で
+        # 消せなかったはずのマクロがディスクから消える
+        self.config["global_macros"] = before
+        return False
     
     def get_settings(self) -> Dict:
         """アプリケーション設定を取得"""
