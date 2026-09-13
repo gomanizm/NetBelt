@@ -384,14 +384,23 @@ class VersionManager:
         中止の判定はチャンクの区切りでしか行えないので、相手が黙り込むと
         読み取りのタイムアウト（60秒）まで戻ってこない。その間スレッドが
         残り続けるため、ソケット側から打ち切る。別のスレッドから呼ばれる。
+
+        閉じる操作自体は別スレッドへ逃がす。requests の Response.close() は
+        下の読み取りが片付くまで戻らないため、呼び出し元（GUI スレッド）で
+        待つと、打ち切るはずの60秒ぶんそのまま固まってしまう。
         """
         response = self._response
         if response is None:
             return
-        try:
-            response.close()
-        except Exception as e:
-            print(f"[VersionManager] 受信の中断に失敗: {e}")
+
+        def _close():
+            try:
+                response.close()
+            except Exception as e:
+                print(f"[VersionManager] 受信の中断に失敗: {e}")
+
+        threading.Thread(target=_close, daemon=True,
+                         name="netbelt-update-abort").start()
 
     @staticmethod
     def _safe_name_part(text) -> str:
