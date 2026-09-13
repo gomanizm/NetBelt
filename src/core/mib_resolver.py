@@ -11,7 +11,7 @@ from typing import Dict, Optional
 # MIB 解析器の版。抽出・解決の規則を変えたら上げる。mib_cache.json は
 # この値も鍵にするので、古い解析器が作ったキャッシュがアプリの更新後に
 # そのまま使われることがなくなる。
-MIB_PARSER_VERSION = '2026-09-14.1'
+MIB_PARSER_VERSION = '2026-09-14.2'
 
 
 def app_dir() -> str:
@@ -359,6 +359,10 @@ class MIBResolver:
         r'([\w-]+)\s+NOTIFICATION-TYPE\b' + _MIB_DEFINITION_BODY
         + _MIB_ASSIGNMENT,
         r'([\w-]+)\s+MODULE-IDENTITY\b' + _MIB_DEFINITION_BODY
+        + _MIB_ASSIGNMENT,
+        # ベンダー MIB は中間ノードを OBJECT-IDENTITY で置くことが多い。
+        # 拾わないと、その節も配下も丸ごと解決できない。
+        r'([\w-]+)\s+OBJECT-IDENTITY\b' + _MIB_DEFINITION_BODY
         + _MIB_ASSIGNMENT,
     )
 
