@@ -199,15 +199,12 @@ if errorlevel 1 (
 echo   展開完了
 echo.
 
-REM 古いバックアップを削除（7日以上前のもの）
-REM 消すのは、このスクリプトが付けた名前（backup_netbelt_*）だけ。利用者が
-REM 隣に置いた backup_* は機器コンフィグの退避先かもしれず、取り返しが
-REM つかない。判定はディレクトリ自身の日付で行う。以前は forfiles /d を
-REM 中身に対して使っていたため「7日以上前のファイルが1つでもある」で成立し、
-REM 当日のファイルを含むディレクトリごと消していた。
+REM アプリの隣にあるフォルダは、名前にかかわらず削除しない。
+REM 以前はここで backup_netbelt_* を「スクリプト自身が付けた名前」として
+REM 7日で掃除していたが、この名前のフォルダを作る実装は NetBelt のどこにも
+REM 無い。実際にあるなら利用者が置いたものであり、機器コンフィグの退避先
+REM かもしれない。更新のついでに無断で消してよいものは一つも無い。
 echo [5/6] ファイルを更新中...
-set "BK_PARENT=!APP_DIR:~0,-1!"
-forfiles /p "!BK_PARENT!" /m "backup_netbelt_*" /d -7 /c "cmd /c if @isdir==TRUE rd /s /q @path" >nul 2>&1
 
 REM 展開されたファイルを確認（ルートに直接あるか、サブフォルダか）
 if exist "!TEMP_DIR!\NetBelt.exe" (

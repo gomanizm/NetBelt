@@ -103,19 +103,24 @@ class UpdaterBackupDirsTest(unittest.TestCase):
         self.assertTrue(os.path.isdir(keep),
                         "利用者の backup_only_old を消している:\n" + out)
 
-    def test_an_old_backup_the_script_made_is_removed(self):
-        """スクリプト自身の識別子が付いた古いものだけを片付けること。"""
-        gone = self._dir("backup_netbelt_20200101", {"NetBelt.exe": EIGHT_DAYS},
-                         age=EIGHT_DAYS)
+    def test_a_backup_named_like_the_script_survives_too(self):
+        """backup_netbelt_* も消さないこと。
+
+        この名前のフォルダを作る実装は NetBelt のどこにも無い。つまり
+        その名前が実際にあるなら利用者が付けたものであり、日付がいくら
+        古くても中身は取り返しがつかない。
+        """
+        old = self._dir("backup_netbelt_20200101", {"NetBelt.exe": EIGHT_DAYS},
+                        age=EIGHT_DAYS)
         recent = self._dir("backup_netbelt_today", {"NetBelt.exe": 0})
 
         code, out = self._run()
 
         self.assertEqual(code, 0, out)
-        self.assertFalse(os.path.exists(gone),
-                         "古い backup_netbelt_* が残っている:\n" + out)
+        self.assertTrue(os.path.exists(os.path.join(old, "NetBelt.exe")),
+                        "古い backup_netbelt_* を消している:\n" + out)
         self.assertTrue(os.path.isdir(recent),
-                        "新しい backup_netbelt_* まで消している:\n" + out)
+                        "新しい backup_netbelt_* を消している:\n" + out)
 
 
 if __name__ == "__main__":
