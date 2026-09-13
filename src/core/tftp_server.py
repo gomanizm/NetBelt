@@ -687,15 +687,22 @@ class TFTPServerManager(QObject):
             # 本物の失敗として通す。
             filename, reason, direction = payload
             suppress = False
-            if filename and "タイムアウト" in reason:
-                # 重複要求の敗者が出すタイムアウトを握り潰す。方向を見ないと、
-                # 同じ機器が同名ファイルを送受で同時に扱ったときに、
-                # 片方の失敗で反対方向まで巻き添えにする。
+            # 台帳から降ろす処理と、握り潰すかどうかの判定は分けて行う。
+            # 理由文字列で降ろす／降ろさないを分けると、タイムアウト以外の
+            # 失敗（保存できない・I/O エラー等）で項目が残り続け、以後その
+            # (ip, filename, direction) の開始通知が出なくなるうえ、
+            # done=True が焼き付いて本物のタイムアウトまで消える。
+            # 方向を見ないと、同じ機器が同名ファイルを送受で同時に扱ったときに、
+            # 片方の失敗で反対方向まで巻き添えにする。
+            if filename:
                 with self._tx_lock:
                     st = self._tx.get((ip, filename, direction))
                     if st is not None:
                         st["count"] -= 1
-                        suppress = st["done"] or st["count"] > 0
+                        # 握り潰してよいのは、重複要求の敗者が出す偽の
+                        # タイムアウトだけ。他の失敗は常に見せる。
+                        if "タイムアウト" in reason:
+                            suppress = st["done"] or st["count"] > 0
                         if st["count"] <= 0:
                             self._tx.pop((ip, filename, direction), None)
             if not suppress:
