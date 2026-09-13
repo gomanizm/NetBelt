@@ -54,6 +54,20 @@ class StaleConnectionNotificationTest(unittest.TestCase):
             self.app.processEvents()
             time.sleep(0.01)
 
+    def _pump_until(self, predicate, seconds=10.0):
+        """predicate が成り立つまでイベントを回す（上限つき）。
+
+        接続はワーカースレッドで動くので、固定時間だけ回す書き方は
+        機械が混んでいると足りなくなる（実測: 全件実行中に 0.5 秒では
+        間に合わず、この 1 件だけが落ちた）。成り立たないまま上限に
+        達したときは、判定はそのまま呼び出し側の assert に任せる。
+        """
+        end = time.time() + seconds
+        while time.time() < end and not predicate():
+            self.app.processEvents()
+            time.sleep(0.01)
+        self.app.processEvents()
+
     # --- ハンドラ単体: 束縛された接続が現在のものでなければ無視する ---
 
     def test_an_error_from_a_replaced_connection_leaves_the_new_one_alone(self):
@@ -256,7 +270,7 @@ class StaleConnectionNotificationTest(unittest.TestCase):
                                   side_effect=lambda d, t: appended.append((d, t))), \
                 mock.patch.object(w.terminal_widget, "show_notice") as notice:
             w._connect_ssh(device)
-            self._pump(0.5)
+            self._pump_until(lambda: appended and notice.called)
 
         self.assertIn(("R", "\r\n接続失敗\r\n"), appended,
                       "接続に失敗したのに、タブには何も出ない")
