@@ -263,6 +263,7 @@ class ConfigManager:
         reserved = 0
         renamed_groups = 0
         dropped_groups = 0
+        emptied_groups = 0
         kept_groups = []
         for group in config.get("groups", []):
             if not isinstance(group, dict):
@@ -284,10 +285,18 @@ class ConfigManager:
                     else:
                         kept.append(d)
                 group["devices"] = kept
+            else:
+                # devices の欠落・辞書・None。この先は list であることが前提で、
+                # add_device は group["devices"] で KeyError、_decrypt_passwords は
+                # 辞書や None を回そうとして読み込み自体を失敗させる。
+                # 名前と同じく、入れ物も空で補って中身の無いグループとして扱う
+                group["devices"] = []
+                emptied_groups += 1
             kept_groups.append(group)
         if dropped_groups:
             config["groups"] = kept_groups
-        if not (removed or reserved or renamed_groups or dropped_groups):
+        if not (removed or reserved or renamed_groups or dropped_groups
+                or emptied_groups):
             return
         self._backup_corrupted_config()
         parts = []
@@ -307,13 +316,17 @@ class ConfigManager:
         if dropped_groups:
             parts.append(f"設定ファイル (config.json) にグループとして読めない項目が"
                          f"{dropped_groups}件あり、除外しました。")
+        if emptied_groups:
+            parts.append(f"設定ファイル (config.json) に機器一覧の形が壊れたグループが"
+                         f"{emptied_groups}件あり、機器の無いグループとして扱います。")
         message = "\n".join(parts)
         if self.backup_path:
             message += f"\n\n元のファイルはバックアップしました:\n  {self.backup_path}"
         self.load_warning = message
         print(f"[Config] 機器{removed + reserved}件を除外 "
               f"(name/host 無し={removed}, 予約語={reserved})、"
-              f"グループ{renamed_groups}件を改名、グループ{dropped_groups}件を除外しました")
+              f"グループ{renamed_groups}件を改名、グループ{dropped_groups}件を除外、"
+              f"グループ{emptied_groups}件の機器一覧を空にしました")
 
     def _backup_corrupted_config(self) -> None:
         """
