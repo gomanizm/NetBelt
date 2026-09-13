@@ -11,7 +11,7 @@ from typing import Dict, Optional
 # MIB 解析器の版。抽出・解決の規則を変えたら上げる。mib_cache.json は
 # この値も鍵にするので、古い解析器が作ったキャッシュがアプリの更新後に
 # そのまま使われることがなくなる。
-MIB_PARSER_VERSION = '2026-09-12.1'
+MIB_PARSER_VERSION = '2026-09-14.1'
 
 
 def app_dir() -> str:
@@ -79,6 +79,20 @@ class MIBResolver:
         
         # 標準MIB-II
         standard_mibs = {
+            # 標準 OID ツリーの起点。iso は ASN.1 の暗黙の根で、どの MIB
+            # ファイルにも定義が無い。ここに無いと、利用者が mibs/ へ置いた
+            # 標準 MIB の `::= { mib-2 n }` が親を引けず、その MIB の配下が
+            # 丸ごと解決できない（知らせるのは標準出力の「0件」だけ）。
+            '1': 'iso',
+            '1.3': 'org',
+            '1.3.6': 'dod',
+            '1.3.6.1': 'internet',
+            '1.3.6.1.2': 'mgmt',
+            '1.3.6.1.2.1': 'mib-2',
+            '1.3.6.1.4': 'private',
+            '1.3.6.1.4.1': 'enterprises',
+            '1.3.6.1.6': 'snmpV2',
+
             # System Group
             '1.3.6.1.2.1.1': 'system',
             '1.3.6.1.2.1.1.1.0': 'sysDescr',
