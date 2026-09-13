@@ -145,8 +145,16 @@ class VersionManager:
         self.github_token = sanitized_token(github_token)
         # 受信中の応答。中止の要求が来たら、これを閉じて読み取りを打ち切る
         self._response = None
-        # 更新用ディレクトリを作成
-        os.makedirs(self.UPDATE_DIR, exist_ok=True)
+        # 更新用ディレクトリを作成。
+        # ここで例外を外へ出さない。起動時の未適用更新チェックは同期で
+        # VersionManager を作るだけなので、%TEMP%\NetBeltUpdates が通常
+        # ファイルになっている／%TEMP% に作成権限が無いといった異常で、
+        # 更新機能ではなくアプリ全体が起動できなくなっていた。
+        # 作れなかった場合は更新が使えないだけに留め、記録して続ける。
+        try:
+            os.makedirs(self.UPDATE_DIR, exist_ok=True)
+        except Exception as e:
+            print(f"[VersionManager] 更新用フォルダを用意できません（更新は使えません）: {e}")
 
     def _redact(self, text) -> str:
         """外へ出す文字列から、トークンの値を伏せる。
