@@ -1040,6 +1040,14 @@ class TerminalWidget(QWidget):
             "記録は失敗する前の行までです。保存先の空きや接続を確認してから、"
             "記録を始め直してください。" % (device_name, error))
     
+    def has_terminal(self, device_name: str) -> bool:
+        """その機器名のターミナルタブが開いているかを返す
+
+        Args:
+            device_name: 機器名
+        """
+        return device_name in self._terminals
+
     def enable_reconnect(self, device_name: str, reconnect_callback):
         """
         再接続モードを有効にする

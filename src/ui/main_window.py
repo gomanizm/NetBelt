@@ -433,6 +433,46 @@ class MainWindow(QMainWindow):
         self.device_tree.load_from_config(groups)
         self.status_bar.showMessage(f"接続先リスト読み込み完了（{len(groups)}グループ）")
     
+    def _device_name_conflict(self, device_name: str, allow: str = "") -> str:
+        """機器名が既に使われていれば理由を返す（使えるなら空文字）
+
+        config だけを見ると穴が残る。改名すると config からは旧名が消えるが、
+        self.connections と terminal_widget のタブ名は旧名のまま残るため、
+        旧名を別の機器へ付け直せてしまう。そうなると _find_group_of_device が
+        旧名を新しい機器のグループへ解決し、そのグループの自動実行コマンドが、
+        まだ生きている前の接続（別の機器）へ飛ぶ。
+
+        Args:
+            device_name: 調べる機器名
+            allow: この名前なら衝突とみなさない（編集で自分自身を残す場合）
+
+        Returns:
+            使われている理由の文言。使えるなら空文字
+        """
+        if not device_name or device_name == allow:
+            return ""
+        owner = self.config_manager.find_device_group(device_name)
+        if owner is not None:
+            return ("機器名 '%s' は既にグループ '%s' で使われています。"
+                    % (device_name, owner))
+        if device_name in self.connections:
+            return ("機器名 '%s' は接続中のセッションで使われています。"
+                    % device_name)
+        if self.terminal_widget.has_terminal(device_name):
+            return ("機器名 '%s' は開いているターミナルタブで使われています。"
+                    % device_name)
+        return ""
+
+    def _warn_device_name_conflict(self, reason: str) -> None:
+        """機器名が使えないことを知らせる
+
+        Args:
+            reason: _device_name_conflict が返した理由の文言
+        """
+        QMessageBox.warning(
+            self, "機器名の重複",
+            "%s\n別の名前を付けてください。" % reason)
+
     def _on_add_device(self):  # 追加
         """機器追加ダイアログを表示"""
         # グループ名リストを取得
@@ -455,12 +495,9 @@ class MainWindow(QMainWindow):
 
             # 機器名は全グループを通して一意。同名があると、接続や自動コマンドの
             # 所属判定が先に見つかった方を選び、別の機器へコマンドが飛ぶ
-            owner = self.config_manager.find_device_group(device_data.get("name", ""))
-            if owner is not None:
-                QMessageBox.warning(
-                    self, "機器名の重複",
-                    "機器名 '%s' は既にグループ '%s' で使われています。\n"
-                    "別の名前を付けてください。" % (device_data.get("name", ""), owner))
+            conflict = self._device_name_conflict(device_data.get("name", ""))
+            if conflict:
+                self._warn_device_name_conflict(conflict)
                 return
 
             # 設定に追加
@@ -508,13 +545,11 @@ class MainWindow(QMainWindow):
             old_device_name = device_data["name"]
             new_name = new_device_data.get("name", "")
 
-            # 改名先が別の機器の名前なら断る（名前は全グループを通して一意）
-            owner = self.config_manager.find_device_group(new_name)
-            if owner is not None and not (owner == group_name and new_name == old_device_name):
-                QMessageBox.warning(
-                    self, "機器名の重複",
-                    "機器名 '%s' は既にグループ '%s' で使われています。\n"
-                    "別の名前を付けてください。" % (new_name, owner))
+            # 改名先が別の機器の名前なら断る（名前は全グループを通して一意）。
+            # 自分自身の名前のままなら、接続中でもタブが開いていても通す
+            conflict = self._device_name_conflict(new_name, allow=old_device_name)
+            if conflict:
+                self._warn_device_name_conflict(conflict)
                 return
 
             # 差し替えは 1 回の保存で行う。削除→追加の 2 段階だと、片方の
@@ -591,12 +626,9 @@ class MainWindow(QMainWindow):
             new_group_name = dialog.get_selected_group()
 
             # 複製でも名前の重複は理由を示して断る（追加・編集と同じ）
-            owner = self.config_manager.find_device_group(new_device_data.get("name", ""))
-            if owner is not None:
-                QMessageBox.warning(
-                    self, "機器名の重複",
-                    "機器名 '%s' は既にグループ '%s' で使われています。\n"
-                    "別の名前を付けてください。" % (new_device_data.get("name", ""), owner))
+            conflict = self._device_name_conflict(new_device_data.get("name", ""))
+            if conflict:
+                self._warn_device_name_conflict(conflict)
                 return
 
             # 設定に追加
