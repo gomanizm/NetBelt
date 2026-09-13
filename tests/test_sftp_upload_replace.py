@@ -101,6 +101,26 @@ class SftpUploadReplaceTest(unittest.TestCase):
         self.assertNotIn(kept, self._removed(m),
                          "前回の試行が残した唯一の完全な写しを消している")
 
+    # --- ルート直下への送信 ---
+
+    def test_an_upload_to_the_root_keeps_its_temporary_name_in_the_root(self):
+        """'/name' への送信で、一時名が開始ディレクトリ側へ落ちないこと。
+
+        ルートと開始ディレクトリが別のファイルシステムだと改名が失敗し、
+        その復旧として既存の最終名が消されたうえ、転送した内容は別の
+        ディレクトリの隠し名に取り残される。
+        """
+        m = self._manager()
+
+        m.upload_file(self.local, "/config.cfg", overwrite=True)
+
+        self.assertTrue(self._wait(lambda: self.done), "終わらない: %s" % self.errors)
+        put_target = self._put_targets(m)[0]
+        self.assertTrue(put_target.startswith("/"),
+                        "ルート直下なのに一時名が相対パス: %s" % put_target)
+        self.assertNotIn("/", put_target[1:],
+                         "一時名がルート直下から外れている: %s" % put_target)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -312,14 +312,20 @@ class SFTPManager(QObject):
         # 切断や容量不足で機器側に途中までの設定ファイルが本来の名前で残る。
         # 同じディレクトリの一時名へ送り、成功してから置き換える
         remote_dir, _, remote_name = remote_path.rpartition("/")
+        if not remote_dir and remote_path.startswith("/"):
+            # '/name' の rpartition はディレクトリを '' で返す。そのまま
+            # 相対の一時名にすると、サーバの開始ディレクトリ側へ書かれ、
+            # ルートと別ファイルシステムなら改名も失敗する
+            remote_dir = "/"
+        # 一時名のディレクトリ部（ルートなら '/' 一つだけを前に付ける）
+        tmp_dir = remote_dir if remote_dir in ("", "/") else remote_dir + "/"
         # スラッシュを含まない相対名なら、一時名も相対のまま（ルート直下に
         # しない。OpenSSH 系の機器はルートに書けないことが多い）
         # 一時名は送信ごとに一意にする（ダウンロード側の mkstemp と同じ理由）。
         # 固定名だと、置き換えに失敗して残した「唯一の完全な写し」を次の試行が
         # 黙って上書きし、その試行が失敗すれば後始末が消してしまう。一意なら
         # 消す相手は必ず今回作った一時名に限られる
-        tmp_remote = ((remote_dir + "/" if remote_dir else "")
-                      + ".%s.netbelt-part.%d-%s"
+        tmp_remote = (tmp_dir + ".%s.netbelt-part.%d-%s"
                       % (remote_name, os.getpid(), uuid.uuid4().hex[:8]))
         # 最終名を消したあとで置き換えに失敗した場合は、一時名が唯一の完全な
         # 写しになるので消さない
