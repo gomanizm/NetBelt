@@ -134,11 +134,42 @@ class MIBResolver:
         # 逆引き辞書も作成
         self.name_to_oid = {v: k for k, v in self.oid_to_name.items()}
     
+    @staticmethod
+    def _valid_custom_entries(custom_mibs) -> dict:
+        """custom_mibs.json の mibs から、使えるエントリだけを返す。
+
+        custom_mibs.json は利用者が手で書くファイルなので、値が文字列で
+        ない（list や数値）ことがある。そのまま辞書へ入れると、逆引きの
+        組み立てで例外になった時点で片側だけ更新された状態が残り、
+        非文字列の名前が resolve_oid() から返って受け取った側
+        （Trap 表の QStandardItem）が Trap 1件ごとに落ちる。
+
+        OID は数字とドットだけ、名前は空でない文字列。外れたものは
+        捨てて警告する。
+        """
+        import re
+
+        if not isinstance(custom_mibs, dict):
+            print("[MIBResolver] custom_mibs.json の mibs が辞書ではありません")
+            return {}
+        valid = {}
+        for oid, name in custom_mibs.items():
+            if not isinstance(oid, str) or not re.fullmatch(r'\d+(\.\d+)*',
+                                                            oid):
+                print(f"[MIBResolver] custom_mibs.json の不正なOIDを無視: {oid!r}")
+                continue
+            if not isinstance(name, str) or not name:
+                print(f"[MIBResolver] custom_mibs.json の不正な名前を無視: "
+                      f"{oid} -> {name!r}")
+                continue
+            valid[oid] = name
+        return valid
+
     def _load_custom_mibs(self):
         """カスタムMIBファイルを読み込み（キャッシュ対応）"""
         import json
         import os
-        
+
         # 1. custom_mibs.jsonを読み込み（アプリのディレクトリ基準）
         custom_mib_file = _app_path('custom_mibs.json')
 
@@ -146,16 +177,17 @@ class MIBResolver:
             try:
                 with open(custom_mib_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                    custom_mibs = data.get('mibs', {})
-                    
-                    # カスタムMIBを登録
-                    self.oid_to_name.update(custom_mibs)
-                    
-                    # 逆引き辞書を更新
-                    for oid, name in custom_mibs.items():
-                        self.name_to_oid[name] = oid
-                    
-                    print(f"[MIBResolver] カスタムMIB {len(custom_mibs)}件を読み込みました")
+                custom_mibs = self._valid_custom_entries(
+                    data.get('mibs', {}) if isinstance(data, dict) else {})
+
+                # カスタムMIBを登録（検証後にまとめて反映する）
+                self.oid_to_name.update(custom_mibs)
+
+                # 逆引き辞書を更新
+                for oid, name in custom_mibs.items():
+                    self.name_to_oid[name] = oid
+
+                print(f"[MIBResolver] カスタムMIB {len(custom_mibs)}件を読み込みました")
             except Exception as e:
                 print(f"[MIBResolver] カスタムMIB読み込みエラー: {str(e)}")
         
