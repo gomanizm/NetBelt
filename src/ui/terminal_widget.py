@@ -459,6 +459,12 @@ class TerminalWidget(QWidget):
     # 多めに取り、画面領域（最大 200 行）を削らない余裕を持たせる
     MAX_DOCUMENT_BLOCKS = 20000
 
+    # 1 ブロック (段落) に許す最大文字数。折り返しで続く履歴行は改行で
+    # 切らずに繋ぐため、改行を一度も含まない出力ではブロックが 1 個の
+    # まま伸び、MAX_DOCUMENT_BLOCKS が永久に効かない。実際の 1 行より
+    # 十分大きく、かつ伸び続けさせない所で強制的に切る
+    MAX_BLOCK_CHARS = 8192
+
     # タブが閉じられたときのシグナル（機器名を送信）
     tab_closed = pyqtSignal(str)
     # 表示中のタブが変わったことを知らせる（機器名。タブが無ければ空文字）。
@@ -889,6 +895,13 @@ class TerminalWidget(QWidget):
             for run, attr in self._runs(cells):
                 region.insertText(run, self._char_format(attr))
             if not wrapped:
+                region.insertText("\n", QTextCharFormat())
+            elif region.positionInBlock() >= self.MAX_BLOCK_CHARS:
+                # 改行を一度も含まない出力 (バイナリの cat など) は、
+                # 折り返し行を繋ぎ続けるかぎりブロックが 1 個のまま伸び、
+                # MAX_DOCUMENT_BLOCKS が永久に効かない。文書もメモリも
+                # 際限なく膨らみ、1 ブロックの組版が重くなって GUI が
+                # 止まる。表示上の折り返し位置は変わるが、ここで切る
                 region.insertText("\n", QTextCharFormat())
 
         cell_rows = [self._visible_cells(line) for line in screen.lines]
