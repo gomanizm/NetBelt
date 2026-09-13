@@ -264,6 +264,29 @@ class SFTPManager(QObject):
             return self._REMOTE_DIR, ""
         return self._REMOTE_FILE, ""
 
+    def _carry_over_mode(self, remote_path: str, tmp_remote: str):
+        """置き換え先の mode を一時名へ写す（ロック内で呼ぶ）
+
+        一時名へ送ってから改名する作りでは、最終名の権限が一時名を作った
+        ときのもの（サーバの umask 任せ）に変わる。0600 の設定ファイルを
+        上書きすると緩くなり得るので、既存の mode が読めたときは改名の前に
+        当て直す。所有者・グループ・ACL は SFTP では引き継げない。
+
+        読めない相手（stat が失敗する）や、当てられない相手（機器の flash の
+        ように mode が意味を持たない）では、これまでどおり何もしない。
+        """
+        try:
+            mode = getattr(self.sftp_client.stat(remote_path), "st_mode", None)
+        except Exception:
+            return
+        if not isinstance(mode, int):
+            return
+        try:
+            self.sftp_client.chmod(tmp_remote, mode & 0o7777)
+        except Exception:
+            # 権限を引き継げないことは、転送そのものの失敗にはしない
+            pass
+
     def upload_file(self, local_path: str, remote_path: str = None,
                     overwrite: bool = False):
         """
@@ -408,6 +431,11 @@ class SFTPManager(QObject):
                                 "転送した内容は一時名 %s に残っています"
                                 % (remote_name, tmp_remote)
                                 + ("（%s）" % why if why else ""))
+                    else:
+                        # 置き換えなら、既存の権限を一時名へ写しておく
+                        # （overwrite=False のときは上で「無い」と確かめた
+                        # あとなので、引き継ぐ mode は無い）
+                        self._carry_over_mode(remote_path, tmp_remote)
                     # 全部送れてから最終名へ。posix_rename（OpenSSH 拡張）は
                     # 既存を上書きできる。無いサーバでは、まず rename を試し、
                     # 既存があって失敗したときだけ消してからもう一度 rename

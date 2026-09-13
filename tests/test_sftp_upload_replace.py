@@ -101,6 +101,54 @@ class SftpUploadReplaceTest(unittest.TestCase):
         self.assertNotIn(kept, self._removed(m),
                          "前回の試行が残した唯一の完全な写しを消している")
 
+    # --- 既存の mode の引き継ぎ ---
+
+    def _existing(self, m, mode):
+        """リモートに mode の付いた最終名がある状態にする。"""
+        attr = mock.Mock()
+        attr.st_mode = mode
+        m.sftp_client.stat.side_effect = None
+        m.sftp_client.stat.return_value = attr
+        return attr
+
+    def _call_names(self, m):
+        return [c[0] for c in m.sftp_client.mock_calls]
+
+    def test_an_overwrite_carries_over_the_existing_mode(self):
+        """置き換えで、既存ファイルの mode が失われないこと。"""
+        m = self._manager()
+        self._existing(m, 0o100600)
+
+        m.upload_file(self.local, "/flash/running.cfg", overwrite=True)
+
+        self.assertTrue(self._wait(lambda: self.done), "完了しない: %s" % self.errors)
+        tmp = self._put_targets(m)[0]
+        m.sftp_client.chmod.assert_called_once_with(tmp, 0o600)
+        names = self._call_names(m)
+        self.assertLess(names.index("chmod"), names.index("posix_rename"),
+                        "改名のあとに権限を当てている（その間は緩いまま）")
+
+    def test_a_new_remote_name_is_not_chmodded(self):
+        """置き換えでなければ、引き継ぐ mode は無いので触らないこと。"""
+        m = self._manager()
+
+        m.upload_file(self.local, "/flash/new.cfg", overwrite=True)
+
+        self.assertTrue(self._wait(lambda: self.done), "完了しない: %s" % self.errors)
+        m.sftp_client.chmod.assert_not_called()
+
+    def test_a_server_that_refuses_chmod_still_completes_the_upload(self):
+        """mode を当てられない機器でも、転送は成功させること。"""
+        m = self._manager()
+        self._existing(m, 0o100600)
+        m.sftp_client.chmod.side_effect = IOError("Operation unsupported")
+
+        m.upload_file(self.local, "/flash/running.cfg", overwrite=True)
+
+        self.assertTrue(self._wait(lambda: self.done or self.errors), "終わらない")
+        self.assertEqual(self.errors, [], "権限を当てられないだけで失敗にしている")
+        m.sftp_client.posix_rename.assert_called_once()
+
     # --- 転送中に現れた同名 ---
 
     def _appear_during_put(self, m, mode=0o100644):
