@@ -318,6 +318,20 @@ class SFTPManager(QObject):
         # 写しになるので消さない
         keep_tmp = [False]
 
+        def unknown_outcome(e):
+            """置き換わったか確かめられないときの扱いを返す。
+
+            応答が期限切れになっただけで、機器側では置き換えが済んでいる
+            ことがある。そこから「消してやり直す」手順へ進むと、置き換わった
+            ばかりの最終名まで消し、転送した写しも一時名ごと失う。
+            どちらの名前にも触れず、確かめ方だけを伝える。
+            """
+            keep_tmp[0] = True
+            return IOError(
+                "最終名へ置き換えられたか確かめられませんでした（応答が期限切れ）。"
+                "機器側を確認してください。一時名 %s が残っていれば置き換えは"
+                "終わっていません: %s" % (tmp_remote, e))
+
         def upload_thread():
             try:
                 # ファイルサイズを取得
@@ -369,9 +383,13 @@ class SFTPManager(QObject):
                     # する（先に消すと、rename に失敗した瞬間に元が消える）
                     try:
                         self.sftp_client.posix_rename(tmp_remote, remote_path)
+                    except TimeoutError as e:      # socket.timeout の別名
+                        raise unknown_outcome(e)
                     except (AttributeError, IOError):
                         try:
                             self.sftp_client.rename(tmp_remote, remote_path)
+                        except TimeoutError as e:
+                            raise unknown_outcome(e)
                         except IOError:
                             try:
                                 self.sftp_client.remove(remote_path)

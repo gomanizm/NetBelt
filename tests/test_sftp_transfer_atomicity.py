@@ -186,6 +186,49 @@ class SftpTransferAtomicityTest(unittest.TestCase):
         self.assertIn(".running.cfg.netbelt-part", self.errors[0],
                      "機器に残った一時名を知らせていない: %s" % self.errors)
 
+    def test_a_rename_that_times_out_removes_neither_name(self):
+        """置き換えの応答が期限切れになったら、どちらの名前も消さないこと。
+
+        posix_rename が機器側では適用され、応答だけが返らない場合がある。
+        socket.timeout（= TimeoutError）は IOError でもあるので、これまでは
+        「posix_rename が使えないサーバ」と同じ後始末へ落ちていた。一時名は
+        既に無いので rename が失敗し、その復旧として最終名を remove する。
+        置き換わったばかりの内容と、転送した写しの両方が消える。
+        """
+        m = self._manager()
+        local = os.path.join(self.dir, "running.cfg")
+        with io.open(local, "w", encoding="utf-8") as f:
+            f.write("hostname R1")
+        m.sftp_client.posix_rename.side_effect = TimeoutError()
+        # 機器側では置き換わっているので、一時名はもう無い
+        m.sftp_client.rename.side_effect = IOError("No such file")
+
+        m.upload_file(local, "/flash/running.cfg")
+
+        self.assertTrue(self._wait(lambda: self.errors), "失敗が通知されない")
+        removed = [c[0][0] for c in m.sftp_client.remove.call_args_list]
+        self.assertEqual(removed, [], "期限切れなのに消しにいっている: %s" % removed)
+        m.sftp_client.rename.assert_not_called()
+        self.assertIn(".running.cfg.netbelt-part", self.errors[0],
+                      "機器側で確かめる一時名を知らせていない: %s" % self.errors)
+
+    def test_a_fallback_rename_that_times_out_removes_neither_name(self):
+        """posix_rename の無いサーバで、代わりの rename が期限切れになった場合も同じ。"""
+        m = self._manager()
+        local = os.path.join(self.dir, "running.cfg")
+        with io.open(local, "w", encoding="utf-8") as f:
+            f.write("hostname R1")
+        m.sftp_client.posix_rename.side_effect = IOError("Operation unsupported")
+        m.sftp_client.rename.side_effect = TimeoutError()
+
+        m.upload_file(local, "/flash/running.cfg")
+
+        self.assertTrue(self._wait(lambda: self.errors), "失敗が通知されない")
+        removed = [c[0][0] for c in m.sftp_client.remove.call_args_list]
+        self.assertEqual(removed, [], "期限切れなのに消しにいっている: %s" % removed)
+        self.assertEqual(m.sftp_client.rename.call_count, 1,
+                         "期限切れのあとに rename をやり直している")
+
     def test_a_successful_upload_is_moved_into_place(self):
         m = self._manager()
         local = os.path.join(self.dir, "running.cfg")
