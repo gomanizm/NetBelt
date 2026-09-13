@@ -923,8 +923,22 @@ class TerminalWidget(QWidget):
                               QTextCursor.MoveMode.KeepAnchor)
             # 書式は空で入れる。insertText は挿入位置の書式を引き継ぐので、
             # 指定しないと直前の色や反転が新しい文字へ伝染する
+            removed = _u16(old_text[prefix:len(old_text) - suffix])
+            added = _u16(new_text[prefix:len(new_text) - suffix])
+            before = terminal.document().characterCount()
             probe.insertText(new_text[prefix:len(new_text) - suffix],
                              QTextCharFormat())
+            # 文書が上限 (MAX_DOCUMENT_BLOCKS) に達していると、この挿入で
+            # Qt が文書の先頭ブロックを捨てる。QTextCursor である region や
+            # probe は自動で詰まるが、int で控えた start は古い位置を指した
+            # まま残る。そのままだと次の差し替え範囲・塗り直し位置・
+            # キャレット位置がずれ、縦にリサイズするたびにスクロール
+            # バックへ重複行と欠落が積み上がる。捨てられた文字数を
+            # 数えて詰め直す
+            dropped = (before - removed + added
+                       - terminal.document().characterCount())
+            if dropped:
+                start -= dropped
             # 下の行との突き合わせは文書の位置で行うので、単位を揃える
             touched = (_u16(new_text[:prefix]),
                        _u16(new_text[:len(new_text) - suffix]))

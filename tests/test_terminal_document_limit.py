@@ -10,8 +10,10 @@ Undo を利用者が発動する経路も無い（Ctrl+Z は機器へ送る）�
 文書のブロック数に上限を置き、Undo 履歴は持たない。
 """
 import os
+import re
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, "src")
 
@@ -80,6 +82,84 @@ class TerminalDocumentLimitTest(unittest.TestCase):
         self.assertIn(last_numbered, tail[-4])
         self.assertNotIn("line 000000", terminal.toPlainText(),
                          "先頭の行が削られていない")
+
+
+class CappedDocumentSurvivesResizeTest(unittest.TestCase):
+    """上限に達した文書を縦にリサイズしても、記録が壊れないことを検証する。
+
+    _render_screen は画面領域の先頭を int (start) で控えてから文書を書き
+    換える。上限に達していると、その書き換えで Qt が文書の先頭ブロックを
+    捨てるため、QTextCursor である region は自動で詰まるのに start だけが
+    古い位置を指したままになる。ずれた start を次の差し替え範囲・塗り直し
+    位置・キャレット位置に使うので、縦にリサイズするたびにスクロール
+    バックへ重複行と欠落が積み上がり、それが画面にも「全ログ保存」にも
+    そのまま出る。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PyQt6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    def _widget(self, cap):
+        """文書の上限を cap 行にした端末を返す。"""
+        from ui.terminal_widget import TerminalWidget
+        patcher = mock.patch.object(TerminalWidget, "MAX_DOCUMENT_BLOCKS", cap)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        w = TerminalWidget()
+        self.addCleanup(w.close)
+        terminal = w.create_terminal_tab("dev")
+        return w, terminal
+
+    @staticmethod
+    def _numbers(terminal):
+        """文書に残っている 'line NNNNNN' の連番を出た順に返す。"""
+        return [int(m) for m in re.findall(r"line (\d{6})",
+                                           terminal.toPlainText())]
+
+    def _resize_cycles(self, w, terminal, cycles):
+        """画面の行数を 1 行ぶん往復させる（_apply_grid_size と同じ手順）。"""
+        screen = terminal._screen
+        base = screen.rows
+        for i in range(cycles):
+            screen.set_size(base - 1 if i % 2 == 0 else base, screen.cols)
+            w._render_screen(terminal)
+
+    def test_resizing_a_capped_document_keeps_the_scrollback_intact(self):
+        """上限到達後にリサイズしても、連番に重複と断裂が出ないこと。"""
+        cap = 400
+        w, terminal = self._widget(cap)
+        for i in range(cap * 2):
+            w.append_output("dev", "line %06d\r\n" % i)
+        self.assertEqual(terminal.document().blockCount(), cap,
+                         "前提: 文書が上限まで切り詰められている")
+
+        self._resize_cycles(w, terminal, 6)
+
+        numbers = self._numbers(terminal)
+        dups = [n for n in set(numbers) if numbers.count(n) > 1]
+        self.assertEqual(dups, [],
+                         "リサイズで行が重複した: %r" % sorted(dups)[:10])
+        gaps = [(a, b) for a, b in zip(numbers, numbers[1:]) if b != a + 1]
+        self.assertEqual(gaps, [],
+                         "リサイズで行が抜けた: %r" % gaps[:10])
+
+    def test_resizing_below_the_cap_is_unaffected(self):
+        """上限に達していなければ、これまでどおり壊れないこと（対照）。"""
+        cap = 400
+        w, terminal = self._widget(cap)
+        for i in range(50):
+            w.append_output("dev", "line %06d\r\n" % i)
+        self.assertLess(terminal.document().blockCount(), cap,
+                        "前提: 文書は上限に達していない")
+
+        self._resize_cycles(w, terminal, 6)
+
+        numbers = self._numbers(terminal)
+        self.assertEqual(numbers, sorted(set(numbers)),
+                         "上限に達していないのに行が壊れた")
 
 
 if __name__ == "__main__":
