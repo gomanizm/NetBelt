@@ -140,6 +140,46 @@ class ReconnectWaitSurvivesFailedReconnectTest(unittest.TestCase):
 
         self.assertEqual(conn2.sent, [], "破棄された接続へ打鍵が渡っている")
 
+    def test_enter_can_retry_after_a_reconnect_by_enter_failed(self):
+        """Enter での再接続に失敗しても、もう一度 Enter で再接続できること。
+
+        keyPressEvent が結果を待たずに待機を解いていたため、1 回目の Enter
+        で再接続が失敗すると待機を張り直す者がおらず、画面に残る案内
+        （「Enterキーを押すと再接続します」）どおりに押しても何も起きな
+        かった。復旧には接続ボタンかタブの閉じ直しが要った。
+        """
+        window, terminal = self._connected_then_dropped()
+
+        self._type(terminal, Qt.Key.Key_Return, "\r")   # 1 回目は失敗する
+        self._pump()
+        self.assertEqual(len(FakeSSH.instances), 2,
+                         "前提: Enter で再接続が試された")
+
+        FakeSSH.always_succeed = True
+        self._type(terminal, Qt.Key.Key_Return, "\r")   # 2 回目
+        self._pump()
+
+        self.assertEqual(len(FakeSSH.instances), 3,
+                         "案内どおりに Enter を押しても再接続が起きない")
+        self.assertTrue(terminal.can_send_input(),
+                        "再接続に成功したのに入力が禁止されたまま")
+
+    def test_keystrokes_are_not_sent_after_a_failed_reconnect_by_enter(self):
+        """Enter での再接続に失敗した後、打鍵を破棄済みの接続へ渡さないこと。"""
+        window, terminal = self._connected_then_dropped()
+
+        self._type(terminal, Qt.Key.Key_Return, "\r")
+        self._pump()
+        self.assertEqual(len(FakeSSH.instances), 2,
+                         "前提: Enter で再接続が試された")
+
+        self.assertFalse(terminal.can_send_input(),
+                         "再接続に失敗したのに入力が通る状態になっている")
+        self._type(terminal, Qt.Key.Key_A, "a")
+        self._pump()
+        self.assertEqual(FakeSSH.instances[1].sent, [],
+                         "破棄された接続へ打鍵が渡っている")
+
     def test_a_successful_reconnect_still_clears_the_wait(self):
         """接続に成功したら、これまでどおり待ちが解けること。"""
         window, terminal = self._connected_then_dropped()
