@@ -1,10 +1,53 @@
 """SSH接続管理"""
 import codecs
+import os
 import paramiko
+import tempfile
 import threading
 import time
+from pathlib import Path
 from typing import Callable, Optional
 from PyQt6.QtCore import QObject, pyqtSignal
+
+# known_hosts の保存を直列化する。同時に保存すると、あとから
+# os.replace した側が先の結果を丸ごと差し替えてしまう
+_known_hosts_save_lock = threading.Lock()
+
+
+def _save_known_hosts(client, known_hosts_path):
+    """client が持つホスト鍵を known_hosts へ書き戻す。
+
+    paramiko 4.0.0 の SSHClient.save_host_keys は保存先を "w" で開いて
+    先に切り詰めるため、書いている途中で落ちると保存済みの鍵をまとめて
+    失う。しかも保存前の再読込は load_host_keys 済みの client でしか
+    走らないので、known_hosts がまだ無い時点で始めた接続は、他の接続が
+    先に保存した鍵を上書きして消す。消された機器は次回また「未知」に
+    戻り、鍵が変わっていても確認なしで受け入れられる。
+
+    書く直前に既存のファイルを読み直して自分の鍵と合流させ、一時
+    ファイルへ書いてから os.replace で差し替える。差し替えは不可分な
+    ので、途中で落ちても前の known_hosts がそのまま残る。
+    """
+    path = Path(str(known_hosts_path))
+    with _known_hosts_save_lock:
+        if path.exists():
+            # 他の接続がこの間に保存した鍵を取り込む
+            client.load_host_keys(str(path))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # os.replace はドライブを跨げないので一時ファイルは同階層に作る
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+        os.close(fd)
+        try:
+            client.save_host_keys(tmp_path)
+            os.replace(tmp_path, str(path))
+            tmp_path = None      # 差し替え済み。後片付けの対象から外す
+        finally:
+            if tmp_path is not None:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
 
 
 class _TofuHostKeyPolicy(paramiko.MissingHostKeyPolicy):
@@ -18,7 +61,7 @@ class _TofuHostKeyPolicy(paramiko.MissingHostKeyPolicy):
     def missing_host_key(self, client, hostname, key):
         client.get_host_keys().add(hostname, key.get_name(), key)
         try:
-            client.save_host_keys(str(self._known_hosts_path))
+            _save_known_hosts(client, self._known_hosts_path)
         except Exception as e:
             # 黙って続けると、次回もこの機器の鍵を検証できないまま任意の
             # 鍵を受け入れる。接続は続けるが、そのことを画面に出す
