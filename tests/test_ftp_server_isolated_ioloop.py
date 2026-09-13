@@ -9,10 +9,17 @@ fd のリストを共有していた。
 
 1. 片方を停止すると close_all() が共有 socket_map を空にするので、
    動いているもう片方の待ち受けソケットまで閉じられる。
-2. 2 本の待受スレッドが同じ list を select() に渡しながら、停止側が
-   その list から fd を remove する。CPython は縮んだ配列の外を読み、
-   Windows では access violation でプロセスごと落ちる（実測: 全体
-   テストが pyftpdlib/ioloop.py:474 poll で 2 回とも落ちた）。
+2. 2 本の待受スレッドが同じ socket_map と fd の一覧を同時に読み書き
+   する。pyftpdlib はひとつの ioloop への登録・解除がすべて、それを
+   poll しているスレッドから行われる前提で書かれており（どちらも
+   素の dict と list で、ロックが無い）、この状態は想定外。
+
+   補足: これを入れた時点では、全体テストを落としていた access
+   violation の原因がここだと考えていた。実際の原因は別で
+   （tests/test_signal_relay_outlives_receiver.py を参照）、select の
+   実行中に別スレッドがその list を縮めても Python 3.12 / Windows 11
+   では落ちないことが後の実測で確かめられている。1 の被害は実測で
+   再現するので、このテストはそれを見ている。
 
 サーバごとに専用の ioloop を持たせる。1 を直接見れば 2 の共有も
 なくなる（共有していなければ他方の fd リストに触れない）。
