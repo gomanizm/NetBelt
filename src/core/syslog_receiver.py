@@ -93,30 +93,47 @@ class SyslogMessage:
             # パースエラーの場合はそのまま表示
             self.message = self.raw_message
     
+    # RFC 3164 の TIMESTAMP は "Mmm dd hh:mm:ss" に限られる
+    _RFC3164_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                       "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+    _RFC3164_TIME_RE = re.compile(r'^\d{2}:\d{2}:\d{2}$')
+
+    @classmethod
+    def _has_rfc3164_timestamp(cls, parts):
+        """先頭 3 語が RFC 3164 の日時（例: "Jan  1 00:00:00"）か"""
+        if len(parts) < 3:
+            return False
+        month, day, tm = parts[0], parts[1], parts[2]
+        if month not in cls._RFC3164_MONTHS:
+            return False
+        if not (day.isdigit() and 1 <= int(day) <= 31):
+            return False
+        return bool(cls._RFC3164_TIME_RE.match(tm))
+
     def _parse_rfc3164(self, message: str):
         """RFC 3164形式のメッセージをパース"""
         try:
             # TIMESTAMP HOSTNAME MESSAGE の形式
             # 例: Jan  1 00:00:00 hostname message
-            
-            # タイムスタンプとホスト名を抽出（簡易版）
+            #
+            # 日時が本当に日時のときだけ消費する。語数だけで決め打ちすると、
+            # 日時を付けない機器（service timestamps log datetime を切った等）の
+            # 本文の先頭 4 語が日時+ホスト名として黙って捨てられる。
             parts = message.split(None, 3)
-            if len(parts) >= 3:
-                # parts[0]: Month, parts[1]: Day, parts[2]: Time, parts[3:]: Hostname + Message
-                if len(parts) == 4:
-                    # ホスト名とメッセージを分離
-                    remaining = parts[3].split(None, 1)
-                    if len(remaining) >= 1:
-                        self.hostname = remaining[0]
-                        self.message = remaining[1] if len(remaining) > 1 else ""
-                else:
-                    self.message = message
-            else:
-                self.message = message
-        
+            if self._has_rfc3164_timestamp(parts) and len(parts) == 4:
+                # parts[0]: Month, parts[1]: Day, parts[2]: Time, parts[3]: Hostname + Message
+                remaining = parts[3].split(None, 1)
+                if len(remaining) >= 1:
+                    self.hostname = remaining[0]
+                    self.message = remaining[1] if len(remaining) > 1 else ""
+                    return
+            # 日時が無い・欠けている場合は、ホスト名は送信元 IP のまま、
+            # 本文は PRI 以降の全文を残す
+            self.message = message
+
         except Exception:
             self.message = message
-    
+
     @staticmethod
     def _skip_structured_data(rest: str):
         """STRUCTURED-DATA を読み飛ばし、その直後の位置を返す（見つからなければ None）。
