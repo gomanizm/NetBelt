@@ -2101,7 +2101,7 @@ for details.
                 print(f"[Main] 検証されていない更新ファイルのため無視します: {zip_path}")
                 continue
             
-            # ファイルの年齢を確認
+            # 落としてからどれだけ経ったかを見る
             file_age_hours = (datetime.now().timestamp() - os.path.getmtime(zip_path)) / 3600
             
             if file_age_hours > 24:

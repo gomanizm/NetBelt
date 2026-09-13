@@ -127,7 +127,8 @@ class SourceRunPromptTest(unittest.TestCase):
         # 勧める条件のひとつが「24 時間以内に落としたファイル」。
         # 代役にこのテストのソースを使うと、チェックアウトから 1 日
         # 経っただけで勧められなくなり、テストが日付で落ちる。
-        # 年齢を自分で決められる一時ファイルを置く。
+        # 落としてからの経過時間をテスト側で決められるよう、
+        # その場で作った一時ファイルを渡す。
         pending_dir = tempfile.mkdtemp(prefix="netbelt-pending-")
         self.addCleanup(shutil.rmtree, pending_dir, True)
         self.pending = os.path.join(pending_dir, "NetBelt-99.9.9.zip")
