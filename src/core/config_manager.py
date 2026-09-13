@@ -17,25 +17,103 @@ def is_reserved_device_name(name) -> bool:
     return isinstance(name, str) and name.strip() in RESERVED_DEVICE_NAMES
 
 
+# 旧 ~/.terminal-tool/known_hosts を引き継げなかったときの警告文。
+# app_data_dir() が呼ばれるたびに更新する。
+_known_hosts_import_warning = None
+
+# 引き継ぎ済みの目印。これができるまで毎回やり直す
+_IMPORT_MARKER_NAME = "known_hosts.imported"
+
+
+def take_known_hosts_import_warning():
+    """旧 known_hosts を引き継げなかったときの警告文を取り出す（無ければ None）。
+
+    一度返したら消す。接続のたびに同じ文言を出し続けないため。
+    """
+    global _known_hosts_import_warning
+    warning = _known_hosts_import_warning
+    _known_hosts_import_warning = None
+    return warning
+
+
+def _known_hosts_entry_id(line):
+    """known_hosts の 1 行を (ホスト, 鍵種別) で見分ける。読めない行は None。"""
+    fields = line.split()
+    if len(fields) < 3:
+        return None
+    return (fields[0], fields[1])
+
+
+def _import_legacy_known_hosts(new_dir):
+    """旧 ~/.terminal-tool/known_hosts の行を引き継ぐ。
+
+    引き継げなかったときは警告文を返す（握り潰さない）。黙って続けると、
+    既知の機器が「未知」に戻り、TOFU ポリシーが何も聞かずに新しい鍵を
+    受け入れる。既知ホスト鍵を読めないなら接続を中止する、という方針の
+    抜け道になる。
+
+    引き継ぎ済みかどうかは目印ファイルで見る。「新しい known_hosts が
+    あるか」で見ると、TOFU が先にファイルを作った時点で二度とやり直され
+    なくなり、旧い鍵が恒久的に捨てられる。
+    """
+    old_kh = Path.home() / ".terminal-tool" / "known_hosts"
+    marker = new_dir / _IMPORT_MARKER_NAME
+    if marker.exists() or not old_kh.exists():
+        return None
+    new_kh = new_dir / "known_hosts"
+    try:
+        old_lines = old_kh.read_text(
+            encoding="utf-8", errors="replace").splitlines()
+        current = (new_kh.read_text(encoding="utf-8", errors="replace")
+                   .splitlines() if new_kh.exists() else [])
+        known = set(filter(None, (_known_hosts_entry_id(l) for l in current)))
+        added = [l for l in old_lines
+                 if _known_hosts_entry_id(l)
+                 and _known_hosts_entry_id(l) not in known]
+        if added:
+            # 本体を直接開くと、その瞬間に切り詰められる。同階層へ書いて
+            # から os.replace で差し替える（差し替えは不可分）。
+            fd, tmp_path = tempfile.mkstemp(
+                dir=str(new_dir), prefix=new_kh.name + ".", suffix=".tmp")
+            try:
+                with os.fdopen(fd, 'w', encoding='utf-8', newline="\n") as f:
+                    for line in current + added:
+                        f.write(line + "\n")
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_path, str(new_kh))
+                tmp_path = None      # 差し替え済み。後片付けの対象から外す
+            finally:
+                if tmp_path is not None:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+            print("[Config] known_hosts を ~/.terminal-tool から引き継ぎました")
+        marker.write_text("", encoding="utf-8")
+        return None
+    except Exception as e:
+        return ("旧 %s を引き継げませんでした（%s）。引き継げるまで、"
+                "この機器は初回接続として扱われ、鍵が変わっていても"
+                "気づけません。手でコピーしてください: %s"
+                % (old_kh, e, new_kh))
+
+
 def app_data_dir():
     """アプリのデータ保存先 (~/.netbelt) を返す。無ければ作る。
 
     known_hosts や SFTP サーバのホストキーなど、設定ファイルとは別に
     ユーザー単位で持ち回るものを置く。
-    旧名 ~/.terminal-tool に known_hosts がある場合は、初回のみ引き継ぐ。
-    引き継ぎに失敗しても致命的ではない（TOFU の確認が再度出るだけ）ので握り潰す。
+    旧名 ~/.terminal-tool に known_hosts がある場合は引き継ぐ。引き継げ
+    なかったときは take_known_hosts_import_warning() で理由を取り出せる。
     """
+    global _known_hosts_import_warning
     new_dir = Path.home() / ".netbelt"
     try:
         new_dir.mkdir(exist_ok=True)
-        old_kh = Path.home() / ".terminal-tool" / "known_hosts"
-        new_kh = new_dir / "known_hosts"
-        if old_kh.exists() and not new_kh.exists():
-            import shutil
-            shutil.copy2(str(old_kh), str(new_kh))
-            print("[Config] known_hosts を ~/.terminal-tool から引き継ぎました")
     except Exception:
         pass
+    _known_hosts_import_warning = _import_legacy_known_hosts(new_dir)
     return new_dir
 
 

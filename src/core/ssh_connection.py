@@ -118,8 +118,14 @@ class SSHConnection(QObject):
         """既知ホスト鍵を読み込み、TOFUポリシーを設定する。
         既知ホストで鍵が変わった場合は接続時に BadHostKeyException となる。
         """
-        from .config_manager import app_data_dir
-        known_hosts_path = app_data_dir() / "known_hosts"
+        from . import config_manager
+        known_hosts_path = config_manager.app_data_dir() / "known_hosts"
+        # 旧 ~/.terminal-tool からの引き継ぎに失敗していたら、それを伏せない。
+        # 既知のはずの機器が「未知」に戻り、確認なしで受け入れられる
+        import_warning = config_manager.take_known_hosts_import_warning()
+        if import_warning:
+            self.output_received.emit(
+                "\r\n[NetBelt] 警告: %s\r\n" % import_warning)
         if known_hosts_path.exists():
             try:
                 client.load_host_keys(str(known_hosts_path))
