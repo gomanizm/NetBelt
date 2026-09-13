@@ -76,7 +76,8 @@ cmd /d /c ""!TMPRUNNER!" "!A1!" "!A2!" --utf8 "!HOME_DIR!" "!WORK_DIR!"" & set "
 
 :nowork
 echo ERROR: could not create a work folder in TEMP.
-echo   The update has not been applied. Free some space in TEMP, or
+echo   Twenty names were tried, so TEMP is most likely full, read-only
+echo   or missing. The update has not been applied. Fix TEMP, or
 echo   extract the new ZIP over this folder by hand.
 pause
 exit /b 1
