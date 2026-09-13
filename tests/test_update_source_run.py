@@ -124,6 +124,15 @@ class SourceRunPromptTest(unittest.TestCase):
     """ソース実行では、そもそも「未適用の更新」を勧めないこと。"""
 
     def setUp(self):
+        # 勧める条件のひとつが「24 時間以内に落としたファイル」。
+        # 代役にこのテストのソースを使うと、チェックアウトから 1 日
+        # 経っただけで勧められなくなり、テストが日付で落ちる。
+        # 年齢を自分で決められる一時ファイルを置く。
+        pending_dir = tempfile.mkdtemp(prefix="netbelt-pending-")
+        self.addCleanup(shutil.rmtree, pending_dir, True)
+        self.pending = os.path.join(pending_dir, "NetBelt-99.9.9.zip")
+        io.open(self.pending, "wb").write(b"PK")
+
         self.asked = []
         from PyQt6.QtWidgets import QMessageBox
         p = unittest.mock.patch.object(
@@ -134,7 +143,7 @@ class SourceRunPromptTest(unittest.TestCase):
         self.addCleanup(p.stop)
 
         from core.version_manager import VersionManager
-        for name, value in (("get_pending_update_files", [HERE]),
+        for name, value in (("get_pending_update_files", [self.pending]),
                             ("is_verified_update", True),
                             ("pending_version", "99.9.9")):
             q = unittest.mock.patch.object(
