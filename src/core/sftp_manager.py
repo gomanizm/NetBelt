@@ -1,6 +1,7 @@
 """SFTP接続管理"""
 import os
 import threading
+import uuid
 from typing import List, Dict, Optional, Callable
 from PyQt6.QtCore import QObject, pyqtSignal
 import paramiko
@@ -313,7 +314,13 @@ class SFTPManager(QObject):
         remote_dir, _, remote_name = remote_path.rpartition("/")
         # スラッシュを含まない相対名なら、一時名も相対のまま（ルート直下に
         # しない。OpenSSH 系の機器はルートに書けないことが多い）
-        tmp_remote = (remote_dir + "/" if remote_dir else "") + ".%s.netbelt-part" % remote_name
+        # 一時名は送信ごとに一意にする（ダウンロード側の mkstemp と同じ理由）。
+        # 固定名だと、置き換えに失敗して残した「唯一の完全な写し」を次の試行が
+        # 黙って上書きし、その試行が失敗すれば後始末が消してしまう。一意なら
+        # 消す相手は必ず今回作った一時名に限られる
+        tmp_remote = ((remote_dir + "/" if remote_dir else "")
+                      + ".%s.netbelt-part.%d-%s"
+                      % (remote_name, os.getpid(), uuid.uuid4().hex[:8]))
         # 最終名を消したあとで置き換えに失敗した場合は、一時名が唯一の完全な
         # 写しになるので消さない
         keep_tmp = [False]
