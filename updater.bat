@@ -67,9 +67,11 @@ rem No falling back to running in place. The update overwrites every file
 rem in the install folder, this script included, so running from there is
 rem the very fault the copy exists to avoid. Stop instead.
 if not exist "!TMPRUNNER!" goto :nocopy
-rem Deliberately one line: nothing may be read from this file after the
-rem child has replaced it. The whole work folder goes at the end, so
-rem this run leaves nothing in TEMP for the next one to collide with.
+rem One line so the work folder goes away on every path out. Note that
+rem cmd reopens this file by path before each line no matter how the
+rem lines are joined, so putting it on one line is not what makes the
+rem removal safe; owning the folder is. Nothing is left in TEMP for the
+rem next run to collide with.
 cmd /d /c ""!TMPRUNNER!" "!A1!" "!A2!" --utf8 "!HOME_DIR!" "!WORK_DIR!"" & set "RC=!errorlevel!" & rd /s /q "!WORK_DIR!" >nul 2>&1 & exit /b !RC!
 
 :nowork
