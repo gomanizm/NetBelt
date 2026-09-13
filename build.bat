@@ -1,7 +1,19 @@
 @echo off
 rem dist/ build/ の削除と spec の参照は相対パス。別のディレクトリから呼ぶと
 rem そちらの dist/ build/ を消すので、先に自分の置き場所へ移る。
+rem 移れなかったときは、必ずここで止める。cmd.exe は UNC パスを
+rem カレントにできないので、共有フォルダから叩くとこの cd は失敗し、
+rem カレントは呼び出し元のまま。そのまま進むと下の rmdir が消すのは
+rem 呼び出し元の dist/ build/ になる。
 cd /d "%~dp0"
+if errorlevel 1 (
+    echo ERROR: このスクリプトの置き場所へ移動できません。
+    echo   場所: %~dp0
+    echo   共有フォルダ ^(\\server\share^) から直接は実行できません。
+    echo   ローカルのドライブへコピーしてから実行してください。
+    pause
+    exit /b 1
+)
 echo ================================
 echo NetBelt ビルドスクリプト
 echo ================================
