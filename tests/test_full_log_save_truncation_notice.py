@@ -91,6 +91,40 @@ class FullLogSaveTruncationNoticeTest(unittest.TestCase):
         self.assertNotIn("line 000000", saved,
                          "前提: 古い行は表示から消えている")
 
+    def test_a_shrunken_window_does_not_silence_the_notice(self):
+        """一度切り詰めたら、窓を縮めて行数が減っても知らせ続けること。
+
+        判定が現在の blockCount だけだったため、上限に達して古い行が実際に
+        捨てられた後でも、窓を 1 行ぶん縦に縮めるだけで blockCount が上限を
+        下回り、以後は知らせが出なくなった。欠けたログが「ログ保存完了」と
+        して黙って書き出される。
+        """
+        from PyQt6.QtWidgets import QMessageBox
+        w = self._widget(cap=50, lines=200)
+        terminal = w.get_current_terminal()
+        self.assertEqual(terminal.document().blockCount(), 50,
+                         "前提: 文書が上限まで切り詰められている")
+        self.assertNotIn("line 000000", terminal.toPlainText(),
+                         "前提: 古い行は実際に捨てられている")
+
+        # 窓を 1 行ぶん縦に縮める（_apply_grid_size と同じ手順）
+        screen = terminal._screen
+        screen.set_size(screen.rows - 1, screen.cols)
+        w._render_screen(terminal)
+        self.assertLess(terminal.document().blockCount(), 50,
+                        "前提: 縮めたことで blockCount が上限を下回った")
+
+        self.warning.return_value = QMessageBox.StandardButton.Cancel
+        with mock.patch("PyQt6.QtWidgets.QFileDialog.getSaveFileName",
+                        return_value=(self.target, "")), \
+                mock.patch(
+                    "ui.dialogs.log_save_dialog.LogSaveProgressDialog") as dlg:
+            w.save_current_log()
+
+        self.assertEqual(self.warning.call_count, 1,
+                         "切り詰め済みなのに知らせずに保存しようとしている")
+        self.assertEqual(dlg.call_count, 0, "取り消したのに保存している")
+
     def test_a_log_within_the_cap_is_saved_without_a_notice(self):
         """上限に達していなければ、これまでどおり黙って保存すること。"""
         w = self._widget(cap=50, lines=5)

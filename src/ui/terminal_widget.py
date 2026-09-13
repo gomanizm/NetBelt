@@ -545,6 +545,11 @@ class TerminalWidget(QWidget):
         # 後の行には効かず、受信行数のまま増え続けていた。超えた分は
         # Qt が先頭ブロックから捨てる。画面領域は末尾なので影響しない
         terminal.document().setMaximumBlockCount(self.MAX_DOCUMENT_BLOCKS)
+        # 一度でも上限に達した（＝古い行が捨てられた）ことを覚えておく。
+        # 「全ログ保存」の欠落警告をいまの blockCount だけで決めると、
+        # 窓を 1 行縦に縮めるだけで上限を下回り、欠けたログが完全なもの
+        # として黙って保存される
+        terminal._log_truncated = False
 
         # フォント設定（_terminal_settings を参照する。設定変更後に作られる
         # タブも同じ外観になるようにするため）
@@ -981,6 +986,11 @@ class TerminalWidget(QWidget):
         bar = terminal.verticalScrollBar()
         bar.setValue(bar.maximum())
 
+        # 上限に達していたら「切り詰めた」を立てたままにする。この後で
+        # 窓を縮めて blockCount が下回っても、捨てた行は戻らない
+        if terminal.document().blockCount() >= self.MAX_DOCUMENT_BLOCKS:
+            terminal._log_truncated = True
+
     def show_notice(self, device_name: str, text: str) -> None:
         """アプリ自身の案内 (切断バナー・エラー文) を画面へ出す。
 
@@ -1212,8 +1222,12 @@ class TerminalWidget(QWidget):
             # 表示文書は MAX_DOCUMENT_BLOCKS 行で頭から切り詰められる。
             # 保存するのはその toPlainText() なので、切り詰められた分は
             # 「全ログ保存」でも出てこない。黙って落とさず先に断る
+            # いまの行数だけで決めない。上限に達して古い行を捨てた後でも、
+            # 窓を縦に 1 行縮めれば blockCount は上限を下回る。捨てた事実の
+            # ほうを見る
             blocks = current_widget.document().blockCount()
-            if blocks >= self.MAX_DOCUMENT_BLOCKS:
+            if (blocks >= self.MAX_DOCUMENT_BLOCKS
+                    or getattr(current_widget, "_log_truncated", False)):
                 answer = QMessageBox.warning(
                     self,
                     "ログ保存",
