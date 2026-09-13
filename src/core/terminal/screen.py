@@ -218,9 +218,10 @@ class Screen(object):
             main_marks.append(False)
         if self.alt_active:
             if self._saved_main:
-                self._saved_main = (min(keep_row, rows - 1),
-                                    min(self._saved_main[1], cols - 1),
-                                    self._saved_main[2])
+                # 位置だけ画面に収め、属性と文字集合はそのまま持ち越す
+                self._saved_main = ((min(keep_row, rows - 1),
+                                     min(self._saved_main[1], cols - 1))
+                                    + self._saved_main[2:])
         else:
             self.cursor_row = keep_row
 
@@ -548,7 +549,11 @@ class Screen(object):
         if to_alt == self.alt_active:
             return
         if to_alt and with_cursor:
-            self._saved_main = (self.cursor_row, self.cursor_col, self.attr)
+            # 1049 は DECSC 相当の保存・復元 (XTerm ctlseqs)。文字集合
+            # の指示まで持ち帰らないと、代替画面が ESC(0 のまま抜けた
+            # ときに以降の出力も記録も罫線文字に化け続ける
+            self._saved_main = (self.cursor_row, self.cursor_col, self.attr,
+                                dict(self._g), self._charset)
         self.lines, self._other = self._other, self.lines
         # 折り返しの印も画面と一緒に入れ替える。裏へ回ったメイン画面の
         # 印を失うと、戻ってきたときに組み直しで繋ぎ直せなくなる
@@ -567,8 +572,10 @@ class Screen(object):
                     self._other[r] = self._blank_line()
                     self._other_wrapped[r] = False
             if with_cursor and self._saved_main:
-                row, col, attr = self._saved_main
+                row, col, attr, g, charset = self._saved_main
                 self.attr = attr
+                self._g = dict(g)
+                self._charset = charset
                 self._move(row, col)
         self.dirty.update(range(self.rows))
         self._pending_wrap = False

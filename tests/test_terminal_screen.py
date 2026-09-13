@@ -811,5 +811,25 @@ class RecordGapTest(unittest.TestCase):
         self.assertEqual(len(s.history), 0)
 
 
+class AltScreenCharsetTest(unittest.TestCase):
+    """?1049 は DECSC 相当の保存・復元 (XTerm ctlseqs)。"""
+
+    def test_leaving_the_alt_screen_restores_the_charset(self):
+        # 代替画面が指示した G0 を持ち帰ると、以降の出力も記録も
+        # 罫線文字に化け続ける
+        s = feed(Screen(), "\x1b[?1049h\x1b(0\x1b[?1049llqk")
+        self.assertEqual(s.text()[0], "lqk")
+
+    def test_leaving_the_alt_screen_restores_the_shift_state(self):
+        # SO で G1 を使っている状態も 1049 で行き来する
+        s = feed(Screen(), "\x1b)0\x1b[?1049h\x0e\x1b[?1049llqk")
+        self.assertEqual(s.text()[0], "lqk")
+
+    def test_entering_the_alt_screen_keeps_the_charset(self):
+        # 保存はするが、入るときに指示を捨てはしない
+        s = feed(Screen(), "\x1b(0\x1b[?1049hlqk")
+        self.assertEqual(s.text()[0], "┌─┐")
+
+
 if __name__ == "__main__":
     unittest.main()
