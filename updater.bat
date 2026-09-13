@@ -44,17 +44,43 @@ rem by byte offset, so a script replaced while it runs carries on at a
 rem meaningless position in the new file: fragments of lines get executed
 rem and the whole sequence can run again. From TEMP the install folder is
 rem only ever written to, never read from.
-set "TMPRUNNER=%TEMP%\NetBeltUpdater_%RANDOM%.bat"
+rem One folder per run, claimed with md. cmd seeds %RANDOM% from the
+rem clock, so two updaters started in the same moment draw the same
+rem numbers: they would share both the copy below and the folder the
+rem ZIP is unpacked into, and whichever finished first would delete
+rem the other one's files out from under it. md fails when the name
+rem is already taken, which is what makes the claim exclusive; a
+rem leftover from an earlier run only costs one more try.
+set "TRY=0"
+:claim
+set /a TRY+=1
+set "WORK_DIR=%TEMP%\NetBeltUpdate_!TRY!_!RANDOM!"
+md "!WORK_DIR!" 2>nul
+if not errorlevel 1 goto :claimed
+if !TRY! lss 20 goto :claim
+goto :nowork
+
+:claimed
+set "TMPRUNNER=!WORK_DIR!\updater.bat"
 copy /y "!SELF!" "!TMPRUNNER!" >nul 2>&1
 rem No falling back to running in place. The update overwrites every file
 rem in the install folder, this script included, so running from there is
 rem the very fault the copy exists to avoid. Stop instead.
 if not exist "!TMPRUNNER!" goto :nocopy
 rem Deliberately one line: nothing may be read from this file after the
-rem child has replaced it.
-cmd /d /c ""!TMPRUNNER!" "!A1!" "!A2!" --utf8 "!HOME_DIR!"" & set "RC=!errorlevel!" & del "!TMPRUNNER!" >nul 2>&1 & exit /b !RC!
+rem child has replaced it. The whole work folder goes at the end, so
+rem this run leaves nothing in TEMP for the next one to collide with.
+cmd /d /c ""!TMPRUNNER!" "!A1!" "!A2!" --utf8 "!HOME_DIR!" "!WORK_DIR!"" & set "RC=!errorlevel!" & rd /s /q "!WORK_DIR!" >nul 2>&1 & exit /b !RC!
+
+:nowork
+echo ERROR: could not create a work folder in TEMP.
+echo   The update has not been applied. Free some space in TEMP, or
+echo   extract the new ZIP over this folder by hand.
+pause
+exit /b 1
 
 :nocopy
+rd /s /q "!WORK_DIR!" 2>nul
 echo ERROR: could not copy the updater to TEMP.
 echo   The update has not been applied. Free some space in TEMP, or
 echo   extract the new ZIP over this folder by hand.
@@ -78,6 +104,8 @@ REM 引数:
 REM   %1 = ダウンロードしたZIPファイルのパス
 REM   %2 = アプリケーション実行ファイルのパス
 REM   %3 = --utf8（コードページ設定後の再入を示す内部用）
+REM   %4 = インストール先（内部用。TEMP の写しでは %~dp0 が使えない）
+REM   %5 = 親が確保した作業フォルダ（内部用。展開先の親になる）
 REM ================================================================
 
 echo ================================================
@@ -104,7 +132,12 @@ REM インストール先。TEMP の写しから走るので %~dp0 は当てに�
 REM 呼び出し元が第4引数で渡してくる（手で直接実行されたときだけ %~dp0）。
 set "APP_DIR=%~dp0"
 if not "%~4"=="" set "APP_DIR=%~4\"
+REM 展開先。親が確保した専用フォルダの中に置く。%RANDOM% で名前を
+REM 作ると、同じ瞬間に始まった別の更新と同じ名前になる（cmd は
+REM %RANDOM% をプロセス開始時の時計で種付けするため）。第5引数が
+REM 無いのは、このファイルを手で直接叩いたときだけ。
 set "TEMP_DIR=%TEMP%\NetBeltUpdate_%RANDOM%"
+if not "%~5"=="" set "TEMP_DIR=%~5\zip"
 
 echo [1/6] 更新情報
 echo   ZIPファイル: !ZIP_FILE!
