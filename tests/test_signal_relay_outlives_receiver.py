@@ -65,9 +65,17 @@ SCRIPT = textwrap.dedent(
 
 class SignalRelayOutlivesReceiverTest(unittest.TestCase):
     def test_a_collected_manager_does_not_take_the_process_down(self):
+        # 子の出力は UTF-8 に固定して読む。text=True だけだと環境の
+        # コードページ（日本語 Windows なら CP932）で解釈するので、
+        # 子が出した日本語のメッセージ 1 行で UnicodeDecodeError になり、
+        # 調べたい終了コードを見る前にテストが落ちる（実測:
+        # 'cp932' codec can't decode byte 0x88 in position 53）。
+        env = dict(os.environ)
+        env["PYTHONIOENCODING"] = "utf-8"
         proc = subprocess.run(
             [sys.executable, "-c", SCRIPT, REPO_ROOT],
             capture_output=True, text=True, timeout=180,
+            encoding="utf-8", errors="replace", env=env,
             cwd=REPO_ROOT)
 
         self.assertEqual(
