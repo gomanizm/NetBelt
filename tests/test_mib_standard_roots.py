@@ -52,9 +52,12 @@ class MibStandardRootsTest(unittest.TestCase):
                           ("internet", "1.3.6.1"),
                           ("mgmt", "1.3.6.1.2"),
                           ("mib-2", "1.3.6.1.2.1"),
+                          ("experimental", "1.3.6.1.3"),
                           ("private", "1.3.6.1.4"),
                           ("enterprises", "1.3.6.1.4.1"),
-                          ("snmpV2", "1.3.6.1.6")):
+                          ("security", "1.3.6.1.5"),
+                          ("snmpV2", "1.3.6.1.6"),
+                          ("snmpModules", "1.3.6.1.6.3")):
             self.assertEqual(resolver.resolve_name(name), oid,
                              "%s が初期辞書に無い" % name)
             self.assertEqual(resolver.resolve_oid(oid), name)
@@ -87,6 +90,31 @@ class MibStandardRootsTest(unittest.TestCase):
         resolver = self._resolver()
         self.assertEqual(resolver.resolve_name("isoGrand"), "1.9.4",
                          "iso から始まる連鎖が解決していない")
+
+    def test_definitions_under_the_other_internet_roots_resolve(self):
+        """experimental / security / snmpModules 配下が解決すること。
+
+        この 3 つも iso と同じくどの MIB ファイルからも引けないので、
+        起点に無いと `::= { snmpModules n }` を親にする定義が連鎖ごと
+        黙って落ちる。snmpModules は SNMPv2-MIB の MODULE-IDENTITY
+        （snmpMIB ::= { snmpModules 1 }）の親にあたる。
+        """
+        self._write_mib("OTHER-ROOTS.my",
+                        "expThing OBJECT IDENTIFIER ::= { experimental 77 }\n"
+                        "secThing OBJECT IDENTIFIER ::= { security 77 }\n"
+                        "modThing OBJECT IDENTIFIER ::= { snmpModules 77 }\n"
+                        "modLeaf OBJECT-TYPE\n"
+                        "    SYNTAX Integer32\n"
+                        "    ::= { modThing 1 }\n")
+
+        resolver = self._resolver()
+        self.assertEqual(resolver.resolve_name("expThing"), "1.3.6.1.3.77",
+                         "experimental 配下が解決していない")
+        self.assertEqual(resolver.resolve_name("secThing"), "1.3.6.1.5.77",
+                         "security 配下が解決していない")
+        self.assertEqual(resolver.resolve_name("modThing"), "1.3.6.1.6.3.77",
+                         "snmpModules 配下が解決していない")
+        self.assertEqual(resolver.resolve_oid("1.3.6.1.6.3.77.1"), "modLeaf")
 
     def test_a_definition_under_enterprises_still_resolves(self):
         """enterprises 配下はこれまでどおり解決すること。"""
