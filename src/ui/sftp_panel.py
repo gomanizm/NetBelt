@@ -805,7 +805,10 @@ class SFTPPanel(QWidget):
             self._abandon("削除")
             return
         item_path = self._remote_path(base_path, file_info['name'])
-        manager.delete_item(item_path, file_info['is_dir'])
+        # is_dir はリンクの追跡先で決まっている（ダブルクリックで先へ入れる
+        # ため）。削除の相手はリンク自身なので、リンクは rmdir へ回さない
+        manager.delete_item(item_path,
+                            file_info['is_dir'] and not file_info.get('is_link'))
     
     def _on_rename_selected(self, file_info: dict, pinned=None):
         """

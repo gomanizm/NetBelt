@@ -246,12 +246,20 @@ class SFTPManager(QObject):
                     # 組み立てるので、リンクであることは 'l' で分かる
                     is_dir = self._is_directory(
                         link_modes.get(item.filename, item.st_mode))
+                    # リンクかどうかは lstat（= listdir_attr の st_mode）で
+                    # 決める。移動の可否は追跡先（is_dir）だが、削除・改名の
+                    # 相手はリンク自身なので、参照先を分けて持たせる。
+                    # ディレクトリへのリンクを is_dir のまま rmdir に渡すと、
+                    # POSIX の rmdir は ENOTDIR で必ず失敗する
+                    is_link = (isinstance(item.st_mode, int)
+                               and stat_mod.S_ISLNK(item.st_mode))
                     file_list.append({
                         'name': item.filename,
                         'size': item.st_size if not is_dir else 0,
                         'mtime': item.st_mtime,
                         'mode': item.st_mode,
                         'is_dir': is_dir,
+                        'is_link': is_link,
                         'permissions': self._format_permissions(item.st_mode)
                     })
                 
@@ -685,7 +693,10 @@ class SFTPManager(QObject):
         
         Args:
             path: ファイル/ディレクトリパス
-            is_dir: ディレクトリの場合True
+            is_dir: 本物のディレクトリの場合True（rmdir を使う）。ディレクトリ
+                へのシンボリックリンクは False で渡すこと。rmdir はリンクに
+                対して ENOTDIR で必ず失敗し、リンクを消せなくなる。一覧の
+                is_dir は追跡先で決まるので、そのままは渡せない
         """
         if not self.is_connected or not self.sftp_client:
             self.error_occurred.emit("SFTP接続がありません")
