@@ -709,10 +709,17 @@ class SNMPManager(QObject):
             oids: OIDのリスト
             **kwargs: その他のパラメータ (port, version, community, など)
         """
-        if self.worker and self.worker.isRunning():
+        # isRunning() で判定してはいけない。result_ready は run() の中から
+        # queued で emit されるので、スレッドが終わってから結果がメイン
+        # スレッドへ届くまでの間は isRunning() == False かつ結果は未配送。
+        # そこで次の要求を受け付けると、あとから届いた前の結果が新しい要求の
+        # ものとして扱われる（呼び出し側はホストを取り違えて記録する）。
+        # 参照を手放すのは finished を受けたときなので、未配送の結果がある間は
+        # 必ず None ではない。
+        if self.worker is not None:
             self.error_occurred.emit("既に操作が実行中です")
             return False
-        
+
         params = {
             'host': host,
             'oids': oids,
@@ -744,10 +751,11 @@ class SNMPManager(QObject):
             oid: 開始OID
             **kwargs: その他のパラメータ (port, version, community, など)
         """
-        if self.worker and self.worker.isRunning():
+        # 未配送の結果がある間は受け付けない（理由は snmp_get と同じ）
+        if self.worker is not None:
             self.error_occurred.emit("既に操作が実行中です")
             return False
-        
+
         params = {
             'host': host,
             'oid': oid,
