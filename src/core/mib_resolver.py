@@ -262,7 +262,12 @@ class MIBResolver:
         # MIBファイルのタイムスタンプをチェック
         current_files = {}
         for filename in os.listdir(mibs_dir):
-            if filename.endswith(('.mib', '.txt', '.my')):
+            # 拡張子は大小を無視して判定する。Windows はファイル名の大小を
+            # 保持するので、CASE.MIB のように大文字で配布された MIB が
+            # 無言で解析からも監視対象からも外れていた（実測）。
+            # current_files の鍵は実ファイル名のままにして mtime 比較と
+            # ファイルを開く経路は変えない。
+            if filename.lower().endswith(('.mib', '.txt', '.my')):
                 filepath = os.path.join(mibs_dir, filename)
                 mtime = os.path.getmtime(filepath)
                 current_files[filename] = mtime
