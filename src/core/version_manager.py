@@ -561,25 +561,47 @@ class VersionManager:
                 return None
             print("[VersionManager] チェックサム照合 OK")
 
-            # 検証を通ったものだけを最終名にする。あわせて検証済みの証として
-            # ハッシュを傍らに残し、適用時にもう一度確かめられるようにする。
+            # 検証済みの証（ハッシュと版）は、最終名にする前に .part の傍らへ
+            # 書く。最終名にしてから書いていたときは、控えの書き込みが失敗しても
+            # zip_path をそのまま返していた。画面は「ダウンロード完了！」まで
+            # 進むのに、適用は is_verified_update が False で必ず拒否される。
+            # 同じ版を取り直した場合はさらに悪く、適用できていた検証済み ZIP を
+            # 先に上書きしてから控えの更新に失敗するため、使えていた更新まで
+            # 巻き添えで壊れた。版の控えは失敗を握り潰していたので、痕跡も
+            # 残らなかった（控えが無いと、次回起動時に「これは今より新しいか」を
+            # 判断できず適用を勧められない）。
+            sha_part = part_path + '.sha256'
+            ver_part = part_path + '.version'
+            try:
+                with open(sha_part, 'w', encoding='ascii') as f:
+                    f.write(actual.lower())
+                if version:
+                    with open(ver_part, 'w', encoding='ascii') as vf:
+                        vf.write(str(version))
+            except Exception as e:
+                print(f"[VersionManager] チェックサムの控えを書けませんでした: {e}")
+                self._discard(sha_part)
+                self._discard(ver_part)
+                self._discard(part_path)
+                return None
+
+            # 3つそろって初めて最終名にする。
             # os.replace は宛先があっても置き換えるので、先に消さない。
             # 消してから改名していたときは、その隙に別の受信が失敗すると
             # 検証済みだった ZIP まで失われた。
-            os.replace(part_path, zip_path)
             try:
-                # 版も控える。控えないと、次回起動時に「これは今より新しいか」を
-                # 判断できず、古い ZIP の適用を勧めてしまう。
+                os.replace(part_path, zip_path)
+                os.replace(sha_part, zip_path + '.sha256')
                 if version:
-                    try:
-                        with open(zip_path + '.version', 'w', encoding='ascii') as vf:
-                            vf.write(str(version))
-                    except Exception:
-                        pass
-                with open(zip_path + '.sha256', 'w', encoding='ascii') as f:
-                    f.write(actual.lower())
+                    os.replace(ver_part, zip_path + '.version')
             except Exception as e:
-                print(f"[VersionManager] チェックサムの控えを書けませんでした: {e}")
+                # 途中で失敗すると ZIP と控えが食い違う。中途半端な組は
+                # 「未適用の更新」として毎回弾かれ続けるだけなので残さない。
+                print(f"[VersionManager] 更新ファイルを確定できませんでした: {e}")
+                for leftover in (part_path, sha_part, ver_part, zip_path,
+                                 zip_path + '.sha256', zip_path + '.version'):
+                    self._discard(leftover)
+                return None
 
             return zip_path
         
