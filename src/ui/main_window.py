@@ -444,6 +444,12 @@ class MainWindow(QMainWindow):
         旧名を新しい機器のグループへ解決し、そのグループの自動実行コマンドが、
         まだ生きている前の接続（別の機器）へ飛ぶ。
 
+        ツリーに並ぶ自動検出COMポート名も第4の名前空間として見る。これが
+        抜けていると、自動検出の COM3 が出ている状態で機器名 "COM3" の
+        登録機器を作れてしまい、どちらか一方へ繋いだあとは
+        self.connections["COM3"] が埋まるため、もう一方は接続できず
+        「COM3 は既に接続されています」という実態と食い違う案内だけが出る。
+
         Args:
             device_name: 調べる機器名
             allow: この名前なら衝突とみなさない（編集で自分自身を残す場合）
@@ -463,6 +469,10 @@ class MainWindow(QMainWindow):
         if self.terminal_widget.has_terminal(device_name):
             return ("機器名 '%s' は開いているターミナルタブで使われています。"
                     % device_name)
+        detected = getattr(self.device_tree, "detected_port_names", None)
+        if detected is not None and device_name in detected():
+            return ("機器名 '%s' は自動検出されたコンソールポートで"
+                    "使われています。" % device_name)
         return ""
 
     def _warn_device_name_conflict(self, reason: str) -> None:

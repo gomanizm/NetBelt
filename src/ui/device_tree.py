@@ -148,6 +148,28 @@ class DeviceTree(QWidget):
         # グループを展開
         console_group.setExpanded(True)
     
+    def detected_port_names(self) -> Set[str]:
+        """いまツリーに並んでいる自動検出ポートの名前を返す
+
+        自動検出のCOMポートは config に無いので、機器名の一意性検査が使う
+        find_device_group には掛からない。検査側から第4の名前空間として
+        参照できるよう、ツリーの実体を見て答える。
+
+        Returns:
+            自動検出項目の機器名の集合（無ければ空集合）
+        """
+        names: Set[str] = set()
+        root = self.tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            group_item = root.child(i)
+            for j in range(group_item.childCount()):
+                data = group_item.child(j).data(0, Qt.ItemDataRole.UserRole)
+                if isinstance(data, dict) and data.get('source') == 'autodetect':
+                    name = data.get('name')
+                    if name:
+                        names.add(name)
+        return names
+
     def _check_serial_ports(self):
         """シリアルポートの変化を定期的にチェック"""
         # 現在のシリアルポート一覧を取得
