@@ -72,11 +72,17 @@ class LogRecordingDialog(QDialog):
         layout.addLayout(button_layout)
     
     def _update_elapsed_time(self):
-        """経過時間を更新"""
+        """経過時間を更新
+
+        timedelta.seconds は days を含まない 0..86399 の値なので、そのまま
+        時・分・秒へ割ると 24 時間ごとに表示だけが巻き戻る。総秒数から
+        組み立て、24 時間を超えたぶんは hours へ繰り上げる。
+        """
         elapsed = datetime.now() - self.start_time
-        hours = elapsed.seconds // 3600
-        minutes = (elapsed.seconds % 3600) // 60
-        seconds = elapsed.seconds % 60
+        total_seconds = int(elapsed.total_seconds())
+        hours = total_seconds // 3600
+        minutes = (total_seconds % 3600) // 60
+        seconds = total_seconds % 60
         self.elapsed_label.setText(f"経過時間: {hours:02d}:{minutes:02d}:{seconds:02d}")
     
     def _on_stop(self):
