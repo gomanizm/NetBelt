@@ -112,6 +112,8 @@ class SSHConnection(QObject):
         self.term_cols = 80
         self.term_rows = 24
         self._read_thread: Optional[threading.Thread] = None
+        # 読み取りの停止と、接続中に後始末が走ったことを兼ねる印。
+        # connect() の入口で戻し、接続が成立したあとにもう一度見る
         self._stop_reading = False
     
     def _setup_host_keys(self, client):
@@ -173,7 +175,7 @@ class SSHConnection(QObject):
     # 認証が通ったあとなので、機器側のログイン猶予も効かない。
     SHELL_TIMEOUT_SECONDS = 30
 
-    def _open_shell(self):
+    def _open_shell(self, client):
         """インタラクティブシェルを開く（上限まで待って開かなければ None）
 
         応答を返さない機器に当たると invoke_shell が無期限に止まり、
@@ -184,8 +186,10 @@ class SSHConnection(QObject):
         別スレッドで開かせ、上限を過ぎたら諦める。取り残されたスレッドは
         呼び出し側（_fail -> dispose）が接続を閉じた時点で例外になって
         終わる。daemon なのでアプリの終了も妨げない。
+
+        client は connect() が握っているローカル参照を受け取る。self.client を
+        見にいくと、待っている間に dispose() が走った場合に None になっている。
         """
-        client = self.client
         outcome = {}
 
         def open_it():
@@ -223,6 +227,23 @@ class SSHConnection(QObject):
         self.error_occurred.emit(message)
         return False
 
+    def _abandon(self, client, channel) -> bool:
+        """破棄済みの接続で成立してしまった分を閉じ、失敗として戻る。
+
+        利用者がタブを閉じただけなので error_occurred は出さない。ここで
+        内部例外の文面を出すと、閉じた覚えのない「接続エラー」に見える。
+        """
+        if channel is not None:
+            try:
+                channel.close()
+            except Exception:
+                pass
+        try:
+            client.close()
+        except Exception:
+            pass
+        return False
+
     def connect(self) -> bool:
         """
         SSH接続を開始
@@ -231,9 +252,13 @@ class SSHConnection(QObject):
             bool: 接続成功時True
         """
         try:
-            self.client = paramiko.SSHClient()
+            # 待っている間に dispose() が走ると self.client は None になる。
+            # 後始末は必ずこのローカル参照に対して行う
+            client = paramiko.SSHClient()
+            self.client = client
+            self._stop_reading = False
             try:
-                self._setup_host_keys(self.client)
+                self._setup_host_keys(client)
             except HostKeyStoreError as e:
                 return self._fail(str(e))
             
@@ -295,23 +320,34 @@ class SSHConnection(QObject):
                 return self._fail("パスワードまたは秘密鍵が必要です")
             
             # SSH接続を実行
-            self.client.connect(**connect_kwargs)
+            client.connect(**connect_kwargs)
+
+            if self._stop_reading:
+                # 名前解決や TCP 接続を待っている間にタブが閉じられた。
+                # dispose() が呼んだ close() は Transport 登録前で何もして
+                # いないので、ここで閉じないと成立したセッションとスレッドが
+                # 残り、機器の vty 枠を掴んだままになる
+                return self._abandon(client, None)
             
             # インタラクティブシェルを開始 (RFC 4254 6.2 pty-req)
-            self.channel = self._open_shell()
-            if self.channel is None:
+            channel = self._open_shell(client)
+            if channel is None:
                 return self._fail(
                     "シェルを開けませんでした（%d 秒待って応答がありません）。\n"
                     "機器が混んでいる、exec 認可の応答を待っている、"
                     "vty が空いていない、などが考えられます。"
                     % self.SHELL_TIMEOUT_SECONDS)
-            self.channel.settimeout(0.1)
+            channel.settimeout(0.1)
             
+            if self._stop_reading:
+                # シェルを開いている間に閉じられた場合も同じ
+                return self._abandon(client, channel)
+
+            self.channel = channel
             self.is_connected = True
             self.connected.emit()
             
             # 読み取りスレッドを開始
-            self._stop_reading = False
             self._read_thread = threading.Thread(target=self._read_output, daemon=True)
             self._read_thread.start()
             
