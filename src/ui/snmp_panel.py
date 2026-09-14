@@ -689,6 +689,26 @@ class SNMPPanel(QWidget):
         return True
 
     @staticmethod
+    def _export_error_text(error: Exception, file_path: str) -> str:
+        """エクスポート失敗の知らせ文を作る（使用中なら言い換える）
+
+        書き出しは一時ファイルへ書き切ってから os.replace() で保存先を
+        置き換える（atomic_text_write）。Windows では保存先を別のプログラム
+        （ビューア等）が開いたままだと、この置き換えが PermissionError に
+        なる。元の内容は残り一時ファイルも消えるので壊れはしないが、
+        既定の文には一時ファイル名しか出ないので、開いているものを閉じれば
+        通ると利用者に分からない。使用中のときだけ、保存先と対処を出す。
+
+        使用中以外の失敗は従来どおりそのまま見せる。
+        """
+        if isinstance(error, PermissionError):
+            return ("このファイルは別のプログラムが開いているか、"
+                    "書き込みが許可されていません:\n%s\n"
+                    "開いているプログラムを閉じてから、もう一度試してください。"
+                    % file_path)
+        return "エクスポート中にエラーが発生しました:\n" + str(error)
+
+    @staticmethod
     def _export_format(file_path: str) -> str:
         """保存先の拡張子から書き出す形式を決める（"csv" / "json" / "txt"）
 
@@ -742,7 +762,8 @@ class SNMPPanel(QWidget):
                 self._export_results_to_txt(file_path, results, host, reason)
             QMessageBox.information(self, "成功", "SNMP結果をエクスポートしました:\n" + file_path)
         except Exception as e:
-            QMessageBox.critical(self, "エラー", "エクスポート中にエラーが発生しました:\n" + str(e))
+            QMessageBox.critical(self, "エラー",
+                                 self._export_error_text(e, file_path))
 
     def _configured_max_traps(self) -> int:
         """settings.snmp.max_traps を読む（壊れていれば既定値）
@@ -1088,7 +1109,8 @@ class SNMPPanel(QWidget):
             
             QMessageBox.information(self, "成功", f"Trapログをエクスポートしました:\n{file_path}")
         except Exception as e:
-            QMessageBox.critical(self, "エラー", f"エクスポート中にエラーが発生しました:\n{str(e)}")
+            QMessageBox.critical(self, "エラー",
+                                 self._export_error_text(e, file_path))
     
     def _export_to_csv(self, file_path: str, traps):
         """CSV形式で Trap を書き出す
