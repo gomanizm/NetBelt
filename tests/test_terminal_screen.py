@@ -422,6 +422,14 @@ class EscDispatchTest(unittest.TestCase):
         s = feed(Screen(), "\x1b)0\x0e\x1b7\x0f\x1b8lqk")
         self.assertEqual(s.text()[0], "┌─┐")
 
+    def test_save_and_restore_cursor_keeps_the_pending_wrap(self):
+        # 右端ちょうどで DECSC/DECRC を挟んでも折り返し待ちは残る
+        # (xterm は wrap_flag を DECSC の保存対象に含める)。落とすと
+        # 次の 1 文字が折り返さず右端の文字を上書きしていた
+        s = feed(Screen(), "\x1b[1;80Ha\x1b7\x1b8b")
+        self.assertEqual(s.text()[0][-1], "a")
+        self.assertEqual(s.text()[1], "b")
+
     def test_reverse_index_at_the_top_scrolls_down(self):
         s = feed(Screen(), "top\x1b[H\x1bMnew")
         self.assertEqual(s.text()[:2], ["new", "top"])
@@ -490,6 +498,13 @@ class AlternateScreenTest(unittest.TestCase):
         feed(s, "\x1b[?1049h~~vi screen~~\x1b[?1049l")
         self.assertEqual(s.text()[0], "user@lab:~$ vi")
         self.assertEqual((s.cursor_row, s.cursor_col), (0, 14))
+
+    def test_the_alt_screen_round_trip_keeps_the_pending_wrap(self):
+        # 1049 の保存・復元も DECSC 相当なので折り返し待ちを持ち帰る
+        s = feed(Screen(), "\x1b[1;80Ha")
+        feed(s, "\x1b[?1049h\x1b[?1049lb")
+        self.assertEqual(s.text()[0][-1], "a")
+        self.assertEqual(s.text()[1], "b")
 
     def test_the_alt_screen_starts_blank(self):
         s = feed(Screen(), "shell stuff\x1b[?1049h")

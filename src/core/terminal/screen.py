@@ -103,8 +103,9 @@ class Screen(object):
         self.scroll_bottom = self.rows - 1
         self._pending_wrap = False
         # ESC 7 / ESC 8。位置・属性に加えて、VT100 と同じく
-        # 文字集合の指示 (G0/G1) と SI/SO の状態も持つ
-        self._saved = (0, 0, DEFAULT, {"(": "B", ")": "B"}, "(")
+        # 文字集合の指示 (G0/G1) と SI/SO の状態、それに xterm と
+        # 同じく右端の折り返し待ち (_pending_wrap) も持つ
+        self._saved = (0, 0, DEFAULT, {"(": "B", ")": "B"}, "(", False)
         self._saved_main = None             # ?1049 用
         self.autowrap = True
         self.cursor_visible = True
@@ -485,13 +486,15 @@ class Screen(object):
             return
         elif seq.final == "7":
             self._saved = (self.cursor_row, self.cursor_col, self.attr,
-                           dict(self._g), self._charset)
+                           dict(self._g), self._charset, self._pending_wrap)
         elif seq.final == "8":
-            row, col, attr, g, charset = self._saved
+            row, col, attr, g, charset, pending = self._saved
             self.attr = attr
             self._g = dict(g)
             self._charset = charset
             self._move(row, col)
+            # _move が折り返し待ちを落とすので、復元はそのあと
+            self._pending_wrap = pending
         elif seq.final == "D":          # IND
             self._linefeed()
         elif seq.final == "M":          # RI: 上端では下へスクロール
@@ -548,12 +551,14 @@ class Screen(object):
         """代替画面と行き来する。clear は代替画面を白紙にするか。"""
         if to_alt == self.alt_active:
             return
+        pending = False                 # 1049 の復元でだけ書き換わる
         if to_alt and with_cursor:
             # 1049 は DECSC 相当の保存・復元 (XTerm ctlseqs)。文字集合
             # の指示まで持ち帰らないと、代替画面が ESC(0 のまま抜けた
             # ときに以降の出力も記録も罫線文字に化け続ける
             self._saved_main = (self.cursor_row, self.cursor_col, self.attr,
-                                dict(self._g), self._charset)
+                                dict(self._g), self._charset,
+                                self._pending_wrap)
         self.lines, self._other = self._other, self.lines
         # 折り返しの印も画面と一緒に入れ替える。裏へ回ったメイン画面の
         # 印を失うと、戻ってきたときに組み直しで繋ぎ直せなくなる
@@ -572,13 +577,15 @@ class Screen(object):
                     self._other[r] = self._blank_line()
                     self._other_wrapped[r] = False
             if with_cursor and self._saved_main:
-                row, col, attr, g, charset = self._saved_main
+                row, col, attr, g, charset, pending = self._saved_main
                 self.attr = attr
                 self._g = dict(g)
                 self._charset = charset
                 self._move(row, col)
         self.dirty.update(range(self.rows))
-        self._pending_wrap = False
+        # 1049 で持ち帰った折り返し待ちだけは残す。_move も、白紙化の
+        # あとの位置決めも落とすので、代入はいちばん最後
+        self._pending_wrap = pending
 
     def _set_margins(self, p):
         # 0 は省略と同じく既定値 (xterm と同じ)。0-1 = -1 を丸めると
