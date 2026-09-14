@@ -688,6 +688,23 @@ class SNMPPanel(QWidget):
             % (device_name, file_path))
         return True
 
+    @staticmethod
+    def _export_format(file_path: str) -> str:
+        """保存先の拡張子から書き出す形式を決める（"csv" / "json" / "txt"）
+
+        大文字小文字は区別しない。区別すると out.CSV が TXT の中身で
+        書かれたうえ「エクスポートしました」と成功扱いになり、中身と
+        拡張子の食い違ったファイルが残る。ダイアログは選んだフィルタの
+        拡張子を小文字で補うので普段は当たるが、利用者が自分で .CSV と
+        打った場合と、大文字名の既存ファイルを選び直した場合に外れる。
+
+        当てはまらない拡張子は従来どおり TXT（既定の形式）。
+        """
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext in ('.csv', '.json'):
+            return ext[1:]
+        return 'txt'
+
     def _on_export_clicked(self):
         """GET/WALK 結果をエクスポート（Trap と同じく txt/csv/json）"""
         # 行・ホスト・途中までの理由は、ダイアログを開く前にまとめて固定し、
@@ -713,9 +730,13 @@ class SNMPPanel(QWidget):
         if self._refuse_if_recording("SNMP結果をエクスポート", file_path):
             return
         try:
-            if file_path.endswith(".csv"):
+            # 拡張子は大文字小文字を区別せずに見る。区別すると out.CSV が
+            # TXT の中身で書かれ、しかも「成功」と出る（理由は
+            # _export_format と同じ）
+            fmt = self._export_format(file_path)
+            if fmt == "csv":
                 self._export_results_to_csv(file_path, results, host, reason)
-            elif file_path.endswith(".json"):
+            elif fmt == "json":
                 self._export_results_to_json(file_path, results, host, reason)
             else:
                 self._export_results_to_txt(file_path, results, host, reason)
@@ -1056,10 +1077,11 @@ class SNMPPanel(QWidget):
             return
 
         try:
-            # ファイル拡張子で形式を判定
-            if file_path.endswith('.csv'):
+            # ファイル拡張子で形式を判定（大文字小文字は区別しない）
+            fmt = self._export_format(file_path)
+            if fmt == 'csv':
                 self._export_to_csv(file_path, traps)
-            elif file_path.endswith('.json'):
+            elif fmt == 'json':
                 self._export_to_json(file_path, traps)
             else:  # .txt or other
                 self._export_to_txt(file_path, traps)
@@ -1215,9 +1237,31 @@ class SNMPPanel(QWidget):
     def _on_trap_received(self, trap_data: dict):
         self._add_trap_to_tree(trap_data)
     
+    def _trap_display_time(self, trap_data: dict) -> str:
+        """表示・保存に使う時刻を決める（受信スレッドが付けた時刻を優先）
+
+        Trap を受け取るのは受信スレッドで、ここが動くのは GUI スレッド。
+        trap_received は queued 配送なので、その間に時間が空く。定常状態の
+        ずれはミリ秒だが、GUI が滞留するとき —— 大量 Trap の配送、終了待ち、
+        モーダルダイアログを開いている間 —— は意味のある差になる。now() で
+        付け直すと滞留分だけ後ろへずれた時刻が表示され、そのままエクスポート
+        にも入り、Trap の前後関係を時刻で追う用途で読み違える。
+
+        received_at が無い、あるいは ISO 8601 として読めないときだけ now()
+        に落とす。時刻列を空にするよりは処理時刻のほうがまだ使える。
+        """
+        received_at = trap_data.get('received_at')
+        if received_at:
+            try:
+                return datetime.fromisoformat(received_at).strftime(
+                    '%Y-%m-%d %H:%M:%S')
+            except (TypeError, ValueError):
+                pass
+        return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
     def _add_trap_to_tree(self, trap_data: dict):
         """TrapデータをツリーViewに追加"""
-        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        timestamp = self._trap_display_time(trap_data)
         source_ip = trap_data.get('source_ip', '')
         source_port = trap_data.get('source_port', 0)
         security = describe_trap_security(trap_data)
