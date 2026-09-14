@@ -79,16 +79,22 @@ def _netascii_encode(data):
     return data.replace(b"\r", b"\r\x00").replace(b"\n", b"\r\n")
 
 
-def _netascii_size(path):
+def _netascii_size(path, should_stop=None):
     """netascii へ変換したあとのバイト数を数える。
 
     tsize（RFC 2349）と進捗の分母は「実際に回線へ乗るオクテット数」なので、
     変換で伸びるぶんを数え直さないと 100% を超える。変換はバイトごとに
     状態を持たないので、読み出し単位で区切って数えてよい。
+
+    should_stop を渡すと、読み出しごとにそれを見て _ServerStopped を送出する。
+    大きいファイルの走査は秒単位かかることがあり、打ち切れないと停止要求が
+    走査の終わりまで待たされる（stop() は各ワーカーを順に join する）。
     """
     size = 0
     with open(path, "rb") as f:
         while True:
+            if should_stop is not None and should_stop():
+                raise _ServerStopped()
             raw = f.read(65536)
             if not raw:
                 return size
@@ -500,7 +506,9 @@ class TFTPServer:
         last_prog = 0.0
         established = False
         try:
-            total = _netascii_size(target) if encode else os.path.getsize(target)
+            # 走査中に停止されたら打ち切る（未確立なので何も通知しない）
+            total = (_netascii_size(target, lambda: self._stopping) if encode
+                     else os.path.getsize(target))
             if "tsize" in neg:
                 neg["tsize"] = str(total)  # 実際に転送するオクテット数を返す
             with open(target, "rb") as f:
@@ -553,6 +561,8 @@ class TFTPServer:
                     if len(chunk) < blksize:
                         break
             self.on_event("transfer_complete", addr[0], (filename, sent, total, "download"))
+        except _ServerStopped:
+            return  # 事前走査の途中で停止。未確立なので何も通知しない
         except socket.timeout:
             self.on_event("protocol_error", addr[0],
                           (filename, "ダウンロードがタイムアウト", "download"))
@@ -687,15 +697,22 @@ class TFTPServerManager(QObject):
             # 本物の失敗として通す。
             filename, reason, direction = payload
             suppress = False
-            if filename and "タイムアウト" in reason:
-                # 重複要求の敗者が出すタイムアウトを握り潰す。方向を見ないと、
-                # 同じ機器が同名ファイルを送受で同時に扱ったときに、
-                # 片方の失敗で反対方向まで巻き添えにする。
+            # 台帳から降ろす処理と、握り潰すかどうかの判定は分けて行う。
+            # 理由文字列で降ろす／降ろさないを分けると、タイムアウト以外の
+            # 失敗（保存できない・I/O エラー等）で項目が残り続け、以後その
+            # (ip, filename, direction) の開始通知が出なくなるうえ、
+            # done=True が焼き付いて本物のタイムアウトまで消える。
+            # 方向を見ないと、同じ機器が同名ファイルを送受で同時に扱ったときに、
+            # 片方の失敗で反対方向まで巻き添えにする。
+            if filename:
                 with self._tx_lock:
                     st = self._tx.get((ip, filename, direction))
                     if st is not None:
                         st["count"] -= 1
-                        suppress = st["done"] or st["count"] > 0
+                        # 握り潰してよいのは、重複要求の敗者が出す偽の
+                        # タイムアウトだけ。他の失敗は常に見せる。
+                        if "タイムアウト" in reason:
+                            suppress = st["done"] or st["count"] > 0
                         if st["count"] <= 0:
                             self._tx.pop((ip, filename, direction), None)
             if not suppress:
