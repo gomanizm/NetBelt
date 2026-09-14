@@ -194,6 +194,23 @@ class EditingTest(unittest.TestCase):
         s = feed(Screen(), "aaa\r\nbbb\r\nccc\x1b[2;1H\x1b[M")
         self.assertEqual(s.text()[:3], ["aaa", "ccc", ""])
 
+    def test_il_returns_the_cursor_to_the_left_margin(self):
+        # DEC の IL/DL はカーソルを左マージンへ戻す (xterm も同じ)。
+        # 戻さないと、直後に位置指定なしで印字したとき桁がずれる
+        s = feed(Screen(), "\x1b[3;5H\x1b[LX")
+        self.assertEqual(s.text()[2], "X")
+        self.assertEqual((s.cursor_row, s.cursor_col), (2, 1))
+
+    def test_dl_returns_the_cursor_to_the_left_margin(self):
+        s = feed(Screen(), "\x1b[3;5H\x1b[MX")
+        self.assertEqual(s.text()[2], "X")
+        self.assertEqual((s.cursor_row, s.cursor_col), (2, 1))
+
+    def test_a_refused_il_leaves_the_cursor_alone(self):
+        # 範囲の外では IL/DL 自体が効かないので、桁も動かさない
+        s = feed(Screen(), "\x1b[5;10r\x1b[2;5H\x1b[L")
+        self.assertEqual((s.cursor_row, s.cursor_col), (1, 4))
+
     def test_inserted_chars_push_the_line_right(self):
         s = feed(Screen(), "abcdef\x1b[3G\x1b[2@")
         self.assertEqual(s.text()[0], "ab  cdef")

@@ -729,6 +729,9 @@ class Screen(object):
                     self.history.append(removed)
                     self._new_history.append((removed, removed_wrap))
         self.dirty.update(range(self.cursor_row, self.scroll_bottom + 1))
+        # DEC の IL/DL はカーソルを左マージンへ戻す (xterm も同じ)。
+        # 戻さないと、直後に位置指定なしで印字したとき桁がずれる
+        self.cursor_col = 0
         self._pending_wrap = False
 
     def _shift_chars(self, n, insert):
