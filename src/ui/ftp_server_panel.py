@@ -135,10 +135,6 @@ class FTPServerPanel(QWidget):
         self.history.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.history.setMaximumHeight(300)
         history_layout.addWidget(self.history)
-        clear_history_btn = QPushButton("履歴をクリア")
-        clear_history_btn.clicked.connect(self._on_clear_history)
-        clear_history_btn.setMaximumWidth(120)
-        history_layout.addWidget(clear_history_btn)
         history_group.setLayout(history_layout)
         layout.addWidget(history_group)
         # アクティビティログ
@@ -330,11 +326,6 @@ class FTPServerPanel(QWidget):
             del self._active[key]
         for st in self._active.values():
             st["row"] -= excess
-
-    def _on_clear_history(self):
-        """転送履歴をクリア（進行中の転送の行追跡も手放す）"""
-        self.history.setRowCount(0)
-        self._active.clear()
 
     def _on_error(self, error_message: str):
         """エラー発生時の処理"""

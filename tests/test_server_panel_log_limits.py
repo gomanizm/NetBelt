@@ -82,16 +82,6 @@ class ServerPanelLogLimitsTest(unittest.TestCase):
                       and panel.history.item(r, 5).text() == "50%"]
             self.assertEqual(others, [], "%s が別の転送の行を上書きした" % name)
 
-    def test_history_can_be_cleared(self):
-        """転送履歴を手動で空にできること。"""
-        for panel in self._history_panels():
-            for i in range(5):
-                panel._on_tx_complete("192.0.2.10", "f%d.bin" % i, 10, 10, "download")
-            self.assertGreater(panel.history.rowCount(), 0)
-            panel._on_clear_history()
-            self.assertEqual(panel.history.rowCount(), 0,
-                             "%s の履歴が消えていない" % type(panel).__name__)
-
 
 if __name__ == "__main__":
     unittest.main()
