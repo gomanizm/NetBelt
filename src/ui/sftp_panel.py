@@ -601,8 +601,15 @@ class SFTPPanel(QWidget):
             refresh_action = menu.addAction("更新")
             refresh_action.triggered.connect(self._on_refresh)
         
-        menu.exec(self.tree_view.viewport().mapToGlobal(position))
-    
+        try:
+            menu.exec(self.tree_view.viewport().mapToGlobal(position))
+        finally:
+            # このパネルを親にしたメニューは、閉じただけでは子として残り、
+            # 右クリックのたびに QMenu 1 件と項目が積み上がる。項目は
+            # menu.addAction で作っておりメニューが所有しているので、
+            # メニューを捨てれば一緒に片付く。
+            menu.deleteLater()
+
     def _on_refresh(self):
         """更新ボタンがクリックされた"""
         if self.sftp_manager:

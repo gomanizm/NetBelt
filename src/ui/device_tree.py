@@ -213,6 +213,21 @@ class DeviceTree(QWidget):
         menu.addSeparator()
         return menu.addAction("接続先リストを非表示")
 
+    @staticmethod
+    def _discard_menu(menu):
+        """開き終えた右クリックメニューを項目ごと捨てる。
+
+        このウィジェットを親にした QMenu は、閉じただけでは子として残る。
+        右クリックのたびに QMenu 1 件と項目が積み上がる（実測: 空欄メニューを
+        5 回開いて QMenu 5 件 / QAction 20 件）。項目は menu.addAction で
+        作っておりメニューが所有しているので、メニューを捨てれば一緒に
+        片付く。
+
+        Args:
+            menu: 表示し終えた QMenu
+        """
+        menu.deleteLater()
+
     def _show_context_menu(self, position):
         """
         右クリックメニューを表示
@@ -280,7 +295,10 @@ class DeviceTree(QWidget):
         hide_action = self._add_hide_action(menu)
 
         # メニュー実行
-        action = menu.exec(self.tree.viewport().mapToGlobal(position))
+        try:
+            action = menu.exec(self.tree.viewport().mapToGlobal(position))
+        finally:
+            self._discard_menu(menu)
 
         # アクション処理
         if action == hide_action:
@@ -333,7 +351,10 @@ class DeviceTree(QWidget):
         add_group_action = menu.addAction("グループを追加")
         hide_action = self._add_hide_action(menu)
 
-        action = menu.exec(self.tree.viewport().mapToGlobal(position))
+        try:
+            action = menu.exec(self.tree.viewport().mapToGlobal(position))
+        finally:
+            self._discard_menu(menu)
 
         if action == add_group_action:
             self.group_add_requested.emit()
@@ -360,7 +381,10 @@ class DeviceTree(QWidget):
                 delete_action = menu.addAction("グループを削除")
         hide_action = self._add_hide_action(menu)
 
-        action = menu.exec(self.tree.viewport().mapToGlobal(position))
+        try:
+            action = menu.exec(self.tree.viewport().mapToGlobal(position))
+        finally:
+            self._discard_menu(menu)
 
         if action == hide_action:
             self.hide_requested.emit()

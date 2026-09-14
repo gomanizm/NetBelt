@@ -707,23 +707,29 @@ class SyslogPanel(QWidget):
         menu = QMenu(self)
         
         # コピー
-        copy_action = QAction("コピー", self)
+        copy_action = QAction("コピー", menu)
         copy_action.triggered.connect(self._copy_selected)
         menu.addAction(copy_action)
-        
+
         # 選択行をログ保存
-        save_action = QAction("選択行をログ保存", self)
+        save_action = QAction("選択行をログ保存", menu)
         save_action.triggered.connect(self._save_selected)
         menu.addAction(save_action)
-        
+
         menu.addSeparator()
-        
+
         # 全てクリア
-        clear_action = QAction("全てクリア", self)
+        clear_action = QAction("全てクリア", menu)
         clear_action.triggered.connect(self._clear_messages)
         menu.addAction(clear_action)
-        
-        menu.exec(self.table_view.viewport().mapToGlobal(pos))
+
+        try:
+            menu.exec(self.table_view.viewport().mapToGlobal(pos))
+        finally:
+            # このパネルを親にしたメニューは、閉じただけでは子として残り、
+            # 右クリックのたびに QMenu 1 件と項目が積み上がる。項目の親も
+            # メニューにしてあるので、メニューが消えるときに一緒に片付く。
+            menu.deleteLater()
     
     def _copy_selected(self):
         """選択行をコピー"""
