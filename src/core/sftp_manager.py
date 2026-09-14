@@ -403,6 +403,9 @@ class SFTPManager(QObject):
         # 送る直前の確認が期限切れになった印。ロックの中では接続を畳めない
         # ので、抜けてから畳むために持ち回る
         probe_timed_out = [False]
+        # 期限切れで抜けるときに添える補足（転送済みの一時名など）。
+        # _fail の期限切れ文面は固定なので、前置きの側へ足す
+        timed_out_note = [""]
 
         def unknown_outcome(e):
             """置き換わったか確かめられないときの扱いを返す。
@@ -476,6 +479,27 @@ class SFTPManager(QObject):
                         # _sftp_lock は同一プロセス内しか直列化しない）。
                         # ただし窓は転送の全体から stat 1 往復まで縮まる
                         state, why = self._remote_probe(remote_path)
+                        if state == self._REMOTE_TIMEOUT:
+                            # 有無は確かめられていない。「作られました」と
+                            # 断定せず、以後使えないチャンネルも畳む。
+                            # ここはロックの中なので畳めない（disconnect が
+                            # 同じロックを取る）。印を付けて抜けてから畳む
+                            keep_tmp[0] = True
+                            probe_timed_out[0] = True
+                            timed_out_note[0] = (
+                                "（リモートに '%s' が現れていないか確かめられませんでした。"
+                                "置き換えていません。転送した内容は一時名 %s に"
+                                "残っています）" % (remote_name, tmp_remote))
+                            return
+                        if state == self._REMOTE_UNSURE:
+                            # 権限エラーなど。有無は分からないが、チャンネル
+                            # そのものは使えるので接続は畳まない
+                            keep_tmp[0] = True
+                            raise IOError(
+                                "転送しているあいだにリモートへ '%s' が現れていないか"
+                                "確かめられませんでした（%s）。上書きになる恐れがあるので"
+                                "置き換えていません。転送した内容は一時名 %s に"
+                                "残っています" % (remote_name, why, tmp_remote))
                         if state != self._REMOTE_MISSING:
                             # 転送した内容は捨てない。一時名に残して知らせる
                             keep_tmp[0] = True
@@ -538,7 +562,8 @@ class SFTPManager(QObject):
             finally:
                 # ロックの外。理由を出して接続を畳むのは _fail に任せる
                 if probe_timed_out[0]:
-                    self._fail("アップロードエラー", TimeoutError())
+                    self._fail("アップロードエラー" + timed_out_note[0],
+                               TimeoutError())
         
         # バックグラウンドスレッドで実行
         threading.Thread(target=upload_thread, daemon=True).start()
