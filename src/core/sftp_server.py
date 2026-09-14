@@ -72,23 +72,38 @@ class SFTPServerHandler(SFTPServerInterface):
         return os.path.join(parent_real, leaf)
 
     def list_folder(self, path):
-        """ディレクトリ一覧を返す"""
+        """ディレクトリ一覧を返す。
+
+        各項目は os.lstat で引く（SFTP の READDIR は lstat 相当を返すのが慣例）。
+        os.stat だとリンクを解決してしまうため、(1) リンクはリンク先の属性で
+        報告され、同じ名前に対する LSTAT の答えと食い違う、(2) リンク先を失った
+        リンクは stat が失敗して一覧から丸ごと消える（ディスク上には実在し、
+        名前を指定すれば削除できるのに見えない）という2つの食い違いが起きる。
+
+        残る制限: Windows のジャンクションは os.lstat でも S_IFLNK が立たず
+        （実測で st_mode = 0o40777）、一覧の側からリンクだと見分けられない。
+        開発者モード等で作れる本来のシンボリックリンクでは S_IFLNK が立つ。
+
+        それでも引けなかった項目だけを落とす。握りつぶすと「一覧に出ない」
+        理由が誰にも分からなくなるので、名前と理由をログに出す。
+        """
         try:
             real_path = self._get_real_path(path)
-            
+
             if not os.path.isdir(real_path):
                 return SFTP_FAILURE
-            
+
             items = []
             for filename in os.listdir(real_path):
                 file_path = os.path.join(real_path, filename)
                 try:
-                    stat_info = os.stat(file_path)
+                    stat_info = os.lstat(file_path)
                     attr = SFTPAttributes.from_stat(stat_info, filename)
                     items.append(attr)
-                except Exception:
+                except Exception as e:
+                    print(f"[SFTP Server] list_folder skipped {filename}: {e}")
                     continue
-            
+
             return items
         except Exception as e:
             print(f"[SFTP Server] list_folder error: {e}")
