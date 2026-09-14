@@ -11,7 +11,7 @@ from typing import Dict, Optional
 # MIB 解析器の版。抽出・解決の規則を変えたら上げる。mib_cache.json は
 # この値も鍵にするので、古い解析器が作ったキャッシュがアプリの更新後に
 # そのまま使われることがなくなる。
-MIB_PARSER_VERSION = '2026-09-12.1'
+MIB_PARSER_VERSION = '2026-09-14.2'
 
 
 def app_dir() -> str:
@@ -79,6 +79,20 @@ class MIBResolver:
         
         # 標準MIB-II
         standard_mibs = {
+            # 標準 OID ツリーの起点。iso は ASN.1 の暗黙の根で、どの MIB
+            # ファイルにも定義が無い。ここに無いと、利用者が mibs/ へ置いた
+            # 標準 MIB の `::= { mib-2 n }` が親を引けず、その MIB の配下が
+            # 丸ごと解決できない（知らせるのは標準出力の「0件」だけ）。
+            '1': 'iso',
+            '1.3': 'org',
+            '1.3.6': 'dod',
+            '1.3.6.1': 'internet',
+            '1.3.6.1.2': 'mgmt',
+            '1.3.6.1.2.1': 'mib-2',
+            '1.3.6.1.4': 'private',
+            '1.3.6.1.4.1': 'enterprises',
+            '1.3.6.1.6': 'snmpV2',
+
             # System Group
             '1.3.6.1.2.1.1': 'system',
             '1.3.6.1.2.1.1.1.0': 'sysDescr',
@@ -134,11 +148,42 @@ class MIBResolver:
         # 逆引き辞書も作成
         self.name_to_oid = {v: k for k, v in self.oid_to_name.items()}
     
+    @staticmethod
+    def _valid_custom_entries(custom_mibs) -> dict:
+        """custom_mibs.json の mibs から、使えるエントリだけを返す。
+
+        custom_mibs.json は利用者が手で書くファイルなので、値が文字列で
+        ない（list や数値）ことがある。そのまま辞書へ入れると、逆引きの
+        組み立てで例外になった時点で片側だけ更新された状態が残り、
+        非文字列の名前が resolve_oid() から返って受け取った側
+        （Trap 表の QStandardItem）が Trap 1件ごとに落ちる。
+
+        OID は数字とドットだけ、名前は空でない文字列。外れたものは
+        捨てて警告する。
+        """
+        import re
+
+        if not isinstance(custom_mibs, dict):
+            print("[MIBResolver] custom_mibs.json の mibs が辞書ではありません")
+            return {}
+        valid = {}
+        for oid, name in custom_mibs.items():
+            if not isinstance(oid, str) or not re.fullmatch(r'\d+(\.\d+)*',
+                                                            oid):
+                print(f"[MIBResolver] custom_mibs.json の不正なOIDを無視: {oid!r}")
+                continue
+            if not isinstance(name, str) or not name:
+                print(f"[MIBResolver] custom_mibs.json の不正な名前を無視: "
+                      f"{oid} -> {name!r}")
+                continue
+            valid[oid] = name
+        return valid
+
     def _load_custom_mibs(self):
         """カスタムMIBファイルを読み込み（キャッシュ対応）"""
         import json
         import os
-        
+
         # 1. custom_mibs.jsonを読み込み（アプリのディレクトリ基準）
         custom_mib_file = _app_path('custom_mibs.json')
 
@@ -146,16 +191,17 @@ class MIBResolver:
             try:
                 with open(custom_mib_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                    custom_mibs = data.get('mibs', {})
-                    
-                    # カスタムMIBを登録
-                    self.oid_to_name.update(custom_mibs)
-                    
-                    # 逆引き辞書を更新
-                    for oid, name in custom_mibs.items():
-                        self.name_to_oid[name] = oid
-                    
-                    print(f"[MIBResolver] カスタムMIB {len(custom_mibs)}件を読み込みました")
+                custom_mibs = self._valid_custom_entries(
+                    data.get('mibs', {}) if isinstance(data, dict) else {})
+
+                # カスタムMIBを登録（検証後にまとめて反映する）
+                self.oid_to_name.update(custom_mibs)
+
+                # 逆引き辞書を更新
+                for oid, name in custom_mibs.items():
+                    self.name_to_oid[name] = oid
+
+                print(f"[MIBResolver] カスタムMIB {len(custom_mibs)}件を読み込みました")
             except Exception as e:
                 print(f"[MIBResolver] カスタムMIB読み込みエラー: {str(e)}")
         
@@ -313,6 +359,10 @@ class MIBResolver:
         r'([\w-]+)\s+NOTIFICATION-TYPE\b' + _MIB_DEFINITION_BODY
         + _MIB_ASSIGNMENT,
         r'([\w-]+)\s+MODULE-IDENTITY\b' + _MIB_DEFINITION_BODY
+        + _MIB_ASSIGNMENT,
+        # ベンダー MIB は中間ノードを OBJECT-IDENTITY で置くことが多い。
+        # 拾わないと、その節も配下も丸ごと解決できない。
+        r'([\w-]+)\s+OBJECT-IDENTITY\b' + _MIB_DEFINITION_BODY
         + _MIB_ASSIGNMENT,
     )
 
