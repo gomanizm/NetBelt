@@ -326,8 +326,13 @@ echo.
 
 REM アプリケーションを再起動
 REM start は成功しても errorlevel を 0 に戻さない。直前の失敗が残って
-REM いると、起動できていても失敗と誤判定する。start の戻り値では判定せず、
-REM 起動する前に実行ファイルの存在を確かめる。
+REM いると、起動できていても失敗と誤判定する。これが v1.1.0 の不具合で、
+REM 長らく start の戻り値を見ない形にしていた。その代わり、起動できない
+REM exe に差し替わっても「起動しました」と表示していた。
+REM 直前に空の cmd を 0 で終わらせて errorlevel を均せば両立する。実測:
+REM   均してから 起動できない exe を start -> 216
+REM   均さず直前を 9 にして 起動できる exe -> 9   （これが v1.1.0 の形）
+REM   均してから 起動できる   exe を start -> 0
 echo [6/6] アプリケーションを再起動中...
 if not exist "!APP_PATH!" (
     echo エラー: 実行ファイルが見つかりません
@@ -336,23 +341,43 @@ if not exist "!APP_PATH!" (
     pause
     exit /b 1
 )
+cmd /d /c exit 0
 start "" "!APP_PATH!"
-echo   起動しました
+if errorlevel 1 set "LAUNCH_FAILED=1"
+if defined LAUNCH_FAILED (
+    echo   起動できませんでした
+    echo   更新そのものは当たっています。NetBelt.exe を手で起動してください。
+) else (
+    echo   起動しました
+)
 echo.
 
 REM クリーンアップ
+REM 起動できなかったときは ZIP と検証用のサイドカーを残す。消してしまうと、
+REM 当て直す材料も、何を当てたのかを確かめる材料も無くなる。
 echo クリーンアップ中...
 ping -n 2 127.0.0.1 >nul 2>&1
 rd /s /q "!TEMP_DIR!" 2>nul
-del "!ZIP_FILE!" 2>nul
-del "!ZIP_FILE!.sha256" 2>nul
-del "!ZIP_FILE!.version" 2>nul
+if not defined LAUNCH_FAILED del "!ZIP_FILE!" 2>nul
+if not defined LAUNCH_FAILED del "!ZIP_FILE!.sha256" 2>nul
+if not defined LAUNCH_FAILED del "!ZIP_FILE!.version" 2>nul
 echo   完了
 echo.
 
 echo ================================================
 echo  更新が完了しました！
 echo ================================================
+REM 残る制限: 起動できなかった場合も、更新そのもの（ファイルの差し替え）は
+REM 当たっているため、上の表示と終了コード 0 は変えていない。呼び出し元は
+REM 更新のために既に終了しているので、この値を読む相手がいない。伝わるのは
+REM この画面だけなので、その場合は自動で閉じずに読ませる。
+if defined LAUNCH_FAILED (
+    echo.
+    echo  ただし NetBelt.exe を起動できませんでした。
+    echo  手で起動できないときは、残してある ZIP を展開し直してください。
+    pause
+    exit /b 0
+)
 ping -n 4 127.0.0.1 >nul 2>&1
 
 exit /b 0
