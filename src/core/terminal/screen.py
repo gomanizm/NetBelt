@@ -640,9 +640,16 @@ class Screen(object):
         # 画面全体が消えるとき (clear は ESC[H ESC[J、つまり home からの
         # mode 0 で来る) は、消す前に見えていた中身を履歴へ送る。
         # clear でセッションの記録を失わない、という v1.1.1 の方針
+        row = self.lines[self.cursor_row]
+        # ED 0 の走査の開始桁も、実際に消える範囲の左端へ合わせる。
+        # カーソルが全角の後半桁にあると _erase_line(0) は _split_wide で
+        # その全角の前半桁まで戻って払うので、丸めずに (0, 0) と比べると
+        # 画面は丸ごと空になるのに記録だけが残らない
+        col = self.cursor_col
+        if 0 < col < len(row) and row[col][0] == "":
+            col -= 1
         wipes_all = (mode >= 2 or
-                     (mode == 0 and (self.cursor_row, self.cursor_col)
-                      == (0, 0)))
+                     (mode == 0 and (self.cursor_row, col) == (0, 0)))
         # ED 1 も、カーソルより下に中身が残らなければ画面は丸ごと
         # 空白になる。最下行の右端に限らず、機器が数行出した直後の
         # ESC[1J (24x80 で 2 行だけ、など) が該当する。消える中身は
@@ -654,7 +661,6 @@ class Screen(object):
         # 継続セル ("", attr) は BLANK と一致しないので、丸めずに数えると
         # 「下に中身が残る」と誤判定して画面だけが消え記録が残らない
         start = self.cursor_col + 1
-        row = self.lines[self.cursor_row]
         if start < len(row) and row[start][0] == "":
             start += 1
         blank_after = mode == 1 and not any(
