@@ -1,10 +1,17 @@
 @echo off
-rem dist/ build/ の削除と spec の参照は相対パス。別のディレクトリから呼ぶと
-rem そちらの dist/ build/ を消すので、先に自分の置き場所へ移る。
-rem 移れなかったときは、必ずここで止める。cmd.exe は UNC パスを
-rem カレントにできないので、共有フォルダから叩くとこの cd は失敗し、
-rem カレントは呼び出し元のまま。そのまま進むと下の rmdir が消すのは
-rem 呼び出し元の dist/ build/ になる。
+rem Comments in this file are ASCII on purpose. There is no chcp here,
+rem so cmd reads the file in the console codepage (CP932 on a Japanese
+rem system) while the file itself is UTF-8. Japanese text then decodes
+rem to a different byte length, the reader loses its place, and pieces
+rem of a comment get run as commands -- which sets errorlevel and turns
+rem a successful build into a reported failure (measured: exit code 1).
+rem Japanese stays in the echo lines, where a garbled line is cosmetic.
+rem
+rem dist/ and build/ are removed by relative path and the spec is read
+rem by relative path, so move to this script's own folder first; called
+rem from elsewhere this would delete that folder's dist/ and build/.
+rem Stop when the move fails: cmd.exe cannot make a UNC path current,
+rem so running this from a share leaves the caller's folder current.
 cd /d "%~dp0"
 if errorlevel 1 (
     echo ERROR: このスクリプトの置き場所へ移動できません。
@@ -25,10 +32,10 @@ if exist "dist" (
     rmdir /s /q dist
     set "NETBELT_DIST_CLEANED=1"
 )
-rem 掃除しそこねると前回の exe がそのまま残る。今回のビルドが失敗しても
-rem その exe を今回の成果物として「ビルド成功」と表示してしまうので、
-rem ここで止める。exit /b は入れ子の括弧の中だと終了コードが伝わらない
-rem ため、確認は括弧の外で行う。
+rem A failed clean leaves the previous exe in place, and a later
+rem failure would then report that stale exe as this build's output.
+rem Stop here. The check sits outside the parentheses because exit /b
+rem inside a nested block does not carry the exit code out.
 if exist "dist" (
     echo ERROR: dist フォルダを削除できませんでした。
     echo   NetBelt.exe を実行中なら、終了してからやり直してください。
@@ -47,8 +54,8 @@ echo [2/3] PyInstallerでビルド中...
 echo このプロセスには数分かかる場合があります...
 echo.
 python -m PyInstaller --clean NetBelt.spec
-rem exe の有無だけでは足りない。PyInstaller が落ちても、掃除しそこねた
-rem 前回の exe が残っていれば「成功」に見えてしまう。
+rem The presence of the exe is not enough: if PyInstaller fails and the
+rem clean also failed, the stale exe would still look like success.
 if errorlevel 1 (
     echo.
     echo [3/3] ビルド失敗
@@ -59,8 +66,8 @@ if errorlevel 1 (
 echo.
 
 if exist "dist\NetBelt.exe" (
-    rem exe は自動更新の最後に updater.bat を自分の隣から探す。
-    rem 入れ忘れると、更新を落とせても適用の直前で必ず失敗する。
+    rem The app looks for updater.bat next to the exe at the end of an
+    rem update. Without it every downloaded update fails at the last step.
     copy /y updater.bat dist\ >nul
     if errorlevel 1 (
         echo [3/3] ビルド失敗
