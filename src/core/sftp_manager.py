@@ -1,6 +1,7 @@
 """SFTP接続管理"""
 import os
 import threading
+import uuid
 from typing import List, Dict, Optional, Callable
 from PyQt6.QtCore import QObject, pyqtSignal
 import paramiko
@@ -263,6 +264,29 @@ class SFTPManager(QObject):
             return self._REMOTE_DIR, ""
         return self._REMOTE_FILE, ""
 
+    def _carry_over_mode(self, remote_path: str, tmp_remote: str):
+        """置き換え先の mode を一時名へ写す（ロック内で呼ぶ）
+
+        一時名へ送ってから改名する作りでは、最終名の権限が一時名を作った
+        ときのもの（サーバの umask 任せ）に変わる。0600 の設定ファイルを
+        上書きすると緩くなり得るので、既存の mode が読めたときは改名の前に
+        当て直す。所有者・グループ・ACL は SFTP では引き継げない。
+
+        読めない相手（stat が失敗する）や、当てられない相手（機器の flash の
+        ように mode が意味を持たない）では、これまでどおり何もしない。
+        """
+        try:
+            mode = getattr(self.sftp_client.stat(remote_path), "st_mode", None)
+        except Exception:
+            return
+        if not isinstance(mode, int):
+            return
+        try:
+            self.sftp_client.chmod(tmp_remote, mode & 0o7777)
+        except Exception:
+            # 権限を引き継げないことは、転送そのものの失敗にはしない
+            pass
+
     def upload_file(self, local_path: str, remote_path: str = None,
                     overwrite: bool = False):
         """
@@ -311,9 +335,21 @@ class SFTPManager(QObject):
         # 切断や容量不足で機器側に途中までの設定ファイルが本来の名前で残る。
         # 同じディレクトリの一時名へ送り、成功してから置き換える
         remote_dir, _, remote_name = remote_path.rpartition("/")
+        if not remote_dir and remote_path.startswith("/"):
+            # '/name' の rpartition はディレクトリを '' で返す。そのまま
+            # 相対の一時名にすると、サーバの開始ディレクトリ側へ書かれ、
+            # ルートと別ファイルシステムなら改名も失敗する
+            remote_dir = "/"
+        # 一時名のディレクトリ部（ルートなら '/' 一つだけを前に付ける）
+        tmp_dir = remote_dir if remote_dir in ("", "/") else remote_dir + "/"
         # スラッシュを含まない相対名なら、一時名も相対のまま（ルート直下に
         # しない。OpenSSH 系の機器はルートに書けないことが多い）
-        tmp_remote = (remote_dir + "/" if remote_dir else "") + ".%s.netbelt-part" % remote_name
+        # 一時名は送信ごとに一意にする（ダウンロード側の mkstemp と同じ理由）。
+        # 固定名だと、置き換えに失敗して残した「唯一の完全な写し」を次の試行が
+        # 黙って上書きし、その試行が失敗すれば後始末が消してしまう。一意なら
+        # 消す相手は必ず今回作った一時名に限られる
+        tmp_remote = (tmp_dir + ".%s.netbelt-part.%d-%s"
+                      % (remote_name, os.getpid(), uuid.uuid4().hex[:8]))
         # 最終名を消したあとで置き換えに失敗した場合は、一時名が唯一の完全な
         # 写しになるので消さない
         keep_tmp = [False]
@@ -377,6 +413,29 @@ class SFTPManager(QObject):
                             return
                     self.sftp_client.put(local_path, tmp_remote,
                                          callback=progress_callback)
+                    if not overwrite:
+                        # 送る前の確認から転送のあいだに、第三者が同じ名前を
+                        # 作っているかもしれない。posix_rename は既存を上書き
+                        # するので、置き換える直前にもう一度確かめる。
+                        # 限界: この確認と改名のあいだは依然として塞げない
+                        # （SFTP に「無ければ置き換える」原子操作が無く、
+                        # _sftp_lock は同一プロセス内しか直列化しない）。
+                        # ただし窓は転送の全体から stat 1 往復まで縮まる
+                        state, why = self._remote_probe(remote_path)
+                        if state != self._REMOTE_MISSING:
+                            # 転送した内容は捨てない。一時名に残して知らせる
+                            keep_tmp[0] = True
+                            raise IOError(
+                                "転送しているあいだにリモートへ '%s' が作られました。"
+                                "上書きの確認を経ていないので置き換えていません。"
+                                "転送した内容は一時名 %s に残っています"
+                                % (remote_name, tmp_remote)
+                                + ("（%s）" % why if why else ""))
+                    else:
+                        # 置き換えなら、既存の権限を一時名へ写しておく
+                        # （overwrite=False のときは上で「無い」と確かめた
+                        # あとなので、引き継ぐ mode は無い）
+                        self._carry_over_mode(remote_path, tmp_remote)
                     # 全部送れてから最終名へ。posix_rename（OpenSSH 拡張）は
                     # 既存を上書きできる。無いサーバでは、まず rename を試し、
                     # 既存があって失敗したときだけ消してからもう一度 rename
