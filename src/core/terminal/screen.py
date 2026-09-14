@@ -218,9 +218,10 @@ class Screen(object):
             main_marks.append(False)
         if self.alt_active:
             if self._saved_main:
-                self._saved_main = (min(keep_row, rows - 1),
-                                    min(self._saved_main[1], cols - 1),
-                                    self._saved_main[2])
+                # 位置だけ画面に収め、属性と文字集合はそのまま持ち越す
+                self._saved_main = ((min(keep_row, rows - 1),
+                                     min(self._saved_main[1], cols - 1))
+                                    + self._saved_main[2:])
         else:
             self.cursor_row = keep_row
 
@@ -548,7 +549,11 @@ class Screen(object):
         if to_alt == self.alt_active:
             return
         if to_alt and with_cursor:
-            self._saved_main = (self.cursor_row, self.cursor_col, self.attr)
+            # 1049 は DECSC 相当の保存・復元 (XTerm ctlseqs)。文字集合
+            # の指示まで持ち帰らないと、代替画面が ESC(0 のまま抜けた
+            # ときに以降の出力も記録も罫線文字に化け続ける
+            self._saved_main = (self.cursor_row, self.cursor_col, self.attr,
+                                dict(self._g), self._charset)
         self.lines, self._other = self._other, self.lines
         # 折り返しの印も画面と一緒に入れ替える。裏へ回ったメイン画面の
         # 印を失うと、戻ってきたときに組み直しで繋ぎ直せなくなる
@@ -567,8 +572,10 @@ class Screen(object):
                     self._other[r] = self._blank_line()
                     self._other_wrapped[r] = False
             if with_cursor and self._saved_main:
-                row, col, attr = self._saved_main
+                row, col, attr, g, charset = self._saved_main
                 self.attr = attr
+                self._g = dict(g)
+                self._charset = charset
                 self._move(row, col)
         self.dirty.update(range(self.rows))
         self._pending_wrap = False
@@ -613,11 +620,18 @@ class Screen(object):
         # ED 2 と同じなので、同じく履歴へ送る
         # (消し方は下の mode == 1 の枝のまま。行が桁数より長い
         # ことがあり、全画面消去と同じに払うと右に残る分も消える)
+        # 走査の開始桁は、実際に消える範囲の右端へ合わせる。カーソルが
+        # 全角の前半桁にあると _erase_line(1) はその継続セルまで払うが、
+        # 継続セル ("", attr) は BLANK と一致しないので、丸めずに数えると
+        # 「下に中身が残る」と誤判定して画面だけが消え記録が残らない
+        start = self.cursor_col + 1
+        row = self.lines[self.cursor_row]
+        if start < len(row) and row[start][0] == "":
+            start += 1
         blank_after = mode == 1 and not any(
             c != BLANK
             for r in range(self.cursor_row, self.rows)
-            for c in self.lines[r][(self.cursor_col + 1)
-                                   if r == self.cursor_row else 0:])
+            for c in self.lines[r][start if r == self.cursor_row else 0:])
         if wipes_all or blank_after:
             self._record_screen()
         if wipes_all:
@@ -684,10 +698,18 @@ class Screen(object):
                 self.lines.insert(self.cursor_row, self._blank_line())
                 self.wrapped.insert(self.cursor_row, False)
             else:
-                self.lines.pop(self.cursor_row)
-                self.wrapped.pop(self.cursor_row)
+                removed = self.lines.pop(self.cursor_row)
+                removed_wrap = self.wrapped.pop(self.cursor_row)
                 self.lines.insert(self.scroll_bottom, self._blank_line())
                 self.wrapped.insert(self.scroll_bottom, False)
+                # 画面の先頭を削ると、押し出された行はどこにも残らない。
+                # 上へ押し出す動きは SU と同じなので、_scroll_up と同じ
+                # 条件で履歴へ送る。条件を揃えないと、画面に残っている
+                # 行まで記録して二重に出る
+                if (not self.alt_active and self.scroll_top == 0
+                        and self.cursor_row == 0):
+                    self.history.append(removed)
+                    self._new_history.append((removed, removed_wrap))
         self.dirty.update(range(self.cursor_row, self.scroll_bottom + 1))
         self._pending_wrap = False
 
