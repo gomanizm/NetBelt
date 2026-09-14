@@ -56,6 +56,14 @@ class LogSaveWorker(QThread):
                     progress_percent = min(100, int((i + chunk_size) / total_size * 100))
                     self.progress.emit(progress_percent)
 
+            # ループの判定はチャンクの切れ目だけなので、最後の write と
+            # close のあいだに立ったキャンセルはここまで届かない。
+            # 保存先へ触る直前にもう一度見て、立っていれば置き換えない
+            # （一時ファイルは finally で消える）。
+            if self._is_cancelled:
+                self.finished.emit(False, "キャンセルされました")
+                return
+
             # 閉じてから差し替える（Windows では開いたままだと置き換えられない）
             os.replace(tmp_path, target)
             tmp_path = None
