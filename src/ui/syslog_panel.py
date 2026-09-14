@@ -606,6 +606,28 @@ class SyslogPanel(QWidget):
         message = cls._escape_for_export(msg.message)
         return f"{msg.timestamp} {msg.source_ip} {hostname} [{msg.level}] {message}"
 
+    def _refuse_if_recording(self, title: str, file_path: str) -> bool:
+        """保存先が端末のログ記録に使われていたら断る（断ったら True）
+
+        保存は保存先を別の内容へ作り直す（_write_text_file_atomically が
+        一時ファイルへ書き切ってから os.replace で置き換える）。記録中の
+        ファイルを選ばれると、置き換えが通れば記録済みの内容は失われ、端末は
+        開いたままのハンドルで自分のオフセットから書き続けるので、双方の
+        ファイルが壊れる。置き換えが Windows の共有違反で弾かれた場合も、
+        利用者に出るのは汎用の保存失敗になり理由が分からない。
+        （SNMPPanel._refuse_if_recording と同じ判定）
+        """
+        from core import log_recording
+        device_name = log_recording.device_using(file_path)
+        if device_name is None:
+            return False
+        QMessageBox.warning(
+            self, title,
+            "このファイルは %s のログ記録に使用中です:\n%s\n"
+            "別のファイルを選ぶか、先にそのログ記録を停止してください。"
+            % (device_name, file_path))
+        return True
+
     @staticmethod
     def _export_format(file_path: str) -> str:
         """保存先の拡張子から書き出す形式を決める（"json" / "txt"）
@@ -633,6 +655,8 @@ class SyslogPanel(QWidget):
         )
 
         if filename:
+            if self._refuse_if_recording("メッセージをエクスポート", filename):
+                return
             try:
                 messages = self.model.get_all_messages()
                 if self._export_format(filename) == 'json':
@@ -742,6 +766,8 @@ class SyslogPanel(QWidget):
         )
 
         if filename:
+            if self._refuse_if_recording("選択行を保存", filename):
+                return
             try:
                 def write_lines(f):
                     for msg in messages:
