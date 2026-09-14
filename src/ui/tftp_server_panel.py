@@ -12,6 +12,13 @@ from ui import theme
 
 class TFTPServerPanel(QWidget):
     """TFTPサーバー制御パネル"""
+
+    # TFTP は認証が無く、存在しないファイルへの RRQ だけでもログと履歴が
+    # 1行ずつ増える。上限が無いと遠隔から叩き続けるだけでメモリを食い潰せる。
+    # 行数は Syslog パネル（1000件）に合わせた。
+    MAX_LOG_LINES = 1000
+    MAX_HISTORY_ROWS = 1000
+
     def __init__(self, parent=None, config_manager=None):
         """初期化。config_managerがNoneの場合は新規のConfigManagerを生成する。"""
         super().__init__(parent)
@@ -111,6 +118,10 @@ class TFTPServerPanel(QWidget):
         self.history.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.history.setMaximumHeight(300)
         history_layout.addWidget(self.history)
+        clear_history_btn = QPushButton("履歴をクリア")
+        clear_history_btn.clicked.connect(self._on_clear_history)
+        clear_history_btn.setMaximumWidth(120)
+        history_layout.addWidget(clear_history_btn)
         history_group.setLayout(history_layout)
         layout.addWidget(history_group)
         # アクティビティログ
@@ -119,6 +130,8 @@ class TFTPServerPanel(QWidget):
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
         self.log_text.setMaximumHeight(150)
+        # 行数の上限。超えた分は Qt が先頭ブロックから捨てる
+        self.log_text.document().setMaximumBlockCount(self.MAX_LOG_LINES)
         self.log_text.setStyleSheet("font-family: Consolas, monospace; font-size: 9pt;")
         log_layout.addWidget(self.log_text)
         clear_log_btn = QPushButton("ログをクリア")
@@ -225,6 +238,7 @@ class TFTPServerPanel(QWidget):
                 self._fmt_bytes(total) if total else "—", "—", status]
         for c, v in enumerate(vals): self.history.setItem(row, c, QTableWidgetItem(v))
         self._active[key] = {"t0": self._time.time(), "total": total, "row": row}
+        self._trim_history()
         self._add_log("[%s] %s 転送開始: %s" % (ip, "取得" if direction == "download" else "受信", filename))
 
     def _on_tx_progress(self, ip, filename, done, total, direction):
@@ -254,7 +268,31 @@ class TFTPServerPanel(QWidget):
                     self._fmt_bytes(done), "—", "完了"]
             for c, v in enumerate(vals):
                 self.history.setItem(row, c, QTableWidgetItem(v))
+            self._trim_history()
         self._add_log("[%s] 転送完了: %s (%s)" % (ip, filename, self._fmt_bytes(done)))
+
+    def _trim_history(self):
+        """転送履歴の行数を上限まで切り詰める（古い行から捨てる）。
+
+        行を捨てると残りの行番号が前へずれるので、進行中の転送が覚えている
+        行番号も同じだけ繰り上げる。ずらさないと、その転送の進捗が別の
+        転送の行を上書きしてしまう。捨てられた行を指していた転送は追跡を
+        やめる（完了時にその場で新しい行を作る）。
+        """
+        excess = self.history.rowCount() - self.MAX_HISTORY_ROWS
+        if excess <= 0:
+            return
+        for _ in range(excess):
+            self.history.removeRow(0)
+        for key in [k for k, st in self._active.items() if st["row"] < excess]:
+            del self._active[key]
+        for st in self._active.values():
+            st["row"] -= excess
+
+    def _on_clear_history(self):
+        """転送履歴をクリア（進行中の転送の行追跡も手放す）"""
+        self.history.setRowCount(0)
+        self._active.clear()
 
     def _on_transfer_interrupted(self, ip: str, filename: str, direction: str):
         """利用者が止めたことによる中断。エラーではないので行だけ確定させる。

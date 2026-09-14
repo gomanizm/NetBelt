@@ -13,7 +13,11 @@ from ui import theme
 
 class SFTPServerPanel(QWidget):
     """SFTPサーバー制御パネル"""
-    
+
+    # 認証前の接続でもログは増える。上限が無いと遠隔から叩き続けるだけで
+    # メモリを食い潰せるため、頭打ちにする。Syslog パネル（1000件）に合わせた。
+    MAX_LOG_LINES = 1000
+
     def __init__(self, parent=None):
         """
         初期化
@@ -133,6 +137,8 @@ class SFTPServerPanel(QWidget):
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
         self.log_text.setMaximumHeight(150)
+        # 行数の上限。超えた分は Qt が先頭ブロックから捨てる
+        self.log_text.document().setMaximumBlockCount(self.MAX_LOG_LINES)
         self.log_text.setStyleSheet("font-family: Consolas, monospace; font-size: 9pt;")
         log_layout.addWidget(self.log_text)
         
