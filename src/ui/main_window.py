@@ -1021,7 +1021,7 @@ class MainWindow(QMainWindow):
 
         # エラーシグナルを接続してデバッグ
         sftp_manager.error_occurred.connect(
-            lambda err: self._on_sftp_error(device_name, err)
+            lambda err, c=conn: self._on_sftp_error(device_name, err, c)
         )
 
         client = conn.client
@@ -2127,15 +2127,23 @@ for details.
         self.port_checker_window.show()
         self.status_bar.showMessage("ポートチェッカーを起動しました")
     
-    def _on_sftp_error(self, device_name: str, error_message: str):
+    def _on_sftp_error(self, device_name: str, error_message: str, conn=None):
         """
         SFTP操作時のエラー処理
-        
+
+        同名で繋ぎ直した直後は、置き換えられた旧セッションの open_sftp が
+        遅れて失敗することがある。その通知でステータスバーを書き換えると、
+        成功した新接続の表示を旧接続のエラーで消してしまう。ログには残し、
+        ステータスバーは触らない。
+
         Args:
             device_name: デバイス名
             error_message: エラーメッセージ
+            conn: このセッションを張った接続オブジェクト（省略時は現在扱い）
         """
         print(f"SFTP Error [{device_name}]: {error_message}")
+        if not self._is_current_connection(device_name, conn):
+            return
         self.status_bar.showMessage(f"SFTP エラー ({device_name}): {error_message}")
     
     def _check_for_updates_on_startup(self):
