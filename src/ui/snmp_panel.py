@@ -688,6 +688,23 @@ class SNMPPanel(QWidget):
             % (device_name, file_path))
         return True
 
+    @staticmethod
+    def _export_format(file_path: str) -> str:
+        """保存先の拡張子から書き出す形式を決める（"csv" / "json" / "txt"）
+
+        大文字小文字は区別しない。区別すると out.CSV が TXT の中身で
+        書かれたうえ「エクスポートしました」と成功扱いになり、中身と
+        拡張子の食い違ったファイルが残る。ダイアログは選んだフィルタの
+        拡張子を小文字で補うので普段は当たるが、利用者が自分で .CSV と
+        打った場合と、大文字名の既存ファイルを選び直した場合に外れる。
+
+        当てはまらない拡張子は従来どおり TXT（既定の形式）。
+        """
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext in ('.csv', '.json'):
+            return ext[1:]
+        return 'txt'
+
     def _on_export_clicked(self):
         """GET/WALK 結果をエクスポート（Trap と同じく txt/csv/json）"""
         # 行・ホスト・途中までの理由は、ダイアログを開く前にまとめて固定し、
@@ -713,9 +730,13 @@ class SNMPPanel(QWidget):
         if self._refuse_if_recording("SNMP結果をエクスポート", file_path):
             return
         try:
-            if file_path.endswith(".csv"):
+            # 拡張子は大文字小文字を区別せずに見る。区別すると out.CSV が
+            # TXT の中身で書かれ、しかも「成功」と出る（理由は
+            # _export_format と同じ）
+            fmt = self._export_format(file_path)
+            if fmt == "csv":
                 self._export_results_to_csv(file_path, results, host, reason)
-            elif file_path.endswith(".json"):
+            elif fmt == "json":
                 self._export_results_to_json(file_path, results, host, reason)
             else:
                 self._export_results_to_txt(file_path, results, host, reason)
@@ -1056,10 +1077,11 @@ class SNMPPanel(QWidget):
             return
 
         try:
-            # ファイル拡張子で形式を判定
-            if file_path.endswith('.csv'):
+            # ファイル拡張子で形式を判定（大文字小文字は区別しない）
+            fmt = self._export_format(file_path)
+            if fmt == 'csv':
                 self._export_to_csv(file_path, traps)
-            elif file_path.endswith('.json'):
+            elif fmt == 'json':
                 self._export_to_json(file_path, traps)
             else:  # .txt or other
                 self._export_to_txt(file_path, traps)
