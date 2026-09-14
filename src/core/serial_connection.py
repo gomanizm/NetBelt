@@ -11,6 +11,20 @@ import threading
 import time
 
 
+class _WriterHandoff:
+    """ポートを閉じる役を、後始末と送信スレッドのどちらか一方に決める印。
+
+    join が空振りしたときだけ、閉じる役が送信スレッドへ移る。判定と印付けを
+    同じ錠の中で行うので、ちょうど一方だけが閉じる（二重 close も閉じ忘れも
+    起きない）。
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.finished = False         # 送信スレッドがループを抜けた
+        self.close_requested = False  # 閉じる役を送信スレッドへ渡した
+
+
 class SerialConnection(QObject):
     """シリアルポート接続を管理するクラス"""
     
@@ -37,6 +51,7 @@ class SerialConnection(QObject):
         # 送信は GUI スレッドを止めないよう、専用スレッドがキューから書く
         self._send_queue: "queue.Queue[Optional[bytes]]" = queue.Queue()
         self._write_thread: Optional[threading.Thread] = None
+        self._write_handoff: Optional[_WriterHandoff] = None
         self._is_connected = False
         self._should_stop = False
     
@@ -114,6 +129,8 @@ class SerialConnection(QObject):
         読み取りスレッドと送信スレッドの join で最大 2 秒ずつ、合わせて
         最大約 4 秒止める。join が空振りした場合でも、残った送信スレッドは
         起動時のポートに束縛されているので、後の接続のポートへは書かない。
+        空振りしたときはポートをここでは閉じず、閉じる役を送信スレッドへ
+        渡すので、そのポートが閉じるのは書き込みが終わったあとになる。
         """
         self._should_stop = True
         self._is_connected = False
@@ -134,13 +151,25 @@ class SerialConnection(QObject):
         self._send_queue = queue.Queue()
         old_queue.put(None)
         writer = self._write_thread
+        handoff = self._write_handoff
+        self._write_thread = None
+        self._write_handoff = None
+        handed_off = False
         if (writer is not None and writer.is_alive()
                 and writer is not threading.current_thread()):
             writer.join(timeout=2)
-        self._write_thread = None
+            if handoff is not None:
+                with handoff.lock:
+                    if not handoff.finished:
+                        # 時間切れ。pyserial の close() は CancelIoEx を投げた
+                        # 直後にハンドルを閉じるので、write の中で待っている
+                        # スレッドの足元からハンドルが消える（Win32 では
+                        # 未定義の動作）。閉じる役は送信スレッドへ渡す
+                        handoff.close_requested = True
+                        handed_off = True
 
-        # 接続が存在する場合は閉じる
-        if self.serial_conn and self.serial_conn.is_open:
+        # 接続が存在する場合は閉じる（送信スレッドへ渡した場合は向こうが閉じる）
+        if not handed_off and self.serial_conn and self.serial_conn.is_open:
             try:
                 self.serial_conn.close()
             except Exception as e:
@@ -220,32 +249,54 @@ class SerialConnection(QObject):
         # キューと同じく、書き込み先のポートも起動時の値で束縛する。
         # self.serial_conn を読み直すと、join が空振りした古いスレッドが
         # 後の接続のポートへ前の接続の残りを書いてしまう
+        self._write_handoff = _WriterHandoff()
         self._write_thread = threading.Thread(
-            target=self._write_loop, args=(self._send_queue, self.serial_conn),
+            target=self._write_loop,
+            args=(self._send_queue, self.serial_conn, self._write_handoff),
             daemon=True)
         self._write_thread.start()
 
-    def _write_loop(self, send_queue, port):
+    def _write_loop(self, send_queue, port, handoff):
         """キューに積まれた送信を、起動時のポートへ順に書く。None で終わる"""
-        while True:
-            data = send_queue.get()
-            if data is None:
-                break
-            if self._should_stop or port is None or not port.is_open:
-                continue
-            try:
-                port.write(data)
-                port.flush()
-            except serial.SerialException as e:
-                # 後始末で閉じられた直後の失敗は、切断済みなので知らせない
-                if self._should_stop:
+        try:
+            while True:
+                data = send_queue.get()
+                if data is None:
+                    break
+                if self._should_stop or port is None or not port.is_open:
                     continue
-                self.error_occurred.emit(f"送信エラー: {str(e)}")
-                self._is_connected = False
-            except Exception as e:
-                if self._should_stop:
-                    continue
-                self.error_occurred.emit(f"予期しないエラー: {str(e)}")
+                try:
+                    port.write(data)
+                    port.flush()
+                except serial.SerialException as e:
+                    # 後始末で閉じられた直後の失敗は、切断済みなので知らせない
+                    if self._should_stop:
+                        continue
+                    self.error_occurred.emit(f"送信エラー: {str(e)}")
+                    self._is_connected = False
+                except Exception as e:
+                    if self._should_stop:
+                        continue
+                    self.error_occurred.emit(f"予期しないエラー: {str(e)}")
+        finally:
+            self._finish_write_loop(port, handoff)
+
+    def _finish_write_loop(self, port, handoff):
+        """送信スレッドの後始末。閉じる役を渡されていればポートを閉じる。
+
+        後始末の join が空振りした場合だけ役が回ってくる。渡されたかどうかの
+        判定は dispose() と同じ錠の中で行うので、二重に閉じることはない。
+        """
+        with handoff.lock:
+            handoff.finished = True
+            should_close = handoff.close_requested
+        if not should_close or port is None:
+            return
+        try:
+            if port.is_open:
+                port.close()
+        except Exception as e:
+            print(f"切断エラー: {e}")
     
     @property
     def is_connected(self) -> bool:
