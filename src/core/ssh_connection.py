@@ -115,6 +115,10 @@ class SSHConnection(QObject):
         # 読み取りの停止と、接続中に後始末が走ったことを兼ねる印。
         # connect() の入口で戻し、接続が成立したあとにもう一度見る
         self._stop_reading = False
+        # dispose() 済み（このオブジェクトは捨てられた）ことを覚えておく印。
+        # _stop_reading と違い connect() の入口で戻さないので、接続スレッドが
+        # 動き出す前に着地した dispose() でも消えない
+        self._disposed = False
     
     def _setup_host_keys(self, client):
         """既知ホスト鍵を読み込み、TOFUポリシーを設定する。
@@ -252,6 +256,13 @@ class SSHConnection(QObject):
             bool: 接続成功時True
         """
         try:
+            if self._disposed:
+                # 接続スレッドが動き出す前にタブが閉じられ、dispose() が先に
+                # 走った。ここで印を無視して進むと、接続は最後まで成立する
+                # のに参照しているものが誰もいない状態になり、閉じる経路が
+                # 無いまま機器の vty 枠を掴んだままになる
+                return False
+
             # 待っている間に dispose() が走ると self.client は None になる。
             # 後始末は必ずこのローカル参照に対して行う
             client = paramiko.SSHClient()
@@ -372,7 +383,18 @@ class SSHConnection(QObject):
         disconnected を出すと、いま処理中の切断処理が再入する。
         閉じずに参照だけ捨てると、Transport スレッド自身がオブジェクトを
         参照し続けるため GC でも回収されない。
+
+        これを呼んだあとの connect() は、何もせず False を返す。呼び出し元
+        （MainWindow._close_connection / _discard_stale）は dispose() の前に
+        接続辞書からこのオブジェクトを外しており、以後この接続を使う人は
+        いないため。同じオブジェクトで繋ぎ直す場合は disconnect() を使う。
+
+        残る制限: 接続スレッドが動き出す前の disconnect() は、繋ぎ直しの
+        ために印を消すので取り消しにならない。利用者が明示的に切断してから
+        タブを残す経路（MainWindow._on_disconnect_device）だけなので、この
+        場合は接続が成立しても同じオブジェクトが保持し続ける。
         """
+        self._disposed = True
         self._stop_reading = True
         self.is_connected = False
 
@@ -388,8 +410,12 @@ class SSHConnection(QObject):
             self.client = None
 
     def disconnect(self):
-        """SSH接続を切断"""
+        """SSH接続を切断（同じオブジェクトで繋ぎ直せる）"""
         self.dispose()
+        # dispose() の印は「このオブジェクトは捨てた」意味なので、利用者が
+        # 明示的に切断しただけの場合は消す。残すと次の connect() が
+        # 取り消し扱いになり、繋ぎ直せなくなる
+        self._disposed = False
         self.disconnected.emit()
     
     def send_command(self, command: str):
