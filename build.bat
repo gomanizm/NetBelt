@@ -20,10 +20,23 @@ echo ================================
 echo.
 
 echo [1/3] 既存のビルドをクリーンアップ中...
+set "NETBELT_DIST_CLEANED="
 if exist "dist" (
     rmdir /s /q dist
-    echo - dist フォルダを削除しました
+    set "NETBELT_DIST_CLEANED=1"
 )
+rem 掃除しそこねると前回の exe がそのまま残る。今回のビルドが失敗しても
+rem その exe を今回の成果物として「ビルド成功」と表示してしまうので、
+rem ここで止める。exit /b は入れ子の括弧の中だと終了コードが伝わらない
+rem ため、確認は括弧の外で行う。
+if exist "dist" (
+    echo ERROR: dist フォルダを削除できませんでした。
+    echo   NetBelt.exe を実行中なら、終了してからやり直してください。
+    pause
+    exit /b 1
+)
+if defined NETBELT_DIST_CLEANED echo - dist フォルダを削除しました
+set "NETBELT_DIST_CLEANED="
 if exist "build" (
     rmdir /s /q build
     echo - build フォルダを削除しました
@@ -34,6 +47,15 @@ echo [2/3] PyInstallerでビルド中...
 echo このプロセスには数分かかる場合があります...
 echo.
 python -m PyInstaller --clean NetBelt.spec
+rem exe の有無だけでは足りない。PyInstaller が落ちても、掃除しそこねた
+rem 前回の exe が残っていれば「成功」に見えてしまう。
+if errorlevel 1 (
+    echo.
+    echo [3/3] ビルド失敗
+    echo PyInstaller がエラーで終了しました。上記のメッセージを確認してください。
+    pause
+    exit /b 1
+)
 echo.
 
 if exist "dist\NetBelt.exe" (
@@ -67,6 +89,8 @@ if exist "dist\NetBelt.exe" (
     echo [3/3] ビルド失敗
     echo エラーが発生しました。上記のメッセージを確認してください。
     echo.
+    pause
+    exit /b 1
 )
 
 pause
