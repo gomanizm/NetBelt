@@ -93,30 +93,47 @@ class SyslogMessage:
             # パースエラーの場合はそのまま表示
             self.message = self.raw_message
     
+    # RFC 3164 の TIMESTAMP は "Mmm dd hh:mm:ss" に限られる
+    _RFC3164_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                       "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+    _RFC3164_TIME_RE = re.compile(r'^\d{2}:\d{2}:\d{2}$')
+
+    @classmethod
+    def _has_rfc3164_timestamp(cls, parts):
+        """先頭 3 語が RFC 3164 の日時（例: "Jan  1 00:00:00"）か"""
+        if len(parts) < 3:
+            return False
+        month, day, tm = parts[0], parts[1], parts[2]
+        if month not in cls._RFC3164_MONTHS:
+            return False
+        if not (day.isdigit() and 1 <= int(day) <= 31):
+            return False
+        return bool(cls._RFC3164_TIME_RE.match(tm))
+
     def _parse_rfc3164(self, message: str):
         """RFC 3164形式のメッセージをパース"""
         try:
             # TIMESTAMP HOSTNAME MESSAGE の形式
             # 例: Jan  1 00:00:00 hostname message
-            
-            # タイムスタンプとホスト名を抽出（簡易版）
+            #
+            # 日時が本当に日時のときだけ消費する。語数だけで決め打ちすると、
+            # 日時を付けない機器（service timestamps log datetime を切った等）の
+            # 本文の先頭 4 語が日時+ホスト名として黙って捨てられる。
             parts = message.split(None, 3)
-            if len(parts) >= 3:
-                # parts[0]: Month, parts[1]: Day, parts[2]: Time, parts[3:]: Hostname + Message
-                if len(parts) == 4:
-                    # ホスト名とメッセージを分離
-                    remaining = parts[3].split(None, 1)
-                    if len(remaining) >= 1:
-                        self.hostname = remaining[0]
-                        self.message = remaining[1] if len(remaining) > 1 else ""
-                else:
-                    self.message = message
-            else:
-                self.message = message
-        
+            if self._has_rfc3164_timestamp(parts) and len(parts) == 4:
+                # parts[0]: Month, parts[1]: Day, parts[2]: Time, parts[3]: Hostname + Message
+                remaining = parts[3].split(None, 1)
+                if len(remaining) >= 1:
+                    self.hostname = remaining[0]
+                    self.message = remaining[1] if len(remaining) > 1 else ""
+                    return
+            # 日時が無い・欠けている場合は、ホスト名は送信元 IP のまま、
+            # 本文は PRI 以降の全文を残す
+            self.message = message
+
         except Exception:
             self.message = message
-    
+
     @staticmethod
     def _skip_structured_data(rest: str):
         """STRUCTURED-DATA を読み飛ばし、その直後の位置を返す（見つからなければ None）。
@@ -209,6 +226,55 @@ class SyslogReceiver(QObject):
         # 届かなくなる。最後に受信してからこの時間が過ぎた接続は切る。
         # 黙っている機器も切られるが、TCP syslog は次に送るときに繋ぎ直す。
         self.tcp_idle_timeout_seconds = 10 * 60
+        # GUI へ渡したまま、まだ処理されていない件数の上限。
+        # max_messages は GUI が受け取った後の保持件数で、受信スレッドから
+        # GUI へ渡す Qt のキュー自体には上限が無い。GUI の処理能力
+        # （実測 約540件/秒）を超えるバーストが来ると、そのぶんがすべて
+        # キューに残り、収まるまで GUI が固まる。UDP には接続数の上限も
+        # 1 行の上限も効かないので、認証の要らない LAN ホストから起こせる。
+        # 超過中の受信は捨て、捨てた件数ははけた時点で 1 件だけ通知する。
+        self.max_pending_messages = 1000
+        self.dropped_message_count = 0
+        self._pending_lock = threading.Lock()
+        self._pending_messages = 0
+        self._dropped_since_notice = 0
+        # 自分の信号を自分でも受ける。受信スレッドから emit した分は
+        # キュー経由で GUI スレッドへ届くので、このスロットが呼ばれた
+        # ことが「GUI が 1 件処理した」の合図になる。
+        self.message_received.connect(self._on_message_delivered)
+
+    def _emit_message(self, message):
+        """GUI へ 1 件渡す。配送待ちが上限に達している間は捨てる。
+
+        Returns:
+            bool: 渡したら True、捨てたら False
+        """
+        with self._pending_lock:
+            if self._pending_messages >= self.max_pending_messages:
+                self.dropped_message_count += 1
+                self._dropped_since_notice += 1
+                return False
+            self._pending_messages += 1
+        self.message_received.emit(message)
+        return True
+
+    def _on_message_delivered(self, _message):
+        """GUI が 1 件処理したので配送待ちを戻す（GUI スレッドで動く）"""
+        with self._pending_lock:
+            if self._pending_messages > 0:
+                self._pending_messages -= 1
+            dropped = self._dropped_since_notice
+            if self._pending_messages == 0 and dropped:
+                self._dropped_since_notice = 0
+            else:
+                dropped = 0
+        if dropped:
+            # 一覧に並ぶので、機器からの行と同じ RFC 3164 の形で組み立てる。
+            # PRI 12 = facility 1 (user) / severity 4 (Warning)
+            self._emit_message(SyslogMessage(
+                "<12>%s NetBelt 受信が追いつかず %d 件を取りこぼしました"
+                % (datetime.now().strftime("%b %d %H:%M:%S"), dropped),
+                "127.0.0.1"))
 
     @property
     def is_running(self):
@@ -387,7 +453,7 @@ class SyslogReceiver(QObject):
                 try:
                     data, addr = sock.recvfrom(65535)
                     message_str = self._decode_bytes(data)
-                    self.message_received.emit(
+                    self._emit_message(
                         SyslogMessage(message_str, addr[0], "UDP", listen_port))
                     self.message_count += 1
                 except socket.timeout:
@@ -450,7 +516,7 @@ class SyslogReceiver(QObject):
         """TCP で切り出した 1 メッセージを配信する（空行は捨てる）"""
         message_str = self._decode_bytes(line).strip()
         if message_str:
-            self.message_received.emit(
+            self._emit_message(
                 SyslogMessage(message_str, client_ip, "TCP", listen_port))
             self.message_count += 1
 
@@ -522,7 +588,7 @@ class SyslogReceiver(QObject):
                         # 組み立てる。生の文言のまま渡すと、先頭の語が
                         # 日時やホスト名として食われて読めなくなる。
                         # PRI 12 = facility 1 (user) / severity 4 (Warning)
-                        self.message_received.emit(SyslogMessage(
+                        self._emit_message(SyslogMessage(
                             "<12>%s NetBelt 1行が %d バイトを超えたため、"
                             "この接続を切断しました"
                             % (datetime.now().strftime("%b %d %H:%M:%S"),
