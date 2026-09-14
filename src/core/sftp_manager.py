@@ -1,5 +1,6 @@
 """SFTP接続管理"""
 import os
+import posixpath
 import threading
 import uuid
 from typing import List, Dict, Optional, Callable
@@ -701,12 +702,19 @@ class SFTPManager(QObject):
         """
         親ディレクトリのパスを取得
         
+        リモートのパスは POSIX なので posixpath で切る。os.path は
+        Windows では ntpath になり、バックスラッシュを含む名前
+        （Unix では合法）を区切りと読んで、'/a\\b' の親を '/a' という
+        実在する別のディレクトリにしてしまう。
+
         Returns:
             str: 親ディレクトリパス
         """
         if self.current_path == "/":
             return "/"
-        return os.path.dirname(self.current_path)
+        # 相対パスの親は空文字になる。そのまま change_directory へ渡すと
+        # 意味のない要求になるので、ルートへ丸める
+        return posixpath.dirname(self.current_path) or "/"
     
     @staticmethod
     def _is_directory(mode: int) -> bool:
