@@ -190,6 +190,7 @@ class SFTPManager(QObject):
             path = self.current_path
         
         def list_thread():
+            import stat as stat_mod
             try:
                 # ディレクトリ一覧を取得（転送中なら空くまで待つ）
                 with self._sftp_lock:
@@ -198,11 +199,36 @@ class SFTPManager(QObject):
                     if not self.is_connected or self.sftp_client is None:
                         return
                     items = self.sftp_client.listdir_attr(path)
+                    # listdir_attr の st_mode は lstat 相当（リンク自身）で、
+                    # そのまま S_ISDIR に掛けるとディレクトリへのリンクが
+                    # 常にファイルになる。パネルは is_dir を見てから移動を
+                    # 決めるので、リンクの先へ入れなくなる。リンクの項目だけ
+                    # 追跡先を引き直す（往復が増えるのはリンクの数だけ）。
+                    # 引けない相手は、これまでどおりファイル扱いにする
+                    link_modes = {}
+                    for item in items:
+                        mode = item.st_mode
+                        if not isinstance(mode, int) or not stat_mod.S_ISLNK(mode):
+                            continue
+                        try:
+                            target = self.sftp_client.stat(
+                                posixpath.join(path, item.filename))
+                        except TimeoutError:
+                            # 期限切れは接続が使えなくなった印。リンクの数だけ
+                            # 期限を積み上げると一覧が何分も返らないので、
+                            # ここでやめて失敗として扱う（_fail が畳む）
+                            raise
+                        except Exception:
+                            continue
+                        link_modes[item.filename] = getattr(target, "st_mode", None)
                 
                 # ファイル情報をリストに変換
                 file_list = []
                 for item in items:
-                    is_dir = self._is_directory(item.st_mode)
+                    # 種別はリンクの追跡先で決める。permissions は lstat のまま
+                    # 組み立てるので、リンクであることは 'l' で分かる
+                    is_dir = self._is_directory(
+                        link_modes.get(item.filename, item.st_mode))
                     file_list.append({
                         'name': item.filename,
                         'size': item.st_size if not is_dir else 0,
