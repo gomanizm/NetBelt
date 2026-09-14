@@ -700,7 +700,10 @@ class Screen(object):
         _split_wide(line, rng.stop)
         for c in rng:
             line[c] = BLANK
-        if mode != 1:               # 行末まで消したら続きは無い
+        # 消した範囲が行の末尾まで届いたら、この行から次の行への続きは
+        # 無い。EL 0 と EL 2 は必ず届く。EL 1 は普段は届かないが、
+        # カーソルが行末にあると行が丸ごと空になるので、そこでも外す
+        if rng.stop >= len(line):
             self.wrapped[self.cursor_row] = False
         self.dirty.add(self.cursor_row)
         self._pending_wrap = False

@@ -297,6 +297,28 @@ class WrapMarkTest(unittest.TestCase):
                           for line, w in s.take_new_history()],
                          [("WXYZ", True), ("E", False)])
 
+    def test_el1_that_reaches_the_right_edge_clears_the_mark(self):
+        """EL 1 が行末まで届いたら、その行から次への続きは無い。
+
+        EL 1 は「行頭からカーソルまで」なので普段は行末に届かず、印を
+        外さないのが正しい。届いたときだけは行が丸ごと空になるので、
+        印を残すと履歴・コピーで空行の境界が消えて字下げが増える。
+        """
+        s = self._wrapped_then_rewritten("\x1b[1;4H\x1b[1K")
+        self.assertEqual(s.text()[0], "")
+        self.assertFalse(s.wrapped[0], "空になった行に折り返しの印が残っている")
+
+    def test_el1_that_stops_short_keeps_the_mark(self):
+        s = self._wrapped_then_rewritten("\x1b[1;3H\x1b[1K")
+        self.assertTrue(s.wrapped[0], "行末へ届いていないのに印が外れた")
+
+    def test_the_emptied_row_reaches_the_history_as_its_own_line(self):
+        s = self._wrapped_then_rewritten("\x1b[1;4H\x1b[1K")
+        feed(s, "\x1b[4;1H\r\n\r\n")          # 2 行押し出す
+        self.assertEqual([("".join(c[0] for c in line).rstrip(), w)
+                          for line, w in s.take_new_history()],
+                         [("", False), ("E", False)])
+
     def test_filling_a_row_to_the_edge_does_not_create_a_mark(self):
         """折り返していない行に、印字だけで印が付いてはいけない。"""
         s = feed(Screen(rows=4, cols=4), "ABCD\x1b[2;1HPONG")
