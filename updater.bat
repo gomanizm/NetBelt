@@ -164,6 +164,24 @@ if not exist "!ZIP_FILE!" (
     exit /b 1
 )
 
+REM 動いている実行ファイルの名前を確かめる。差し替えるのは
+REM !APP_DIR!NetBelt.exe だけなので、exe を改名して使っていると
+REM 動いている実体は旧版のまま残り、身に覚えのない NetBelt.exe が
+REM 増えるだけになる。それでも成功として終わっていたため、次の起動でも
+REM 同じ更新が見つかり、通知が繰り返されていた。展開も削除もまだ
+REM していないこの位置で止める。
+for %%f in ("!APP_PATH!") do set "EXE_NAME=%%~nxf"
+if /i not "!EXE_NAME!"=="NetBelt.exe" (
+    echo エラー: 実行ファイルの名前が NetBelt.exe ではありません
+    echo   実行ファイル: !EXE_NAME!
+    echo   自動更新が差し替えられるのは NetBelt.exe だけです。このまま
+    echo   進めても !EXE_NAME! は旧版のまま残り、別名の NetBelt.exe が
+    echo   増えるだけになるため、更新を当てずに中止しました。
+    echo   名前を NetBelt.exe へ戻すか、新しい ZIP を手で展開してください。
+    pause
+    exit /b 1
+)
+
 REM アプリケーションの終了を待機
 REM timeout は標準入力がリダイレクトされていると失敗し、errorlevel を
 REM 残す。待つだけなので ping を使う（どの Windows にもある）。

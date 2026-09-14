@@ -60,8 +60,12 @@ class UpdaterScriptTest(unittest.TestCase):
         バッチを置くと start が cmd /K で開くため、コンソールが開いた
         まま残る。全体テストを一度回すと十数個たまって画面が埋まるので、
         引数なしで即終了する exe を借りてくる。
+        名前は NetBelt.exe。updater.bat は改名された exe を受け取ると
+        更新を当てずに中止するので、本番と同じ名前でなければならない。
+        更新後は中身が zip の本文（実行できないファイル）に変わるが、
+        start はその場で失敗を書くだけで窓も残さない。
         """
-        target = os.path.join(directory, "dummy_app.exe")
+        target = os.path.join(directory, "NetBelt.exe")
         shutil.copyfile(
             os.path.join(os.environ["SystemRoot"], "System32",
                          "rundll32.exe"), target)
