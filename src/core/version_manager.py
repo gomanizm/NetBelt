@@ -96,6 +96,32 @@ def updater_env() -> dict:
     return env
 
 
+def sanitized_token(token: Optional[str]) -> Optional[str]:
+    """設定された GitHub トークンを、ヘッダへ載せられる形へ整える。
+
+    前後の空白は取り除き、制御文字（CR/LF を含む）が残るものは捨てる。
+    requests のヘッダ検証は、値が壊れているとヘッダ値そのもの
+    （= `token <トークン>`）を例外文へ埋める。凍結ビルドの stdout は
+    %LOCALAPPDATA%\\NetBelt\\logs\\ へ恒久的に退避されるので、その例外を
+    そのまま記録するとトークンが平文でディスクに残る。載せなければ、
+    その例外自体が起きない。
+
+    Returns:
+        使えるトークン、または None（未設定・壊れている）
+    """
+    if not token:
+        return None
+    cleaned = token.strip()
+    if not cleaned:
+        return None
+    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in cleaned):
+        # 値そのものは出さない。含まれていること自体を伝えるに留める。
+        print("[VersionManager] GitHub トークンに使えない文字が含まれるため、"
+              "認証なしで続けます")
+        return None
+    return cleaned
+
+
 class VersionManager:
     """バージョン管理とアップデート機能を提供するクラス"""
     
@@ -116,12 +142,36 @@ class VersionManager:
         Args:
             github_token: GitHub Personal Access Token（プライベートリポジトリの場合必須）
         """
-        self.github_token = github_token
+        self.github_token = sanitized_token(github_token)
         # 受信中の応答。中止の要求が来たら、これを閉じて読み取りを打ち切る
         self._response = None
-        # 更新用ディレクトリを作成
-        os.makedirs(self.UPDATE_DIR, exist_ok=True)
-    
+        # 更新用ディレクトリを作成。
+        # ここで例外を外へ出さない。起動時の未適用更新チェックは同期で
+        # VersionManager を作るだけなので、%TEMP%\NetBeltUpdates が通常
+        # ファイルになっている／%TEMP% に作成権限が無いといった異常で、
+        # 更新機能ではなくアプリ全体が起動できなくなっていた。
+        # 作れなかった場合は更新が使えないだけに留め、記録して続ける。
+        try:
+            os.makedirs(self.UPDATE_DIR, exist_ok=True)
+        except Exception as e:
+            print(f"[VersionManager] 更新用フォルダを用意できません（更新は使えません）: {e}")
+
+    def _redact(self, text) -> str:
+        """外へ出す文字列から、トークンの値を伏せる。
+
+        例外文はトークンを生のままでも、repr を通した形（改行が `\\n` の
+        2文字になる）でも持ちうる。どちらの形も伏字にしてから
+        print と error へ渡す。
+        """
+        text = str(text)
+        token = self.github_token
+        if not token:
+            return text
+        for form in (token, repr(token)[1:-1]):
+            if form:
+                text = text.replace(form, '***')
+        return text
+
     @staticmethod
     def compare_versions(version1: str, version2: str) -> int:
         """
@@ -319,11 +369,14 @@ class VersionManager:
         except requests.exceptions.RequestException as e:
             # None を返すと呼び出し側が「更新なし」と区別できず、
             # 通信が壊れていても『最新です』と表示されてしまう。
-            print(f"[VersionManager] 更新チェックエラー: {e}")
-            return {'available': False, 'error': f"更新の確認に失敗しました: {e}"}
+            # 例外文にはヘッダ値（＝トークン）が混ざりうるので伏せてから出す
+            detail = self._redact(e)
+            print(f"[VersionManager] 更新チェックエラー: {detail}")
+            return {'available': False, 'error': f"更新の確認に失敗しました: {detail}"}
         except Exception as e:
-            print(f"[VersionManager] 予期しないエラー: {e}")
-            return {'available': False, 'error': f"更新の確認に失敗しました: {e}"}
+            detail = self._redact(e)
+            print(f"[VersionManager] 予期しないエラー: {detail}")
+            return {'available': False, 'error': f"更新の確認に失敗しました: {detail}"}
     
     def abort(self) -> None:
         """受信中の応答を閉じ、読み取りを直ちに終わらせる。
@@ -331,14 +384,23 @@ class VersionManager:
         中止の判定はチャンクの区切りでしか行えないので、相手が黙り込むと
         読み取りのタイムアウト（60秒）まで戻ってこない。その間スレッドが
         残り続けるため、ソケット側から打ち切る。別のスレッドから呼ばれる。
+
+        閉じる操作自体は別スレッドへ逃がす。requests の Response.close() は
+        下の読み取りが片付くまで戻らないため、呼び出し元（GUI スレッド）で
+        待つと、打ち切るはずの60秒ぶんそのまま固まってしまう。
         """
         response = self._response
         if response is None:
             return
-        try:
-            response.close()
-        except Exception as e:
-            print(f"[VersionManager] 受信の中断に失敗: {e}")
+
+        def _close():
+            try:
+                response.close()
+            except Exception as e:
+                print(f"[VersionManager] 受信の中断に失敗: {e}")
+
+        threading.Thread(target=_close, daemon=True,
+                         name="netbelt-update-abort").start()
 
     @staticmethod
     def _safe_name_part(text) -> str:
@@ -402,7 +464,7 @@ class VersionManager:
             value = first[0].strip().lower()
             return value if len(value) == 64 else None
         except Exception as e:
-            print(f"[VersionManager] チェックサム取得エラー: {e}")
+            print(f"[VersionManager] チェックサム取得エラー: {self._redact(e)}")
             return None
 
     def download_update(
@@ -522,7 +584,7 @@ class VersionManager:
             return zip_path
         
         except Exception as e:
-            print(f"[VersionManager] ダウンロードエラー: {e}")
+            print(f"[VersionManager] ダウンロードエラー: {self._redact(e)}")
             # 受信中に切れた場合、ここまでは書きかけが残ったままだった。
             # get_pending_update_files は .zip しか拾わないので掃除にも
             # かからず、利用者が再試行しない限り temp に居座り続ける。
