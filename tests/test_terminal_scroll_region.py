@@ -156,5 +156,30 @@ class HistoryFromATopAnchoredRegionTest(unittest.TestCase):
                          "代替画面の内容が記録に混ざっている")
 
 
+class NextAndPreviousLineTest(unittest.TestCase):
+    """CNL (CSI E) / CPL (CSI F) も範囲で止まること。
+
+    xterm の CursorNextLine / CursorPrevLine は CursorDown / CursorUp を
+    通るので、CUD / CUU と同じ頭打ちが効く。
+    """
+
+    def test_cnl_stops_at_the_bottom_of_the_region(self):
+        s = feed(Screen(rows=24, cols=80), "\x1b[5;10r\x1b[8;3H\x1b[20E")
+        self.assertEqual((s.cursor_row, s.cursor_col), (9, 0))
+
+    def test_cpl_stops_at_the_top_of_the_region(self):
+        s = feed(Screen(rows=24, cols=80), "\x1b[5;10r\x1b[8;3H\x1b[20F")
+        self.assertEqual((s.cursor_row, s.cursor_col), (4, 0))
+
+    def test_cnl_from_below_the_region_still_stops_at_the_screen(self):
+        # 範囲の外にいるカーソルは、CUD と同じく画面の端まで動ける
+        s = feed(Screen(rows=24, cols=80), "\x1b[5;10r\x1b[12;3H\x1b[20E")
+        self.assertEqual((s.cursor_row, s.cursor_col), (23, 0))
+
+    def test_cpl_from_above_the_region_still_stops_at_the_screen(self):
+        s = feed(Screen(rows=24, cols=80), "\x1b[5;10r\x1b[2;3H\x1b[20F")
+        self.assertEqual((s.cursor_row, s.cursor_col), (0, 0))
+
+
 if __name__ == "__main__":
     unittest.main()

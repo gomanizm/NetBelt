@@ -437,10 +437,15 @@ class Screen(object):
             self._move(self.cursor_row, self.cursor_col + n)
         elif f == "D":
             self._move(self.cursor_row, self.cursor_col - n)
-        elif f == "E":
-            self._move(self.cursor_row + n, 0)
-        elif f == "F":
-            self._move(self.cursor_row - n, 0)
+        elif f == "E":                  # CNL: xterm は CUD 経由なので
+            limit = (self.scroll_bottom  # 範囲の下端で止まる
+                     if self.cursor_row <= self.scroll_bottom
+                     else self.rows - 1)
+            self._move(min(limit, self.cursor_row + n), 0)
+        elif f == "F":                  # CPL: 同じく CUU 経由
+            limit = (self.scroll_top
+                     if self.cursor_row >= self.scroll_top else 0)
+            self._move(max(limit, self.cursor_row - n), 0)
         elif f in "G`":
             self._move(self.cursor_row, _param(p, 0, 1) - 1)
         elif f == "d":
