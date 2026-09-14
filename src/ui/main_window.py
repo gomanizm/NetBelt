@@ -1846,7 +1846,14 @@ class MainWindow(QMainWindow):
             menu.addSeparator()
         act = menu.addAction("ツールエリアを非表示")
         act.triggered.connect(self._toggle_tool_area)
-        menu.exec(self.tool_tabs.tabBar().mapToGlobal(pos))
+        try:
+            menu.exec(self.tool_tabs.tabBar().mapToGlobal(pos))
+        finally:
+            # ウィンドウを親にしたメニューは、閉じただけでは子として残り、
+            # 右クリックのたびに QMenu 1 件と項目が積み上がる。項目は
+            # menu.addAction で作っておりメニューが所有しているので、
+            # メニューを捨てれば一緒に片付く。
+            menu.deleteLater()
 
     def _tool_key_at(self, index):
         """タブ index に対応するツールキーを返す（範囲外は None）"""
