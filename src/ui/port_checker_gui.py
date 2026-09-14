@@ -68,8 +68,26 @@ class PortCheckThread(QThread):
         self.protocol = protocol  # 'UDP' or 'TCP'
     
     def run(self):
+        """チェックを実行し、どう転んでも result_ready を 1 回 emit する。
+
+        netstat や tasklist を起動できない環境では、以前は OSError が
+        run() を突き抜けてスレッドごと死に、result_ready が一度も
+        emit されなかった。利用者から見ると押したボタンが無反応に
+        なるだけで、失敗した事実さえ伝わらない。想定外の例外も
+        ここで受け止め、「確認できていません」と伝える。
+        """
+        try:
+            result = self._build_result()
+        except Exception as e:
+            result = ("ポートチェック中に想定外のエラーが発生しました: "
+                      f"{e!r}\n"
+                      "→ このポートの使用状況は確認できていません\n")
+        self.result_ready.emit(result)
+
+    def _build_result(self):
+        """チェック結果の文字列を組み立てて返す。"""
         result = ""
-        
+
         # ポートバインドテスト
         if self.check_type in ["all", "bind"]:
             result += "=" * 60 + "\n"
@@ -163,7 +181,9 @@ class PortCheckThread(QThread):
                             if len(parts) >= 2:
                                 proc_name = parts[0]
                                 result += f"  PID {pid}: {proc_name}\n"
-                        except subprocess.CalledProcessError:
+                        except (subprocess.CalledProcessError, OSError):
+                            # tasklist を起動できない環境（OSError）でも、
+                            # 取れている netstat の結果ごと捨てない
                             result += f"  PID {pid}: プロセス情報取得失敗\n"
                     result += "\n"
         
@@ -194,8 +214,11 @@ class PortCheckThread(QThread):
                     for line in select_netstat_lines(output, None, self.protocol)[:20]:
                         result += line + "\n"
                 result += "\n"
-            except subprocess.CalledProcessError:
-                result += f"{self.protocol}接続情報の取得に失敗しました\n\n"
+            except (subprocess.CalledProcessError, OSError) as e:
+                # netstat を起動できない環境（OSError）も失敗として扱う。
+                # netstat 経路と同じく、確認できていないことを明示する
+                result += f"{self.protocol}接続情報の取得に失敗しました: {e}\n"
+                result += "→ このポートの使用状況は確認できていません\n\n"
         
         # ファイアウォール情報
         if self.check_type in ["all", "firewall"]:
@@ -268,7 +291,7 @@ class PortCheckThread(QThread):
                 result += f"ポート {self.port}/{self.protocol} の情報:\n"
                 result += f"  カスタムポートまたは非標準ポートです\n\n"
         
-        self.result_ready.emit(result)
+        return result
 
 
 class PortCheckerGUI(QMainWindow):
