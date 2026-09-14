@@ -459,6 +459,12 @@ class TerminalWidget(QWidget):
     # 多めに取り、画面領域（最大 200 行）を削らない余裕を持たせる
     MAX_DOCUMENT_BLOCKS = 20000
 
+    # 1 ブロック (段落) に許す最大文字数。折り返しで続く履歴行は改行で
+    # 切らずに繋ぐため、改行を一度も含まない出力ではブロックが 1 個の
+    # まま伸び、MAX_DOCUMENT_BLOCKS が永久に効かない。実際の 1 行より
+    # 十分大きく、かつ伸び続けさせない所で強制的に切る
+    MAX_BLOCK_CHARS = 8192
+
     # タブが閉じられたときのシグナル（機器名を送信）
     tab_closed = pyqtSignal(str)
     # 表示中のタブが変わったことを知らせる（機器名。タブが無ければ空文字）。
@@ -545,6 +551,11 @@ class TerminalWidget(QWidget):
         # 後の行には効かず、受信行数のまま増え続けていた。超えた分は
         # Qt が先頭ブロックから捨てる。画面領域は末尾なので影響しない
         terminal.document().setMaximumBlockCount(self.MAX_DOCUMENT_BLOCKS)
+        # 一度でも上限に達した（＝古い行が捨てられた）ことを覚えておく。
+        # 「全ログ保存」の欠落警告をいまの blockCount だけで決めると、
+        # 窓を 1 行縦に縮めるだけで上限を下回り、欠けたログが完全なもの
+        # として黙って保存される
+        terminal._log_truncated = False
 
         # フォント設定（_terminal_settings を参照する。設定変更後に作られる
         # タブも同じ外観になるようにするため）
@@ -885,6 +896,13 @@ class TerminalWidget(QWidget):
                 region.insertText(run, self._char_format(attr))
             if not wrapped:
                 region.insertText("\n", QTextCharFormat())
+            elif region.positionInBlock() >= self.MAX_BLOCK_CHARS:
+                # 改行を一度も含まない出力 (バイナリの cat など) は、
+                # 折り返し行を繋ぎ続けるかぎりブロックが 1 個のまま伸び、
+                # MAX_DOCUMENT_BLOCKS が永久に効かない。文書もメモリも
+                # 際限なく膨らみ、1 ブロックの組版が重くなって GUI が
+                # 止まる。表示上の折り返し位置は変わるが、ここで切る
+                region.insertText("\n", QTextCharFormat())
 
         cell_rows = [self._visible_cells(line) for line in screen.lines]
         # カーソルの行は、カーソルの桁まで空白を残す。プロンプト末尾の
@@ -923,8 +941,22 @@ class TerminalWidget(QWidget):
                               QTextCursor.MoveMode.KeepAnchor)
             # 書式は空で入れる。insertText は挿入位置の書式を引き継ぐので、
             # 指定しないと直前の色や反転が新しい文字へ伝染する
+            removed = _u16(old_text[prefix:len(old_text) - suffix])
+            added = _u16(new_text[prefix:len(new_text) - suffix])
+            before = terminal.document().characterCount()
             probe.insertText(new_text[prefix:len(new_text) - suffix],
                              QTextCharFormat())
+            # 文書が上限 (MAX_DOCUMENT_BLOCKS) に達していると、この挿入で
+            # Qt が文書の先頭ブロックを捨てる。QTextCursor である region や
+            # probe は自動で詰まるが、int で控えた start は古い位置を指した
+            # まま残る。そのままだと次の差し替え範囲・塗り直し位置・
+            # キャレット位置がずれ、縦にリサイズするたびにスクロール
+            # バックへ重複行と欠落が積み上がる。捨てられた文字数を
+            # 数えて詰め直す
+            dropped = (before - removed + added
+                       - terminal.document().characterCount())
+            if dropped:
+                start -= dropped
             # 下の行との突き合わせは文書の位置で行うので、単位を揃える
             touched = (_u16(new_text[:prefix]),
                        _u16(new_text[:len(new_text) - suffix]))
@@ -966,6 +998,11 @@ class TerminalWidget(QWidget):
         # 画面の上半分しか窓に入らない
         bar = terminal.verticalScrollBar()
         bar.setValue(bar.maximum())
+
+        # 上限に達していたら「切り詰めた」を立てたままにする。この後で
+        # 窓を縮めて blockCount が下回っても、捨てた行は戻らない
+        if terminal.document().blockCount() >= self.MAX_DOCUMENT_BLOCKS:
+            terminal._log_truncated = True
 
     def show_notice(self, device_name: str, text: str) -> None:
         """アプリ自身の案内 (切断バナー・エラー文) を画面へ出す。
@@ -1206,8 +1243,12 @@ class TerminalWidget(QWidget):
             # 表示文書は MAX_DOCUMENT_BLOCKS 行で頭から切り詰められる。
             # 保存するのはその toPlainText() なので、切り詰められた分は
             # 「全ログ保存」でも出てこない。黙って落とさず先に断る
+            # いまの行数だけで決めない。上限に達して古い行を捨てた後でも、
+            # 窓を縦に 1 行縮めれば blockCount は上限を下回る。捨てた事実の
+            # ほうを見る
             blocks = current_widget.document().blockCount()
-            if blocks >= self.MAX_DOCUMENT_BLOCKS:
+            if (blocks >= self.MAX_DOCUMENT_BLOCKS
+                    or getattr(current_widget, "_log_truncated", False)):
                 answer = QMessageBox.warning(
                     self,
                     "ログ保存",
