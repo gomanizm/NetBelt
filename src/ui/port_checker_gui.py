@@ -93,8 +93,12 @@ class PortCheckThread(QThread):
                     test_socket.listen(1)
                 
                 test_socket.close()
+                # テストソケットは AF_INET 固定なので、分かるのは IPv4 の空き
+                # だけ。IPv6 専用（IPV6_V6ONLY）の待ち受けとは競合せず bind が
+                # 通るため、プロトコル全体を空きと断定しない
                 result += f"✓ ポート {self.port}/{self.protocol} はバインド可能です\n"
-                result += f"  → 現在このポートは使用されていません\n"
+                result += f"  → IPv4 (0.0.0.0) では使用されていません\n"
+                result += f"  → IPv6 専用の待ち受けはこの試験では分かりません（netstat の結果も確認してください）\n"
                 if self.protocol == "UDP":
                     result += f"  → SNMPTrapリスナーを起動できます\n\n"
                 else:
