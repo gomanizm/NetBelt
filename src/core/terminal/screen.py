@@ -321,11 +321,20 @@ class Screen(object):
         """幅 0 の文字 (結合文字・ZWJ 等) を直前の文字のセルへ繋げる。
 
         右端で折り返し待ちなら今のセル、そうでなければ 1 つ左のセル。
+        折り返しが無効 (ESC[?7l) なら右端で印字してもカーソルが動かず
+        折り返し待ちも立たないので、最終桁にいるときは今のセルを選ぶ。
         そこが全角の継続セルなら、その全角本体へ繋げる。前に文字が無い
         (行頭) ときと、セルが MAX_CELL_TEXT まで伸びているときは捨てる。
+
+        残る制限: 折り返しが無効なとき、最終桁で印字した直後なのか、
+        最終桁へ CUP しただけなのかを区別していない。後者では 1 つ左の
+        文字へ付けるべきだが、ここでは最終桁のセルへ繋げる。
         """
         line = self.lines[self.cursor_row]
-        i = self.cursor_col if self._pending_wrap else self.cursor_col - 1
+        at_last_col = (not self.autowrap
+                       and self.cursor_col == self.cols - 1)
+        i = (self.cursor_col if self._pending_wrap or at_last_col
+             else self.cursor_col - 1)
         if 0 < i < len(line) and line[i][0] == "":
             i -= 1
         if not 0 <= i < len(line):

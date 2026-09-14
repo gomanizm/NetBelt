@@ -109,6 +109,12 @@ class ZeroWidthCharacterTest(unittest.TestCase):
                              "1 セルの文字列が限りなく伸びる")
         self.assertEqual(s.lines[0][1][0], "X", "次の文字が落ちている")
 
+    def test_a_combining_mark_joins_the_last_column_with_autowrap_off(self):
+        # ESC[?7l では右端で印字してもカーソルが動かないので、折り返し
+        # 待ちも立たない。1 つ左を選ぶと、アクセントが手前の文字へ付いた
+        s = feed(Screen(rows=2, cols=4), "\x1b[?7lABCe" + ACUTE)
+        self.assertEqual(s.text()[0], "ABCe" + ACUTE)
+
     def test_a_combining_mark_with_nothing_before_it_is_dropped(self):
         s = feed(Screen(rows=2, cols=10), ACUTE + "X")
         self.assertEqual(s.text()[0], "X")
