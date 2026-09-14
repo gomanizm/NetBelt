@@ -41,6 +41,27 @@ class PendingUpdateQuitTest(unittest.TestCase):
     def tearDownClass(cls):
         cls._windows.clear()
 
+    def setUp(self):
+        """前のテストが残した終了要求を、ここで使い切っておく。
+
+        QApplication はプロセス全体でひとつを共有する（tests/conftest.py）。
+        イベントループが回っていないときの QApplication.quit() は捨てられ
+        ず、次にイベントを捌くまで保留されたまま残る。
+        tests/test_update_source_run.py の
+        test_the_pending_path_still_applies_from_a_frozen_build は exec()
+        を回さずに _apply_pending_update を呼ぶので、その終了要求がこの
+        ファイルまで持ち越され、exec() に入った直後に 0 で戻ってしまう。
+        実測: この2ファイルを同じプロセスで走らせると
+        test_a_failed_updater_launch_does_not_quit が `0 != 42` で落ち、
+        単独では通る。
+
+        ここで捌いておくと、どのテストも「終了要求ゼロ」から始まる。
+        テスト本体が出した終了要求はこのあとに起きるので、判定は変わら
+        ない。
+        """
+        for _ in range(5):
+            self.app.processEvents()
+
     def _window(self):
         from ui.main_window import MainWindow
         from core.config_manager import ConfigManager
