@@ -743,7 +743,10 @@ class MainWindow(QMainWindow):
         # せず、打鍵・貼り付けと同じターミナルの送信キューを通す。直結だと
         # まだ送り終えていない貼り付けのチャンク間へマクロやキープアライブの
         # CR が割り込み、途中までの設定行がその場で実行される
-        self.macro_manager.register_send_callback(device_name, terminal._queue_send)
+        self.macro_manager.register_send_callback(
+            device_name, terminal._queue_send,
+            command_callback=terminal.queue_macro_send,
+            cancel_callback=terminal.cancel_macro_sends)
         
         # マクロマネージャーのシグナルをターミナルに接続（初回のみ）
         if device_name not in self.macro_signal_connected:
@@ -824,7 +827,10 @@ class MainWindow(QMainWindow):
         # せず、打鍵・貼り付けと同じターミナルの送信キューを通す。直結だと
         # まだ送り終えていない貼り付けのチャンク間へマクロやキープアライブの
         # CR が割り込み、途中までの設定行がその場で実行される
-        self.macro_manager.register_send_callback(device_name, terminal._queue_send)
+        self.macro_manager.register_send_callback(
+            device_name, terminal._queue_send,
+            command_callback=terminal.queue_macro_send,
+            cancel_callback=terminal.cancel_macro_sends)
         
         # マクロマネージャーのシグナルをターミナルに接続（初回のみ）
         if device_name not in self.macro_signal_connected:
@@ -903,7 +909,10 @@ class MainWindow(QMainWindow):
         # せず、打鍵・貼り付けと同じターミナルの送信キューを通す。直結だと
         # まだ送り終えていない貼り付けのチャンク間へマクロやキープアライブの
         # CR が割り込み、途中までの設定行がその場で実行される
-        self.macro_manager.register_send_callback(device_name, terminal._queue_send)
+        self.macro_manager.register_send_callback(
+            device_name, terminal._queue_send,
+            command_callback=terminal.queue_macro_send,
+            cancel_callback=terminal.cancel_macro_sends)
         
         # マクロマネージャーのシグナルをターミナルに接続（初回のみ）
         if device_name not in self.macro_signal_connected:

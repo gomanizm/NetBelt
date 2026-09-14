@@ -136,7 +136,25 @@ class InteractiveTerminal(QTextEdit):
     # その規模なら数回で終わる。
     SEND_CHUNK = 512
 
-    def _queue_send(self, payload: str):
+    def queue_macro_send(self, payload: str):
+        """マクロ（コマンドリスト）の1行を送信列へ積む
+
+        マクロ由来という印を付けておく。停止したときに、まだ送っていない
+        ぶんだけを cancel_macro_sends で取り消せるようにするため。
+        """
+        self._queue_send(payload, from_macro=True)
+
+    def cancel_macro_sends(self):
+        """まだ送っていないマクロ由来の断片を送信列から取り除く
+
+        停止したのに、貼り付けの排出待ちで列に残っていたコマンドが
+        後から機器へ届くのを防ぐ。打鍵や貼り付けは巻き添えにしない。
+        """
+        self._send_queue = [
+            entry for entry in self._send_queue if not entry[1]
+        ]
+
+    def _queue_send(self, payload: str, from_macro: bool = False):
         """機器へ送るものを列の末尾へ積む
 
         機器へ向かうものは、貼り付けも打鍵も IME の確定も問い合わせへの
@@ -151,7 +169,8 @@ class InteractiveTerminal(QTextEdit):
         """
         if not payload:
             return
-        self._send_queue.append(payload)
+        # [送る文字列, マクロ由来か] の形で積む。停止のときに由来で選り分ける
+        self._send_queue.append([payload, from_macro])
         if not self._sending:
             self._drain_send_queue()
 
@@ -182,10 +201,11 @@ class InteractiveTerminal(QTextEdit):
             return
 
         self._sending = True
-        payload = self._send_queue[0]
+        entry = self._send_queue[0]
+        payload = entry[0]
         chunk, rest = payload[:self.SEND_CHUNK], payload[self.SEND_CHUNK:]
         if rest:
-            self._send_queue[0] = rest
+            entry[0] = rest
         else:
             self._send_queue.pop(0)
 
