@@ -105,9 +105,22 @@ class SFTPServerHandler(SFTPServerInterface):
             return SFTP_FAILURE
     
     def lstat(self, path):
-        """ファイル/ディレクトリの情報を返す（シンボリックリンクをたどらない）"""
+        """ファイル/ディレクトリの情報を返す（シンボリックリンクをたどらない）。
+
+        最終要素まで realpath で解決してから os.lstat を呼ぶと、LSTAT が STAT と
+        同じ意味になり、リンク自身ではなくリンク先の属性を返してしまう
+        （os.lstat 自体はリンクを解決しないので、渡す前に解決したら取り返せない）。
+        閉じ込めの判定は親ディレクトリを解決して行い、最終要素はその名前のまま
+        os.lstat へ渡す。ルート自身と '.' / '..' はリンクになり得ないので従来どおり
+        解決する。リンクを通ってルートの外へ出るパスは、親が外側に解決されるので
+        これまでどおり拒否される。
+        """
         try:
-            real_path = self._get_real_path(path)
+            relative = path.replace("\\", "/").strip("/")
+            if not relative or relative.rpartition("/")[2] in ("", ".", ".."):
+                real_path = self._get_real_path(path)
+            else:
+                real_path = self._get_link_path(path)
             stat_info = os.lstat(real_path)
             return SFTPAttributes.from_stat(stat_info)
         except Exception as e:
