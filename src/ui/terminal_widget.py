@@ -269,13 +269,13 @@ class InteractiveTerminal(QTextEdit):
         menu = QMenu(self)
         
         # コピー（選択範囲がある場合のみ有効）
-        copy_action = QAction("コピー", self)
+        copy_action = QAction("コピー", menu)
         copy_action.triggered.connect(self.copy)
         copy_action.setEnabled(self.textCursor().hasSelection())
         menu.addAction(copy_action)
         
         # 貼り付け（カスタムペースト機能を使用）
-        paste_action = QAction("貼り付け", self)
+        paste_action = QAction("貼り付け", menu)
         paste_action.triggered.connect(self.custom_paste)
         paste_action.setEnabled(self.can_send_input())
         menu.addAction(paste_action)
@@ -283,7 +283,7 @@ class InteractiveTerminal(QTextEdit):
         menu.addSeparator()
         
         # すべて選択
-        select_all_action = QAction("すべて選択", self)
+        select_all_action = QAction("すべて選択", menu)
         select_all_action.triggered.connect(self.selectAll)
         menu.addAction(select_all_action)
         
@@ -293,10 +293,10 @@ class InteractiveTerminal(QTextEdit):
         if self._input_enabled:
             # キープアライブ
             if self._keepalive_active:
-                keepalive_action = QAction("キープアライブ停止", self)
+                keepalive_action = QAction("キープアライブ停止", menu)
                 keepalive_action.triggered.connect(lambda: self.keepalive_stop_requested.emit())
             else:
-                keepalive_action = QAction("キープアライブ開始", self)
+                keepalive_action = QAction("キープアライブ開始", menu)
                 keepalive_action.triggered.connect(lambda: self.keepalive_start_requested.emit())
             menu.addAction(keepalive_action)
             
@@ -304,7 +304,7 @@ class InteractiveTerminal(QTextEdit):
             
             # マクロ実行サブメニュー
             if self._macro_list:
-                macro_menu = QMenu("マクロ実行", self)
+                macro_menu = QMenu("マクロ実行", menu)
                 for macro in self._macro_list:
                     macro_name = macro.get("name", "")
                     macro_desc = macro.get("description", "")
@@ -314,7 +314,7 @@ class InteractiveTerminal(QTextEdit):
                     else:
                         action_text = macro_name
                     
-                    macro_action = QAction(action_text, self)
+                    macro_action = QAction(action_text, macro_menu)
                     macro_action.triggered.connect(
                         lambda checked, name=macro_name: self.macro_execute_requested.emit(name)
                     )
@@ -325,7 +325,7 @@ class InteractiveTerminal(QTextEdit):
             # 実行中のマクロを止める。これが無いと、誤ったマクロを流し
             # 始めたときタブを閉じる以外に中断する手段が無い
             if self._command_list_active:
-                macro_stop_action = QAction("マクロ停止", self)
+                macro_stop_action = QAction("マクロ停止", menu)
                 macro_stop_action.triggered.connect(lambda: self.macro_stop_requested.emit())
                 menu.addAction(macro_stop_action)
             
@@ -333,22 +333,30 @@ class InteractiveTerminal(QTextEdit):
         
         # ログ機能メニュー
         # 1. 現在表示されている全ログの保存
-        save_all_log_action = QAction("全ログ保存", self)
+        save_all_log_action = QAction("全ログ保存", menu)
         save_all_log_action.triggered.connect(self._on_save_all_log)
         menu.addAction(save_all_log_action)
         
         # 2. ログ記録開始/停止（記録状態によって切り替え）
         if self._is_recording:
-            stop_log_action = QAction("ログ記録停止", self)
+            stop_log_action = QAction("ログ記録停止", menu)
             stop_log_action.triggered.connect(self._on_stop_log_recording)
             menu.addAction(stop_log_action)
         else:
-            start_log_action = QAction("ログ記録開始", self)
+            start_log_action = QAction("ログ記録開始", menu)
             start_log_action.triggered.connect(self._on_start_log_recording)
             menu.addAction(start_log_action)
         
         # メニューを表示
-        menu.exec(event.globalPos())
+        try:
+            menu.exec(event.globalPos())
+        finally:
+            # 端末を親にしたメニューは、閉じただけでは子として残る。
+            # 右クリックのたびに QMenu 1 件と項目が積み上がるので、
+            # 開き終えたら項目ごと捨てる（実測: 5 回で QMenu 5 件、
+            # QAction 40 件）。項目の親もメニューにしてあるので、
+            # メニューが消えるときに一緒に片付く。
+            menu.deleteLater()
     
     def _on_save_all_log(self):
         """現在表示されている全ログを保存"""
@@ -1070,6 +1078,20 @@ class TerminalWidget(QWidget):
                 except Exception as e:
                     self._abort_log_recording(device_name, e)
 
+    def _discard_log_dialog(self, dialog) -> None:
+        """記録中ダイアログを閉じて、捨てる。
+
+        LogRecordingDialog は TerminalWidget を親にしているので、close() だけ
+        だと親子関係からは外れず、1 秒ごとのタイマーを持ったまま子として残る。
+        記録の開始と停止を繰り返すたびに 1 件ずつ積み上がる（実測: 3 回で 3 件）。
+        呼ぶ側は必ず _log_dialogs から外してから渡すこと。
+
+        deleteLater() は今のイベントループへ戻ったところで効くので、停止ボタン
+        （ダイアログ自身のスロット）から呼ばれても、その場で足元を消さない。
+        """
+        dialog.close()
+        dialog.deleteLater()
+
     def _abort_log_recording(self, device_name: str, error: Exception) -> None:
         """書き込みに失敗した記録を止めて、知らせる。
 
@@ -1093,7 +1115,7 @@ class TerminalWidget(QWidget):
             terminal._is_recording = False
         dialog = self._log_dialogs.pop(device_name, None)
         if dialog is not None:
-            dialog.close()
+            self._discard_log_dialog(dialog)
         QMessageBox.warning(
             self, "ログ記録",
             "%s のログ記録を停止しました。書き込みに失敗しました:\n%s\n\n"
@@ -1427,34 +1449,40 @@ class TerminalWidget(QWidget):
 
         # ログファイルを閉じる
         if tab_name in self._log_files:
+            # 後始末は close() より先に済ませる。close() は残った書き込みを
+            # 吐き出すので、ディスク満杯・共有フォルダの切断で失敗しうる。
+            # 後始末を close() の後ろに置くと、失敗したときだけ記録フラグと
+            # ハンドルと「記録中」ダイアログが残り、記録を始め直そうとしても
+            # 「既にログ記録中です。」で断られる（止める手段が無くなる）。
+            handle = self._log_files.pop(tab_name)
+            from core import log_recording
+            log_recording.stop(tab_name)
+
+            # ターミナルの記録フラグをクリア
+            if isinstance(current_widget, InteractiveTerminal):
+                current_widget._is_recording = False
+
+            # ダイアログを閉じる。停止ボタン経由だと相手は自分でも
+            # close() を呼んでいるので、二度閉じても平気にしておく
+            dialog = self._log_dialogs.pop(tab_name, None)
+            if dialog is not None:
+                self._discard_log_dialog(dialog)
+
             try:
-                self._log_files[tab_name].close()
-                del self._log_files[tab_name]
-                from core import log_recording
-                log_recording.stop(tab_name)
-
-                # ターミナルの記録フラグをクリア
-                if isinstance(current_widget, InteractiveTerminal):
-                    current_widget._is_recording = False
-                
-                # ダイアログを閉じる。停止ボタン経由だと相手は自分でも
-                # close() を呼んでいるので、二度閉じても平気にしておく
-                dialog = self._log_dialogs.pop(tab_name, None)
-                if dialog is not None:
-                    dialog.close()
-
-                if notify:
-                    QMessageBox.information(
-                        self,
-                        "ログ記録停止",
-                        "ログ記録を停止しました。"
-                    )
-                
+                handle.close()
             except Exception as e:
                 QMessageBox.warning(
                     self,
                     "エラー",
                     f"ログファイルを閉じる際にエラーが発生しました:\n{str(e)}"
+                )
+                return
+
+            if notify:
+                QMessageBox.information(
+                    self,
+                    "ログ記録停止",
+                    "ログ記録を停止しました。"
                 )
     
     def _on_current_tab_changed(self, index: int) -> None:
