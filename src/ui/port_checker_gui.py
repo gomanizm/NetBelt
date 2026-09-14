@@ -117,13 +117,20 @@ class PortCheckThread(QThread):
             result += "=" * 60 + "\n"
             # Windows netstat コマンド。findstr で絞らず、行を列に分けて
             # ローカル側のポート番号とプロトコルを完全一致で選ぶ
+            # 取得に失敗したときは output = "" にしない。0 件（＝本当に空き）と
+            # 区別が付かなくなり、確認できていないポートを「使用されていません」
+            # と言い切ってしまうため
             try:
                 output = subprocess.check_output("netstat -ano", shell=True, text=True, 
                                                stderr=subprocess.STDOUT)
-            except subprocess.CalledProcessError:
-                output = ""
-            lines = select_netstat_lines(output, self.port, self.protocol)
-            if not lines:
+            except (subprocess.CalledProcessError, OSError) as e:
+                error, lines = e, []
+            else:
+                error, lines = None, select_netstat_lines(output, self.port, self.protocol)
+            if error is not None:
+                result += f"{self.protocol}接続情報の取得に失敗しました: {error}\n"
+                result += "→ このポートの使用状況は確認できていません\n\n"
+            elif not lines:
                 result += f"ポート {self.port}/{self.protocol} を使用している接続は見つかりませんでした\n"
                 result += "→ このポートは現在使用されていません\n\n"
             else:
