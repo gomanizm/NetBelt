@@ -526,8 +526,11 @@ class SFTPManager(QObject):
                 with self._sftp_lock:
                     # 待っているあいだに切断されたかもしれない。取得前の
                     # 確認だけでは足りない（起きたら None を触ることになる）。
+                    # ここで黙って return すると、起動前に作った一時ファイルが
+                    # 保存先のディレクトリに 0 バイトで残り、しかも利用者には
+                    # 何も起きない。後始末と通知のある経路へ寄せる
                     if not self.is_connected or self.sftp_client is None:
-                        return
+                        raise IOError("SFTP接続がありません")
                     self.sftp_client.get(remote_path, tmp_local,
                                          callback=progress_callback)
                 
