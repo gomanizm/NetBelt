@@ -561,6 +561,16 @@ class VersionManager:
                 return None
             print("[VersionManager] チェックサム照合 OK")
 
+            # 受信し終わっても、チェックサムの取得（別の要求。応答が遅いと
+            # 最大30秒）と照合が残る。ここを見ていなかったため、その間に
+            # 中止しても最終名の ZIP と検証記録がそのまま公開され、次回起動時に
+            # 「未適用の更新」として提示されていた。abort() が閉じられるのは
+            # 本体側の応答だけで、この窓は短くならない。
+            if cancel_check is not None and cancel_check():
+                print("[VersionManager] ダウンロードを中止しました")
+                self._discard(part_path)
+                return None
+
             # 検証済みの証（ハッシュと版）は、最終名にする前に .part の傍らへ
             # 書く。最終名にしてから書いていたときは、控えの書き込みが失敗しても
             # zip_path をそのまま返していた。画面は「ダウンロード完了！」まで
@@ -580,6 +590,15 @@ class VersionManager:
                         vf.write(str(version))
             except Exception as e:
                 print(f"[VersionManager] チェックサムの控えを書けませんでした: {e}")
+                self._discard(sha_part)
+                self._discard(ver_part)
+                self._discard(part_path)
+                return None
+
+            # 最終名にする直前にも中止を見る。控えを書いている間に押された
+            # 中止を取りこぼすと、やはり検証済みの更新として公開されてしまう。
+            if cancel_check is not None and cancel_check():
+                print("[VersionManager] ダウンロードを中止しました")
                 self._discard(sha_part)
                 self._discard(ver_part)
                 self._discard(part_path)
