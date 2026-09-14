@@ -506,6 +506,16 @@ class AlternateScreenTest(unittest.TestCase):
         self.assertEqual(s.text()[0][-1], "a")
         self.assertEqual(s.text()[1], "b")
 
+    def test_the_alt_screen_has_its_own_decsc_slot(self):
+        # xterm は DECSC の保存領域を画面ごとに持つ (screen->sc[])。
+        # 共有すると、代替画面のアプリが撃った ESC 7 がメイン画面の
+        # 保存位置を潰し、戻ってきた ESC 8 が別の行へ飛んでいた
+        s = feed(Screen(), "\x1b[5;10H\x1b7")
+        feed(s, "\x1b[?1049h\x1b[20;70H\x1b7\x1b[?1049l")
+        feed(s, "\x1b8X")
+        self.assertEqual((s.cursor_row, s.cursor_col), (4, 10))
+        self.assertEqual(s.text()[4], " " * 9 + "X")
+
     def test_the_alt_screen_starts_blank(self):
         s = feed(Screen(), "shell stuff\x1b[?1049h")
         self.assertEqual(s.text(), [""] * 24)

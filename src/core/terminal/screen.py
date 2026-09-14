@@ -106,6 +106,9 @@ class Screen(object):
         # 文字集合の指示 (G0/G1) と SI/SO の状態、それに xterm と
         # 同じく右端の折り返し待ち (_pending_wrap) も持つ
         self._saved = (0, 0, DEFAULT, {"(": "B", ")": "B"}, "(", False)
+        # 保存領域は画面ごと (xterm の screen->sc[])。裏へ回った画面の
+        # ぶんはここへ退避する
+        self._other_saved = self._saved
         self._saved_main = None             # ?1049 用
         self.autowrap = True
         self.cursor_visible = True
@@ -564,6 +567,9 @@ class Screen(object):
         # 印を失うと、戻ってきたときに組み直しで繋ぎ直せなくなる
         self.wrapped, self._other_wrapped = (
             self._other_wrapped, self.wrapped)
+        # DECSC の保存領域も画面と一緒に入れ替える。共有したままだと、
+        # 代替画面のアプリの ESC 7 がメイン画面の保存位置を潰す
+        self._saved, self._other_saved = self._other_saved, self._saved
         self.alt_active = to_alt
         if to_alt:
             if clear:               # 1049 の代替画面は白紙で始まる
