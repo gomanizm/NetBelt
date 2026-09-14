@@ -65,39 +65,41 @@ if errorlevel 1 (
 )
 echo.
 
-if exist "dist\NetBelt.exe" (
-    rem The app looks for updater.bat next to the exe at the end of an
-    rem update. Without it every downloaded update fails at the last step.
-    copy /y updater.bat dist\ >nul
-    if errorlevel 1 (
-        echo [3/3] ビルド失敗
-        echo updater.bat を dist へコピーできませんでした。
-        echo 自動更新が動かないため、中止します。
-        pause
-        exit /b 1
-    )
-    echo [3/3] ビルド成功！
-    echo.
-    echo 実行ファイルの場所: dist\NetBelt.exe
-    echo 更新用スクリプト: dist\updater.bat
-    echo.
-    echo ================================
-    echo ビルド完了！
-    echo ================================
-    echo.
-    echo 配布方法:
-    echo 1. dist フォルダ内の NetBelt.exe と updater.bat を、同じ
-    echo    フォルダに置いたまま配布してください
-    echo 2. updater.bat が exe の隣に無いと、自動更新が適用されません
-    echo 3. Python のインストールは不要です
-    echo 4. 初回起動時に config.json が自動生成されます
-    echo.
-) else (
+rem Bail out first, so nothing below sits inside parentheses: exit /b in
+rem a nested block does not carry the exit code out, and the copy check
+rem used to live two levels deep -- a failed copy still exited with 0.
+if not exist "dist\NetBelt.exe" (
     echo [3/3] ビルド失敗
     echo エラーが発生しました。上記のメッセージを確認してください。
     echo.
     pause
     exit /b 1
 )
+rem The app looks for updater.bat next to the exe at the end of an
+rem update. Without it every downloaded update fails at the last step.
+copy /y updater.bat dist\ >nul
+if errorlevel 1 (
+    echo [3/3] ビルド失敗
+    echo updater.bat を dist へコピーできませんでした。
+    echo 自動更新が動かないため、中止します。
+    pause
+    exit /b 1
+)
+echo [3/3] ビルド成功！
+echo.
+echo 実行ファイルの場所: dist\NetBelt.exe
+echo 更新用スクリプト: dist\updater.bat
+echo.
+echo ================================
+echo ビルド完了！
+echo ================================
+echo.
+echo 配布方法:
+echo 1. dist フォルダ内の NetBelt.exe と updater.bat を、同じ
+echo    フォルダに置いたまま配布してください
+echo 2. updater.bat が exe の隣に無いと、自動更新が適用されません
+echo 3. Python のインストールは不要です
+echo 4. 初回起動時に config.json が自動生成されます
+echo.
 
 pause
