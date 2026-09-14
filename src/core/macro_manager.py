@@ -33,26 +33,47 @@ class MacroManager(QObject):
         
         # コマンド送信コールバック（device_name -> callback）
         self._send_callbacks: Dict[str, Callable] = {}
-    
-    def register_send_callback(self, device_name: str, callback: Callable):
+        # コマンドリスト専用の送信コールバック（device_name -> callback）
+        self._command_send_callbacks: Dict[str, Callable] = {}
+        # 送信待ちのコマンドを取り消すコールバック（device_name -> callback）
+        self._cancel_callbacks: Dict[str, Callable] = {}
+
+    def register_send_callback(self, device_name: str, callback: Callable,
+                               command_callback: Optional[Callable] = None,
+                               cancel_callback: Optional[Callable] = None):
         """
         コマンド送信コールバックを登録
-        
+
         Args:
             device_name: 機器名
             callback: コマンド送信関数（引数: command文字列）
+            command_callback: コマンドリスト専用の送信関数。省略時は callback を使う。
+                送信先が列に溜める作りなら、cancel_callback で取り消せるように
+                印を付けて積む版を渡す
+            cancel_callback: 送信待ちのコマンドを取り消す関数（引数なし）。
+                停止したのに、列に残ったコマンドが後から機器へ届くのを防ぐ
         """
         self._send_callbacks[device_name] = callback
-    
+        if command_callback is not None:
+            self._command_send_callbacks[device_name] = command_callback
+        else:
+            self._command_send_callbacks.pop(device_name, None)
+        if cancel_callback is not None:
+            self._cancel_callbacks[device_name] = cancel_callback
+        else:
+            self._cancel_callbacks.pop(device_name, None)
+
     def unregister_send_callback(self, device_name: str):
         """
         コマンド送信コールバックを解除
-        
+
         Args:
             device_name: 機器名
         """
         if device_name in self._send_callbacks:
             del self._send_callbacks[device_name]
+        self._command_send_callbacks.pop(device_name, None)
+        self._cancel_callbacks.pop(device_name, None)
     
     def start_keepalive(self, device_name: str, interval_seconds: int = 60):
         """
@@ -140,9 +161,24 @@ class MacroManager(QObject):
     def stop_command_list(self, device_name: str):
         """
         コマンドリスト実行を停止
-        
+
+        送信先が列に溜める作りだと、停止した時点でまだ送っていないコマンドが
+        残っていることがある（長い貼り付けの排出待ちなど）。そのまま放って
+        おくと、停止したのに後から機器へ届くので、ここで取り消す。
+
         Args:
             device_name: 機器名
+        """
+        self._teardown_command_list(device_name, cancel_pending=True)
+
+    def _teardown_command_list(self, device_name: str, cancel_pending: bool):
+        """
+        コマンドリストの実行状態を畳む
+
+        Args:
+            device_name: 機器名
+            cancel_pending: 送信待ちのコマンドも取り消すか。走り切った場合は
+                最後のコマンドがまだ列にいることがあるので取り消さない
         """
         was_active = device_name in self._command_timers
         if was_active:
@@ -155,6 +191,8 @@ class MacroManager(QObject):
             del self._command_delays[device_name]
 
         if was_active:
+            if cancel_pending and device_name in self._cancel_callbacks:
+                self._cancel_callbacks[device_name]()
             self.command_list_state_changed.emit(device_name, False)
     
     def is_command_list_active(self, device_name: str) -> bool:
@@ -185,14 +223,18 @@ class MacroManager(QObject):
         # すべてのコマンドを実行した場合
         if index >= len(commands):
             self.macro_finished.emit(device_name)
-            self.stop_command_list(device_name)
+            # 走り切った場合、最後のコマンドがまだ送信待ちのことがある。
+            # 停止と違って取り消してはいけない
+            self._teardown_command_list(device_name, cancel_pending=False)
             return
-        
+
         # コマンドを送信
         command = commands[index]
         if device_name in self._send_callbacks:
             # コマンド送信（改行付き）
-            self._send_callbacks[device_name](command + "\r")
+            send = self._command_send_callbacks.get(
+                device_name, self._send_callbacks[device_name])
+            send(command + "\r")
 
             # 送信が同期で失敗すると、このコールバックの中で切断の後始末
             # （cleanup_device）まで走り、この機器の実行はすでに畳まれている。
