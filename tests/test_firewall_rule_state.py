@@ -126,6 +126,23 @@ class RuleExistsTest(unittest.TestCase):
     def test_one_good_rule_among_bad_ones_is_true(self):
         self.assertTrue(self._exists(_CP(0, JP_DISABLED_ALLOW + JP_ENABLED_ALLOW)))
 
+    def test_an_enabled_block_beside_an_enabled_allow_is_not_allowed(self):
+        # 同名で有効な許可と有効なブロックが併存すると受信は通らない
+        # （Windows FW はブロックを優先する）。並び順に依存してはいけない。
+        self.assertFalse(self._exists(_CP(0, JP_ENABLED_ALLOW + JP_ENABLED_BLOCK)),
+                         "許可の後ろにある有効なブロックを見落としている")
+        self.assertFalse(self._exists(_CP(0, JP_ENABLED_BLOCK + JP_ENABLED_ALLOW)),
+                         "許可の前にある有効なブロックを見落としている")
+        self.assertFalse(self._exists(_CP(0, EN_ENABLED_ALLOW + EN_ENABLED_BLOCK)))
+        self.assertFalse(self._exists(_CP(0, EN_ENABLED_BLOCK + EN_ENABLED_ALLOW)))
+
+    def test_a_disabled_block_beside_an_enabled_allow_is_allowed(self):
+        # 無効なブロックは受信を妨げないので許可済みのまま
+        disabled_block = JP_ENABLED_BLOCK.replace(
+            "有効:                                 はい".encode("utf-8"),
+            "有効:                                 いいえ".encode("utf-8"))
+        self.assertTrue(self._exists(_CP(0, JP_ENABLED_ALLOW + disabled_block)))
+
     def test_show_is_restricted_to_inbound(self):
         calls = []
 
@@ -203,6 +220,22 @@ class EnsureInboundAllowTest(unittest.TestCase):
         self.assertNotIn("既存", msg, "無効ルールを既存の許可として使っている: %s" % msg)
         self.assertTrue(any(a[2] in ("add", "set") for a in calls),
                         "修復のための netsh が実行されていない: %s" % calls)
+
+    def test_admin_enabled_block_beside_allow_is_repaired_not_reused(self):
+        calls = []
+
+        def _run(args):
+            calls.append(args)
+            if args[2] == "show":
+                return _CP(0, JP_ENABLED_ALLOW + JP_ENABLED_BLOCK)
+            return _CP(0)
+        with mock.patch.object(self.fw, "is_admin", return_value=True), \
+             mock.patch.object(self.fw, "_netsh", side_effect=_run):
+            ok, msg = self.fw.ensure_inbound_allow("SFTP Server", "TCP", 2222)
+        self.assertNotIn("既存", msg,
+                         "ブロックが併存しているのに既存の許可として使っている: %s" % msg)
+        self.assertTrue(any(a[2] == "set" for a in calls),
+                        "修復のための netsh set が実行されていない: %s" % calls)
 
     def test_elevated_rule_never_appears_is_not_success(self):
         with mock.patch.object(self.fw, "is_admin", return_value=False), \
