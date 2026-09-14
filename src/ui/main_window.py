@@ -1346,13 +1346,23 @@ class MainWindow(QMainWindow):
             group_name = dialog.get_group_name()
             auto_commands = dialog.get_auto_commands()
 
+            # add_group は save_config() の前に in-memory へ追加し、保存に
+            # 失敗しても巻き戻さない。「失敗しました」とだけ案内してツリーを
+            # 放置すると、実行中の設定とツリーが食い違ったまま残り、次の
+            # 無関係な保存でこの追加がそのまま永続化される
+            existed_before = self.config_manager.get_group(group_name) is not None
+
             # 設定に追加
             if self.config_manager.add_group(group_name, auto_commands):
                 # ツリーを再読み込み
                 self._load_devices()
                 self.status_bar.showMessage(f"グループ '{group_name}' を追加しました")
             else:
-                QMessageBox.warning(self, "エラー", "グループの追加に失敗しました。")
+                # add_group は「同名が既にある」場合も False を返す。
+                # 実行中の設定に追加されたかどうかで見分ける
+                applied = (not existed_before
+                           and self.config_manager.get_group(group_name) is not None)
+                self._warn_change_failed("グループの追加", applied)
 
     def _warn_change_failed(self, what: str, applied_in_memory: bool):
         """
@@ -1463,7 +1473,10 @@ class MainWindow(QMainWindow):
                 self._load_devices()
                 self.status_bar.showMessage(f"グループ '{group_name}' を削除しました")
             else:
-                QMessageBox.warning(self, "エラー", "グループの削除に失敗しました。")
+                # remove_group も save_config() の前に in-memory から消す。
+                # 保存だけ失敗した場合は、実行中の設定から既に消えている
+                applied = self.config_manager.get_group(group_name) is None
+                self._warn_change_failed("グループの削除", applied)
     
     def _on_save_log(self):
         """ログ保存メニューがクリックされたときの処理"""
