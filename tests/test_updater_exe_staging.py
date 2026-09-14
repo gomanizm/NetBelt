@@ -58,10 +58,9 @@ class UpdaterExeStagingTest(unittest.TestCase):
         os.makedirs(self.app_dir)
         self.updater = os.path.join(self.app_dir, "updater.bat")
         shutil.copyfile(UPDATER, self.updater)
-        self.app_path = os.path.join(self.app_dir, "dummy_app.exe")
-        shutil.copyfile(
-            os.path.join(os.environ["SystemRoot"], "System32",
-                         "rundll32.exe"), self.app_path)
+        # 再起動先は NetBelt.exe。updater.bat は改名された exe を
+        # 受け取ると更新を当てずに中止するため、本番と同じ名前で渡す。
+        self.app_path = os.path.join(self.app_dir, "NetBelt.exe")
         self._write("NetBelt.exe", "old")
 
     def _write(self, name, text):

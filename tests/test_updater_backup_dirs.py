@@ -43,12 +43,10 @@ class UpdaterBackupDirsTest(unittest.TestCase):
         os.makedirs(self.app_dir)
         self.updater = os.path.join(self.app_dir, "updater.bat")
         shutil.copyfile(UPDATER, self.updater)
-        self.app_path = os.path.join(self.app_dir, "dummy_app.exe")
-        shutil.copyfile(
-            os.path.join(os.environ["SystemRoot"], "System32",
-                         "rundll32.exe"), self.app_path)
-        io.open(os.path.join(self.app_dir, "NetBelt.exe"), "w",
-                encoding="ascii").write("old")
+        # 再起動先は NetBelt.exe。updater.bat は改名された exe を
+        # 受け取ると更新を当てずに中止するため、本番と同じ名前で渡す。
+        self.app_path = os.path.join(self.app_dir, "NetBelt.exe")
+        io.open(self.app_path, "w", encoding="ascii").write("old")
 
     def _dir(self, name, files, age=0):
         """files: {ファイル名: 経過秒}。age はディレクトリ自身の経過秒。"""

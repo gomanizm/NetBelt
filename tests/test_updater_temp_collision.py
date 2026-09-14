@@ -50,12 +50,10 @@ class _Sandbox(object):
         os.makedirs(self.app_dir)
         self.updater = os.path.join(self.app_dir, "updater.bat")
         shutil.copyfile(UPDATER, self.updater)
-        self.app_path = os.path.join(self.app_dir, "dummy_app.exe")
-        # start が窓を残さないよう、引数なしで即終了する exe を借りる
-        shutil.copyfile(
-            os.path.join(os.environ["SystemRoot"], "System32",
-                         "rundll32.exe"), self.app_path)
-        io.open(os.path.join(self.app_dir, "NetBelt.exe"), "w",
+        # 再起動先は NetBelt.exe。updater.bat は改名された exe を
+        # 受け取ると更新を当てずに中止するため、本番と同じ名前で渡す。
+        self.app_path = os.path.join(self.app_dir, "NetBelt.exe")
+        io.open(self.app_path, "w",
                 encoding="ascii", newline="").write("old")
         self.zip_path = os.path.join(self.dir, "update.zip")
         with zipfile.ZipFile(self.zip_path, "w") as z:
