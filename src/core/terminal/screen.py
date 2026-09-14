@@ -776,6 +776,12 @@ class Screen(object):
                 line.append(BLANK)
                 if line[self.cursor_col][0] == "":
                     line[self.cursor_col] = BLANK
+        # 詰め・押し出しで行が丸ごと空白になったら、この行から次の行への
+        # 続きは無い。EL 1 と同じ症状に DCH / ICH からも到達でき、印が
+        # 残ると空になった行が履歴・コピーで次の行と繋がる。中身が残る
+        # ときは折り返しのまま (EL 1 の判定と揃える)
+        if all(c == BLANK for c in line):
+            self.wrapped[self.cursor_row] = False
         self.dirty.add(self.cursor_row)
         self._pending_wrap = False
 
