@@ -281,7 +281,17 @@ class SFTPServerManager(QObject):
         self._client_sockets = set()
         self._client_lock = threading.Lock()
         self._stop_event = threading.Event()
-        
+
+        # 同時に受け付けるクライアント接続の上限。認証前の接続でも
+        # スレッドと Transport を 1 つずつ消費するので、上限が無いと
+        # 待受アドレス（0.0.0.0）へ届く任意のホストに資源を積まれる。
+        # 他サーバと桁を揃える（TFTP は 16、Syslog TCP は 64）
+        self.max_client_connections = 32
+        # 認証前の接続を打ち切る期限（秒）。paramiko の既定値と同じだが、
+        # 既定に頼らず明示して、枠が返る時間を上限側で決められるようにする
+        self.banner_timeout_seconds = 15.0
+        self.auth_timeout_seconds = 30.0
+
         # サーバー設定
         self.port = 2222
         self.root_dir = "./sftp_root"
@@ -484,6 +494,8 @@ class SFTPServerManager(QObject):
                     # ロックを離すと、その隙間に stop() が入った接続は誰にも
                     # 閉じられず join もされず、ハンドラが停止後に起きて
                     # 破棄済みかもしれないマネージャへ emit する
+                    accepted = False
+                    reject_reason = ""
                     with self._client_lock:
                         if self._stop_event.is_set():
                             try:
@@ -491,23 +503,47 @@ class SFTPServerManager(QObject):
                             except OSError:
                                 pass
                             break
-                        self._client_sockets.add(client_socket)
-                        client_thread = threading.Thread(
-                            target=self._handle_client,
-                            args=(client_socket, client_addr),
-                            daemon=True
-                        )
-                        client_thread.start()
-                        # 終わったスレッドを外してから足す（Syslog と同じ）。
-                        # 外さないとサーバを止めるまで単調に増える。stop() が
-                        # 同じリストを走査するので、差し替えずその場で入れ替える
-                        self.client_threads[:] = [t for t in self.client_threads
-                                                  if t.is_alive()]
-                        self.client_threads.append(client_thread)
+                        if len(self._client_sockets) >= self.max_client_connections:
+                            # 上限に達している。枠が空くまでは受け付けず、
+                            # スレッドも Transport も作らずにその場で閉じる
+                            reject_reason = (
+                                f"connection limit reached "
+                                f"({self.max_client_connections})")
+                        else:
+                            self._client_sockets.add(client_socket)
+                            client_thread = threading.Thread(
+                                target=self._handle_client,
+                                args=(client_socket, client_addr),
+                                daemon=True
+                            )
+                            try:
+                                client_thread.start()
+                            except Exception as e:
+                                # 起こせなかったハンドラのソケットは誰も
+                                # 閉じない。登録を戻し、下で閉じる
+                                self._client_sockets.discard(client_socket)
+                                reject_reason = f"cannot start handler: {e}"
+                            else:
+                                # 終わったスレッドを外してから足す（Syslog と同じ）。
+                                # 外さないとサーバを止めるまで単調に増える。stop() が
+                                # 同じリストを走査するので、差し替えずその場で入れ替える
+                                self.client_threads[:] = [t for t in self.client_threads
+                                                          if t.is_alive()]
+                                self.client_threads.append(client_thread)
+                                accepted = True
+
+                    if not accepted:
+                        try:
+                            client_socket.close()
+                        except OSError:
+                            pass
+                        print(f"[SFTP Server] Rejected {client_addr[0]}:"
+                              f"{client_addr[1]}: {reject_reason}")
+                        continue
 
                     print(f"[SFTP Server] Client connected from {client_addr[0]}:{client_addr[1]}")
                     self.client_connected.emit(client_addr[0])
-                    
+
                 except socket.timeout:
                     # タイムアウトは正常（停止チェックのため）
                     continue
@@ -530,6 +566,10 @@ class SFTPServerManager(QObject):
         try:
             # SSHトランスポートを作成
             transport = paramiko.Transport(client_socket)
+            # 認証前の接続に期限を持たせる。黙り込んだ相手が枠を占有し
+            # 続けると、上限を入れても正規の接続が入れなくなる
+            transport.banner_timeout = self.banner_timeout_seconds
+            transport.auth_timeout = self.auth_timeout_seconds
             transport.add_server_key(self.host_key)
             
             # SFTP サブシステムを登録する。
