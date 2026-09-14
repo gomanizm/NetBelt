@@ -129,6 +129,27 @@ class BuildScriptFailureTest(unittest.TestCase):
         self.assertNotEqual(code, 0,
                             "exe が無いのに成功として終わっている:\n" + out)
 
+    def test_a_failed_updater_copy_is_not_reported_as_success(self):
+        """updater.bat を dist へ入れられなければ、失敗として終わること。"""
+        os.remove(os.path.join(self.proj, "updater.bat"))
+
+        self._write_fake_pyinstaller(
+            "import os\n"
+            "os.makedirs('dist', exist_ok=True)\n"
+            "open(os.path.join('dist', 'NetBelt.exe'), 'wb').write(b'exe')\n")
+
+        code, out = self._run()
+
+        self.assertTrue(os.path.exists(self.exe),
+                        "前提が崩れている: 偽の PyInstaller が exe を作っていない:\n"
+                        + out)
+        self.assertFalse(
+            os.path.exists(os.path.join(self.dist, "updater.bat")),
+            "前提が崩れている: updater.bat が dist へ入っている:\n" + out)
+        self.assertNotEqual(
+            code, 0,
+            "updater.bat をコピーできなかったのに成功として終わっている:\n" + out)
+
     def test_a_successful_build_still_succeeds(self):
         """本当に成功したビルドは、これまで通り成功として終わること。"""
         self._write_fake_pyinstaller(
