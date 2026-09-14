@@ -853,6 +853,24 @@ class RecordGapTest(unittest.TestCase):
         self.assertEqual(s.text(), ["", "", ""])
         self.assertIn("あい", everything(s))
 
+    def test_erase_below_on_a_wide_character_keeps_the_record(self):
+        # カーソルが 1 行目の全角の後半桁にあると、ED 0 はその全角ごと
+        # 払うので画面は丸ごと空白になる。消える中身は ED 2 と同じなので、
+        # 履歴にも同じだけ残る
+        s = feed(Screen(rows=3, cols=10), "あい config")
+        self.assertEqual(s.text(), ["あい confi", "g", ""])
+        feed(s, "\x1b[1;2H\x1b[J")
+        self.assertEqual(s.text(), ["", "", ""])
+        self.assertIn("あい confi", everything(s))
+
+    def test_erase_below_that_leaves_content_is_not_recorded(self):
+        # 同じ (0, 1) でも半角なら 0 桁目は残る。画面が空にならない
+        # 経路で記録すると、同じ行が画面と履歴に二重に出る
+        s = feed(Screen(rows=3, cols=10), "ab")
+        feed(s, "\x1b[1;2H\x1b[J")
+        self.assertEqual(s.text(), ["a", "", ""])
+        self.assertEqual(len(s.history), 0)
+
     def test_deleting_the_top_line_of_the_screen_keeps_the_record(self):
         # 画面先頭の DL は上へ押し出す動きで、SU (CSI S) と同じ。
         # 消えた行は履歴へ送る
