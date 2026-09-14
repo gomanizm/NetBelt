@@ -1215,9 +1215,31 @@ class SNMPPanel(QWidget):
     def _on_trap_received(self, trap_data: dict):
         self._add_trap_to_tree(trap_data)
     
+    def _trap_display_time(self, trap_data: dict) -> str:
+        """表示・保存に使う時刻を決める（受信スレッドが付けた時刻を優先）
+
+        Trap を受け取るのは受信スレッドで、ここが動くのは GUI スレッド。
+        trap_received は queued 配送なので、その間に時間が空く。定常状態の
+        ずれはミリ秒だが、GUI が滞留するとき —— 大量 Trap の配送、終了待ち、
+        モーダルダイアログを開いている間 —— は意味のある差になる。now() で
+        付け直すと滞留分だけ後ろへずれた時刻が表示され、そのままエクスポート
+        にも入り、Trap の前後関係を時刻で追う用途で読み違える。
+
+        received_at が無い、あるいは ISO 8601 として読めないときだけ now()
+        に落とす。時刻列を空にするよりは処理時刻のほうがまだ使える。
+        """
+        received_at = trap_data.get('received_at')
+        if received_at:
+            try:
+                return datetime.fromisoformat(received_at).strftime(
+                    '%Y-%m-%d %H:%M:%S')
+            except (TypeError, ValueError):
+                pass
+        return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
     def _add_trap_to_tree(self, trap_data: dict):
         """TrapデータをツリーViewに追加"""
-        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        timestamp = self._trap_display_time(trap_data)
         source_ip = trap_data.get('source_ip', '')
         source_port = trap_data.get('source_port', 0)
         security = describe_trap_security(trap_data)
