@@ -79,9 +79,8 @@ class SyslogMessage:
                 self.level = "Info"
                 self.severity = 6
             
-            # RFC 5424形式チェック（VERSIONがある）
-            version_match = re.match(r'^(\d+)\s+', message_after_pri)
-            if version_match:
+            # RFC 5424形式チェック（VERSION の次が本当に TIMESTAMP か）
+            if self._has_rfc5424_header(message_after_pri):
                 # RFC 5424形式
                 self._parse_rfc5424(message_after_pri)
             else:
@@ -109,6 +108,33 @@ class SyslogMessage:
         if not (day.isdigit() and 1 <= int(day) <= 31):
             return False
         return bool(cls._RFC3164_TIME_RE.match(tm))
+
+    # RFC 5424 の TIMESTAMP は RFC 3339 の日時か NILVALUE "-" に限られる
+    _RFC5424_TIMESTAMP_RE = re.compile(
+        r'^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?'
+        r'(?:[Zz]|[+-]\d{2}:\d{2})$')
+
+    @classmethod
+    def _has_rfc5424_timestamp(cls, parts):
+        """2 語目が RFC 5424 の TIMESTAMP（RFC 3339 か "-"）か"""
+        if len(parts) < 2:
+            return False
+        return parts[1] == '-' or bool(cls._RFC5424_TIMESTAMP_RE.match(parts[1]))
+
+    @classmethod
+    def _has_rfc5424_header(cls, message: str):
+        """PRI 以降が RFC 5424 のヘッダで始まっているか
+
+        VERSION があるだけ（`^\\d+\\s`）で RFC 5424 と決めると、日時を付けない
+        機器の本文が「数字＋空白」で始まっただけで RFC 5424 側へ回される。
+        あちらは日時の妥当性を見ないので 3 語目がホスト名として拾われ、本文が
+        大きく欠ける（実測: "3 interfaces are down on rtr01 now" が
+        hostname='are' message='now' になった）。VERSION は 1〜2 桁に限り、
+        その次が本当に TIMESTAMP のときだけ RFC 5424 として扱う。
+        """
+        if not re.match(r'^\d{1,2}\s', message):
+            return False
+        return cls._has_rfc5424_timestamp(message.split(None, 2))
 
     def _parse_rfc3164(self, message: str):
         """RFC 3164形式のメッセージをパース"""

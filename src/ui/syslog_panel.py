@@ -606,6 +606,24 @@ class SyslogPanel(QWidget):
         message = cls._escape_for_export(msg.message)
         return f"{msg.timestamp} {msg.source_ip} {hostname} [{msg.level}] {message}"
 
+    @staticmethod
+    def _export_format(file_path: str) -> str:
+        """保存先の拡張子から書き出す形式を決める（"json" / "txt"）
+
+        大文字小文字は区別しない。区別すると out.JSON がテキストの中身で
+        書かれたうえ「エクスポートしました」と成功扱いになり、中身と拡張子
+        の食い違ったファイルが残る（SNMPPanel._export_format と同じ理由）。
+        ダイアログは選んだフィルタの拡張子を小文字で補うので普段は当たるが、
+        利用者が自分で .JSON と打った場合と、大文字名の既存ファイルを選び
+        直した場合に外れる。
+
+        当てはまらない拡張子は従来どおり TXT（既定の形式）。
+        """
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext == '.json':
+            return 'json'
+        return 'txt'
+
     def _export_messages(self):
         """メッセージをエクスポート"""
         filename, _ = QFileDialog.getSaveFileName(
@@ -617,7 +635,7 @@ class SyslogPanel(QWidget):
         if filename:
             try:
                 messages = self.model.get_all_messages()
-                if filename.endswith('.json'):
+                if self._export_format(filename) == 'json':
                     # JSON形式でエクスポート（送信元と受信生データも残す）
                     data = [
                         {
