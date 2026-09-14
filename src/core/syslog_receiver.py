@@ -512,13 +512,23 @@ class SyslogReceiver(QObject):
     # PRI（"<"）で始まるので、改行区切りの行が数字で始まる場合と区別できる
     _OCTET_COUNT_RE = re.compile(rb"^(\d{1,9}) <")
 
-    def _emit_tcp_line(self, line, client_ip, listen_port):
-        """TCP で切り出した 1 メッセージを配信する（空行は捨てる）"""
-        message_str = self._decode_bytes(line).strip()
-        if message_str:
-            self._emit_message(
-                SyslogMessage(message_str, client_ip, "TCP", listen_port))
-            self.message_count += 1
+    def _emit_tcp_line(self, line, client_ip, listen_port, octet_counted=False):
+        """TCP で切り出した 1 メッセージを配信する（空行は捨てる）
+
+        octet_counted=True（RFC 6587 §3.4.1）は宣言された長さぶんがそのまま
+        本文なので、末尾の空白・タブ・NEL(U+0085)・NBSP(U+00A0) も原文のまま
+        残す。両端を落とすと raw_message が受信原文と一致しなくなる。
+        改行区切り（§3.4.2）は終端の CR/LF を落とす必要があるので、そちらは
+        従来どおり strip する。
+        """
+        decoded = self._decode_bytes(line)
+        # 空行かどうかの判定だけは、どちらの方式でも strip 済みの値で行う
+        if not decoded.strip():
+            return
+        message_str = decoded if octet_counted else decoded.strip()
+        self._emit_message(
+            SyslogMessage(message_str, client_ip, "TCP", listen_port))
+        self.message_count += 1
 
     def _handle_tcp_client(self, client_socket, client_ip, stop_event, listen_port=None):
         """TCPクライアントからのメッセージを処理
@@ -551,7 +561,8 @@ class SyslogReceiver(QObject):
                             end = m.end() - 1 + length
                             if len(buffer) < end:
                                 break
-                            self._emit_tcp_line(buffer[m.end() - 1:end], client_ip, listen_port)
+                            self._emit_tcp_line(buffer[m.end() - 1:end], client_ip,
+                                                listen_port, octet_counted=True)
                             buffer = buffer[end:]
                             continue
                         # 改行区切り。いま組み立てている 1 行が上限を超えたら、
