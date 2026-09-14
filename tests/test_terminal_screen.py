@@ -545,6 +545,15 @@ class AlternateScreenTest(unittest.TestCase):
         self.assertEqual(s.text()[0][-1], "a")
         self.assertEqual(s.text()[1], "b")
 
+    def test_entering_the_alt_screen_keeps_the_cursor(self):
+        # xterm の 1049 入場は CursorSave → ToAlternate → ClearScreen で、
+        # ClearScreen はカーソルを動かさない。ここだけホームへ戻すと
+        # 1047/47 とも食い違っていた
+        s = feed(Screen(), "shell\r\n\x1b[3;5H\x1b[?1049hX")
+        self.assertEqual((s.cursor_row, s.cursor_col), (2, 5))
+        self.assertEqual(s.text()[2], "    X")
+        self.assertEqual(s.text()[0], "")
+
     def test_the_alt_screen_has_its_own_decsc_slot(self):
         # xterm は DECSC の保存領域を画面ごとに持つ (screen->sc[])。
         # 共有すると、代替画面のアプリが撃った ESC 7 がメイン画面の

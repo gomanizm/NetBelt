@@ -587,10 +587,12 @@ class Screen(object):
         self.alt_active = to_alt
         if to_alt:
             if clear:               # 1049 の代替画面は白紙で始まる
+                # 白紙にするだけ。xterm の 1049 入場は CursorSave →
+                # ToAlternate → ClearScreen で、ClearScreen はカーソルを
+                # 動かさない (1047/47 も動かさない)
                 for r in range(self.rows):
                     self.lines[r] = self._blank_line()
                     self.wrapped[r] = False
-                self._move(0, 0)
         else:
             if clear:               # 1047 は出るときに代替画面を消す
                 for r in range(self.rows):
