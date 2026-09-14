@@ -211,8 +211,10 @@ class SFTPManager(QObject):
                 with self._sftp_lock:
                     # 待っているあいだに切断されたかもしれない。取得前の
                     # 確認だけでは足りない（起きたら None を触ることになる）。
+                    # 黙って戻ると、一覧が変わらない理由が利用者に届かない。
+                    # 既存の except / _fail 経路へ寄せて通知する
                     if not self.is_connected or self.sftp_client is None:
-                        return
+                        raise IOError("SFTP接続がありません")
                     items = self.sftp_client.listdir_attr(path)
                     # listdir_attr の st_mode は lstat 相当（リンク自身）で、
                     # そのまま S_ISDIR に掛けるとディレクトリへのリンクが
@@ -446,8 +448,11 @@ class SFTPManager(QObject):
                 with self._sftp_lock:
                     # 待っているあいだに切断されたかもしれない。取得前の
                     # 確認だけでは足りない（起きたら None を触ることになる）。
+                    # 黙って戻ると、送られたのかどうかが利用者に届かない。
+                    # 既存の except / _fail 経路へ寄せて通知する（まだ何も
+                    # 送っていないので、後始末が消す一時名も無い）
                     if not self.is_connected or self.sftp_client is None:
-                        return
+                        raise IOError("SFTP接続がありません")
                     # 確認を経ていない送信は、送る直前の実際の状態で判定する。
                     # ロック内なので、先行する転送の結果も見える
                     if not overwrite:
