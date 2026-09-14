@@ -38,6 +38,12 @@ def _start_line(text):
     raise AssertionError("起動している行が見つからない")
 
 
+def _level_line(text):
+    """起動の直前で errorlevel を 0 に均している行を返す。"""
+    lines = text.split("\r\n")
+    return lines[lines.index(_start_line(text)) - 1]
+
+
 
 class UpdaterScriptTest(unittest.TestCase):
     """実際に cmd.exe で走らせて確かめる。"""
@@ -142,14 +148,23 @@ class UpdaterScriptTest(unittest.TestCase):
         これが v1.1.0 で起きた不具合そのもの。start は成功しても
         errorlevel を 0 に戻さないので、直前の失敗を start の失敗として
         読んでしまう。失敗を注入した写しで確かめる。
+
+        注入するのは errorlevel を均す行の手前。均したあとに入れると、
+        守りそのものを跨いでしまい、何も確かめられない。据える exe も
+        本当に起動できるものにする。起動できない中身では、持ち越しの
+        誤判定と本当の起動失敗を見分けられない。
         """
         self._write(os.path.join(self.app_dir, "NetBelt.exe"), "old")
-        zip_path = self._make_zip({"NetBelt.exe": "new"})
+        real_exe = io.open(
+            os.path.join(os.environ["SystemRoot"], "System32",
+                         "rundll32.exe"), "rb").read()
+        zip_path = self._make_zip({"NetBelt.exe": real_exe})
 
         # updater.bat の写しに、再起動の直前で必ず失敗する行を入れる
         original = io.open(UPDATER, encoding="utf-8", newline="").read()
-        anchor = _start_line(original)
-        self.assertIn(anchor, original, "起動行の形が変わっている")
+        anchor = _level_line(original)
+        self.assertIn("cmd /d /c exit 0", anchor,
+                      "errorlevel を均す行が見つからない: %r" % anchor)
         injected = original.replace(
             anchor,
             "netbelt_no_such_command_for_test 2>nul\r\n" + anchor, 1)
@@ -161,8 +176,12 @@ class UpdaterScriptTest(unittest.TestCase):
 
         self.assertNotIn("アプリケーションの起動に失敗", out,
                          "直前の失敗を start の失敗として報告している")
+        self.assertNotIn("起動できませんでした", out,
+                         "直前の失敗を start の失敗として報告している:\n" + out)
         self.assertEqual(code, 0, out)
-        self.assertEqual(self._installed(), "new", out)
+        self.assertEqual(
+            io.open(os.path.join(self.app_dir, "NetBelt.exe"), "rb").read(),
+            real_exe, out)
 
     def test_a_folder_with_parentheses_still_updates(self):
         """括弧を含むフォルダでも更新できること。
@@ -486,15 +505,28 @@ class UpdaterEncodingTest(unittest.TestCase):
         self.assertNotIn('set "RUNNER=!SELF!"', head,
                          "写しを作れないとき、元の場所で走る分岐が残っている")
 
-    def test_the_restart_is_not_judged_by_errorlevel(self):
-        """start の戻り値で成否を判定しないこと。
+    def test_the_restart_levels_errorlevel_before_judging_it(self):
+        """start の戻り値を見るなら、その直前で errorlevel を 0 に均すこと。
 
-        start は成功しても errorlevel を 0 に戻さない。実測で確認済み。
+        start は成功しても errorlevel を 0 に戻さない。そのまま
+        `if errorlevel 1` を書くと、直前の失敗を start の失敗として
+        読んでしまう（v1.1.0 の不具合）。長らく戻り値を一切見ない形に
+        していたが、それでは起動できない exe に差し替わっても
+        「起動しました」と表示してしまう。
+
+        実測では、直前で 0 に均しておけば両立する。
+
+            均してから 起動できない exe を start -> 216
+            均さず直前を 9 にして 起動できる exe -> 9
+            均してから 起動できる   exe を start -> 0
+
+        均す行が消えれば v1.1.0 の誤判定がそのまま戻るので、
+        「直前の行で均していること」を形として固定する。
         """
-        after = self.text[self.text.index(_start_line(self.text)):]
-        head = after.split("\r\n")[1:4]
-        self.assertNotIn("errorlevel", "\n".join(head),
-                         "start の直後で errorlevel を見ている: %r" % head)
+        level = _level_line(self.text)
+        self.assertIn("cmd /d /c exit 0", level,
+                      "start の直前で errorlevel を 0 に均していない: %r"
+                      % level)
 
 
 class UpdaterLaunchTest(unittest.TestCase):

@@ -150,6 +150,18 @@ REM その道では名前の重複を防げないので、常用しないこと�
 set "TEMP_DIR=%TEMP%\NetBeltUpdate_%RANDOM%"
 if not "%~5"=="" set "TEMP_DIR=%~5\zip"
 
+REM 新しい exe をいったん置く一時名に混ぜる、実行ごとの目印。
+REM 親が md で排他確保した作業フォルダの名前をそのまま借りる。
+REM TEMP 側と違い、インストール先は他の更新と共有し得るためで、
+REM 詳しい理由は下の [5/6] の手前に書いた。第5引数が無いのは
+REM --utf8 を手で渡して直接叩いたときだけなので、そこは TEMP_DIR と
+REM 同じく %RANDOM% に落とす（重複を防げないので常用しないこと）。
+set "STAMP_FROM=%~5"
+set "STAMP=%RANDOM%"
+if not "!STAMP_FROM!"=="" for %%w in ("!STAMP_FROM!") do set "STAMP=%%~nxw"
+set "STAGED_NAME=NetBelt.exe.!STAMP!.new"
+set "STAGED_PATH=!APP_DIR!!STAGED_NAME!"
+
 echo [1/6] 更新情報
 echo   ZIPファイル: !ZIP_FILE!
 echo   アプリパス: !APP_PATH!
@@ -250,7 +262,17 @@ REM 一時名で置くのは exe だけ。同梱の他のファイルは従来�
 REM 直接上書きするので、下の差し替えが失敗すると旧 exe と新しい同梱
 REM ファイルが混在する。全部を揃えてから入れ替えるには展開先ごと
 REM 差し替える必要があるため、ここでは失敗時にその旨を伝えるに留める。
-if exist "!SOURCE_DIR!\NetBelt.exe" ren "!SOURCE_DIR!\NetBelt.exe" "NetBelt.exe.new"
+REM 一時名は実行ごとに変える（上で組み立てた STAGED_NAME）。TEMP の作業場所は md で
+REM 排他確保しているが、インストール先は同じ場所を指す別の更新と
+REM 共有し得る。固定名にすると、その 1 つのファイルを取り合うことに
+REM なり、実測では先に改名した側が相手の exe を据えたうえで
+REM 「更新が完了しました！」と表示して exit 0 を返し、もう一方は
+REM 対象が消えているために「NetBelt.exe は旧版のままです」という
+REM 事実と違う失敗を出していた。
+REM 残る制限: 同梱の他のファイルは名前を変えられない（配布物の
+REM 一部そのもの）ため、同じインストール先へ同時に更新をかけると、
+REM どちらの版のファイルが残るかは混ざったままになる。
+if exist "!SOURCE_DIR!\NetBelt.exe" ren "!SOURCE_DIR!\NetBelt.exe" "!STAGED_NAME!"
 
 REM ファイルをコピー（上書き）
 xcopy "!SOURCE_DIR!\*" "!APP_DIR!" /E /I /Y /Q >nul 2>&1
@@ -259,7 +281,7 @@ if errorlevel 1 (
     echo   アプリがまだ起動したままだと、上書きできません
     echo   NetBelt.exe は旧版のままですが、同梱の他のファイルは
     echo   一部またはすべてが新しい版に置き換わっている場合があります。
-    del "!APP_DIR!NetBelt.exe.new" 2>nul
+    del "!STAGED_PATH!" 2>nul
     rd /s /q "!TEMP_DIR!" 2>nul
     pause
     exit /b 1
@@ -267,11 +289,11 @@ if errorlevel 1 (
 
 REM 更新に実行ファイルが入っていたかを確かめる。xcopy の戻り値
 REM だけでは分からない。見るのはコピー先ではなくコピー元。上の改名を
-REM 実行できたときだけ NetBelt.exe.new ができるから。コピー先を
+REM 実行できたときだけ一時名の exe ができるから。コピー先を
 REM 見ると、前回の更新が改名の直前で止まって残した
-REM NetBelt.exe.new が条件を満たし、exe を含まない zip でも
+REM 一時名の exe が条件を満たし、exe を含まない zip でも
 REM 動いている exe をその残骸で上書きしてしまう。
-if not exist "!SOURCE_DIR!\NetBelt.exe.new" (
+if not exist "!SOURCE_DIR!\!STAGED_NAME!" (
     echo エラー: 更新ファイルに NetBelt.exe が含まれていません
     echo   場所: !SOURCE_DIR!
     echo   NetBelt.exe は旧版のままですが、同梱の他のファイルは
@@ -280,14 +302,14 @@ if not exist "!SOURCE_DIR!\NetBelt.exe.new" (
     pause
     exit /b 1
 )
-move /y "!APP_DIR!NetBelt.exe.new" "!APP_DIR!NetBelt.exe" >nul 2>&1
+move /y "!STAGED_PATH!" "!APP_DIR!NetBelt.exe" >nul 2>&1
 if errorlevel 1 (
     echo エラー: NetBelt.exe を差し替えられませんでした
     echo   アプリがまだ起動したままだと、差し替えられません
     echo   NetBelt.exe は旧版のままですが、同梱の他のファイルは
     echo   既に新しい版へ置き換わっています。アプリを終了してから
     echo   もう一度更新してください。
-    del "!APP_DIR!NetBelt.exe.new" 2>nul
+    del "!STAGED_PATH!" 2>nul
     rd /s /q "!TEMP_DIR!" 2>nul
     pause
     exit /b 1
@@ -304,8 +326,13 @@ echo.
 
 REM アプリケーションを再起動
 REM start は成功しても errorlevel を 0 に戻さない。直前の失敗が残って
-REM いると、起動できていても失敗と誤判定する。start の戻り値では判定せず、
-REM 起動する前に実行ファイルの存在を確かめる。
+REM いると、起動できていても失敗と誤判定する。これが v1.1.0 の不具合で、
+REM 長らく start の戻り値を見ない形にしていた。その代わり、起動できない
+REM exe に差し替わっても「起動しました」と表示していた。
+REM 直前に空の cmd を 0 で終わらせて errorlevel を均せば両立する。実測:
+REM   均してから 起動できない exe を start -> 216
+REM   均さず直前を 9 にして 起動できる exe -> 9   （これが v1.1.0 の形）
+REM   均してから 起動できる   exe を start -> 0
 echo [6/6] アプリケーションを再起動中...
 if not exist "!APP_PATH!" (
     echo エラー: 実行ファイルが見つかりません
@@ -314,23 +341,43 @@ if not exist "!APP_PATH!" (
     pause
     exit /b 1
 )
+cmd /d /c exit 0
 start "" "!APP_PATH!"
-echo   起動しました
+if errorlevel 1 set "LAUNCH_FAILED=1"
+if defined LAUNCH_FAILED (
+    echo   起動できませんでした
+    echo   更新そのものは当たっています。NetBelt.exe を手で起動してください。
+) else (
+    echo   起動しました
+)
 echo.
 
 REM クリーンアップ
+REM 起動できなかったときは ZIP と検証用のサイドカーを残す。消してしまうと、
+REM 当て直す材料も、何を当てたのかを確かめる材料も無くなる。
 echo クリーンアップ中...
 ping -n 2 127.0.0.1 >nul 2>&1
 rd /s /q "!TEMP_DIR!" 2>nul
-del "!ZIP_FILE!" 2>nul
-del "!ZIP_FILE!.sha256" 2>nul
-del "!ZIP_FILE!.version" 2>nul
+if not defined LAUNCH_FAILED del "!ZIP_FILE!" 2>nul
+if not defined LAUNCH_FAILED del "!ZIP_FILE!.sha256" 2>nul
+if not defined LAUNCH_FAILED del "!ZIP_FILE!.version" 2>nul
 echo   完了
 echo.
 
 echo ================================================
 echo  更新が完了しました！
 echo ================================================
+REM 残る制限: 起動できなかった場合も、更新そのもの（ファイルの差し替え）は
+REM 当たっているため、上の表示と終了コード 0 は変えていない。呼び出し元は
+REM 更新のために既に終了しているので、この値を読む相手がいない。伝わるのは
+REM この画面だけなので、その場合は自動で閉じずに読ませる。
+if defined LAUNCH_FAILED (
+    echo.
+    echo  ただし NetBelt.exe を起動できませんでした。
+    echo  手で起動できないときは、残してある ZIP を展開し直してください。
+    pause
+    exit /b 0
+)
 ping -n 4 127.0.0.1 >nul 2>&1
 
 exit /b 0
