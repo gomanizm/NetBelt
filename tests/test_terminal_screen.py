@@ -319,6 +319,35 @@ class WrapMarkTest(unittest.TestCase):
                           for line, w in s.take_new_history()],
                          [("", False), ("E", False)])
 
+    def test_dch_that_empties_the_row_clears_the_mark(self):
+        """DCH で中身を全部押し出したら、その行から次への続きは無い。
+
+        EL 1 と同じ症状に DCH (CSI P) から到達できる。印が残ると、
+        空になった行が履歴・コピーで次の行と繋がってしまう。
+        """
+        s = self._wrapped_then_rewritten("\x1b[1;1HWXYZ\x1b[1;1H\x1b[4P")
+        self.assertEqual(s.text()[:2], ["", "E"])
+        self.assertFalse(s.wrapped[0], "空になった行に折り返しの印が残っている")
+
+    def test_ich_that_pushes_the_whole_row_out_clears_the_mark(self):
+        """ICH (CSI @) で行の中身を全部押し出したときも同じ。"""
+        s = self._wrapped_then_rewritten("\x1b[1;1HWXYZ\x1b[1;1H\x1b[4@")
+        self.assertEqual(s.text()[:2], ["", "E"])
+        self.assertFalse(s.wrapped[0], "空になった行に折り返しの印が残っている")
+
+    def test_dch_that_leaves_content_keeps_the_mark(self):
+        """中身が残る DCH では印を外さない。続きの行はまだ続き。"""
+        s = self._wrapped_then_rewritten("\x1b[1;1HWXYZ\x1b[1;1H\x1b[1P")
+        self.assertEqual(s.text()[:2], ["XYZ", "E"])
+        self.assertTrue(s.wrapped[0], "中身が残っているのに印が外れた")
+
+    def test_the_row_emptied_by_dch_reaches_the_history_on_its_own(self):
+        s = self._wrapped_then_rewritten("\x1b[1;1HWXYZ\x1b[1;1H\x1b[4P")
+        feed(s, "\x1b[4;1H\r\n\r\n")          # 2 行押し出す
+        self.assertEqual([("".join(c[0] for c in line).rstrip(), w)
+                          for line, w in s.take_new_history()],
+                         [("", False), ("E", False)])
+
     def test_filling_a_row_to_the_edge_does_not_create_a_mark(self):
         """折り返していない行に、印字だけで印が付いてはいけない。"""
         s = feed(Screen(rows=4, cols=4), "ABCD\x1b[2;1HPONG")
