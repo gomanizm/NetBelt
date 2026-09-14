@@ -1427,34 +1427,40 @@ class TerminalWidget(QWidget):
 
         # ログファイルを閉じる
         if tab_name in self._log_files:
+            # 後始末は close() より先に済ませる。close() は残った書き込みを
+            # 吐き出すので、ディスク満杯・共有フォルダの切断で失敗しうる。
+            # 後始末を close() の後ろに置くと、失敗したときだけ記録フラグと
+            # ハンドルと「記録中」ダイアログが残り、記録を始め直そうとしても
+            # 「既にログ記録中です。」で断られる（止める手段が無くなる）。
+            handle = self._log_files.pop(tab_name)
+            from core import log_recording
+            log_recording.stop(tab_name)
+
+            # ターミナルの記録フラグをクリア
+            if isinstance(current_widget, InteractiveTerminal):
+                current_widget._is_recording = False
+
+            # ダイアログを閉じる。停止ボタン経由だと相手は自分でも
+            # close() を呼んでいるので、二度閉じても平気にしておく
+            dialog = self._log_dialogs.pop(tab_name, None)
+            if dialog is not None:
+                dialog.close()
+
             try:
-                self._log_files[tab_name].close()
-                del self._log_files[tab_name]
-                from core import log_recording
-                log_recording.stop(tab_name)
-
-                # ターミナルの記録フラグをクリア
-                if isinstance(current_widget, InteractiveTerminal):
-                    current_widget._is_recording = False
-                
-                # ダイアログを閉じる。停止ボタン経由だと相手は自分でも
-                # close() を呼んでいるので、二度閉じても平気にしておく
-                dialog = self._log_dialogs.pop(tab_name, None)
-                if dialog is not None:
-                    dialog.close()
-
-                if notify:
-                    QMessageBox.information(
-                        self,
-                        "ログ記録停止",
-                        "ログ記録を停止しました。"
-                    )
-                
+                handle.close()
             except Exception as e:
                 QMessageBox.warning(
                     self,
                     "エラー",
                     f"ログファイルを閉じる際にエラーが発生しました:\n{str(e)}"
+                )
+                return
+
+            if notify:
+                QMessageBox.information(
+                    self,
+                    "ログ記録停止",
+                    "ログ記録を停止しました。"
                 )
     
     def _on_current_tab_changed(self, index: int) -> None:
