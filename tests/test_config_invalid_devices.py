@@ -105,7 +105,7 @@ class ConfigManagerQuarantinesInvalidDevicesTest(unittest.TestCase):
 
         groups = cm.get_groups()
         self.assertEqual([g["name"] for g in groups],
-                         ["Default", "(名前なし)", "(名前なし)", "(名前なし)"])
+                         ["Default", "(名前なし)", "(名前なし) 2", "(名前なし) 3"])
         self.assertEqual(groups[1]["devices"], [VALID], "中の機器まで消えている")
         self.assertIsNone(cm.load_error)
         self.assertTrue(cm.load_warning, "警告が記録されていない")
@@ -136,6 +136,54 @@ class ConfigManagerQuarantinesInvalidDevicesTest(unittest.TestCase):
         self.assertEqual(cm.get_groups()[0]["devices"], [VALID])
         self.assertIsNone(cm.load_warning)
         self.assertIsNone(cm.backup_path)
+
+
+class ConfigManagerNormalisesTheDevicesKeyTest(unittest.TestCase):
+    """devices が list でないグループも、読み込み時に整えること。
+
+    _quarantine_invalid_devices は devices が list のときしか触らないため、
+    キーの欠落・辞書・None は警告なしで通り、その後 add_device が
+    group["devices"] で KeyError、append で AttributeError になる
+    （実測: 「予期しないエラーが発生しました」のダイアログが出て追加が失敗）。
+    名前の欠落と同じく、入れ物の欠落もここで空の一覧に正規化する。
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="netbelt-baddevkey-")
+        self.path = os.path.join(self.dir, "config.json")
+        home = mock.patch("core.config_manager.app_data_dir",
+                          return_value=Path(tempfile.mkdtemp(prefix="netbelt-testhome-")))
+        home.start()
+        self.addCleanup(home.stop)
+
+    def test_groups_without_a_device_list_are_normalised_with_a_warning(self):
+        from core.config_manager import ConfigManager
+        _write_groups(self.path, [
+            {"name": "Default", "auto_commands": []},              # devices が無い
+            {"name": "辞書", "devices": {"a": VALID}},              # devices が辞書
+            {"name": "空", "devices": None},                        # devices が None
+        ])
+
+        cm = ConfigManager(config_path=self.path)
+
+        self.assertEqual([g.get("devices") for g in cm.get_groups()], [[], [], []],
+                         "機器一覧が list に正規化されていない")
+        self.assertIsNone(cm.load_error)
+        self.assertTrue(cm.load_warning, "警告が記録されていない")
+        self.assertIn("3", cm.load_warning)
+        self.assertTrue(cm.backup_path and os.path.exists(cm.backup_path),
+                        "元ファイルのバックアップが無い")
+
+    def test_a_device_can_be_added_to_a_group_that_had_no_device_list(self):
+        from core.config_manager import ConfigManager
+        _write_groups(self.path, [{"name": "Default", "auto_commands": []}])
+
+        cm = ConfigManager(config_path=self.path)
+
+        # 修正前はここで KeyError: 'devices'
+        self.assertTrue(cm.add_device("Default", dict(VALID)))
+        self.assertEqual([d["name"] for d in cm.get_groups()[0]["devices"]],
+                         [VALID["name"]])
 
 
 class MainWindowSurvivesInvalidDevicesTest(unittest.TestCase):

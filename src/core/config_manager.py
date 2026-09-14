@@ -241,6 +241,21 @@ class ConfigManager:
     # 機器まで消えるので、名前だけ補って中身は残す
     UNNAMED_GROUP_NAME = "(名前なし)"
 
+    def _unused_group_name(self, used_names) -> str:
+        """まだ使われていない「(名前なし)」系の表示名を返す。
+
+        同名のグループを作ってはいけない。グループは名前で指すため、
+        get_group() は先頭の 1 件を返すのに remove_group() は同名を
+        すべて消す。同じ補完名が並ぶと、空のグループを消したつもりで
+        同名の別グループの機器まで消える。
+        """
+        name = self.UNNAMED_GROUP_NAME
+        number = 1
+        while name in used_names:
+            number += 1
+            name = f"{self.UNNAMED_GROUP_NAME} {number}"
+        return name
+
     def _quarantine_invalid_devices(self, config: Dict) -> None:
         """必須フィールドの無い機器とグループを整えて、警告を記録する。
 
@@ -263,7 +278,11 @@ class ConfigManager:
         reserved = 0
         renamed_groups = 0
         dropped_groups = 0
+        emptied_groups = 0
         kept_groups = []
+        # 手で付けられた名前とも衝突させない
+        used_names = {g["name"] for g in config.get("groups", [])
+                      if isinstance(g, dict) and isinstance(g.get("name"), str)}
         for group in config.get("groups", []):
             if not isinstance(group, dict):
                 # 名前も機器も取り出せないので、この項目は諦めるしかない
@@ -271,7 +290,8 @@ class ConfigManager:
                 continue
             name = group.get("name")
             if not isinstance(name, str) or not name:
-                group["name"] = self.UNNAMED_GROUP_NAME
+                group["name"] = self._unused_group_name(used_names)
+                used_names.add(group["name"])
                 renamed_groups += 1
             devices = group.get("devices")
             if isinstance(devices, list):
@@ -284,10 +304,18 @@ class ConfigManager:
                     else:
                         kept.append(d)
                 group["devices"] = kept
+            else:
+                # devices の欠落・辞書・None。この先は list であることが前提で、
+                # add_device は group["devices"] で KeyError、_decrypt_passwords は
+                # 辞書や None を回そうとして読み込み自体を失敗させる。
+                # 名前と同じく、入れ物も空で補って中身の無いグループとして扱う
+                group["devices"] = []
+                emptied_groups += 1
             kept_groups.append(group)
         if dropped_groups:
             config["groups"] = kept_groups
-        if not (removed or reserved or renamed_groups or dropped_groups):
+        if not (removed or reserved or renamed_groups or dropped_groups
+                or emptied_groups):
             return
         self._backup_corrupted_config()
         parts = []
@@ -307,13 +335,17 @@ class ConfigManager:
         if dropped_groups:
             parts.append(f"設定ファイル (config.json) にグループとして読めない項目が"
                          f"{dropped_groups}件あり、除外しました。")
+        if emptied_groups:
+            parts.append(f"設定ファイル (config.json) に機器一覧の形が壊れたグループが"
+                         f"{emptied_groups}件あり、機器の無いグループとして扱います。")
         message = "\n".join(parts)
         if self.backup_path:
             message += f"\n\n元のファイルはバックアップしました:\n  {self.backup_path}"
         self.load_warning = message
         print(f"[Config] 機器{removed + reserved}件を除外 "
               f"(name/host 無し={removed}, 予約語={reserved})、"
-              f"グループ{renamed_groups}件を改名、グループ{dropped_groups}件を除外しました")
+              f"グループ{renamed_groups}件を改名、グループ{dropped_groups}件を除外、"
+              f"グループ{emptied_groups}件の機器一覧を空にしました")
 
     def _backup_corrupted_config(self) -> None:
         """
@@ -477,8 +509,14 @@ class ConfigManager:
         Returns:
             削除成功時True、失敗時False
         """
+        # 消すのは get_group() が返すのと同じ 1 件だけ。同名のグループが
+        # あるとき全部消すと、UI が「機器が含まれていません」と確認した
+        # グループを消したつもりで、同名の別グループの機器まで消える
         groups = self.config.get("groups", [])
-        self.config["groups"] = [g for g in groups if g["name"] != group_name]
+        for index, group in enumerate(groups):
+            if group.get("name") == group_name:
+                del groups[index]
+                break
         return self.save_config()
     
     def rename_group(self, old_name: str, new_name: str) -> bool:
@@ -749,8 +787,14 @@ class ConfigManager:
         if "global_macros" not in self.config:
             self.config["global_macros"] = []
         
-        self.config["global_macros"].append(new_macro)
-        return self.save_config()
+        macros = self.config["global_macros"]
+        macros.append(new_macro)
+        if self.save_config():
+            return True
+        # 保存できなかったのにメモリへ残すと、次の無関係な保存で
+        # 追加できなかったはずのコマンド列がディスクに確定する
+        macros.pop()
+        return False
     
     def get_macro_by_name(self, macro_name: str) -> Optional[Dict]:
         """
@@ -783,9 +827,15 @@ class ConfigManager:
         if not macro:
             return False
         
+        before = dict(macro)
         macro["commands"] = commands
         macro["description"] = description
-        return self.save_config()
+        if self.save_config():
+            return True
+        # 保存できなかった編集を残さない（add_device と同じ）
+        macro.clear()
+        macro.update(before)
+        return False
     
     def remove_global_macro(self, macro_name: str) -> bool:
         """
@@ -801,8 +851,14 @@ class ConfigManager:
             return False
         
         macros = self.config["global_macros"]
+        before = list(macros)
         self.config["global_macros"] = [m for m in macros if m.get("name") != macro_name]
-        return self.save_config()
+        if self.save_config():
+            return True
+        # 保存できなかったのにメモリから消すと、次の無関係な保存で
+        # 消せなかったはずのマクロがディスクから消える
+        self.config["global_macros"] = before
+        return False
     
     def get_settings(self) -> Dict:
         """アプリケーション設定を取得"""
