@@ -201,7 +201,10 @@ class FTPServerPanel(QWidget):
         port = self.port_spin.value()
         root_dir = self.root_dir_edit.text().strip()
         username = self.username_edit.text().strip()
-        password = self.password_edit.text().strip()
+        # パスワードは入力そのままを使う。前後の空白も資格情報の一部で、
+        # 削ると画面の表示ではログインできず、削った値が保存されるので
+        # 次回以降も食い違う。未入力かどうかの判定だけ strip() で行う。
+        password = self.password_edit.text()
         anonymous = self.anonymous_check.isChecked()
         anonymous_write = anonymous and self.anonymous_write_check.isChecked()
         lo = self.passive_lo_spin.value()
@@ -209,7 +212,7 @@ class FTPServerPanel(QWidget):
         if not root_dir:
             QMessageBox.warning(self, "入力エラー", "ルートディレクトリを指定してください。")
             return
-        if not anonymous and (not username or not password):
+        if not anonymous and (not username or not password.strip()):
             QMessageBox.warning(self, "入力エラー", "匿名を許可しない場合は、ユーザー名とパスワードを入力してください。")
             return
         # 起動前に設定を保存してからサーバーを起動

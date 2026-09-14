@@ -188,7 +188,10 @@ class SFTPServerPanel(QWidget):
         port = self.port_spin.value()
         root_dir = self.root_dir_edit.text().strip()
         username = self.username_edit.text().strip()
-        password = self.password_edit.text().strip()
+        # パスワードは入力そのままを使う。前後の空白も資格情報の一部で、
+        # 削ると画面に見えている文字列ではログインできない。
+        # 未入力かどうかの判定だけ strip() で行う。
+        password = self.password_edit.text()
         
         # 入力検証
         if not root_dir:
@@ -199,7 +202,7 @@ class SFTPServerPanel(QWidget):
             QMessageBox.warning(self, "入力エラー", "ユーザー名を入力してください。")
             return
         
-        if not password:
+        if not password.strip():
             QMessageBox.warning(self, "入力エラー", "パスワードを入力してください。")
             return
         
