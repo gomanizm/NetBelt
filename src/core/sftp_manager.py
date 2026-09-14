@@ -119,6 +119,21 @@ class SFTPManager(QObject):
             # ホームディレクトリを取得
             try:
                 self.current_path = self.sftp_client.normalize('.')
+            except TimeoutError:   # socket.timeout の別名
+                # 期限切れは「ホームが分からない」ではなく、チャンネルが
+                # 使えないという印。要求と応答はずれたままなので、'/' から
+                # 始めても以後の操作は失敗し続ける。掴んだまま接続成功を
+                # 返さず、ここで畳んで失敗にする（connected をまだ出して
+                # いないので、disconnect ではなく直接閉じる）
+                try:
+                    self.sftp_client.close()
+                except Exception:
+                    pass
+                self.sftp_client = None
+                self.ssh_client = None
+                self.error_occurred.emit(
+                    f"SFTP接続エラー: 機器が{self.CHANNEL_TIMEOUT_SECONDS:g}秒応答しません")
+                return False
             except Exception:
                 self.current_path = "/"
             
@@ -258,6 +273,9 @@ class SFTPManager(QObject):
     _REMOTE_FILE = "file"
     _REMOTE_DIR = "dir"
     _REMOTE_UNSURE = "unsure"
+    # 期限切れ。有無が分からないのは unsure と同じだが、以後この接続が
+    # 使えないことまで分かるので、呼び出し側が切断へ回せるよう分ける
+    _REMOTE_TIMEOUT = "timeout"
 
     def _remote_probe(self, remote_path: str):
         """送る直前のリモートの状態を stat で確かめる（ロック内で呼ぶ）
@@ -274,15 +292,17 @@ class SFTPManager(QObject):
         締めると、そうした機器へは新しい名前すら送れなくなる。
 
         Returns:
-            (状態, 理由): 状態は "missing" / "file" / "dir" / "unsure"。
-            "unsure" は有無を確かめられなかったときで、理由にその説明が入る
+            (状態, 理由): 状態は "missing" / "file" / "dir" / "unsure" /
+            "timeout"。"unsure" と "timeout" は有無を確かめられなかった
+            ときで、理由にその説明が入る。"timeout" はチャンネルが以後
+            使えないことまで分かっている場合
         """
         try:
             attr = self.sftp_client.stat(remote_path)
         except PermissionError as e:
             return self._REMOTE_UNSURE, str(e) or e.__class__.__name__
         except TimeoutError:   # socket.timeout の別名。str が空なので補う
-            return self._REMOTE_UNSURE, (
+            return self._REMOTE_TIMEOUT, (
                 f"機器が{self.CHANNEL_TIMEOUT_SECONDS:g}秒応答しません")
         except Exception:
             return self._REMOTE_MISSING, ""
@@ -380,6 +400,9 @@ class SFTPManager(QObject):
         # 最終名を消したあとで置き換えに失敗した場合は、一時名が唯一の完全な
         # 写しになるので消さない
         keep_tmp = [False]
+        # 送る直前の確認が期限切れになった印。ロックの中では接続を畳めない
+        # ので、抜けてから畳むために持ち回る
+        probe_timed_out = [False]
 
         def unknown_outcome(e):
             """置き換わったか確かめられないときの扱いを返す。
@@ -429,11 +452,15 @@ class SFTPManager(QObject):
                                 f"リモートに '{remote_name}' が既にあります。上書きの確認を"
                                 "経ていないので送りませんでした。一覧を更新してからやり直してください")
                             return
+                        if state == self._REMOTE_TIMEOUT:
+                            # 期限切れのあとは要求と応答がずれたままで、この
+                            # 接続はもう使えない。接続中のまま戻ると、同じ
+                            # 送信を繰り返す限り毎回ここで期限ぶん待たされる。
+                            # ここはロックの中なので畳めない（disconnect が
+                            # 同じロックを取る）。印を付けて抜けてから畳む
+                            probe_timed_out[0] = True
+                            return
                         if state == self._REMOTE_UNSURE:
-                            # 期限切れで確かめられなかった場合、この接続は
-                            # 以後も使えないが、ここはロックの中なので畳めない
-                            # （disconnect が同じロックを取る）。次の操作が
-                            # _fail で切断する
                             self.error_occurred.emit(
                                 f"リモートに '{remote_name}' があるか確かめられませんでした"
                                 f"（{why}）。上書きになる恐れがあるので送りませんでした")
@@ -508,6 +535,10 @@ class SFTPManager(QObject):
                     except Exception:
                         pass
                 self._fail("アップロードエラー", e)
+            finally:
+                # ロックの外。理由を出して接続を畳むのは _fail に任せる
+                if probe_timed_out[0]:
+                    self._fail("アップロードエラー", TimeoutError())
         
         # バックグラウンドスレッドで実行
         threading.Thread(target=upload_thread, daemon=True).start()
