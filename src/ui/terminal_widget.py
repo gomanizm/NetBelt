@@ -149,9 +149,15 @@ class InteractiveTerminal(QTextEdit):
 
         停止したのに、貼り付けの排出待ちで列に残っていたコマンドが
         後から機器へ届くのを防ぐ。打鍵や貼り付けは巻き添えにしない。
+
+        すでに送り始めてしまった行（SEND_CHUNK を超える長い行の先頭ぶんが
+        機器へ届いている状態）は取り消さず、最後まで送り切る。ここで捨てると
+        機器の入力行に中途半端な文字列と行末の CR 抜けが残り、次に利用者が
+        打った文字がその続きになってしまう。
         """
         self._send_queue = [
-            entry for entry in self._send_queue if not entry[1]
+            entry for entry in self._send_queue
+            if not entry[1] or entry[2]
         ]
 
     def _queue_send(self, payload: str, from_macro: bool = False):
@@ -169,8 +175,9 @@ class InteractiveTerminal(QTextEdit):
         """
         if not payload:
             return
-        # [送る文字列, マクロ由来か] の形で積む。停止のときに由来で選り分ける
-        self._send_queue.append([payload, from_macro])
+        # [送る文字列, マクロ由来か, 送り始めたか] の形で積む。
+        # 停止のときに由来で選り分け、送りかけの行だけは残す
+        self._send_queue.append([payload, from_macro, False])
         if not self._sending:
             self._drain_send_queue()
 
@@ -206,6 +213,8 @@ class InteractiveTerminal(QTextEdit):
         chunk, rest = payload[:self.SEND_CHUNK], payload[self.SEND_CHUNK:]
         if rest:
             entry[0] = rest
+            # 先頭ぶんは機器へ届いた。以降この行は取り消しの対象にしない
+            entry[2] = True
         else:
             self._send_queue.pop(0)
 
