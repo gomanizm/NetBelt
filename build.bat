@@ -1,11 +1,25 @@
 @echo off
-rem Comments in this file are ASCII on purpose. There is no chcp here,
-rem so cmd reads the file in the console codepage (CP932 on a Japanese
-rem system) while the file itself is UTF-8. Japanese text then decodes
-rem to a different byte length, the reader loses its place, and pieces
-rem of a comment get run as commands -- which sets errorlevel and turns
-rem a successful build into a reported failure (measured: exit code 1).
-rem Japanese stays in the echo lines, where a garbled line is cosmetic.
+rem Settle the codepage, then run this file again from the top.
+rem The file is UTF-8 with no BOM, and cmd reads a batch file in the
+rem console codepage (CP932 on a Japanese system) while it tracks
+rem where to read next by byte offset. Japanese decoded as CP932 has
+rem a different length, so the reader loses its place and the tail of
+rem a line gets run as a command -- which sets errorlevel and can
+rem flip the result of a later 'if errorlevel 1'.
+rem chcp on its own does not cure it: cmd has already read ahead
+rem under the old codepage. Measured from CP932, six runs each of a
+rem good build and of a failing updater copy: as it was, with a bare
+rem chcp, and with chcp plus goto, every run printed two 'is not
+rem recognized' lines; re-running the file in a child cmd printed
+rem none. updater.bat re-enters itself for the same reason.
+rem Everything down to the re-entry must stay ASCII. Comments are
+rem ASCII throughout anyway; Japanese lives in the echo lines.
+if "%~1"=="--utf8" goto :start
+chcp 65001 >nul
+"%COMSPEC%" /d /c ""%~f0" --utf8"
+exit /b %errorlevel%
+
+:start
 rem
 rem dist/ and build/ are removed by relative path and the spec is read
 rem by relative path, so move to this script's own folder first; called
