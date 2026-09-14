@@ -353,12 +353,21 @@ class TelnetConnection(QObject):
     def _send_telnet_command(self, command: bytes):
         """
         Telnetコマンドを送信
-        
+
+        交渉の応答は3バイトで1つの意味を持つ。send は送れたバイト数を
+        返すだけなので、途中までしか出ないと相手から見て交渉が成立せず、
+        残りは次の送信にくっついて本文として届く（WONT と DONT が
+        ff ff ＝エスケープされた 0xFF 1バイトに化ける）。send_command と
+        揃えて sendall で送り切る。
+
         Args:
             command: 送信するコマンド
         """
         if self.socket and self.is_connected:
             try:
-                self.socket.send(command)
-            except:
-                pass
+                self.socket.sendall(command)
+            except OSError as e:
+                # 裸の except は KeyboardInterrupt まで飲む。送信の失敗は
+                # OSError（socket.error / socket.timeout を含む）だけを
+                # 捕まえ、黙って落とさず操作者へ知らせる。
+                self.error_occurred.emit(f"Telnet交渉の応答を送信できませんでした: {str(e)}")
