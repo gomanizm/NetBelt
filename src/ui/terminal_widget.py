@@ -1070,6 +1070,20 @@ class TerminalWidget(QWidget):
                 except Exception as e:
                     self._abort_log_recording(device_name, e)
 
+    def _discard_log_dialog(self, dialog) -> None:
+        """記録中ダイアログを閉じて、捨てる。
+
+        LogRecordingDialog は TerminalWidget を親にしているので、close() だけ
+        だと親子関係からは外れず、1 秒ごとのタイマーを持ったまま子として残る。
+        記録の開始と停止を繰り返すたびに 1 件ずつ積み上がる（実測: 3 回で 3 件）。
+        呼ぶ側は必ず _log_dialogs から外してから渡すこと。
+
+        deleteLater() は今のイベントループへ戻ったところで効くので、停止ボタン
+        （ダイアログ自身のスロット）から呼ばれても、その場で足元を消さない。
+        """
+        dialog.close()
+        dialog.deleteLater()
+
     def _abort_log_recording(self, device_name: str, error: Exception) -> None:
         """書き込みに失敗した記録を止めて、知らせる。
 
@@ -1093,7 +1107,7 @@ class TerminalWidget(QWidget):
             terminal._is_recording = False
         dialog = self._log_dialogs.pop(device_name, None)
         if dialog is not None:
-            dialog.close()
+            self._discard_log_dialog(dialog)
         QMessageBox.warning(
             self, "ログ記録",
             "%s のログ記録を停止しました。書き込みに失敗しました:\n%s\n\n"
@@ -1444,7 +1458,7 @@ class TerminalWidget(QWidget):
             # close() を呼んでいるので、二度閉じても平気にしておく
             dialog = self._log_dialogs.pop(tab_name, None)
             if dialog is not None:
-                dialog.close()
+                self._discard_log_dialog(dialog)
 
             try:
                 handle.close()
