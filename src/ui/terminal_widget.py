@@ -269,13 +269,13 @@ class InteractiveTerminal(QTextEdit):
         menu = QMenu(self)
         
         # コピー（選択範囲がある場合のみ有効）
-        copy_action = QAction("コピー", self)
+        copy_action = QAction("コピー", menu)
         copy_action.triggered.connect(self.copy)
         copy_action.setEnabled(self.textCursor().hasSelection())
         menu.addAction(copy_action)
         
         # 貼り付け（カスタムペースト機能を使用）
-        paste_action = QAction("貼り付け", self)
+        paste_action = QAction("貼り付け", menu)
         paste_action.triggered.connect(self.custom_paste)
         paste_action.setEnabled(self.can_send_input())
         menu.addAction(paste_action)
@@ -283,7 +283,7 @@ class InteractiveTerminal(QTextEdit):
         menu.addSeparator()
         
         # すべて選択
-        select_all_action = QAction("すべて選択", self)
+        select_all_action = QAction("すべて選択", menu)
         select_all_action.triggered.connect(self.selectAll)
         menu.addAction(select_all_action)
         
@@ -293,10 +293,10 @@ class InteractiveTerminal(QTextEdit):
         if self._input_enabled:
             # キープアライブ
             if self._keepalive_active:
-                keepalive_action = QAction("キープアライブ停止", self)
+                keepalive_action = QAction("キープアライブ停止", menu)
                 keepalive_action.triggered.connect(lambda: self.keepalive_stop_requested.emit())
             else:
-                keepalive_action = QAction("キープアライブ開始", self)
+                keepalive_action = QAction("キープアライブ開始", menu)
                 keepalive_action.triggered.connect(lambda: self.keepalive_start_requested.emit())
             menu.addAction(keepalive_action)
             
@@ -304,7 +304,7 @@ class InteractiveTerminal(QTextEdit):
             
             # マクロ実行サブメニュー
             if self._macro_list:
-                macro_menu = QMenu("マクロ実行", self)
+                macro_menu = QMenu("マクロ実行", menu)
                 for macro in self._macro_list:
                     macro_name = macro.get("name", "")
                     macro_desc = macro.get("description", "")
@@ -314,7 +314,7 @@ class InteractiveTerminal(QTextEdit):
                     else:
                         action_text = macro_name
                     
-                    macro_action = QAction(action_text, self)
+                    macro_action = QAction(action_text, macro_menu)
                     macro_action.triggered.connect(
                         lambda checked, name=macro_name: self.macro_execute_requested.emit(name)
                     )
@@ -325,7 +325,7 @@ class InteractiveTerminal(QTextEdit):
             # 実行中のマクロを止める。これが無いと、誤ったマクロを流し
             # 始めたときタブを閉じる以外に中断する手段が無い
             if self._command_list_active:
-                macro_stop_action = QAction("マクロ停止", self)
+                macro_stop_action = QAction("マクロ停止", menu)
                 macro_stop_action.triggered.connect(lambda: self.macro_stop_requested.emit())
                 menu.addAction(macro_stop_action)
             
@@ -333,22 +333,30 @@ class InteractiveTerminal(QTextEdit):
         
         # ログ機能メニュー
         # 1. 現在表示されている全ログの保存
-        save_all_log_action = QAction("全ログ保存", self)
+        save_all_log_action = QAction("全ログ保存", menu)
         save_all_log_action.triggered.connect(self._on_save_all_log)
         menu.addAction(save_all_log_action)
         
         # 2. ログ記録開始/停止（記録状態によって切り替え）
         if self._is_recording:
-            stop_log_action = QAction("ログ記録停止", self)
+            stop_log_action = QAction("ログ記録停止", menu)
             stop_log_action.triggered.connect(self._on_stop_log_recording)
             menu.addAction(stop_log_action)
         else:
-            start_log_action = QAction("ログ記録開始", self)
+            start_log_action = QAction("ログ記録開始", menu)
             start_log_action.triggered.connect(self._on_start_log_recording)
             menu.addAction(start_log_action)
         
         # メニューを表示
-        menu.exec(event.globalPos())
+        try:
+            menu.exec(event.globalPos())
+        finally:
+            # 端末を親にしたメニューは、閉じただけでは子として残る。
+            # 右クリックのたびに QMenu 1 件と項目が積み上がるので、
+            # 開き終えたら項目ごと捨てる（実測: 5 回で QMenu 5 件、
+            # QAction 40 件）。項目の親もメニューにしてあるので、
+            # メニューが消えるときに一緒に片付く。
+            menu.deleteLater()
     
     def _on_save_all_log(self):
         """現在表示されている全ログを保存"""
