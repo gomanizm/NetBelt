@@ -113,8 +113,14 @@ class SourceRunApplyTest(unittest.TestCase):
     def test_the_pending_path_still_applies_from_a_frozen_build(self):
         from ui.main_window import MainWindow
 
+        # 起動時の適用経路も、更新ダイアログと同じ確認（存在・検証済み・
+        # 版の一致）を Popen の直前に通す。揃った ZIP を置いて試す
+        tmp = tempfile.mkdtemp(prefix="netbelt-source-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        zip_path = place_verified_zip(tmp, "9.9.9")
         with _frozen(True):
-            MainWindow._apply_pending_update(types.SimpleNamespace(), HERE)
+            MainWindow._apply_pending_update(types.SimpleNamespace(),
+                                             zip_path, "9.9.9")
 
         self.assertEqual(len(self.popen.calls), 1,
                          "凍結ビルドでも適用できなくなっている")

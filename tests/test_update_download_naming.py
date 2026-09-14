@@ -229,7 +229,7 @@ class PendingPicksTheNewestTest(unittest.TestCase):
             return QMessageBox.StandardButton.Yes
 
         me = types.SimpleNamespace(
-            _apply_pending_update=lambda path: applied.append(path))
+            _apply_pending_update=lambda path, version=None: applied.append(path))
         with unittest.mock.patch(
                 "ui.main_window.QMessageBox.question", question):
             with unittest.mock.patch(

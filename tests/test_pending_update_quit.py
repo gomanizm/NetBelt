@@ -17,6 +17,7 @@ _apply_pending_update はソース実行では案内を出して何もしない�
 上書きしてしまうため）。ここで見たいのは終了の経路なので、凍結された
 exe として動いているふりをする。
 """
+import hashlib
 import os
 import sys
 import tempfile
@@ -56,6 +57,24 @@ class PendingUpdateQuitTest(unittest.TestCase):
         """凍結された exe として動いているふりをする文脈。"""
         return mock.patch.object(sys, "frozen", True, create=True)
 
+    @staticmethod
+    def _staged_update():
+        """検証済みの更新ファイルを作り、そのパスを返す。
+
+        _apply_pending_update は updater を起動する前に、ZIP の存在と
+        ダウンロード時の検証記録を確かめ直す（起動時の適用経路も更新
+        ダイアログと同じ確認を通すようにしたため）。ここで見たいのは
+        終了の経路なので、その確認を通るファイルを用意する。
+        """
+        d = tempfile.mkdtemp(prefix="netbelt-pending-zip-")
+        zip_path = os.path.join(d, "NetBelt-9.9.9.zip")
+        body = b"PK\x03\x04 dummy netbelt update"
+        with open(zip_path, "wb") as f:
+            f.write(body)
+        with open(zip_path + ".sha256", "w", encoding="ascii") as f:
+            f.write(hashlib.sha256(body).hexdigest())
+        return zip_path
+
     def _run_event_loop_with_watchdog(self, seconds=2.0):
         """exec() を回し、上限を過ぎたら 42 で抜ける。戻り値と経過秒を返す。"""
         from PyQt6.QtCore import QTimer
@@ -74,8 +93,7 @@ class PendingUpdateQuitTest(unittest.TestCase):
         w = self._window()
         w.show()
         with self._as_frozen_build(), mock.patch("subprocess.Popen") as popen:
-            w._apply_pending_update(os.path.join(tempfile.gettempdir(),
-                                                 "NetBelt-9.9.9.zip"))
+            w._apply_pending_update(self._staged_update())
         popen.assert_called_once()
 
         code, elapsed = self._run_event_loop_with_watchdog()
@@ -87,8 +105,7 @@ class PendingUpdateQuitTest(unittest.TestCase):
         """updater を起動できなかったときは、これまでどおり終了しないこと。"""
         w = self._window()
         with self._as_frozen_build(),              mock.patch("subprocess.Popen", side_effect=OSError("見つかりません")),              mock.patch("ui.main_window.QMessageBox.critical") as critical:
-            w._apply_pending_update(os.path.join(tempfile.gettempdir(),
-                                                 "NetBelt-9.9.9.zip"))
+            w._apply_pending_update(self._staged_update())
         critical.assert_called_once()
 
         code, _ = self._run_event_loop_with_watchdog(0.3)

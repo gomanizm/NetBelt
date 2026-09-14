@@ -623,6 +623,35 @@ class VersionManager:
             print(f"[VersionManager] 検証記録の確認に失敗: {e}")
             return False
 
+    def verify_before_apply(self, zip_path: str,
+                            expected_version: Optional[str] = None) -> Optional[str]:
+        """updater を起動する直前に、更新ファイルをもう一度確かめる
+
+        候補を選んだ時点と、利用者が確認ダイアログを閉じた時点の間には
+        間がある。その間に ZIP が消えたり、別の版へ差し替わったりしうる
+        （NetBelt を二重に起動しているときなど）。適用の直前にもう一度
+        見ないと、見せた内容と違うものがそのまま展開される。
+
+        更新ダイアログからの適用と、起動時の未適用更新の適用が同じ確認を
+        通るように、ここへまとめる。
+
+        Args:
+            zip_path: 適用しようとしている更新ファイル
+            expected_version: 利用者へ見せた版（省略時は版を確かめない）
+
+        Returns:
+            問題が無ければ None。あれば利用者へ見せる文言
+        """
+        if not zip_path or not os.path.exists(zip_path):
+            return "更新ファイルが見つかりません。"
+        if not self.is_verified_update(zip_path):
+            return ("ダウンロードした更新ファイルが、表示していた内容と\n"
+                    "一致しません。もう一度ダウンロードしてください。")
+        if expected_version and self.pending_version(zip_path) != expected_version:
+            return ("ダウンロードした更新ファイルが、表示していた内容と\n"
+                    "一致しません。もう一度ダウンロードしてください。")
+        return None
+
     def get_pending_update_files(self) -> list:
         """
         未適用の更新ファイルをリストアップ

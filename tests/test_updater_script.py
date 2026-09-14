@@ -513,7 +513,16 @@ class UpdaterLaunchTest(unittest.TestCase):
         from unittest import mock
         from ui.main_window import MainWindow
 
-        zip_path = r"C:\lab\a,b\NetBelt-update.zip"
+        # 起動時の適用経路も、直前に「検証を通った ZIP か」を確かめる
+        # （ダイアログ側と同じ門）。コンマを含むフォルダに一式を置いて通す
+        base = tempfile.mkdtemp(prefix="netbelt_pending_")
+        self.addCleanup(shutil.rmtree, base, True)
+        folder = os.path.join(base, "a,b")
+        os.makedirs(folder)
+        zip_path = os.path.join(folder, "NetBelt-update.zip")
+        io.open(zip_path, "wb").write(b"PK\x03\x04")
+        io.open(zip_path + ".sha256", "w", encoding="ascii").write(
+            hashlib.sha256(b"PK\x03\x04").hexdigest())
         with mock.patch.object(MainWindow,
                                "_check_for_updates_on_startup"):
             window = MainWindow()

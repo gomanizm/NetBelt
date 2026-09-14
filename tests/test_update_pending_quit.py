@@ -14,16 +14,35 @@ QApplication.quit() を呼んでも、イベントループはまだ始まって
 ここでは exec() をループ開始前の呼び出しと同じ順序で回し、「安全弁を
 使わずに戻ってくる」ことで判定する。
 """
+import hashlib
 import os
 import sys
+import tempfile
 import types
 import unittest
 import unittest.mock
 
 sys.path.insert(0, "src")
 
-HERE = os.path.abspath(__file__)
 SAFETY_RC = 42
+
+
+def staged_update():
+    """検証済みの更新ファイルを作り、そのパスを返す。
+
+    _apply_pending_update は updater を起動する前に、ZIP の存在と
+    ダウンロード時の検証記録を確かめ直す（起動時の適用経路も更新
+    ダイアログと同じ確認を通すようにしたため）。ここで見たいのは
+    終了の経路なので、その確認を通るファイルを用意する。
+    """
+    d = tempfile.mkdtemp(prefix="netbelt-quit-")
+    zip_path = os.path.join(d, "NetBelt-9.9.9.zip")
+    body = b"PK\x03\x04 dummy netbelt update"
+    with open(zip_path, "wb") as f:
+        f.write(body)
+    with open(zip_path + ".sha256", "w", encoding="ascii") as f:
+        f.write(hashlib.sha256(body).hexdigest())
+    return zip_path
 
 
 class PendingUpdateQuitTest(unittest.TestCase):
@@ -38,7 +57,8 @@ class PendingUpdateQuitTest(unittest.TestCase):
         # コンストラクタ内（＝ exec() の前）と同じ順序で呼ぶ
         with unittest.mock.patch("subprocess.Popen", popen), \
                 unittest.mock.patch.object(sys, "frozen", True, create=True):
-            MainWindow._apply_pending_update(types.SimpleNamespace(), HERE)
+            MainWindow._apply_pending_update(types.SimpleNamespace(),
+                                             staged_update())
 
         popen.assert_called_once()
 

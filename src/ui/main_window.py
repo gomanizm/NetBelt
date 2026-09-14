@@ -2236,10 +2236,15 @@ for details.
         )
 
         if reply == QMessageBox.StandardButton.Yes:
-            self._apply_pending_update(zip_path)
+            self._apply_pending_update(zip_path, pending_version)
     
-    def _apply_pending_update(self, zip_path: str):
-        """未適用の更新を適用"""
+    def _apply_pending_update(self, zip_path: str, expected_version: str = None):
+        """未適用の更新を適用
+
+        Args:
+            zip_path: 適用する更新ファイル
+            expected_version: 確認ダイアログで見せた版（省略時は版を確かめない）
+        """
         # updater.batのパスを取得
         import sys
 
@@ -2249,7 +2254,15 @@ for details.
         if running_from_source():
             QMessageBox.information(self, "更新", SOURCE_RUN_MESSAGE)
             return
-        
+
+        # 候補を選んだのは確認ダイアログを出す前。閉じるまでの間に ZIP が
+        # 消えたり差し替えられたりしうるので、更新ダイアログからの適用と
+        # 同じ確認をここでもう一度通す
+        problem = VersionManager().verify_before_apply(zip_path, expected_version)
+        if problem:
+            QMessageBox.warning(self, "エラー", problem)
+            return
+
         if getattr(sys, 'frozen', False):
             app_dir = os.path.dirname(sys.executable)
             app_path = sys.executable

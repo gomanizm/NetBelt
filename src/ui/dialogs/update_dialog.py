@@ -358,29 +358,15 @@ class UpdateDialog(QDialog):
             QMessageBox.information(self, "更新", SOURCE_RUN_MESSAGE)
             return
 
-        if not self.downloaded_zip_path or not os.path.exists(self.downloaded_zip_path):
-            QMessageBox.warning(
-                self,
-                "エラー",
-                "更新ファイルが見つかりません。"
-            )
-            return
-        
         # 表示した版と同じものを渡す。ダウンロード先が版ごとに分かれる前は、
         # 後から来た受信が、先に表示したダイアログの ZIP を置き換えられた。
         # 適用時は存在確認しかしていなかったので、そのまま別の版が当たる。
-        version_mgr = VersionManager()
-        shown_version = self.update_info.get('version')
-        pending_version = VersionManager.pending_version(
-            self.downloaded_zip_path)
-        if not version_mgr.is_verified_update(self.downloaded_zip_path) or (
-                shown_version and pending_version != shown_version):
-            QMessageBox.warning(
-                self,
-                "エラー",
-                "ダウンロードした更新ファイルが、表示していた内容と\n"
-                "一致しません。もう一度ダウンロードしてください。"
-            )
+        # 同じ確認は起動時の適用経路（MainWindow._apply_pending_update）も
+        # 通る。片方だけ直る形にしないため VersionManager へまとめてある。
+        problem = VersionManager().verify_before_apply(
+            self.downloaded_zip_path, self.update_info.get('version'))
+        if problem:
+            QMessageBox.warning(self, "エラー", problem)
             return
 
         # updater.batのパスを取得
