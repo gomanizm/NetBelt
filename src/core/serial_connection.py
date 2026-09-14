@@ -54,15 +54,26 @@ class SerialConnection(QObject):
         self._write_handoff: Optional[_WriterHandoff] = None
         self._is_connected = False
         self._should_stop = False
-    
+        # dispose() 済み（このオブジェクトは捨てられた）ことを覚えておく印。
+        # _should_stop と違い connect() の入口で戻さないので、接続スレッドが
+        # 動き出す前に着地した dispose() でも消えない
+        self._disposed = False
+
     def connect(self) -> bool:
         """
         シリアルポートに接続
-        
+
         Returns:
             接続に成功した場合True、失敗した場合False
         """
         try:
+            if self._disposed:
+                # 接続スレッドが動き出す前にタブが閉じられ、dispose() が先に
+                # 走った。ここで印を無視して進むと、ポートは最後まで開くのに
+                # 参照しているものが誰もいない状態になり、閉じる経路が無い
+                # まま同じ COM への再接続が Access is denied になる
+                return False
+
             # 既に接続されている場合は切断
             if self._is_connected:
                 self.disconnect()
@@ -125,6 +136,16 @@ class SerialConnection(QObject):
         Windows の COM ポートは同一プロセス内でも排他なので、閉じずに
         参照だけ捨てると、同じ機器への再接続が Access is denied になる。
 
+        これを呼んだあとの connect() は、何もせず False を返す。呼び出し元
+        （タブを閉じたときの MainWindow）は dispose() の前に接続辞書から
+        このオブジェクトを外しており、以後この接続を使う人はいないため。
+        同じオブジェクトで繋ぎ直す場合は disconnect() を使う。
+
+        残る制限: 接続スレッドが動き出す前の disconnect() は、繋ぎ直しの
+        ために印を消すので取り消しにならない。利用者が明示的に切断してから
+        タブを残す経路だけなので、この場合は接続が成立しても同じ
+        オブジェクトが保持し続ける。
+
         残る制限: 呼び出し元（タブを閉じたときは GUI スレッド）を、
         読み取りスレッドと送信スレッドの join で最大 2 秒ずつ、合わせて
         最大約 4 秒止める。join が空振りした場合でも、残った送信スレッドは
@@ -132,6 +153,7 @@ class SerialConnection(QObject):
         空振りしたときはポートをここでは閉じず、閉じる役を送信スレッドへ
         渡すので、そのポートが閉じるのは書き込みが終わったあとになる。
         """
+        self._disposed = True
         self._should_stop = True
         self._is_connected = False
 
@@ -178,8 +200,12 @@ class SerialConnection(QObject):
         self.serial_conn = None
 
     def disconnect(self):
-        """シリアルポートから切断"""
+        """シリアルポートから切断（同じオブジェクトで繋ぎ直せる）"""
         self.dispose()
+        # dispose() の印は「このオブジェクトは捨てた」意味なので、利用者が
+        # 明示的に切断しただけの場合は消す。残すと次の connect() が
+        # 取り消し扱いになり、繋ぎ直せなくなる
+        self._disposed = False
         self.disconnected.emit()
     
     def _start_read_thread(self):
