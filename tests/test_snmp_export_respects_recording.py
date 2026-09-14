@@ -2,8 +2,8 @@
 
 端末どうしの上書きは tests/test_log_file_in_use_refused.py で塞いだが、
 その検査は TerminalWidget の中にあり、SNMP パネルは通らない。
-SNMP パネルの6つの書き出しは保存先を直接 open('w') するので、記録中の
-ファイルを選ぶと記録済みの内容が消え、端末は開いたままのハンドルで
+SNMP パネルの6つの書き出しは保存先を丸ごと作り直すので、記録中の
+ファイルを選ぶと記録済みの内容が失われ、端末は開いたままのハンドルで
 自分のオフセットから書き続ける（実測: 双方のファイルが壊れる）。
 
 記録中のファイルが選ばれたら、端末の場合と同じく拒否して警告する。
@@ -57,8 +57,11 @@ class SnmpExportRespectsRecordingTest(unittest.TestCase):
         from ui.snmp_panel import SNMPPanel
         panel = SNMPPanel()
         self.addCleanup(panel.close)
+        # 結果行は (OID, Type, Value) の組。SNMPWorker が渡す形に合わせる。
+        # dict を置くと書き出しが KeyError で落ち、「普通の保存はできる」側の
+        # 検査が保存の成否を見られない
         panel.result_model.set_results([
-            {"oid": "1.3.6.1.2.1.1.5.0", "type": "OctetString", "value": "rtrB"},
+            ("1.3.6.1.2.1.1.5.0", "OctetString", "rtrB"),
         ])
         panel._result_host = "192.0.2.1"
         return panel

@@ -9,11 +9,42 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QAbstractTableModel, QModelIndex, QThread, pyqtSignal
 from PyQt6.QtGui import QAction, QStandardItemModel, QStandardItem
+from contextlib import contextmanager
 from datetime import datetime
 import json
+import os
 import re
+import tempfile
 from core.mib_resolver import get_resolver, MIBResolver
 from core.snmp_manager import v3_password_error
+
+
+@contextmanager
+def atomic_text_write(file_path: str, **open_kwargs):
+    """書き切れた時だけ保存先を置き換える open('w') の代わり
+
+    保存先を直接開くと、開いた時点で元の内容が消える。書き込みの途中で
+    失敗（ディスク満杯・共有断）すると新しい内容も書き切れないので、
+    利用者は新旧どちらも失う。同じディレクトリの一時ファイルへ書き切って
+    から os.replace() で差し替え、失敗したら一時ファイルだけ捨てる。
+
+    open_kwargs は open() にそのまま渡す（encoding / newline など）。
+    """
+    directory = os.path.dirname(os.path.abspath(file_path))
+    fd, tmp_path = tempfile.mkstemp(dir=directory,
+                                    prefix=".netbelt-export-", suffix=".tmp")
+    os.close(fd)
+    try:
+        with open(tmp_path, "w", **open_kwargs) as f:
+            yield f
+        # 同じディレクトリなので、置き換えは失敗しても中途半端にはならない
+        os.replace(tmp_path, file_path)
+    except BaseException:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 # pysnmp が渡す securityModel / securityLevel の値
@@ -641,9 +672,10 @@ class SNMPPanel(QWidget):
     def _refuse_if_recording(self, title: str, file_path: str) -> bool:
         """保存先が端末のログ記録に使われていたら断る（断ったら True）
 
-        書き出しは保存先を open('w') で開く。記録中のファイルを選ばれると
-        記録済みの内容が消え、端末は開いたままのハンドルで自分のオフセット
-        から書き続けるので、双方のファイルが壊れる。
+        書き出しは保存先を別の内容へ作り直す（atomic_text_write が一時ファイル
+        へ書き切ってから os.replace で置き換える）。記録中のファイルを選ばれる
+        と、置き換えが通れば記録済みの内容は失われ、端末は開いたままのハンドル
+        で自分のオフセットから書き続けるので、双方のファイルが壊れる。
         """
         from core import log_recording
         device_name = log_recording.device_using(file_path)
@@ -772,7 +804,7 @@ class SNMPPanel(QWidget):
         import csv
         # BOM 付き（utf-8-sig）。日本語版 Excel は BOM の無い UTF-8 の CSV を
         # cp932 として開くため、見出しも機器から来た日本語も文字化けする
-        with open(file_path, "w", newline="", encoding="utf-8-sig") as f:
+        with atomic_text_write(file_path, newline="", encoding="utf-8-sig") as f:
             if reason:
                 # 途中までの結果であることを、見出しの前に残す
                 f.write("# 途中まで: %s のため中断。全部ではありません\n" % reason)
@@ -796,13 +828,13 @@ class SNMPPanel(QWidget):
                 {"oid": row[0], "type": row[1], "value": row[2]} for row in results
             ],
         }
-        with open(file_path, "w", encoding="utf-8") as f:
+        with atomic_text_write(file_path, encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
 
     def _export_results_to_txt(self, file_path: str, results, host: str,
                                reason):
         """テキスト形式で GET/WALK 結果を書き出す（host / reason は CSV と同じ）"""
-        with open(file_path, "w", encoding="utf-8") as f:
+        with atomic_text_write(file_path, encoding="utf-8") as f:
             f.write("SNMP GET/WALK 結果\n")
             f.write("エクスポート日時: " + datetime.now().strftime("%Y-%m-%d %H:%M:%S") + "\n")
             f.write("対象ホスト: " + host + "\n")
@@ -1045,7 +1077,7 @@ class SNMPPanel(QWidget):
         import csv
 
         # BOM 付き（utf-8-sig）。理由は _export_results_to_csv と同じ
-        with open(file_path, 'w', newline='', encoding='utf-8-sig') as f:
+        with atomic_text_write(file_path, newline='', encoding='utf-8-sig') as f:
             writer = csv.writer(f)
             
             # ヘッダー
@@ -1074,14 +1106,14 @@ class SNMPPanel(QWidget):
     
     def _export_to_json(self, file_path: str, traps):
         """JSON形式で Trap を書き出す（traps は CSV と同じ）"""
-        with open(file_path, 'w', encoding='utf-8') as f:
+        with atomic_text_write(file_path, encoding='utf-8') as f:
             json.dump(traps, f, indent=2, ensure_ascii=False)
 
     def _export_to_txt(self, file_path: str, traps):
         """テキスト形式で Trap を書き出す（traps は CSV と同じ）"""
         resolver = get_resolver()
         
-        with open(file_path, 'w', encoding='utf-8') as f:
+        with atomic_text_write(file_path, encoding='utf-8') as f:
             f.write("=" * 80 + "\n")
             f.write("SNMP Trap Log\n")
             f.write(f"エクスポート日時: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
