@@ -5,6 +5,7 @@
 import os
 import sys
 import json
+import shutil
 import tempfile
 import threading
 import requests
@@ -629,8 +630,10 @@ class VersionManager:
             # 受信中に切れた場合、ここまでは書きかけが残ったままだった。
             # get_pending_update_files は .zip しか拾わないので掃除にも
             # かからず、利用者が再試行しない限り temp に居座り続ける。
+            # 書きかけの控え（.part.sha256 / .part.version）も同じ扱い。
             if part_path:
-                self._discard(part_path)
+                for suffix in ('', '.sha256', '.version'):
+                    self._discard(part_path + suffix)
             return None
         finally:
             self._response = None
@@ -692,6 +695,73 @@ class VersionManager:
             return ("ダウンロードした更新ファイルが、表示していた内容と\n"
                     "一致しません。もう一度ダウンロードしてください。")
         return None
+
+    def stage_for_apply(self, zip_path: str,
+                        expected_version: Optional[str] = None):
+        """適用の直前に、あとから差し替えられない写しを用意する。
+
+        verify_before_apply が通ってから updater.bat が Expand-Archive で
+        開き直すまでには間がある（updater.bat は NetBelt が終わるのを待つ。
+        実測で約3.0〜3.5秒）。渡しているのはパス文字列だけで、写しもロックも
+        取っていなかったため、その間に同じ利用者の権限で動く別プロセスが
+        更新フォルダの「版ごとの決まった名前」の ZIP を別の有効な ZIP へ
+        置き換えると、.sha256 と一致しないバイト列がそのまま展開・
+        インストールされ、しかも「更新が完了しました」と表示された。
+
+        確かめたバイト列と展開されるバイト列を同じものにする。名前を
+        推測できない写しを作り、その写し自身をもう一度 verify_before_apply へ
+        かけ、通ったら写しのパスを updater.bat へ渡す。写している最中に
+        元が差し替えられた場合は、写しと控えが食い違うのでここで止まる。
+
+        残る制限: 写しの置き場は元と同じ更新フォルダで、そこへ書ける相手
+        （＝同じ利用者の権限で既にコードを実行できている相手）は、フォルダを
+        列挙すれば写しの名前も知れる。窓を完全に閉じるには、展開の直前に
+        updater.bat 側でも受け取った期待値とハッシュを突き合わせる必要が
+        あり、それは updater.bat 側で別に追う。
+
+        元の ZIP はここでは消さない（updater.bat が消すのは渡した写しの
+        ほう）。当たらなかったときに手元から失わせないためで、残ったぶんは
+        cleanup_old_updates が24時間で片付ける。
+
+        Args:
+            zip_path: 適用しようとしている更新ファイル
+            expected_version: 利用者へ見せた版（省略時は版を確かめない）
+
+        Returns:
+            (updater.bat へ渡すパス, 問題の文言)。
+            問題があれば (None, 文言)
+        """
+        problem = self.verify_before_apply(zip_path, expected_version)
+        if problem:
+            return None, problem
+
+        staged = None
+        try:
+            fd, staged = tempfile.mkstemp(
+                prefix='%s-apply-' % APP_NAME, suffix='.zip',
+                dir=os.path.dirname(os.path.abspath(zip_path)))
+            os.close(fd)
+            shutil.copyfile(zip_path, staged)
+            for suffix in ('.sha256', '.version'):
+                if os.path.exists(zip_path + suffix):
+                    shutil.copyfile(zip_path + suffix, staged + suffix)
+        except OSError as e:
+            print(f"[VersionManager] 更新ファイルの写しを作れませんでした: {e}")
+            if staged:
+                self._discard_staged(staged)
+            return None, ("更新の準備ができませんでした。\n"
+                          "空き容量を確かめて、もう一度お試しください。")
+
+        problem = self.verify_before_apply(staged, expected_version)
+        if problem:
+            self._discard_staged(staged)
+            return None, problem
+        return staged, None
+
+    def _discard_staged(self, staged: str) -> None:
+        """用意しかけた写しを、控えごと片付ける。"""
+        for suffix in ('', '.sha256', '.version'):
+            self._discard(staged + suffix)
 
     def get_pending_update_files(self) -> list:
         """

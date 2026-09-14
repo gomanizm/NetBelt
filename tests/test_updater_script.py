@@ -543,7 +543,13 @@ class UpdaterLaunchTest(unittest.TestCase):
         self.assertIsInstance(
             sent, str,
             "リストのまま渡している。コンマや等号で %1 が切れる")
-        self.assertIn('"%s"' % zip_path, sent,
+        # 渡すのは元の ZIP そのものではなく、適用直前に確かめた写し
+        # （VersionManager.stage_for_apply）。置き場は元と同じコンマ入りの
+        # フォルダなので、引用符の検査はそのまま成り立つ。
+        handed = sent.split('" "')[1]
+        self.assertEqual(os.path.dirname(handed), os.path.dirname(zip_path),
+                         "ZIP を元と別のフォルダから渡している: %r" % sent)
+        self.assertIn('"%s"' % handed, sent,
                       "ZIP のパスが引用符で包まれていない: %r" % sent)
         self.assertEqual(sent.count('"'), 6,
                          "3 つの引数それぞれを包むこと: %r" % sent)
@@ -656,7 +662,12 @@ class UpdaterLaunchTest(unittest.TestCase):
         self.assertIsInstance(
             sent, str,
             "リストのまま渡している。コンマや等号で引数が切れる")
-        self.assertIn('"%s"' % zip_path, sent,
+        # 渡すのは適用直前に確かめた写し（stage_for_apply）。置き場は元と
+        # 同じコンマ入りフォルダなので、引用符の検査はそのまま成り立つ。
+        handed = sent.split('" "')[1]
+        self.assertEqual(os.path.dirname(handed), os.path.dirname(zip_path),
+                         "ZIP を元と別のフォルダから渡している: %r" % sent)
+        self.assertIn('"%s"' % handed, sent,
                       "ZIP のパスが引用符で包まれていない: %r" % sent)
         self.assertEqual(sent.count('"'), 6,
                          "3 つの引数それぞれを包むこと: %r" % sent)

@@ -363,7 +363,10 @@ class UpdateDialog(QDialog):
         # 適用時は存在確認しかしていなかったので、そのまま別の版が当たる。
         # 同じ確認は起動時の適用経路（MainWindow._apply_pending_update）も
         # 通る。片方だけ直る形にしないため VersionManager へまとめてある。
-        problem = VersionManager().verify_before_apply(
+        # 確認を通ってから updater.bat が ZIP を開き直すまでにも間があるので、
+        # 確かめた写しを作り、updater.bat にはそのパスを渡す
+        # （VersionManager.stage_for_apply の説明を参照）
+        staged_path, problem = VersionManager().stage_for_apply(
             self.downloaded_zip_path, self.update_info.get('version'))
         if problem:
             QMessageBox.warning(self, "エラー", problem)
@@ -405,7 +408,7 @@ class UpdateDialog(QDialog):
             # リストで渡すと、パスの , や = で引数が途中で切れる
             # （updater_command の説明を参照）
             subprocess.Popen(
-                updater_command(updater_path, self.downloaded_zip_path, app_path),
+                updater_command(updater_path, staged_path, app_path),
                 creationflags=subprocess.CREATE_NEW_CONSOLE,
                 env=updater_env()
             )
