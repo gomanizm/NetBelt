@@ -2172,9 +2172,16 @@ for details.
         if not self.config_manager.get_check_on_startup():
             return
         
-        # 未適用の更新をチェック
-        self._check_pending_updates()
-        
+        # 未適用の更新をチェック。
+        # 更新チェックの失敗で起動そのものを止めない。ここを素通しに
+        # していたときは、走査中に ZIP が消えただけで MainWindow() が
+        # 例外で終わり、window.show() にも app.exec() にも到達しなかった。
+        # 下の非同期チェックが try で包んであるのと扱いを揃える。
+        try:
+            self._check_pending_updates()
+        except Exception as e:
+            print(f"[Update] 未適用の更新の確認に失敗しました: {e}")
+
         # 新しい更新をチェック（非同期）
         import threading
         def check_thread():
@@ -2223,33 +2230,43 @@ for details.
         # 古い方を勧めていた。
         best = None  # (版, ZIPのパス, 経過時間)
         for zip_path in pending_files:
-            if not os.path.exists(zip_path):
-                continue
+            # 候補1件ぶんをまとめて包む。走査の途中で ZIP が消えるのは
+            # 正常な競合で（NetBelt を二重に起動している、別インストールの
+            # 掃除が走った、など）、存在確認をすり抜けた直後の getmtime が
+            # FileNotFoundError を投げていた。この例外は __init__ から
+            # main() まで抜け、app.exec() に到達せず起動そのものが止まる。
+            # 消えた候補は黙って飛ばし、残りの走査を続ける。
+            try:
+                if not os.path.exists(zip_path):
+                    continue
 
-            # ダウンロード時の検証を通ったファイルだけを候補にする。
-            # 中断などで残った未検証のZIPを、検証なしで適用させない。
-            if not version_mgr.is_verified_update(zip_path):
-                print(f"[Main] 検証されていない更新ファイルのため無視します: {zip_path}")
-                continue
-            
-            # 落としてからどれだけ経ったかを見る
-            file_age_hours = (datetime.now().timestamp() - os.path.getmtime(zip_path)) / 3600
-            
-            if file_age_hours > 24:
-                # 24時間以上前のファイルは削除済み（cleanup_old_updatesで）
-                continue
+                # ダウンロード時の検証を通ったファイルだけを候補にする。
+                # 中断などで残った未検証のZIPを、検証なしで適用させない。
+                if not version_mgr.is_verified_update(zip_path):
+                    print(f"[Main] 検証されていない更新ファイルのため無視します: {zip_path}")
+                    continue
 
-            # いま動いているものより新しいときだけ勧める。版を見ないと、
-            # 手で入れ直したあとに残った古い ZIP でダウングレードさせてしまう。
-            pending_version = version_mgr.pending_version(zip_path)
-            if not pending_version:
-                print("[Main] 版が分からない更新ファイルのため無視します: "
-                      f"{zip_path}")
-                continue
-            if VersionManager.compare_versions(
-                    pending_version, version_mgr.CURRENT_VERSION) <= 0:
-                print("[Main] 現在のバージョン以下のため無視します: "
-                      f"{pending_version}")
+                # 落としてからどれだけ経ったかを見る
+                file_age_hours = (datetime.now().timestamp() - os.path.getmtime(zip_path)) / 3600
+
+                if file_age_hours > 24:
+                    # 24時間以上前のファイルは削除済み（cleanup_old_updatesで）
+                    continue
+
+                # いま動いているものより新しいときだけ勧める。版を見ないと、
+                # 手で入れ直したあとに残った古い ZIP でダウングレードさせてしまう。
+                pending_version = version_mgr.pending_version(zip_path)
+                if not pending_version:
+                    print("[Main] 版が分からない更新ファイルのため無視します: "
+                          f"{zip_path}")
+                    continue
+                if VersionManager.compare_versions(
+                        pending_version, version_mgr.CURRENT_VERSION) <= 0:
+                    print("[Main] 現在のバージョン以下のため無視します: "
+                          f"{pending_version}")
+                    continue
+            except OSError as e:
+                print(f"[Main] 更新ファイルを確認できないため無視します: {zip_path} ({e})")
                 continue
 
             if best is None or VersionManager.compare_versions(
