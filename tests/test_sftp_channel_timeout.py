@@ -235,6 +235,78 @@ class SftpTransferTimeoutTest(unittest.TestCase):
         self.assertTrue(self._wait(lambda: not m.is_connected),
                         "使用不能になったセッションが接続中のまま残っている")
 
+    def test_an_upload_whose_probe_times_out_closes_the_session(self):
+        """送る直前の stat が期限切れになったら、接続を畳むこと。
+
+        期限で戻っても要求と応答はずれたままなので、この接続はもう使えない。
+        それでも接続中のまま戻ると、同じアップロードを繰り返すたびに毎回
+        期限ぶん待たされ、しかも再接続すべきだと分からない。
+        """
+        m = self._manager()
+        # 失敗すると接続を畳んで sftp_client を手放すので、先に控える
+        client = m.sftp_client
+        local = os.path.join(self.dir, "running.cfg")
+        with io.open(local, "w", encoding="utf-8") as f:
+            f.write("hostname R1")
+        client.stat.side_effect = TimeoutError()
+
+        # overwrite=False。送る直前の確認で期限切れになる
+        m.upload_file(local, "/flash/running.cfg")
+
+        self.assertTrue(self._wait(lambda: self.errors), "失敗が通知されない")
+        self.assertTrue(any("応答しません" in e for e in self.errors), self.errors)
+        self.assertTrue(self._wait(lambda: not m.is_connected),
+                        "使用不能になったセッションが接続中のまま残っている")
+        client.put.assert_not_called()
+
+
+class SftpConnectTimeoutTest(unittest.TestCase):
+    """接続直後のホーム取得が期限切れになったときの扱い。
+
+    normalize の失敗を種別を問わず握りつぶして current_path='/' にすると、
+    使えないチャンネルを掴んだまま「接続成功」を返す。以後の操作はすべて
+    期限ぶん固まってから失敗する。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PyQt6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    def _ssh_with_sftp(self, sftp):
+        ssh = mock.Mock()
+        ssh.open_sftp.return_value = sftp
+        return ssh
+
+    def test_connect_fails_when_the_home_lookup_times_out(self):
+        from core.sftp_manager import SFTPManager
+
+        m = SFTPManager()
+        errors = []
+        m.error_occurred.connect(errors.append)
+        sftp = mock.Mock()
+        sftp.normalize.side_effect = TimeoutError()
+
+        self.assertFalse(m.connect(self._ssh_with_sftp(sftp)),
+                         "使えないチャンネルで接続成功を返した")
+        self.assertFalse(m.is_connected)
+        self.assertIsNone(m.sftp_client, "使えないチャンネルを掴んだまま")
+        self.assertTrue(any("応答しません" in e for e in errors), errors)
+        sftp.close.assert_called_once()
+
+    def test_connect_still_falls_back_to_root_when_the_home_is_unknown(self):
+        """期限切れ以外の失敗は、これまでどおり / から始める。"""
+        from core.sftp_manager import SFTPManager
+
+        m = SFTPManager()
+        sftp = mock.Mock()
+        sftp.normalize.side_effect = IOError("No such file")
+
+        self.assertTrue(m.connect(self._ssh_with_sftp(sftp)))
+        self.assertTrue(m.is_connected)
+        self.assertEqual(m.get_current_path(), "/")
+
 
 if __name__ == "__main__":
     unittest.main()

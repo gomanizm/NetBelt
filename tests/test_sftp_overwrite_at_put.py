@@ -103,13 +103,15 @@ class SftpManagerRefusesUnconfirmedOverwriteTest(unittest.TestCase):
     def test_a_probe_that_times_out_refuses_and_says_so(self):
         """stat が期限切れでも「無い」とは読まず、理由の書かれた拒否にすること。"""
         m = self._manager()
-        m.sftp_client.stat.side_effect = TimeoutError()   # socket.timeout は str が空
+        # 期限切れの確認は使えなくなった接続を畳むので、先に参照を控える
+        client = m.sftp_client
+        client.stat.side_effect = TimeoutError()   # socket.timeout は str が空
 
         m.upload_file(self.local, "/A/config.cfg")
 
         self.assertTrue(self._wait(lambda: self.errors or self.done),
                         "完了もエラーも届かない")
-        m.sftp_client.put.assert_not_called()
+        client.put.assert_not_called()
         self.assertTrue(any("応答しません" in e for e in self.errors), self.errors)
 
     def test_a_name_taken_by_a_remote_directory_is_not_an_overwrite(self):

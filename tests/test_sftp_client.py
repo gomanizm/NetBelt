@@ -268,6 +268,22 @@ class SftpClientTest(unittest.TestCase):
         self.assertEqual(m.get_parent_directory(), "/",
                          "ルートより上へは行かせない")
 
+    def test_get_parent_directory_treats_backslash_as_a_plain_character(self):
+        """リモートは POSIX。名前にバックスラッシュを含んでも親は POSIX で決める。
+
+        Windows では os.path が ntpath なので dirname('/a\\b') が '/a' になり、
+        「親へ」が実在する別のディレクトリを静かに開いていた。
+        """
+        m = self.manager(connect=False)
+        m.current_path = "/a\\b"
+        self.assertEqual(m.get_parent_directory(), "/",
+                         "バックスラッシュを区切りとして扱っている")
+        m.current_path = "/dir/name\\with\\backslash"
+        self.assertEqual(m.get_parent_directory(), "/dir")
+        # 相対パスでも空文字を返さない（change_directory へそのまま渡るため）
+        m.current_path = "sub"
+        self.assertEqual(m.get_parent_directory(), "/")
+
     # --- 純粋関数 ---
 
     def test_is_directory(self):
