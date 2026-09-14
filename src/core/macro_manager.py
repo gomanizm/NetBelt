@@ -193,7 +193,14 @@ class MacroManager(QObject):
         if device_name in self._send_callbacks:
             # コマンド送信（改行付き）
             self._send_callbacks[device_name](command + "\r")
-            
+
+            # 送信が同期で失敗すると、このコールバックの中で切断の後始末
+            # （cleanup_device）まで走り、この機器の実行はすでに畳まれている。
+            # そのまま続けると消えた遅延を読んで KeyError になり、
+            # インデックスだけが作り直されて残る
+            if device_name not in self._command_lists:
+                return
+
             # インデックスを進める
             self._command_indices[device_name] = index + 1
             

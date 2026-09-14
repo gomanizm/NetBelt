@@ -1580,7 +1580,8 @@ class MainWindow(QMainWindow):
             device_name=current_tab_name,
             keepalive_active=keepalive_active,
             command_list_active=command_list_active,
-            config_manager=self.config_manager
+            config_manager=self.config_manager,
+            keepalive_interval=self.keepalive_intervals.get(current_tab_name, 60)
         )
         
         # シグナル接続
@@ -1665,7 +1666,8 @@ class MainWindow(QMainWindow):
             device_name=device_name,
             keepalive_active=keepalive_active,
             command_list_active=command_list_active,
-            config_manager=self.config_manager
+            config_manager=self.config_manager,
+            keepalive_interval=self.keepalive_intervals.get(device_name, 60)
         )
         
         # シグナル接続（UI更新も行う）
