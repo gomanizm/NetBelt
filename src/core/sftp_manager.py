@@ -407,19 +407,28 @@ class SFTPManager(QObject):
         # _fail の期限切れ文面は固定なので、前置きの側へ足す
         timed_out_note = [""]
 
-        def unknown_outcome(e):
+        def unknown_outcome(e, final_removed: bool = False):
             """置き換わったか確かめられないときの扱いを返す。
 
             応答が期限切れになっただけで、機器側では置き換えが済んでいる
             ことがある。そこから「消してやり直す」手順へ進むと、置き換わった
             ばかりの最終名まで消し、転送した写しも一時名ごと失う。
             どちらの名前にも触れず、確かめ方だけを伝える。
+
+            Args:
+                e: 期限切れの例外。socket.timeout は str が空なので、
+                    そのまま連結すると理由の無い「: 」で終わる
+                final_removed: 復旧手順で最終名を既に remove したあとなら
+                    True。利用者が最終名の無事を誤解しないよう書き添える
             """
             keep_tmp[0] = True
+            why = str(e) or f"機器が{self.CHANNEL_TIMEOUT_SECONDS:g}秒応答しません"
+            gone = "最終名は置き換えの手順で既に消してあります。" if final_removed else ""
             return IOError(
                 "最終名へ置き換えられたか確かめられませんでした（応答が期限切れ）。"
-                "機器側を確認してください。一時名 %s が残っていれば置き換えは"
-                "終わっていません: %s" % (tmp_remote, e))
+                "機器側を確認してください。" + gone +
+                "一時名 %s が残っていれば置き換えは"
+                "終わっていません: %s" % (tmp_remote, why))
 
         def upload_thread():
             try:
@@ -534,6 +543,11 @@ class SFTPManager(QObject):
                                 pass
                             try:
                                 self.sftp_client.rename(tmp_remote, remote_path)
+                            except TimeoutError as e:
+                                # 1本目・2本目と同じ。機器側では置き換わって
+                                # いて応答だけが返らないことがあるので、
+                                # 確定した失敗として報告しない
+                                raise unknown_outcome(e, final_removed=True)
                             except IOError as e:
                                 keep_tmp[0] = True
                                 raise IOError(
