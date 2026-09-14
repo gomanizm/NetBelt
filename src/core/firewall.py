@@ -90,6 +90,10 @@ def _rule_state(name):
     片方しか読めない（キーは英語と同綴りだが値が未知の語、など）出力を
     "present" にすると、実際は許可されているのに毎回 UAC で修復を求める。
 
+    同名ルールは全件を読み終えてから判定する。Windows はブロックを許可より
+    優先するため、有効なブロックが1件でもあれば受信は通らない。先に有効な
+    許可を見つけた時点で "ok" を返すと、その後ろのブロックを見落とす。
+
     制限事項: プロファイル・プロトコル・ローカルポートは見ていない。
     同名でプロファイル限定・別ポートのルールがあると "ok" と判定する。
     ルール名にプロトコルとポートを含めているため実運用では一致するが、
@@ -101,14 +105,12 @@ def _rule_state(name):
         return "absent"
     text = _decode_netsh(r.stdout or b"")
     # ルールごとに 有効/操作 を集める。区切り線（----）で次のルールへ移る
-    parsed_any = False
+    rules = []  # 両方を値まで読めた (有効, 許可) の組
     enabled = allow = None
     for line in text.splitlines():
         if line.startswith("----"):
             if enabled is not None and allow is not None:
-                parsed_any = True
-                if enabled and allow:
-                    return "ok"
+                rules.append((enabled, allow))
             enabled = allow = None
             continue
         key, sep, val = line.partition(":")
@@ -121,10 +123,15 @@ def _rule_state(name):
         elif key in _KEY_ACTION:
             allow = _tri(val, _VAL_ALLOW, _VAL_BLOCK)
     if enabled is not None and allow is not None:
-        parsed_any = True
-        if enabled and allow:
-            return "ok"
-    return "present" if parsed_any else "unknown"
+        rules.append((enabled, allow))
+    if not rules:
+        return "unknown"
+    # 有効なブロックは有効な許可に優先する（修復対象）
+    if any(en and not al for en, al in rules):
+        return "present"
+    if any(en and al for en, al in rules):
+        return "ok"
+    return "present"
 
 
 def rule_exists(name):
