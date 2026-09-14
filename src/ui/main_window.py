@@ -336,6 +336,8 @@ class MainWindow(QMainWindow):
         self.device_tree.group_edit_requested.connect(self._on_edit_group)
         self.device_tree.group_delete_requested.connect(self._on_delete_group)
         self.device_tree.hide_requested.connect(self._toggle_device_list)
+        self.device_tree.serial_baudrate_changed.connect(
+            self._on_serial_baudrate_changed)
         splitter.addWidget(self.device_tree)
         
         # 右側: ターミナル
@@ -1113,6 +1115,27 @@ class MainWindow(QMainWindow):
         if not isinstance(device_data, dict):
             return False
         return device_data.get('source') == 'autodetect'
+
+    def _on_serial_baudrate_changed(self, port: str, baudrate: int):
+        """自動検出COMポートのボーレート変更を、再接続用の写しへ反映する
+
+        device_info は初回接続時の機器データの写しで、Enter による再接続は
+        こちらを読む。ツリー側だけ更新すると、接続ボタン（ツリー項目を読む）
+        と Enter で違うボーレートになり、コンソール出力が文字化けする。
+
+        config 由来の機器は設定ファイルの値が正なので触らない。
+
+        Args:
+            port: ボーレートを変えたシリアルポート名
+            baudrate: 新しいボーレート
+        """
+        for device_data in self.device_info.values():
+            if not isinstance(device_data, dict):
+                continue
+            if device_data.get('source') != 'autodetect':
+                continue
+            if device_data.get('port') == port:
+                device_data['baudrate'] = baudrate
 
     def _run_auto_commands(self, device_name: str):
         """接続先グループの自動実行コマンドを送信する(GUIスレッドで実行)"""

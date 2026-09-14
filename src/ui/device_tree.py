@@ -19,6 +19,9 @@ class DeviceTree(QWidget):
     group_edit_requested = pyqtSignal(str)  # グループ編集要求（グループ名）
     group_delete_requested = pyqtSignal(str)  # グループ削除要求（グループ名）
     hide_requested = pyqtSignal()  # このエリアを隠す要求（戻すのは表示メニュー）
+    # 自動検出ポートのボーレート変更（ポート名, ボーレート）。ツリーの外に
+    # ある再接続用の写しへ届けるために出す
+    serial_baudrate_changed = pyqtSignal(str, int)
     
     # 一般的なボーレート値
     BAUD_RATES = [300, 1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600]
@@ -358,6 +361,11 @@ class DeviceTree(QWidget):
         
         # リストを更新（表示には影響しないが、内部データを更新）
         self.refresh_serial_ports()
+
+        # ツリーの外にも同じ値を持っている相手がいる。MainWindow は初回接続
+        # 時の機器データを再接続用に写しており、そこを更新しないと Enter に
+        # よる再接続だけ旧ボーレートのまま繋がる
+        self.serial_baudrate_changed.emit(port, baudrate)
     
     def _on_item_double_clicked(self, item: QTreeWidgetItem, column: int):
         """
