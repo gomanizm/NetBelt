@@ -221,7 +221,7 @@ class DeviceTree(QWidget):
         self._tools_state_provider = provider
 
     def _add_tools_menu(self, menu, device_name):
-        """機器メニューに「ツール」を足し、（項目, 選ばれたときの処理）の並びを返す
+        """機器メニューに「ツール」を足す（選ばれた項目は要求のシグナルを出す）
 
         キープアライブとマクロは、以前は端末の右クリックにあった。端末の
         右クリックは貼り付けにしたので、ここへ移した。接続していない機器では
@@ -234,13 +234,12 @@ class DeviceTree(QWidget):
         tools = menu.addMenu("ツール")
         tools.setEnabled(bool(state.get("connected")))
 
-        actions = []
         if state.get("keepalive_active"):
-            actions.append((tools.addAction("キープアライブ停止"),
-                            lambda: self.keepalive_stop_requested.emit(device_name)))
+            tools.addAction("キープアライブ停止").triggered.connect(
+                lambda: self.keepalive_stop_requested.emit(device_name))
         else:
-            actions.append((tools.addAction("キープアライブ開始"),
-                            lambda: self.keepalive_start_requested.emit(device_name)))
+            tools.addAction("キープアライブ開始").triggered.connect(
+                lambda: self.keepalive_start_requested.emit(device_name))
         macros = state.get("macros") or []
         if macros:
             macro_menu = tools.addMenu("マクロ実行")
@@ -248,15 +247,14 @@ class DeviceTree(QWidget):
                 name = macro.get("name", "")
                 description = macro.get("description", "")
                 text = f"{name} - {description}" if description else name
-                actions.append((
-                    macro_menu.addAction(text),
-                    lambda n=name: self.macro_execute_requested.emit(device_name, n)))
+                macro_menu.addAction(text).triggered.connect(
+                    lambda checked=False, n=name:
+                    self.macro_execute_requested.emit(device_name, n))
         # 実行中のマクロを止める。これが無いと、誤ったマクロを流し始めたとき
         # タブを閉じる以外に中断する手段が無い
         if state.get("command_list_active"):
-            actions.append((tools.addAction("マクロ停止"),
-                            lambda: self.macro_stop_requested.emit(device_name)))
-        return actions
+            tools.addAction("マクロ停止").triggered.connect(
+                lambda: self.macro_stop_requested.emit(device_name))
 
     def _add_hide_action(self, menu):
         """どの右クリックメニューにも「非表示」を足す。
@@ -317,7 +315,7 @@ class DeviceTree(QWidget):
         menu = QMenu(self)
         
         connect_action = menu.addAction("接続")
-        tool_actions = self._add_tools_menu(menu, device_data["name"])
+        self._add_tools_menu(menu, device_data["name"])
         
         # コンソール接続の場合はボーレート設定メニューを追加
         if is_serial:
@@ -356,10 +354,6 @@ class DeviceTree(QWidget):
             self._discard_menu(menu)
 
         # アクション処理
-        for tool_action, run in tool_actions:
-            if action is not None and action == tool_action:
-                run()
-                return
         if action == hide_action:
             self.hide_requested.emit()
         elif action == connect_action:

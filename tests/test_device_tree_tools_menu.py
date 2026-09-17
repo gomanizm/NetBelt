@@ -53,6 +53,8 @@ def _open_device_menu(tree, device_item, choose=None):
             action = next(a for a in current.actions() if a.text() == text)
             if action.menu() is not None:
                 current = action.menu()
+        # 本物の exec と同じく、選ばれた項目の triggered を出してから返す
+        action.trigger()
         return action
 
     pos = tree.tree.visualItemRect(device_item).center()
