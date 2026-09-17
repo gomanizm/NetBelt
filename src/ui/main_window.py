@@ -982,7 +982,7 @@ class MainWindow(QMainWindow):
         if (not self._is_current_connection(device_name, conn)
                 and self.connections.get(device_name) is not None):
             return
-        self.terminal_widget.append_output(device_name, text)
+        self.terminal_widget.queue_output(device_name, text)
 
     def _drop_sftp_manager(self, device_name: str) -> None:
         """機器の SFTP マネージャを切断して外し、表示中ならパネルも空にする"""

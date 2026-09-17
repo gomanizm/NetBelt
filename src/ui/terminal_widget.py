@@ -518,6 +518,11 @@ class TerminalWidget(QWidget):
     # 十分大きく、かつ伸び続けさせない所で強制的に切る
     MAX_BLOCK_CHARS = 8192
 
+    # 受信した出力を 1 回に描く最大文字数（受信スレッドのかたまり 4 個ぶん）。
+    # 描いている間はキー入力も再描画も止まるので、大きいと固まって見え、
+    # 小さいと描き直しの回数が増えて追いつくのが遅れる
+    OUTPUT_SLICE = 16384
+
     # タブが閉じられたときのシグナル（機器名を送信）
     tab_closed = pyqtSignal(str)
     # 表示中のタブが変わったことを知らせる（機器名。タブが無ければ空文字）。
@@ -552,6 +557,12 @@ class TerminalWidget(QWidget):
         self._resize_timer.setSingleShot(True)
         self._resize_timer.setInterval(200)
         self._resize_timer.timeout.connect(self._apply_pending_resizes)
+        # まだ描いていない受信出力（機器名 -> かたまりの並び）
+        self._pending_output: Dict[str, list] = {}
+        self._output_timer = QTimer(self)
+        self._output_timer.setSingleShot(True)
+        self._output_timer.setInterval(0)
+        self._output_timer.timeout.connect(self._flush_pending_output)
         self._create_ui()
     
     def _create_ui(self):
@@ -602,8 +613,11 @@ class TerminalWidget(QWidget):
         terminal.setUndoRedoEnabled(False)
         # 文書の行数にも上限を置く。Screen.history の上限は文書へ写した
         # 後の行には効かず、受信行数のまま増え続けていた。超えた分は
-        # Qt が先頭ブロックから捨てる。画面領域は末尾なので影響しない
-        terminal.document().setMaximumBlockCount(self.MAX_DOCUMENT_BLOCKS)
+        # 描き終えるたびに _trim_document が先頭からまとめて捨てる。
+        # setMaximumBlockCount は使わない（挿入のたびに Qt が先頭を 1 行ずつ
+        # 捨て、QTextEdit では文書の大きさに比例して重い。実測: 上限 20000 行に
+        # 達すると 4096 文字の描画が約 9ms から約 360ms になり、大量の出力で
+        # 端末が固まった）
         # 一度でも上限に達した（＝古い行が捨てられた）ことを覚えておく。
         # 「全ログ保存」の欠落警告をいまの blockCount だけで決めると、
         # 窓を 1 行縦に縮めるだけで上限を下回り、欠けたログが完全なもの
@@ -727,6 +741,9 @@ class TerminalWidget(QWidget):
             for i in range(self.tab_widget.count()):
                 if self.tab_widget.tabText(i) == device_name:
                     self.tab_widget.setCurrentIndex(i)
+                    # 前の接続から届いて描いていない出力は、前の画面へ描き切る
+                    if self._pending_output.get(device_name):
+                        self.append_output(device_name, "")
                     # 再接続は新しいセッション。前の画面はそのまま記録と
                     # して文書に残し、端末状態 (パーサ・画面) は作り直す
                     self._attach_screen(self._terminals[device_name])
@@ -912,6 +929,17 @@ class TerminalWidget(QWidget):
             painter.setCharFormat(self._char_format(attr))
             offset += _u16(text)
 
+    def _trim_document(self, terminal: QTextEdit) -> None:
+        """上限を超えた先頭の行を、1 回の編集でまとめて捨てる。"""
+        document = terminal.document()
+        excess = document.blockCount() - self.MAX_DOCUMENT_BLOCKS
+        if excess <= 0:
+            return
+        cut = QTextCursor(document)
+        cut.movePosition(QTextCursor.MoveOperation.NextBlock,
+                         QTextCursor.MoveMode.KeepAnchor, excess)
+        cut.removeSelectedText()
+
     @staticmethod
     def _block_top(terminal: QTextEdit, cursor: QTextCursor) -> int:
         """カーソルのある行の、文書上の上端（スクロールバーの値と同じ単位）。"""
@@ -974,6 +1002,12 @@ class TerminalWidget(QWidget):
                 # 止まる。表示上の折り返し位置は変わるが、ここで切る
                 region.insertText("\n", QTextCharFormat())
 
+        # 上限を超えた先頭の行は、超えた時点で捨てる（ここと描き終えた後）。
+        # 画面領域の先頭を int (start) で控えている間は捨てないこと。控えた
+        # 後で捨てると start が古い位置を指したまま残り、差し替え範囲・
+        # 塗り直し位置・キャレット位置がずれる
+        self._trim_document(terminal)
+
         cell_rows = [self._visible_cells(line) for line in screen.lines]
         # カーソルの行は、カーソルの桁まで空白を残す。プロンプト末尾の
         # 空白 ("Router# ") を落とすとキャレットが $ に張り付いて見える
@@ -1011,22 +1045,8 @@ class TerminalWidget(QWidget):
                               QTextCursor.MoveMode.KeepAnchor)
             # 書式は空で入れる。insertText は挿入位置の書式を引き継ぐので、
             # 指定しないと直前の色や反転が新しい文字へ伝染する
-            removed = _u16(old_text[prefix:len(old_text) - suffix])
-            added = _u16(new_text[prefix:len(new_text) - suffix])
-            before = terminal.document().characterCount()
             probe.insertText(new_text[prefix:len(new_text) - suffix],
                              QTextCharFormat())
-            # 文書が上限 (MAX_DOCUMENT_BLOCKS) に達していると、この挿入で
-            # Qt が文書の先頭ブロックを捨てる。QTextCursor である region や
-            # probe は自動で詰まるが、int で控えた start は古い位置を指した
-            # まま残る。そのままだと次の差し替え範囲・塗り直し位置・
-            # キャレット位置がずれ、縦にリサイズするたびにスクロール
-            # バックへ重複行と欠落が積み上がる。捨てられた文字数を
-            # 数えて詰め直す
-            dropped = (before - removed + added
-                       - terminal.document().characterCount())
-            if dropped:
-                start -= dropped
             # 下の行との突き合わせは文書の位置で行うので、単位を揃える
             touched = (_u16(new_text[:prefix]),
                        _u16(new_text[:len(new_text) - suffix]))
@@ -1062,6 +1082,9 @@ class TerminalWidget(QWidget):
             caret = QTextCursor(terminal.document())
             caret.setPosition(pos)
             terminal.setTextCursor(caret)
+        # 画面領域の差し替えで増えた分。start はもう使わない
+        self._trim_document(terminal)
+
         # 最下部を見ていたなら下端へ寄せる。画面は文書の末尾 rows 行
         # なので、ここを見せることが「いま端末に映っているもの」を
         # 見せることになる。カーソルへ寄せると、全画面アプリでは
@@ -1096,9 +1119,14 @@ class TerminalWidget(QWidget):
             device_name: 機器名
             text: 追加するテキスト
         """
+        # 溜めてある受信出力が先。直接書く案内（切断バナーなど）や
+        # マクロの出力に追い越させない
+        pending = self._pending_output.pop(device_name, None)
         if device_name not in self._terminals:
             return
         terminal = self._terminals[device_name]
+        if pending:
+            text = "".join(pending) + text
 
         events = terminal._parser.feed(text)
         terminal._screen.apply(events)
@@ -1122,6 +1150,36 @@ class TerminalWidget(QWidget):
                     self._log_files[device_name].flush()
                 except Exception as e:
                     self._abort_log_recording(device_name, e)
+
+    def queue_output(self, device_name: str, text: str) -> None:
+        """受信した出力を溜め、イベントループへ戻ってから描く
+
+        受信スレッドのシグナルはイベントキューに積まれ、Qt はそれを 1 回の
+        処理でまとめて配る。届くたびに描くと、積まれた数だけ描き終えるまで
+        キー入力も再描画も受け付けない（実測: 1 万 1 千行 146 かたまりが
+        1 回で描かれ 0.61 秒止まった。show tech-support では数十秒になる）。
+        ここでは溜めるだけにして、描くのは _flush_pending_output に任せる。
+        """
+        if device_name not in self._terminals:
+            return
+        self._pending_output.setdefault(device_name, []).append(text)
+        if not self._output_timer.isActive():
+            self._output_timer.start()
+
+    def _flush_pending_output(self) -> None:
+        """溜めた出力を機器ごとに OUTPUT_SLICE 文字まで描き、残りは次の回へ回す"""
+        for device_name in list(self._pending_output):
+            chunks = self._pending_output.pop(device_name, None)
+            if not chunks:
+                continue
+            text = "".join(chunks)
+            self.append_output(device_name, text[:self.OUTPUT_SLICE])
+            rest = text[self.OUTPUT_SLICE:]
+            if rest and device_name in self._terminals:
+                # 描いている間に届いた分より前へ戻す
+                self._pending_output.setdefault(device_name, []).insert(0, rest)
+        if self._pending_output:
+            self._output_timer.start()
 
     def _discard_log_dialog(self, dialog) -> None:
         """記録中ダイアログを閉じて、捨てる。
@@ -1237,6 +1295,7 @@ class TerminalWidget(QWidget):
         # 辞書から削除
         if tab_name in self._terminals:
             del self._terminals[tab_name]
+        self._pending_output.pop(tab_name, None)
 
         # タブを削除（ページごと捨てる）
         self._discard_page(index)
