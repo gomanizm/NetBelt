@@ -71,10 +71,15 @@ class MenuActionsTest(unittest.TestCase):
         QApplication.clipboard().setText("show clock\nreload\n")
 
         with mock.patch("PyQt6.QtWidgets.QDialog.exec", return_value=1) as dialog:
-            QTest.keyClick(terminal, Qt.Key.Key_V,
-                           Qt.KeyboardModifier.ControlModifier
-                           | Qt.KeyboardModifier.ShiftModifier)
-            self.app.processEvents()
+            try:
+                QTest.keyClick(terminal, Qt.Key.Key_V,
+                               Qt.KeyboardModifier.ControlModifier
+                               | Qt.KeyboardModifier.ShiftModifier)
+                self.app.processEvents()
+            finally:
+                # QTest の keyClick は Shift を押したままの状態をアプリ全体に残す。
+                # 残すと後のテストの行選択が Shift 付き（範囲選択）として扱われる
+                QTest.keyRelease(terminal, Qt.Key.Key_Shift)
         w.close()
 
         self.assertNotIn("show clock", "".join(sent),
