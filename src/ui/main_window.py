@@ -236,16 +236,14 @@ class MainWindow(QMainWindow):
         file_menu.addAction("終了(&X)", self.close)
         
         # 編集メニュー
-        # 端末ソフトの慣習に合わせて Ctrl+Shift+C / Ctrl+Shift+V を使う。
+        # 端末ソフトの慣習に合わせて Ctrl+Shift+C を使う。
         # Ctrl+C はターミナルから機器へ 0x03（中断）として送られるので奪わない。
+        # ペースト（Ctrl+Shift+V）は置かない。改行を含む内容でも確かめずに
+        # 機器へ送っていたので、貼り付けは確認つきの端末の右クリックだけにした
         edit_menu = menubar.addMenu("編集(&E)")
         self.copy_action = edit_menu.addAction("コピー(&C)")
         self.copy_action.setShortcut("Ctrl+Shift+C")
         self.copy_action.triggered.connect(self._on_copy)
-
-        self.paste_action = edit_menu.addAction("ペースト(&P)")
-        self.paste_action.setShortcut("Ctrl+Shift+V")
-        self.paste_action.triggered.connect(self._on_paste)
         
         # 表示メニュー
         view_menu = menubar.addMenu("表示(&V)")
@@ -1566,18 +1564,6 @@ class MainWindow(QMainWindow):
         if terminal is None:
             return
         terminal.copy()
-
-    def _on_paste(self):
-        """クリップボードの内容を現在のターミナルから機器へ送信する"""
-        from .terminal_widget import InteractiveTerminal
-
-        terminal = self.terminal_widget.get_current_terminal()
-        # ホームタブは読み取り専用の QTextEdit で送信先を持たない。
-        # 接続タブでも再接続待機中は送信できない（can_send_input が見分ける）。
-        if not isinstance(terminal, InteractiveTerminal) or not terminal.can_send_input():
-            self.status_bar.showMessage("ペーストできるのは接続中のターミナルタブだけです")
-            return
-        terminal.custom_paste()
 
     def _apply_terminal_settings_from_config(self):
         """config の settings.terminal をターミナルへ適用する"""
