@@ -2,6 +2,8 @@ from PyQt6.QtWidgets import QWidget, QVBoxLayout, QTextEdit, QTabWidget
 from PyQt6.QtGui import (QFont, QColor, QPalette, QKeyEvent, QContextMenuEvent,
                          QTextCursor, QTextCharFormat)
 from PyQt6.QtCore import Qt, pyqtSignal
+from itertools import groupby
+from operator import itemgetter
 from typing import Dict, Optional
 
 from core.terminal import parser as vt
@@ -19,6 +21,16 @@ def _u16(text: str) -> int:
     隣の文字を巻き込んで消したりする。位置を数えるときは必ずこれを使う。
     """
     return len(text.encode("utf-16-le")) // 2
+
+
+# QTextCursor.insertText が段落（ブロック）の区切りに変える文字。Qt 6.10 で
+# 0x0000-0xFFFF を 1 文字ずつ挿して調べると、LF / CR / U+2029 PARAGRAPH
+# SEPARATOR / 枠の始まり・終わりの U+FDD0 / U+FDD1 の 5 つだった（CRLF は
+# 1 つの区切り）。機器が印字すると、書いた行の途中でブロックが切れる。
+# いまはパーサが 0x20 未満をセルに入れないので LF と CR は届かないが、
+# 行内位置の数え方を Qt と揃えておく
+_BLOCK_SEPARATORS = (chr(0x0A), chr(0x0D), chr(0x2029), chr(0xFDD0),
+                     chr(0xFDD1))
 
 
 ANSI_COLOURS = (
@@ -853,6 +865,11 @@ class TerminalWidget(QWidget):
             painter.setCharFormat(self._char_format(attr))
             offset += _u16(text)
 
+    def _insert_pending(self, region: QTextCursor, pending) -> None:
+        """溜めた (属性, [文字列, ...]) を、区間ごとに 1 回ずつ region へ書く。"""
+        for attr, parts in pending:
+            region.insertText("".join(parts), self._char_format(attr))
+
     def _trim_document(self, terminal: QTextEdit) -> None:
         """上限を超えた先頭の行を、1 回の編集でまとめて捨てる。"""
         document = terminal.document()
@@ -895,36 +912,72 @@ class TerminalWidget(QWidget):
         # 近道は使えない (使うと押し出された行が書かれずに消える)
         reflowed = screen.take_reflowed()
 
+        # 押し出された行は、属性が同じ区間を改行ごと 1 回の insertText に
+        # まとめて書く。行ごと・区間ごとに書くと挿入のたびに文書の更新が
+        # 走り、大量出力で描画が追いつかない（Qt 単体の実測: 70 行を行ごとに
+        # 書くと 4.9ms、1 回にまとめると 0.6ms）。できる文書（文字・書式・
+        # ブロックの切れ目）は行ごとに書いたときと同じにするため、
+        # - 改行は空の書式で入れる（区切り文字の書式が次の行の charFormat
+        #   になる）。空の書式は DEFAULT の区間と同じなので、そこへだけ繋ぐ
+        # - 溜めた分は region の手前に入るだけで、region から後ろの文書は
+        #   変えない。近道の判定に使う「region から行末まで」は、境目を
+        #   進めるまで同じなので読み直さない
+        # - 近道で境目を進める前に、溜めた分を書き出す
+        pending = []                        # (属性, [文字列, ...]) の並び
+        column = region.positionInBlock()   # 溜めた分を書いた後の行内位置
+        probe_text = None
         for line, wrapped in screen.take_new_history():
             # 折り返しで続いている行は、改行で切らずに次の行と繋げる。
             # 切ると、窓を縮めている間に流れた出力が刻まれたまま記録に
             # 残り、窓を戻しても直らない
-            cells = list(line) if wrapped else self._visible_cells(line)
-            text = "".join(cell[0] for cell in cells)
+            cells = line if wrapped else self._visible_cells(line)
+            runs = [(attr, "".join(map(itemgetter(0), group)))
+                    for attr, group in groupby(cells, key=itemgetter(1))]
+            text = "".join([run for _, run in runs])
             # 押し出された行は、画面領域の先頭として文書にもう書いて
             # ある。同じ内容なら書き直さず、記録との境目を進めるだけに
             # する。書き直すと画面領域が丸ごと入れ替わり、そこにある
             # 範囲選択が消える (機器がログを 1 行吐くだけで起きる)
-            probe = QTextCursor(terminal.document())
-            probe.setPosition(region.position())
-            probe.movePosition(QTextCursor.MoveOperation.EndOfBlock,
-                               QTextCursor.MoveMode.KeepAnchor)
-            if (not reflowed and not wrapped
-                    and probe.selectedText() == text
-                    and not probe.atEnd()):
-                region.setPosition(probe.position() + 1)
-                continue
-            for run, attr in self._runs(cells):
-                region.insertText(run, self._char_format(attr))
-            if not wrapped:
-                region.insertText("\n", QTextCharFormat())
-            elif region.positionInBlock() >= self.MAX_BLOCK_CHARS:
+            if not reflowed and not wrapped:
+                if probe_text is None:
+                    probe = QTextCursor(terminal.document())
+                    probe.setPosition(region.position())
+                    probe.movePosition(QTextCursor.MoveOperation.EndOfBlock,
+                                       QTextCursor.MoveMode.KeepAnchor)
+                    probe_text = probe.selectedText()
+                    # 次の行の頭までの距離。文書の最後の行なら近道は無い
+                    skip = (None if probe.atEnd()
+                            else probe.position() - region.position() + 1)
+                if skip is not None and probe_text == text:
+                    self._insert_pending(region, pending)
+                    pending = []
+                    region.setPosition(region.position() + skip)
+                    column = 0
+                    probe_text = None
+                    continue
+            for attr, run in runs:
+                if pending and pending[-1][0] == attr:
+                    pending[-1][1].append(run)
+                else:
+                    pending.append((attr, [run]))
+            if wrapped:
                 # 改行を一度も含まない出力 (バイナリの cat など) は、
                 # 折り返し行を繋ぎ続けるかぎりブロックが 1 個のまま伸び、
                 # MAX_DOCUMENT_BLOCKS が永久に効かない。文書もメモリも
                 # 際限なく膨らみ、1 ブロックの組版が重くなって GUI が
-                # 止まる。表示上の折り返し位置は変わるが、ここで切る
-                region.insertText("\n", QTextCharFormat())
+                # 止まる。表示上の折り返し位置は変わるが、ここで切る。
+                # 行内位置は、書いた文字に段落の区切りが混ざればその後ろから
+                cut = max(map(text.rfind, _BLOCK_SEPARATORS))
+                column = (column + _u16(text) if cut < 0
+                          else _u16(text[cut + 1:]))
+                if column < self.MAX_BLOCK_CHARS:
+                    continue
+            if pending and pending[-1][0] == DEFAULT:
+                pending[-1][1].append("\n")
+            else:
+                pending.append((DEFAULT, ["\n"]))
+            column = 0
+        self._insert_pending(region, pending)
 
         # 上限を超えた先頭の行は、超えた時点で捨てる（ここと描き終えた後）。
         # 画面領域の先頭を int (start) で控えている間は捨てないこと。控えた
