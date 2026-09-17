@@ -90,9 +90,15 @@ class SftpServerListingDanglingLinkTest(unittest.TestCase):
         with open(broken, "w", encoding="utf-8") as f:
             f.write("hostname R1")
         real_lstat = os.lstat
+        # サーバは公開ルートを realpath で正規化してから組み立てるので、
+        # 一時フォルダが 8.3 短縮名（CI の C:\Users\RUNNER~1\...）だと、
+        # os.lstat に渡るのは長い名前になる。どちらの形でも当たるようにする。
+        # realpath はパッチの外で求める（中で呼ぶと os.lstat を再帰で踏む）
+        broken_names = {os.path.normcase(broken),
+                        os.path.normcase(os.path.realpath(broken))}
 
         def flaky(path, *args, **kwargs):
-            if os.path.normcase(str(path)) == os.path.normcase(broken):
+            if os.path.normcase(str(path)) in broken_names:
                 raise OSError("Access denied")
             return real_lstat(path, *args, **kwargs)
 

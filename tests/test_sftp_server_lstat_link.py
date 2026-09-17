@@ -67,13 +67,22 @@ class SftpServerLstatLinkTest(unittest.TestCase):
             seen.append(os.path.normcase(str(path)))
             return real_lstat(path, *args, **kwargs)
 
+        # サーバは公開ルートを realpath で正規化してから組み立てるので、
+        # 一時フォルダが 8.3 短縮名（CI の C:\Users\RUNNER~1\...）だと、
+        # os.lstat に渡るのは長い名前になる。比べる側も同じ形にそろえる。
+        # リンク自身は親だけを解決して名前を足す（全体を realpath すると
+        # リンク先になってしまう）
+        root_real = os.path.realpath(self.root)
+        alias = os.path.normcase(os.path.join(root_real, "alias"))
+        target = os.path.normcase(os.path.realpath(self.target))
+
         with mock.patch("os.lstat", spy):
             attr = self.handler.lstat("/alias")
 
         self.assertNotEqual(attr, SFTP_FAILURE)
-        self.assertIn(os.path.normcase(self.alias), seen,
+        self.assertIn(alias, seen,
                       "リンク自身のパスで os.lstat が呼ばれていない")
-        self.assertNotIn(os.path.normcase(self.target), seen,
+        self.assertNotIn(target, seen,
                          "リンク先まで解決してから os.lstat を呼んでいる")
 
     def test_lstat_of_a_link_pointing_outside_the_root_describes_the_link(self):
