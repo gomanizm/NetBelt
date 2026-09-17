@@ -66,6 +66,43 @@ class _RefusingPort:
         self.is_open = False
 
 
+class _PickyPort:
+    """pyserial と同じ順で値を書き換える疑似ポート。
+
+    pyserial 3.5 の baudrate setter は、SetCommState を呼ぶ前に内部の
+    値を新しい値へ書き換え、失敗しても戻さない。refuse に挙げた値だけを
+    拒む。
+    """
+
+    def __init__(self, baudrate=9600, refuse=()):
+        self._baudrate = baudrate
+        self.refuse = set(refuse)
+        self.is_open = True
+        self.in_waiting = 0
+
+    @property
+    def baudrate(self):
+        return self._baudrate
+
+    @baudrate.setter
+    def baudrate(self, value):
+        self._baudrate = value
+        if value in self.refuse:
+            raise serial.SerialException("SetCommState failed")
+
+    def read(self, n):
+        return b""
+
+    def write(self, data):
+        return len(data)
+
+    def flush(self):
+        pass
+
+    def close(self):
+        self.is_open = False
+
+
 def open_connection(port_name="COM3", baudrate=9600, port=None):
     """開いたポートを持つ SerialConnection を作る（実機の COM は開かない）。"""
     from core.serial_connection import SerialConnection
@@ -124,6 +161,56 @@ class SerialConnectionBaudrateTest(unittest.TestCase):
         self.assertTrue(conn.set_baudrate(38400))
 
         self.assertEqual(conn.baudrate, 38400)
+
+    def test_a_refused_baudrate_leaves_the_port_on_the_old_value(self):
+        """拒まれたら、ポートの持つ値も元へ戻すこと。
+
+        pyserial は設定し直す前に内部の値を書き換え、失敗しても戻さない。
+        残しておくと、実際の速度（旧）とポートが名乗る速度（新）が食い違う。
+        """
+        port = _PickyPort(9600, refuse={230400})
+        conn = open_connection(baudrate=9600, port=port)
+        self.addCleanup(conn.dispose)
+
+        self.assertFalse(conn.set_baudrate(230400))
+
+        self.assertEqual(port.baudrate, 9600, "ポートが拒んだ値を名乗ったまま残っている")
+
+    def test_a_change_made_while_the_port_is_opening_takes_effect(self):
+        """ポートを開いている最中に変えた値も、開き終えたポートへ効くこと。
+
+        MainWindow は接続スレッドを起こす前に接続を登録するので、開いて
+        いる最中にツリーからボーレートを変えられる。開くときに読んだ値は
+        その時点で古い。
+        """
+        import threading
+        from core.serial_connection import SerialConnection
+
+        opening = threading.Event()
+        proceed = threading.Event()
+        created = []
+
+        def slow_serial(**kwargs):
+            opening.set()
+            proceed.wait(5)
+            port = _PickyPort(kwargs["baudrate"])
+            created.append(port)
+            return port
+
+        conn = SerialConnection("COM3", 9600)
+        self.addCleanup(conn.dispose)
+        with mock.patch("core.serial_connection.serial.Serial",
+                        side_effect=slow_serial):
+            worker = threading.Thread(target=conn.connect)
+            worker.start()
+            self.assertTrue(opening.wait(5), "前提: ポートを開き始めていない")
+            conn.set_baudrate(115200)
+            proceed.set()
+            worker.join(5)
+
+        self.assertEqual(len(created), 1, "前提: ポートが開いていない")
+        self.assertEqual(created[0].baudrate, 115200,
+                         "開いている最中に変えた値が、開いたポートへ届いていない")
 
 
 class TreeBaudrateReachesTheOpenSessionTest(unittest.TestCase):

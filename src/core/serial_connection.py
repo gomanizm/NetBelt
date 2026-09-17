@@ -58,6 +58,9 @@ class SerialConnection(QObject):
         # _should_stop と違い connect() の入口で戻さないので、接続スレッドが
         # 動き出す前に着地した dispose() でも消えない
         self._disposed = False
+        # set_baudrate と「開いたポートを serial_conn へ入れる」を直列にする。
+        # 開いている最中に変えられた値を、開き終えたポートへ確実に届けるため
+        self._baud_lock = threading.Lock()
 
     def connect(self) -> bool:
         """
@@ -82,10 +85,12 @@ class SerialConnection(QObject):
             # 知るための印。ここで戻しておき、生成後にもう一度見る
             self._should_stop = False
 
-            # シリアルポートを開く
+            # シリアルポートを開く。開いている最中に set_baudrate されたか
+            # を後で見分けるため、開くときに使った値を控えておく
+            opened_at = self.baudrate
             port = serial.Serial(
                 port=self.port,
-                baudrate=self.baudrate,
+                baudrate=opened_at,
                 bytesize=serial.EIGHTBITS,
                 parity=serial.PARITY_NONE,
                 stopbits=serial.STOPBITS_ONE,
@@ -102,7 +107,12 @@ class SerialConnection(QObject):
                 port.close()
                 return False
 
-            self.serial_conn = port
+            with self._baud_lock:
+                self.serial_conn = port
+                # 開いている最中に set_baudrate されていたら、開くときに
+                # 使った値は古い。開き終えたポートへ合わせ直す
+                if self.baudrate != opened_at:
+                    self._apply_baudrate(port, self.baudrate)
             self._is_connected = True
             
             # 接続成功メッセージ
@@ -144,15 +154,33 @@ class SerialConnection(QObject):
         Returns:
             反映できたら True。ポートが拒んだら False（値は元のまま）
         """
-        port = self.serial_conn
-        if port is not None and port.is_open:
-            try:
-                port.baudrate = baudrate
-            except (serial.SerialException, ValueError, OSError) as e:
-                print(f"[Serial] ボーレートを変更できませんでした: {e}")
+        with self._baud_lock:
+            port = self.serial_conn
+            if (port is not None and port.is_open
+                    and not self._apply_baudrate(port, baudrate)):
                 return False
-        self.baudrate = baudrate
-        return True
+            self.baudrate = baudrate
+            return True
+
+    @staticmethod
+    def _apply_baudrate(port, baudrate: int) -> bool:
+        """開いたポートのボーレートを変える。拒まれたら元の値へ戻して False。
+
+        pyserial 3.5 は SetCommState を呼ぶ前に内部の値を書き換え、失敗しても
+        戻さない。そのままだと、実際の速度（旧）とポートが名乗る速度（新）が
+        食い違うので、元の値を代入し直す（実際の速度は変わっていない）。
+        """
+        old = port.baudrate
+        try:
+            port.baudrate = baudrate
+            return True
+        except (serial.SerialException, ValueError, OSError) as e:
+            print(f"[Serial] ボーレートを変更できませんでした: {e}")
+            try:
+                port.baudrate = old
+            except (serial.SerialException, ValueError, OSError):
+                pass   # 抜かれたポートなどは戻すのも失敗しうる
+            return False
 
     def dispose(self):
         """ポートを閉じて資源を手放す（切断の通知は出さない）
