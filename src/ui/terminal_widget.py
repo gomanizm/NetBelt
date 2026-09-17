@@ -1259,6 +1259,18 @@ class TerminalWidget(QWidget):
             "記録は失敗する前の行までです。保存先の空きや接続を確認してから、"
             "記録を始め直してください。" % (device_name, error))
     
+    def tools_state_for(self, device_name: str) -> dict:
+        """接続先リストの「ツール」に出す、その機器のセッションの状態"""
+        terminal = self._terminals.get(device_name)
+        if not isinstance(terminal, InteractiveTerminal):
+            return {"connected": False}
+        return {
+            "connected": terminal.can_send_input(),
+            "keepalive_active": terminal._keepalive_active,
+            "command_list_active": terminal._command_list_active,
+            "macros": list(terminal._macro_list),
+        }
+
     def has_terminal(self, device_name: str) -> bool:
         """その機器名のターミナルタブが開いているかを返す
 

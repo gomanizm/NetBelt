@@ -22,12 +22,19 @@ class DeviceTree(QWidget):
     # 自動検出ポートのボーレート変更（ポート名, ボーレート）。ツリーの外に
     # ある再接続用の写しへ届けるために出す
     serial_baudrate_changed = pyqtSignal(str, int)
+    # 機器メニューの「ツール」から、接続中のセッションへの操作を求める（機器名, …）
+    keepalive_start_requested = pyqtSignal(str)
+    keepalive_stop_requested = pyqtSignal(str)
+    macro_execute_requested = pyqtSignal(str, str)  # 機器名, マクロ名
+    macro_stop_requested = pyqtSignal(str)
     
     # 一般的なボーレート値
     BAUD_RATES = [300, 1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600]
     
     def __init__(self):
         super().__init__()
+        # 機器名 -> そのセッションの状態（set_tools_state_provider を参照）
+        self._tools_state_provider = None
         self._create_ui()
         
         # シリアルポート監視用
@@ -204,6 +211,53 @@ class DeviceTree(QWidget):
         # 再度追加
         self._add_serial_ports_group()
     
+    def set_tools_state_provider(self, provider):
+        """「ツール」に出すセッションの状態を返す関数を登録する
+
+        接続先リストはセッションを持たないので、開くたびに聞く。
+        provider(機器名) は connected / keepalive_active /
+        command_list_active / macros を持つ辞書を返す。
+        """
+        self._tools_state_provider = provider
+
+    def _add_tools_menu(self, menu, device_name):
+        """機器メニューに「ツール」を足し、（項目, 選ばれたときの処理）の並びを返す
+
+        キープアライブとマクロは、以前は端末の右クリックにあった。端末の
+        右クリックは貼り付けにしたので、ここへ移した。接続していない機器では
+        灰色にして選べないようにする（隠すと、どこにあるのか分からなくなる）。
+        ログの保存・記録はメニューバーの「ログ」にあるので入れない。
+        """
+        state = {}
+        if self._tools_state_provider is not None:
+            state = self._tools_state_provider(device_name) or {}
+        tools = menu.addMenu("ツール")
+        tools.setEnabled(bool(state.get("connected")))
+
+        actions = []
+        if state.get("keepalive_active"):
+            actions.append((tools.addAction("キープアライブ停止"),
+                            lambda: self.keepalive_stop_requested.emit(device_name)))
+        else:
+            actions.append((tools.addAction("キープアライブ開始"),
+                            lambda: self.keepalive_start_requested.emit(device_name)))
+        macros = state.get("macros") or []
+        if macros:
+            macro_menu = tools.addMenu("マクロ実行")
+            for macro in macros:
+                name = macro.get("name", "")
+                description = macro.get("description", "")
+                text = f"{name} - {description}" if description else name
+                actions.append((
+                    macro_menu.addAction(text),
+                    lambda n=name: self.macro_execute_requested.emit(device_name, n)))
+        # 実行中のマクロを止める。これが無いと、誤ったマクロを流し始めたとき
+        # タブを閉じる以外に中断する手段が無い
+        if state.get("command_list_active"):
+            actions.append((tools.addAction("マクロ停止"),
+                            lambda: self.macro_stop_requested.emit(device_name)))
+        return actions
+
     def _add_hide_action(self, menu):
         """どの右クリックメニューにも「非表示」を足す。
 
@@ -263,6 +317,7 @@ class DeviceTree(QWidget):
         menu = QMenu(self)
         
         connect_action = menu.addAction("接続")
+        tool_actions = self._add_tools_menu(menu, device_data["name"])
         
         # コンソール接続の場合はボーレート設定メニューを追加
         if is_serial:
@@ -301,6 +356,10 @@ class DeviceTree(QWidget):
             self._discard_menu(menu)
 
         # アクション処理
+        for tool_action, run in tool_actions:
+            if action is not None and action == tool_action:
+                run()
+                return
         if action == hide_action:
             self.hide_requested.emit()
         elif action == connect_action:

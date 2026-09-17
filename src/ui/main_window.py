@@ -356,6 +356,17 @@ class MainWindow(QMainWindow):
         self.terminal_widget.keepalive_start_requested.connect(self._on_keepalive_start_requested)
         self.terminal_widget.keepalive_stop_requested.connect(self._on_keepalive_stop_requested)
         self.terminal_widget.terminal_resized.connect(self._on_terminal_resized)
+        # 接続先リストの機器メニュー「ツール」（キープアライブ・マクロ）
+        self.device_tree.set_tools_state_provider(
+            self.terminal_widget.tools_state_for)
+        self.device_tree.macro_execute_requested.connect(
+            self._on_macro_execute_requested)
+        self.device_tree.macro_stop_requested.connect(
+            self.macro_manager.stop_command_list)
+        self.device_tree.keepalive_start_requested.connect(
+            self._on_keepalive_start_requested)
+        self.device_tree.keepalive_stop_requested.connect(
+            self._on_keepalive_stop_requested)
         splitter.addWidget(self.terminal_widget)
         
         # デフォルトの分割比率を設定（30% : 70%）
