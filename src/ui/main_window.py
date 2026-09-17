@@ -569,6 +569,20 @@ class MainWindow(QMainWindow):
                 self._warn_device_name_conflict(conflict)
                 return
 
+            # タブを開いている（接続が残っている）機器の改名は断る。タブ・接続・
+            # マクロの実行状態は古い名前のまま残り、接続先リストの「ツール」は
+            # 新しい名前で引くので、そのセッションのマクロやキープアライブを
+            # 止められなくなる。名前以外の変更はそのまま通す
+            if new_name != old_device_name and (
+                    self.terminal_widget.has_terminal(old_device_name)
+                    or old_device_name in self.connections):
+                QMessageBox.warning(
+                    self, "機器の編集",
+                    f"'{old_device_name}' のタブを開いている間は、名前を変えられません。\n"
+                    "タブを閉じてから、もう一度名前を変更してください。\n"
+                    "（今回の変更は保存していません）")
+                return
+
             # 差し替えは 1 回の保存で行う。削除→追加の 2 段階だと、片方の
             # 保存だけ失敗したときに機器が消えたり新旧 2 件になったりする
             if self.config_manager.update_device(group_name, old_device_name,
