@@ -104,6 +104,11 @@ class WindowCloseDoesNotCrashTest(unittest.TestCase):
             f.write(self.SCRIPT % {"src": os.path.abspath("src")})
         env = dict(os.environ)
         env["QT_QPA_PLATFORM"] = "offscreen"
+        # 子の出力は下で UTF-8 として読むので、書く側もそろえる。固定しないと
+        # 子はロケールのコードページで書き、英語版 Windows（GitHub の CI は
+        # cp1252）では製品の日本語の print が UnicodeEncodeError になって、
+        # 調べたい「閉じた直後に落ちるか」を見る前に終わる
+        env["PYTHONIOENCODING"] = "utf-8"
 
         proc = subprocess.run([sys.executable, script], env=env,
                               capture_output=True, timeout=180)
