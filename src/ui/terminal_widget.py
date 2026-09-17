@@ -60,6 +60,9 @@ class InteractiveTerminal(QTextEdit):
         # 区切りごとにイベントループへ譲りながら流す
         self._send_queue = []
         self._sending = False
+        # テキストのドロップは受け付けない。選択範囲をうっかりドラッグした
+        # だけで、改行ごと機器へ送られて各行が実行されていた（利用者報告）
+        self.setAcceptDrops(False)
     
     def set_keepalive_status(self, active: bool):
         """キープアライブの状態を設定"""
@@ -96,16 +99,35 @@ class InteractiveTerminal(QTextEdit):
         """
         return self._input_enabled and not self._reconnect_mode
 
+    def mousePressEvent(self, event):
+        """選択範囲の上から押しても、テキストを運ばず新しい範囲選択を始める
+
+        QTextEdit は選択範囲の上で押してドラッグすると、その文字列の
+        ドラッグ＆ドロップを始める。端末では Tera Term と同じく、どこから
+        ドラッグしても範囲選択にする。押す前に選択を外しておけば、Qt は
+        ドラッグではなく選択として扱う。
+        """
+        if (event.button() == Qt.MouseButton.LeftButton
+                and self.textCursor().hasSelection()):
+            bar = self.verticalScrollBar()
+            value = bar.value()
+            self.setTextCursor(self.cursorForPosition(event.position().toPoint()))
+            bar.setValue(value)
+        super().mousePressEvent(event)
+
     def mouseReleaseEvent(self, event):
-        """マウスリリース後、カーソルを末尾に戻す"""
+        """選んだ範囲をクリップボードへ入れる。選んでいなければカーソルを末尾に戻す"""
         # デフォルトの動作（テキスト選択）を実行
         super().mouseReleaseEvent(event)
         
+        # Tera Term と同じく、選んだ時点でコピーする（右クリックで貼り付ける）。
         # 選択がない場合のみカーソルを末尾に移動。setTextCursor はカーソルが
         # 見えるところまでスクロールするので、過去の出力を読んでいる位置は戻す
         from PyQt6.QtGui import QTextCursor
         cursor = self.textCursor()
-        if not cursor.hasSelection():
+        if cursor.hasSelection():
+            self.copy()
+        else:
             bar = self.verticalScrollBar()
             value = bar.value()
             cursor.movePosition(QTextCursor.MoveOperation.End)
@@ -236,14 +258,26 @@ class InteractiveTerminal(QTextEdit):
         self.send_text(QApplication.clipboard().text())
 
     def insertFromMimeData(self, source):
-        """ドロップや挿入経路を機器送信へ振り替える
+        """ドロップや挿入経路では、画面へも機器へも何も入れない
 
         QTextEdit は編集可能なので、既定ではドロップされたテキストを
-        そのまま画面へ挿入する。機器は何も受け取っていないのに
-        入力済みに見えるため、送信へ回して画面へは書かない。
+        そのまま画面へ挿入する。機器は何も受け取っていないのに入力済みに
+        見える。以前はこれを機器への送信へ振り替えていたが、選択範囲を
+        うっかりドラッグしただけで改行ごと送られ、各行が実行された。
+        貼り付けは右クリック（custom_paste）だけにする。
         """
-        if source.hasText():
-            self.send_text(source.text())
+
+    def canInsertFromMimeData(self, source):
+        return False
+
+    def dragEnterEvent(self, event):
+        event.ignore()
+
+    def dragMoveEvent(self, event):
+        event.ignore()
+
+    def dropEvent(self, event):
+        event.ignore()
 
     def inputMethodEvent(self, event):
         """IME の入力を機器送信へ振り替える
