@@ -126,6 +126,34 @@ class SerialConnection(QObject):
             self.error_occurred.emit(error_msg)
             return False
     
+    def set_baudrate(self, baudrate: int) -> bool:
+        """ボーレートを変える。開いているポートにはその場で反映する。
+
+        機器側で `speed 115200` などを実行すると、機器のコンソールはその
+        時点で新しい速度に切り替わる。こちらが旧速度のままだと画面が
+        文字化けし、タブを閉じて繋ぎ直すしかなかった。
+
+        pyserial は開いたポートの baudrate へ代入すると SetCommState で
+        設定し直すので、ポートは開いたまま、読み取り・送信スレッドも
+        止めずに済む。
+
+        ポートが拒んだときは error_occurred を出さない。受け手の MainWindow
+        はそれを接続エラーとして扱い、まだ使える接続を捨てて再接続待ちに
+        入ってしまう。失敗は戻り値で返し、知らせ方は呼び出し側に任せる。
+
+        Returns:
+            反映できたら True。ポートが拒んだら False（値は元のまま）
+        """
+        port = self.serial_conn
+        if port is not None and port.is_open:
+            try:
+                port.baudrate = baudrate
+            except (serial.SerialException, ValueError, OSError) as e:
+                print(f"[Serial] ボーレートを変更できませんでした: {e}")
+                return False
+        self.baudrate = baudrate
+        return True
+
     def dispose(self):
         """ポートを閉じて資源を手放す（切断の通知は出さない）
 

@@ -1136,7 +1136,11 @@ class MainWindow(QMainWindow):
         return device_data.get('source') == 'autodetect'
 
     def _on_serial_baudrate_changed(self, port: str, baudrate: int):
-        """自動検出COMポートのボーレート変更を、再接続用の写しへ反映する
+        """自動検出COMポートのボーレート変更を、開いている接続と再接続用の写しへ反映する
+
+        機器側で `speed 115200` などを実行したあと、ツリーでボーレートを
+        合わせれば、タブを閉じて繋ぎ直さなくてもそのまま打てるようにする。
+        開いている接続にはその場で反映する（ポートは開いたまま）。
 
         device_info は初回接続時の機器データの写しで、Enter による再接続は
         こちらを読む。ツリー側だけ更新すると、接続ボタン（ツリー項目を読む）
@@ -1148,13 +1152,27 @@ class MainWindow(QMainWindow):
             port: ボーレートを変えたシリアルポート名
             baudrate: 新しいボーレート
         """
-        for device_data in self.device_info.values():
+        for device_name, device_data in self.device_info.items():
             if not isinstance(device_data, dict):
                 continue
             if device_data.get('source') != 'autodetect':
                 continue
-            if device_data.get('port') == port:
-                device_data['baudrate'] = baudrate
+            if device_data.get('port') != port:
+                continue
+            device_data['baudrate'] = baudrate
+            conn = self.connections.get(device_name)
+            if not isinstance(conn, SerialConnection):
+                continue
+            if conn.set_baudrate(baudrate):
+                self.status_bar.showMessage(
+                    f"{device_name}: ボーレートを {baudrate} baud に変更しました")
+            else:
+                # 接続は生きているので切らない。ポートが拒むのは、アダプタが
+                # その速度に対応していないか、抜かれた場合で、どちらも繋ぎ
+                # 直して直るとは限らないので、起きたことだけを伝える
+                self.status_bar.showMessage(
+                    f"{device_name}: ボーレートを {baudrate} baud に変更できませんでした"
+                    "（接続は元のボーレートのままです）")
 
     def _run_auto_commands(self, device_name: str):
         """接続先グループの自動実行コマンドを送信する(GUIスレッドで実行)"""
