@@ -101,12 +101,16 @@ class InteractiveTerminal(QTextEdit):
         # デフォルトの動作（テキスト選択）を実行
         super().mouseReleaseEvent(event)
         
-        # 選択がない場合のみカーソルを末尾に移動
+        # 選択がない場合のみカーソルを末尾に移動。setTextCursor はカーソルが
+        # 見えるところまでスクロールするので、過去の出力を読んでいる位置は戻す
         from PyQt6.QtGui import QTextCursor
         cursor = self.textCursor()
         if not cursor.hasSelection():
+            bar = self.verticalScrollBar()
+            value = bar.value()
             cursor.movePosition(QTextCursor.MoveOperation.End)
             self.setTextCursor(cursor)
+            bar.setValue(value)
     
     def send_text(self, text: str) -> bool:
         """テキストを機器へ送る（画面へは直接書かない）
@@ -128,7 +132,7 @@ class InteractiveTerminal(QTextEdit):
         screen = getattr(self, "_screen", None)
         if screen is not None and screen.bracketed_paste:
             payload = "\x1b[200~" + payload + "\x1b[201~"
-        self._queue_send(payload)
+        self._send_typed(payload)
         return True
 
     # 1回に送り出す文字数。大きすぎると譲る間隔が空き、小さすぎると
@@ -261,7 +265,7 @@ class InteractiveTerminal(QTextEdit):
         event.accept()
         commit = event.commitString()
         if commit and self.can_send_input():
-            self._queue_send(commit)
+            self._send_typed(commit)
 
 
     def set_macro_list(self, macros: list):
@@ -432,6 +436,18 @@ class InteractiveTerminal(QTextEdit):
             return "\x1bO" + letter
         return "\x1b[" + letter
 
+    def _send_typed(self, payload: str):
+        """利用者が打った・貼った文字を送り、最下部へ戻す
+
+        過去の出力を読むために上へスクロールしていても、打ったら端末の
+        慣習どおり最下部へ戻す。戻さないと、打った文字のエコーもプロンプトも
+        見えないまま入力することになる。マクロやキープアライブ、機器の
+        問い合わせへの応答はここを通さない（読んでいる位置を勝手に動かさない）。
+        """
+        bar = self.verticalScrollBar()
+        bar.setValue(bar.maximum())
+        self._queue_send(payload)
+
     def keyPressEvent(self, event: QKeyEvent):
         """キーイベントを処理"""
         if not self._input_enabled:
@@ -454,26 +470,26 @@ class InteractiveTerminal(QTextEdit):
                 self.reconnect_requested.emit()
                 return
             # 通常モードの場合はSSHに送信
-            self._queue_send('\r')
+            self._send_typed('\r')
         elif key == Qt.Key.Key_Backspace:
-            self._queue_send('\x7f')  # DEL文字
+            self._send_typed('\x7f')  # DEL文字
         elif key == Qt.Key.Key_Tab:
-            self._queue_send('\t')
+            self._send_typed('\t')
         elif key == Qt.Key.Key_Escape:
-            self._queue_send('\x1b')
+            self._send_typed('\x1b')
         elif key == Qt.Key.Key_Up:
-            self._queue_send(self._cursor_key('A'))
+            self._send_typed(self._cursor_key('A'))
         elif key == Qt.Key.Key_Down:
-            self._queue_send(self._cursor_key('B'))
+            self._send_typed(self._cursor_key('B'))
         elif key == Qt.Key.Key_Right:
-            self._queue_send(self._cursor_key('C'))
+            self._send_typed(self._cursor_key('C'))
         elif key == Qt.Key.Key_Left:
-            self._queue_send(self._cursor_key('D'))
+            self._send_typed(self._cursor_key('D'))
         else:
             # 通常の文字入力
             text = event.text()
             if text:
-                self._queue_send(text)
+                self._send_typed(text)
 
 
 class TerminalWidget(QWidget):
@@ -896,6 +912,12 @@ class TerminalWidget(QWidget):
             painter.setCharFormat(self._char_format(attr))
             offset += _u16(text)
 
+    @staticmethod
+    def _block_top(terminal: QTextEdit, cursor: QTextCursor) -> int:
+        """カーソルのある行の、文書上の上端（スクロールバーの値と同じ単位）。"""
+        layout = terminal.document().documentLayout()
+        return int(layout.blockBoundingRect(cursor.block()).top())
+
     def _render_screen(self, terminal: QTextEdit) -> None:
         """画面の中身を文書へ写す。
 
@@ -904,6 +926,17 @@ class TerminalWidget(QWidget):
         """
         screen = terminal._screen
         region = terminal._region
+
+        # 上へスクロールして過去の出力を読んでいるなら、描き終えたあとも
+        # 同じ行を見せる。スクロールバーの値だけを控えると、上限で先頭の
+        # 行が捨てられたぶん中身がずれるので、見えている先頭の位置を
+        # QTextCursor で持つ（手前が消えれば自動で詰まる）
+        bar = terminal.verticalScrollBar()
+        anchor = None
+        if bar.value() < bar.maximum():
+            from PyQt6.QtCore import QPoint
+            anchor = terminal.cursorForPosition(QPoint(0, 0))
+            anchor_offset = bar.value() - self._block_top(terminal, anchor)
 
         # 組み直しの直後は、文書に残っている「今の画面」が組み直し前の
         # ものなので、内容が一致しても同じ行とは限らない。境目を進める
@@ -1029,12 +1062,15 @@ class TerminalWidget(QWidget):
             caret = QTextCursor(terminal.document())
             caret.setPosition(pos)
             terminal.setTextCursor(caret)
-        # 端末と同じく、常に下端へ寄せる。画面は文書の末尾 rows 行
+        # 最下部を見ていたなら下端へ寄せる。画面は文書の末尾 rows 行
         # なので、ここを見せることが「いま端末に映っているもの」を
         # 見せることになる。カーソルへ寄せると、全画面アプリでは
-        # 画面の上半分しか窓に入らない
-        bar = terminal.verticalScrollBar()
-        bar.setValue(bar.maximum())
+        # 画面の上半分しか窓に入らない。上へスクロールしていたなら、
+        # 上のキャレット移動で動いた位置を戻して同じ行を見せる
+        if anchor is None:
+            bar.setValue(bar.maximum())
+        else:
+            bar.setValue(self._block_top(terminal, anchor) + anchor_offset)
 
         # 上限に達していたら「切り詰めた」を立てたままにする。この後で
         # 窓を縮めて blockCount が下回っても、捨てた行は戻らない
