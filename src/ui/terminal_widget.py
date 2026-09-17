@@ -33,11 +33,7 @@ class InteractiveTerminal(QTextEdit):
     
     key_pressed = pyqtSignal(str)  # キー入力シグナル
     reconnect_requested = pyqtSignal()  # 再接続要求シグナル
-    macro_execute_requested = pyqtSignal(str)  # マクロ実行要求シグナル（マクロ名）
     macro_settings_requested = pyqtSignal()  # マクロ設定画面要求シグナル
-    macro_stop_requested = pyqtSignal()  # 実行中のマクロ（コマンドリスト）停止要求シグナル
-    keepalive_start_requested = pyqtSignal()  # キープアライブ開始要求シグナル
-    keepalive_stop_requested = pyqtSignal()  # キープアライブ停止要求シグナル
     # Ctrl+ホイールでのフォントサイズ変更要求（回した向き: +1 / -1）
     font_size_change_requested = pyqtSignal(int)
     # ウィジェットの大きさが変わった（行数・桁数の再計算が要る）
@@ -342,45 +338,6 @@ class InteractiveTerminal(QTextEdit):
         if event.reason() == QContextMenuEvent.Reason.Mouse:
             self.custom_paste()
 
-    def _on_save_all_log(self):
-        """現在表示されている全ログを保存"""
-        # 親ウィジェット（TerminalWidget）にシグナルを送る
-        parent = self.parent()
-        while parent and not isinstance(parent, TerminalWidget):
-            parent = parent.parent()
-        
-        if parent and isinstance(parent, TerminalWidget):
-            # 現在のタブのインデックスを取得
-            current_widget = parent.tab_widget.currentWidget()
-            if current_widget == self:
-                parent.save_current_log()
-    
-    def _on_start_log_recording(self):
-        """ログ記録を開始"""
-        # 親ウィジェット（TerminalWidget）にシグナルを送る
-        parent = self.parent()
-        while parent and not isinstance(parent, TerminalWidget):
-            parent = parent.parent()
-        
-        if parent and isinstance(parent, TerminalWidget):
-            # 現在のタブのインデックスを取得
-            current_widget = parent.tab_widget.currentWidget()
-            if current_widget == self:
-                parent.start_log_recording()
-    
-    def _on_stop_log_recording(self):
-        """ログ記録を停止"""
-        # 親ウィジェット（TerminalWidget）にシグナルを送る
-        parent = self.parent()
-        while parent and not isinstance(parent, TerminalWidget):
-            parent = parent.parent()
-        
-        if parent and isinstance(parent, TerminalWidget):
-            # 現在のタブのインデックスを取得
-            current_widget = parent.tab_widget.currentWidget()
-            if current_widget == self:
-                parent.stop_log_recording()
-    
     def wheelEvent(self, event):
         """Ctrl+ホイールを設定経路へ回す
 
@@ -499,18 +456,10 @@ class TerminalWidget(QWidget):
     # 表示中のタブが変わったことを知らせる（機器名。タブが無ければ空文字）。
     # SFTP パネルなど、機器に紐づく表示を追従させるために要る。
     current_tab_changed = pyqtSignal(str)
-    # マクロ実行要求シグナル（機器名、マクロ名）
-    macro_execute_requested = pyqtSignal(str, str)
     # Ctrl+ホイールでのフォントサイズ変更要求（回した向き: +1 / -1）
     font_size_change_requested = pyqtSignal(int)
     # マクロ設定画面要求シグナル（機器名）
     macro_settings_requested = pyqtSignal(str)
-    # 実行中のマクロ停止要求シグナル（機器名）
-    macro_stop_requested = pyqtSignal(str)
-    # キープアライブ開始要求シグナル（機器名）
-    keepalive_start_requested = pyqtSignal(str)
-    # キープアライブ停止要求シグナル（機器名）
-    keepalive_stop_requested = pyqtSignal(str)
     # 端末の行数・桁数が変わった（機器名, 桁, 行）。機器への通知に使う
     terminal_resized = pyqtSignal(str, int, int)
 
@@ -737,27 +686,13 @@ class TerminalWidget(QWidget):
         terminal = self._create_terminal(interactive=True)
         self._terminals[device_name] = terminal
         
-        # マクロ実行要求シグナルを接続
+        # Ctrl+ホイールの拡大縮小を上へ中継する
         terminal.font_size_change_requested.connect(
             self.font_size_change_requested.emit)
-        terminal.macro_execute_requested.connect(
-            lambda macro_name: self.macro_execute_requested.emit(device_name, macro_name)
-        )
         
         # マクロ設定画面要求シグナルを接続
         terminal.macro_settings_requested.connect(
             lambda: self.macro_settings_requested.emit(device_name)
-        )
-        terminal.macro_stop_requested.connect(
-            lambda: self.macro_stop_requested.emit(device_name)
-        )
-        
-        # キープアライブ開始/停止要求シグナルを接続
-        terminal.keepalive_start_requested.connect(
-            lambda: self.keepalive_start_requested.emit(device_name)
-        )
-        terminal.keepalive_stop_requested.connect(
-            lambda: self.keepalive_stop_requested.emit(device_name)
         )
 
         # ウィンドウの大きさに画面の格子を追従させる
