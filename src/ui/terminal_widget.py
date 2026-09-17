@@ -59,7 +59,16 @@ class InteractiveTerminal(QTextEdit):
         # テキストのドロップは受け付けない。選択範囲をうっかりドラッグした
         # だけで、改行ごと機器へ送られて各行が実行されていた（利用者報告）
         self.setAcceptDrops(False)
+        # 出力に追従するか（最下部を見ているか）。描画のたびに「値 < 最大値」で
+        # 決めると、窓を縦に縮めたり文字を大きくしたりしただけで最大値が増え、
+        # 利用者が何も動かしていないのに追従をやめてしまう。値が動いたとき
+        # （スクロール操作・打鍵での移動・描画での移動）にだけ決め直す
+        self._follow_output = True
+        self.verticalScrollBar().valueChanged.connect(self._on_scrolled)
     
+    def _on_scrolled(self, value: int) -> None:
+        self._follow_output = value >= self.verticalScrollBar().maximum()
+
     def set_keepalive_status(self, active: bool):
         """キープアライブの状態を設定"""
         self._keepalive_active = active
@@ -486,6 +495,9 @@ class TerminalWidget(QWidget):
         self._resize_timer.timeout.connect(self._apply_pending_resizes)
         # まだ描いていない受信出力（機器名 -> かたまりの並び）
         self._pending_output: Dict[str, list] = {}
+        # _flush_pending_output が 1 片を渡している機器（append_output が
+        # 溜まり分の後ろへ並べずに描くための目印）
+        self._flushing_device = None
         self._output_timer = QTimer(self)
         self._output_timer.setSingleShot(True)
         self._output_timer.setInterval(0)
@@ -669,8 +681,7 @@ class TerminalWidget(QWidget):
                 if self.tab_widget.tabText(i) == device_name:
                     self.tab_widget.setCurrentIndex(i)
                     # 前の接続から届いて描いていない出力は、前の画面へ描き切る
-                    if self._pending_output.get(device_name):
-                        self.append_output(device_name, "")
+                    self._draw_pending_now(device_name)
                     # 再接続は新しいセッション。前の画面はそのまま記録と
                     # して文書に残し、端末状態 (パーサ・画面) は作り直す
                     self._attach_screen(self._terminals[device_name])
@@ -874,7 +885,7 @@ class TerminalWidget(QWidget):
         # QTextCursor で持つ（手前が消えれば自動で詰まる）
         bar = terminal.verticalScrollBar()
         anchor = None
-        if bar.value() < bar.maximum():
+        if not getattr(terminal, "_follow_output", True):
             from PyQt6.QtCore import QPoint
             anchor = terminal.cursorForPosition(QPoint(0, 0))
             anchor_offset = bar.value() - self._block_top(terminal, anchor)
@@ -1032,14 +1043,20 @@ class TerminalWidget(QWidget):
             device_name: 機器名
             text: 追加するテキスト
         """
-        # 溜めてある受信出力が先。直接書く案内（切断バナーなど）や
-        # マクロの出力に追い越させない
-        pending = self._pending_output.pop(device_name, None)
+        # 描いていない受信出力が溜まっていれば、その後ろへ並べるだけにする。
+        # 直接書く案内（切断バナーなど）やマクロの出力に追い越させないためで、
+        # ここで溜まり分を全部描くと大量出力の最中に固まる（実測: 0.92MB で
+        # 2.51 秒）。_flush_pending_output が 1 片ずつ描くときだけは素通りする
+        from_flush = self._flushing_device == device_name
+        self._flushing_device = None
+        if not from_flush and self._pending_output.get(device_name):
+            self._pending_output[device_name].append(text)
+            if not self._output_timer.isActive():
+                self._output_timer.start()
+            return
         if device_name not in self._terminals:
             return
         terminal = self._terminals[device_name]
-        if pending:
-            text = "".join(pending) + text
 
         events = terminal._parser.feed(text)
         terminal._screen.apply(events)
@@ -1083,16 +1100,32 @@ class TerminalWidget(QWidget):
         """溜めた出力を機器ごとに OUTPUT_SLICE 文字まで描き、残りは次の回へ回す"""
         for device_name in list(self._pending_output):
             chunks = self._pending_output.pop(device_name, None)
-            if not chunks:
+            if not chunks or device_name not in self._terminals:
                 continue
             text = "".join(chunks)
-            self.append_output(device_name, text[:self.OUTPUT_SLICE])
             rest = text[self.OUTPUT_SLICE:]
-            if rest and device_name in self._terminals:
-                # 描いている間に届いた分より前へ戻す
-                self._pending_output.setdefault(device_name, []).insert(0, rest)
+            if rest:
+                # 描く前に戻しておく。描いている最中（警告のモーダルなどで
+                # イベントループが回ったとき）に届いた出力や案内は、この
+                # 描き残しの後ろに並ぶ
+                self._pending_output[device_name] = [rest]
+            self._flushing_device = device_name
+            try:
+                self.append_output(device_name, text[:self.OUTPUT_SLICE])
+            finally:
+                self._flushing_device = None
         if self._pending_output:
             self._output_timer.start()
+
+    def _draw_pending_now(self, device_name: str) -> None:
+        """その機器の溜まり分を、いまここで全部描く（画面を付け直す前など）"""
+        chunks = self._pending_output.pop(device_name, None)
+        if chunks and device_name in self._terminals:
+            self._flushing_device = device_name
+            try:
+                self.append_output(device_name, "".join(chunks))
+            finally:
+                self._flushing_device = None
 
     def _discard_log_dialog(self, dialog) -> None:
         """記録中ダイアログを閉じて、捨てる。
