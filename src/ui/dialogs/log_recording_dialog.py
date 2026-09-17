@@ -1,6 +1,7 @@
 from PyQt6.QtWidgets import QDialog, QVBoxLayout, QLabel, QPushButton, QHBoxLayout
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer
 from datetime import datetime
+import os
 from ui import theme
 
 
@@ -25,6 +26,7 @@ class LogRecordingDialog(QDialog):
         # タイマーで経過時間を更新
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._update_elapsed_time)
+        self.timer.timeout.connect(self._update_byte_count)
         self.timer.start(1000)  # 1秒ごとに更新
         
         self._create_ui()
@@ -48,6 +50,12 @@ class LogRecordingDialog(QDialog):
         self.elapsed_label = QLabel("経過時間: 00:00:00")
         self.elapsed_label.setStyleSheet("font-size: 10pt;")
         layout.addWidget(self.elapsed_label)
+
+        # 記録したバイト数（本当に書けているかを見えるようにする）
+        self.bytes_label = QLabel()
+        self.bytes_label.setStyleSheet("font-size: 10pt;")
+        layout.addWidget(self.bytes_label)
+        self._update_byte_count()
         
         # 注意事項ラベル
         note_label = QLabel(
@@ -85,6 +93,20 @@ class LogRecordingDialog(QDialog):
         seconds = total_seconds % 60
         self.elapsed_label.setText(f"経過時間: {hours:02d}:{minutes:02d}:{seconds:02d}")
     
+    def _update_byte_count(self):
+        """保存先ファイルの実際の大きさを表示する
+
+        受信した文字数ではなくファイルの大きさを出す。テキストモードで
+        開いているので改行は CRLF になり、日本語は UTF-8 で 3 バイトになる。
+        書き込みのたびに flush しているので、ここで読む値が記録できた量。
+        """
+        try:
+            size = os.path.getsize(self.file_path)
+        except OSError:
+            self.bytes_label.setText("記録したバイト数: 取得できません")
+            return
+        self.bytes_label.setText(f"記録したバイト数: {size:,} バイト")
+
     def _on_stop(self):
         """停止ボタンクリック時の処理"""
         self.timer.stop()

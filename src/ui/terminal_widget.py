@@ -1290,7 +1290,7 @@ class TerminalWidget(QWidget):
         # 記録中なら止めてから閉じる。放っておくとファイルハンドルが
         # 開いたまま残り（Windows ではファイルがロックされたままになる）、
         # 宙に浮いたダイアログの停止ボタンが以後は別の機器を止めてしまう
-        self._stop_log_recording_for(tab_name, notify=False)
+        self._stop_log_recording_for(tab_name)
 
         # 辞書から削除
         if tab_name in self._terminals:
@@ -1510,11 +1510,8 @@ class TerminalWidget(QWidget):
                 dialog.show()
                 self._log_dialogs[tab_name] = dialog
                 
-                QMessageBox.information(
-                    self,
-                    "ログ記録開始",
-                    f"ログ記録を開始しました:\n{file_path}"
-                )
+                # 開始の知らせは出さない。記録中ダイアログが出れば分かり、
+                # 複数の機器を記録するときに毎回 OK を押させることになる
                 
             except Exception as e:
                 QMessageBox.warning(
@@ -1539,13 +1536,15 @@ class TerminalWidget(QWidget):
             device_name = self.tab_widget.tabText(current_index)
         self._stop_log_recording_for(device_name)
 
-    def _stop_log_recording_for(self, tab_name: str, notify: bool = True):
+    def _stop_log_recording_for(self, tab_name: str):
         """指定した機器のログ記録を止めて後始末する
+
+        止まったことの知らせは出さない。記録中ダイアログが消えれば分かり、
+        複数の機器を記録するときに毎回 OK を押させることになる。閉じる
+        処理に失敗したときの警告だけは出す（記録が欠けているかもしれない）。
 
         Args:
             tab_name: 止める機器
-            notify: 完了の通知を出すか。タブを閉じたときの後始末では
-                出さない（閉じる操作のたびにダイアログが出てしまう）
         """
         from PyQt6.QtWidgets import QMessageBox
 
@@ -1581,13 +1580,6 @@ class TerminalWidget(QWidget):
                     f"ログファイルを閉じる際にエラーが発生しました:\n{str(e)}"
                 )
                 return
-
-            if notify:
-                QMessageBox.information(
-                    self,
-                    "ログ記録停止",
-                    "ログ記録を停止しました。"
-                )
     
     def _on_current_tab_changed(self, index: int) -> None:
         """表示中のタブが変わったことを知らせる"""
