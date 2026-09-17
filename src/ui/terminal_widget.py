@@ -1,5 +1,5 @@
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QTextEdit, QTabWidget, QMenu
-from PyQt6.QtGui import (QFont, QColor, QPalette, QKeyEvent, QAction,
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QTextEdit, QTabWidget
+from PyQt6.QtGui import (QFont, QColor, QPalette, QKeyEvent, QContextMenuEvent,
                          QTextCursor, QTextCharFormat)
 from PyQt6.QtCore import Qt, pyqtSignal
 from typing import Dict, Optional
@@ -252,10 +252,29 @@ class InteractiveTerminal(QTextEdit):
             self._sending = False
 
     def custom_paste(self):
-        """カスタムペースト機能 - ペーストされたテキストをSSHセッションに送信"""
-        from PyQt6.QtWidgets import QApplication
+        """クリップボードの内容を機器へ送る
 
-        self.send_text(QApplication.clipboard().text())
+        改行を含むと、機器は行ごとにコマンドとして実行する。誤って貼っても
+        取り消せないので、そのときだけ送る内容を見せて確かめる。改行の無い
+        1 行は Enter を押すまで実行されないので、そのまま送る。
+        """
+        from PyQt6.QtWidgets import QApplication, QDialog
+
+        text = QApplication.clipboard().text()
+        if not text or not self.can_send_input():
+            return
+        if "\n" in text or "\r" in text:
+            from .dialogs.paste_confirm_dialog import PasteConfirmDialog
+            dialog = PasteConfirmDialog(text, self)
+            try:
+                if dialog.exec() != QDialog.DialogCode.Accepted:
+                    return
+            finally:
+                # 端末を親にしたダイアログは、閉じただけでは子として残る
+                dialog.setParent(None)
+                dialog.deleteLater()
+        # 確かめている間に切れていれば、send_text が送らない
+        self.send_text(text)
 
     def insertFromMimeData(self, source):
         """ドロップや挿入経路では、画面へも機器へも何も入れない
@@ -312,99 +331,17 @@ class InteractiveTerminal(QTextEdit):
         self._macro_list = macros
     
     def contextMenuEvent(self, event):
-        """右クリックメニューをカスタマイズ（日本語化、切り取り機能を削除）"""
-        menu = QMenu(self)
-        
-        # コピー（選択範囲がある場合のみ有効）
-        copy_action = QAction("コピー", menu)
-        copy_action.triggered.connect(self.copy)
-        copy_action.setEnabled(self.textCursor().hasSelection())
-        menu.addAction(copy_action)
-        
-        # 貼り付け（カスタムペースト機能を使用）
-        paste_action = QAction("貼り付け", menu)
-        paste_action.triggered.connect(self.custom_paste)
-        paste_action.setEnabled(self.can_send_input())
-        menu.addAction(paste_action)
-        
-        menu.addSeparator()
-        
-        # すべて選択
-        select_all_action = QAction("すべて選択", menu)
-        select_all_action.triggered.connect(self.selectAll)
-        menu.addAction(select_all_action)
-        
-        menu.addSeparator()
-        
-        # マクロメニュー
-        if self._input_enabled:
-            # キープアライブ
-            if self._keepalive_active:
-                keepalive_action = QAction("キープアライブ停止", menu)
-                keepalive_action.triggered.connect(lambda: self.keepalive_stop_requested.emit())
-            else:
-                keepalive_action = QAction("キープアライブ開始", menu)
-                keepalive_action.triggered.connect(lambda: self.keepalive_start_requested.emit())
-            menu.addAction(keepalive_action)
-            
-            menu.addSeparator()
-            
-            # マクロ実行サブメニュー
-            if self._macro_list:
-                macro_menu = QMenu("マクロ実行", menu)
-                for macro in self._macro_list:
-                    macro_name = macro.get("name", "")
-                    macro_desc = macro.get("description", "")
-                    
-                    if macro_desc:
-                        action_text = f"{macro_name} - {macro_desc}"
-                    else:
-                        action_text = macro_name
-                    
-                    macro_action = QAction(action_text, macro_menu)
-                    macro_action.triggered.connect(
-                        lambda checked, name=macro_name: self.macro_execute_requested.emit(name)
-                    )
-                    macro_menu.addAction(macro_action)
-                
-                menu.addMenu(macro_menu)
+        """右クリックで貼り付ける（Tera Term と同じ）
 
-            # 実行中のマクロを止める。これが無いと、誤ったマクロを流し
-            # 始めたときタブを閉じる以外に中断する手段が無い
-            if self._command_list_active:
-                macro_stop_action = QAction("マクロ停止", menu)
-                macro_stop_action.triggered.connect(lambda: self.macro_stop_requested.emit())
-                menu.addAction(macro_stop_action)
-            
-            menu.addSeparator()
-        
-        # ログ機能メニュー
-        # 1. 現在表示されている全ログの保存
-        save_all_log_action = QAction("全ログ保存", menu)
-        save_all_log_action.triggered.connect(self._on_save_all_log)
-        menu.addAction(save_all_log_action)
-        
-        # 2. ログ記録開始/停止（記録状態によって切り替え）
-        if self._is_recording:
-            stop_log_action = QAction("ログ記録停止", menu)
-            stop_log_action.triggered.connect(self._on_stop_log_recording)
-            menu.addAction(stop_log_action)
-        else:
-            start_log_action = QAction("ログ記録開始", menu)
-            start_log_action.triggered.connect(self._on_start_log_recording)
-            menu.addAction(start_log_action)
-        
-        # メニューを表示
-        try:
-            menu.exec(event.globalPos())
-        finally:
-            # 端末を親にしたメニューは、閉じただけでは子として残る。
-            # 右クリックのたびに QMenu 1 件と項目が積み上がるので、
-            # 開き終えたら項目ごと捨てる（実測: 5 回で QMenu 5 件、
-            # QAction 40 件）。項目の親もメニューにしてあるので、
-            # メニューが消えるときに一緒に片付く。
-            menu.deleteLater()
-    
+        メニューは出さない。コピーは範囲選択した時点で済んでいる。キープ
+        アライブとマクロは接続先リストの機器メニュー「ツール」へ、ログは
+        メニューバーの「ログ」へ移し、「すべて選択」はやめた。キーボードの
+        メニューキーでは貼り付けない（押し間違いで機器へ送らないため）。
+        """
+        event.accept()
+        if event.reason() == QContextMenuEvent.Reason.Mouse:
+            self.custom_paste()
+
     def _on_save_all_log(self):
         """現在表示されている全ログを保存"""
         # 親ウィジェット（TerminalWidget）にシグナルを送る

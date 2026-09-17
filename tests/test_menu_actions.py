@@ -281,21 +281,23 @@ class PasteGuardTest(unittest.TestCase):
         terminal.custom_paste()
         self.assertEqual("".join(sent), "show version")
 
-    def test_context_menu_paste_is_disabled_while_waiting_to_reconnect(self):
-        """右クリック経路も同じ条件で塞がっていること。"""
+    def test_right_click_sends_nothing_while_waiting_to_reconnect(self):
+        """右クリックの貼り付けも同じ条件で塞がっていること（確認も出さない）。"""
         from PyQt6.QtGui import QContextMenuEvent
         from PyQt6.QtCore import QPoint
+        from PyQt6.QtWidgets import QApplication
         terminal = self._terminal(reconnecting=True)
-        captured = {}
+        sent = []
+        terminal.key_pressed.connect(sent.append)
+        QApplication.clipboard().setText("show running-config\n")
 
-        def fake_exec(menu, *args, **kwargs):
-            captured["items"] = [(a.text(), a.isEnabled()) for a in menu.actions()]
-            return None
-
-        with mock.patch("PyQt6.QtWidgets.QMenu.exec", fake_exec):
+        with mock.patch("PyQt6.QtWidgets.QMenu.exec", return_value=None), \
+                mock.patch("PyQt6.QtWidgets.QDialog.exec", return_value=1) as dialog:
             terminal.contextMenuEvent(QContextMenuEvent(
                 QContextMenuEvent.Reason.Mouse, QPoint(1, 1)))
-        self.assertIn(("貼り付け", False), captured["items"])
+
+        self.assertEqual(sent, [])
+        self.assertEqual(dialog.call_count, 0)
 
     def test_menu_paste_explains_why_nothing_happened(self):
         """メニューからのペーストは理由を伝えること（無反応にしない）。"""

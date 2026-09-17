@@ -8,6 +8,10 @@ MacroManager には stop_command_list があり MainWindow の接続も済んで
 
 実行中のときだけ右クリックメニューに「マクロ停止」を出し、選ぶと
 そのタブの機器のコマンドリストを止める。
+
+端末の右クリックは Tera Term と同じく貼り付けになったので、「マクロ停止」は
+接続先リストの機器メニュー「ツール」へ移った（利用者判断 2026-09-17）。
+ここでは移った先で同じことができるかを確かめる。
 """
 import os
 import sys
@@ -82,6 +86,7 @@ class MacroStopFromContextMenuTest(unittest.TestCase):
         self.addCleanup(window.close)
         device = {"name": "dev", "host": "192.0.2.10", "port": 22,
                   "username": "u", "password": "", "protocol": "ssh"}
+        window.device_tree.load_from_config([{"name": "Lab", "devices": [device]}])
         window._on_connect_requested(device)
         self._pump()
         terminal = window.terminal_widget._terminals["dev"]
@@ -91,24 +96,24 @@ class MacroStopFromContextMenuTest(unittest.TestCase):
         return window, terminal, conn
 
     @staticmethod
-    def _context_menu_actions(terminal):
-        """右クリックメニューを開いたつもりで、項目（テキスト → QAction）を集める。"""
-        from PyQt6.QtGui import QContextMenuEvent
-        from PyQt6.QtCore import QPoint
+    def _context_menu_actions(window):
+        """接続先リストで機器を右クリックしたつもりで、「ツール」の項目（テキスト → QAction）を集める。"""
         captured = {}
 
         def fake_exec(menu, *args, **kwargs):
-            captured["actions"] = {a.text(): a for a in menu.actions()}
+            tools = next(a for a in menu.actions() if a.text() == "ツール").menu()
+            captured["actions"] = {a.text(): a for a in tools.actions()}
             return None
 
+        tree = window.device_tree
+        item = tree.tree.topLevelItem(0).child(0)
         with mock.patch("PyQt6.QtWidgets.QMenu.exec", fake_exec):
-            terminal.contextMenuEvent(QContextMenuEvent(
-                QContextMenuEvent.Reason.Mouse, QPoint(1, 1)))
+            tree._show_context_menu(tree.tree.visualItemRect(item).center())
         return captured["actions"]
 
     def test_stop_item_is_absent_while_no_macro_runs(self):
         window, terminal, conn = self._connected_window()
-        self.assertNotIn("マクロ停止", self._context_menu_actions(terminal))
+        self.assertNotIn("マクロ停止", self._context_menu_actions(window))
 
     def test_stop_item_appears_and_stops_the_running_macro(self):
         """実行中は「マクロ停止」が出て、選ぶと残りのコマンドが送られないこと。"""
@@ -117,7 +122,7 @@ class MacroStopFromContextMenuTest(unittest.TestCase):
             "dev", ["cmd1", "cmd2", "cmd3"], 200)
         self.assertEqual(conn.sent, ["cmd1\r"], "前提: 最初のコマンドは即送られる")
 
-        actions = self._context_menu_actions(terminal)
+        actions = self._context_menu_actions(window)
         self.assertIn("マクロ停止", actions,
                       "実行中なのに止める項目が無い: %s" % sorted(actions))
         actions["マクロ停止"].trigger()
@@ -126,17 +131,17 @@ class MacroStopFromContextMenuTest(unittest.TestCase):
         self._pump(0.6)
         self.assertEqual(conn.sent, ["cmd1\r"],
                          "停止したのに残りのコマンドが送られた: %r" % conn.sent)
-        self.assertNotIn("マクロ停止", self._context_menu_actions(terminal),
+        self.assertNotIn("マクロ停止", self._context_menu_actions(window),
                          "止めた後も項目が残っている")
 
     def test_stop_item_disappears_when_the_macro_finishes(self):
         window, terminal, conn = self._connected_window()
         window.macro_manager.start_command_list("dev", ["cmd1"], 50)
-        self.assertIn("マクロ停止", self._context_menu_actions(terminal))
+        self.assertIn("マクロ停止", self._context_menu_actions(window))
         self._pump(0.4)
         self.assertFalse(window.macro_manager.is_command_list_active("dev"),
                          "前提: マクロは終わっている")
-        self.assertNotIn("マクロ停止", self._context_menu_actions(terminal),
+        self.assertNotIn("マクロ停止", self._context_menu_actions(window),
                          "終わった後も項目が残っている")
 
 
