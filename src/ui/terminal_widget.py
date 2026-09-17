@@ -117,12 +117,17 @@ class InteractiveTerminal(QTextEdit):
         super().mouseReleaseEvent(event)
         
         # Tera Term と同じく、選んだ時点でコピーする（右クリックで貼り付ける）。
+        # コピーするのは左ボタンで選び終えたときだけ。Windows では右クリックの
+        # メニュー事象がボタンを離したときに出るので、右ボタンの解放でも
+        # コピーすると、残っていた選択範囲がクリップボードを上書きしてから
+        # 貼り付けになり、他でコピーした内容ではなくその選択範囲が送られる。
         # 選択がない場合のみカーソルを末尾に移動。setTextCursor はカーソルが
         # 見えるところまでスクロールするので、過去の出力を読んでいる位置は戻す
         from PyQt6.QtGui import QTextCursor
         cursor = self.textCursor()
         if cursor.hasSelection():
-            self.copy()
+            if event.button() == Qt.MouseButton.LeftButton:
+                self.copy()
         else:
             bar = self.verticalScrollBar()
             value = bar.value()
@@ -252,14 +257,16 @@ class InteractiveTerminal(QTextEdit):
 
         改行を含むと、機器は行ごとにコマンドとして実行する。誤って貼っても
         取り消せないので、そのときだけ送る内容を見せて確かめる。改行の無い
-        1 行は Enter を押すまで実行されないので、そのまま送る。
+        1 行は Enter を押すまで実行されないので、そのまま送る。ただし制御文字
+        （Ctrl+Z など。IOS の設定モードでは入力中の行を実行して抜ける）を
+        含むときも確かめる。タブは補完に使うだけなので除く。
         """
         from PyQt6.QtWidgets import QApplication, QDialog
 
         text = QApplication.clipboard().text()
         if not text or not self.can_send_input():
             return
-        if "\n" in text or "\r" in text:
+        if any(ord(ch) < 0x20 and ch != "\t" for ch in text):
             from .dialogs.paste_confirm_dialog import PasteConfirmDialog
             dialog = PasteConfirmDialog(text, self)
             try:

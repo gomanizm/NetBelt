@@ -237,11 +237,21 @@ class ToolsMenuDrivesTheSessionTest(unittest.TestCase):
             self.app.processEvents()
             time.sleep(0.01)
 
-    def _connected_window(self):
+    def _connected_window(self, macros=()):
         from ui.main_window import MainWindow
-        with mock.patch.object(MainWindow, "_check_for_updates_on_startup"):
+        from core.config_manager import ConfigManager
+        # 設定は一時フォルダに置く。既定の ConfigManager は作業フォルダの
+        # config.json を読み書きするので、マクロの登録が手元の設定に残る
+        d = tempfile.mkdtemp(prefix="netbelt-tools-config-")
+        with mock.patch("ui.main_window.ConfigManager") as fake, \
+                mock.patch.object(MainWindow, "_check_for_updates_on_startup"):
+            fake.return_value = ConfigManager(
+                config_path=os.path.join(d, "config.json"))
             window = MainWindow()
         self.addCleanup(window.close)
+        for name, commands, description in macros:
+            self.assertTrue(window.config_manager.add_global_macro(
+                name, commands, description), "前提: マクロを登録できた")
         device = {"name": "dev", "host": "192.0.2.10", "port": 22,
                   "username": "u", "password": "", "protocol": "ssh"}
         window.device_tree.load_from_config([{"name": "Lab", "devices": [device]}])
@@ -282,6 +292,18 @@ class ToolsMenuDrivesTheSessionTest(unittest.TestCase):
         _open_device_menu(window.device_tree, item,
                           choose=["ツール", "キープアライブ停止"])
         self.assertFalse(window.macro_manager.is_keepalive_active("dev"))
+
+    def test_running_a_macro_from_the_device_list_sends_it(self):
+        """「ツール → マクロ実行」で選んだマクロが、その機器へ送られること。"""
+        window, terminal, conn, item = self._connected_window(
+            macros=[("show-clock", ["show clock"], "時刻")])
+
+        _open_device_menu(window.device_tree, item,
+                          choose=["ツール", "マクロ実行", "show-clock - 時刻"])
+        self._pump(0.3)
+
+        self.assertEqual(conn.sent[:1], ["show clock\r"],
+                         "選んだマクロが送られていない: %r" % conn.sent)
 
     def test_tools_turn_grey_while_waiting_to_reconnect(self):
         """切断されて再接続待ちになったら、「ツール」は灰色になること。"""

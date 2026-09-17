@@ -115,6 +115,51 @@ class TerminalRightClickPasteTest(unittest.TestCase):
         self.assertEqual(len(self.dialogs), 1)
         self.assertEqual(self.sent, [])
 
+    def test_a_carriage_return_alone_is_a_line_break_too(self):
+        """CR だけの改行（Mac の古い形式や機器の出力のコピー）でも確かめること。"""
+        w, terminal = self._terminal()
+
+        self._right_click(terminal, "reload\r")
+
+        self.assertEqual(len(self.dialogs), 1)
+        self.assertEqual(self.sent, [])
+
+    def test_control_characters_are_confirmed_too(self):
+        """改行が無くても、制御文字（Ctrl+Z など）を含めば確かめること。
+
+        IOS の設定モードで Ctrl+Z は入力中の行を実行して抜ける。改行が無いから
+        実行されない、という前提が成り立たない（検査役の指摘）。
+        """
+        w, terminal = self._terminal()
+
+        self._right_click(terminal, "shutdown\x1a")
+
+        self.assertEqual(len(self.dialogs), 1, "制御文字入りを確かめずに送った")
+        self.assertEqual(self.sent, [])
+
+    def test_a_tab_in_one_line_is_sent_without_asking(self):
+        """タブ（補完に使うだけで実行はしない）だけなら、そのまま送ること。"""
+        w, terminal = self._terminal()
+
+        self._right_click(terminal, "show\tclock")
+
+        self.assertEqual(self.dialogs, [])
+        self.assertEqual("".join(self.sent), "show\tclock")
+
+    def test_the_cancel_button_has_the_focus(self):
+        """開いた時点のフォーカスはキャンセルにあること（Space の押し癖で送らない）。"""
+        from ui.dialogs.paste_confirm_dialog import PasteConfirmDialog
+        dialog = PasteConfirmDialog("conf t\nhostname R1\n")
+        self.addCleanup(dialog.deleteLater)
+        dialog.show()
+        self.app.processEvents()
+        try:
+            focused = dialog.focusWidget()
+            self.assertIsNotNone(focused, "フォーカスの行き先が無い")
+            self.assertEqual(getattr(focused, "text", lambda: None)(), "キャンセル")
+        finally:
+            dialog.hide()
+
     def test_nothing_happens_when_the_tab_cannot_send(self):
         """未接続・再接続待ちでは、確認も送信もしないこと。"""
         for label, kwargs in (("未接続", {"connected": False}),
@@ -135,6 +180,75 @@ class TerminalRightClickPasteTest(unittest.TestCase):
         self.assertEqual(self.sent, [])
         self.assertEqual(self.dialogs, [])
         self.assertEqual(self.menus, [])
+
+
+class RightClickWithALeftoverSelectionTest(unittest.TestCase):
+    """端末に選択範囲が残ったまま右クリックしても、クリップボードの中身を貼ること。
+
+    Windows では右クリックのメニュー事象がボタンを離したときに出る。離したとき
+    の mouseReleaseEvent が、左ボタンに限らず選択範囲をコピーしていたので、
+    「解放でコピー → 貼り付け」の順になり、他のアプリでコピーした内容ではなく
+    端末に残っていた選択範囲が機器へ送られていた（検査役が確認）。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PyQt6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_the_clipboard_is_pasted_not_the_leftover_selection(self):
+        from PyQt6.QtCore import QEvent, QPoint, QPointF, Qt
+        from PyQt6.QtGui import QContextMenuEvent, QMouseEvent, QTextCursor
+        from PyQt6.QtTest import QTest
+        from PyQt6.QtWidgets import QApplication
+        from ui.terminal_widget import TerminalWidget
+        w = TerminalWidget()
+        self.addCleanup(w.close)
+        w.resize(900, 500)
+        w.show()
+        terminal = w.create_terminal_tab("dev")
+        terminal.set_input_enabled(True)
+        w.append_output("dev", "Router#show run | i hostname\r\nhostname R1\r\nRouter#")
+        self.app.processEvents()
+        sent = []
+        terminal.key_pressed.connect(sent.append)
+        viewport = terminal.viewport()
+
+        def point(row, col):
+            cursor = QTextCursor(terminal.document().findBlockByNumber(row))
+            cursor.setPosition(cursor.position() + col)
+            rect = terminal.cursorRect(cursor)
+            return QPoint(rect.left() + 2, rect.center().y())
+
+        # 端末で 2 行目を選ぶ（その時点でクリップボードに入る）
+        start, end = point(1, 0), point(1, 11)
+        QTest.mousePress(viewport, Qt.MouseButton.LeftButton,
+                         Qt.KeyboardModifier.NoModifier, start)
+        QApplication.sendEvent(viewport, QMouseEvent(
+            QEvent.Type.MouseMove, QPointF(end), QPointF(viewport.mapToGlobal(end)),
+            Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier))
+        QTest.mouseRelease(viewport, Qt.MouseButton.LeftButton,
+                           Qt.KeyboardModifier.NoModifier, end)
+        self.assertEqual(terminal.textCursor().selectedText(), "hostname R1",
+                         "前提: 範囲を選んでいる")
+
+        # 他のアプリでコピーしてから、選択が残ったままの端末を右クリックする
+        QApplication.clipboard().setText("interface Gi1/0/2")
+        where = point(2, 3)
+        QTest.mousePress(viewport, Qt.MouseButton.RightButton,
+                         Qt.KeyboardModifier.NoModifier, where)
+        QTest.mouseRelease(viewport, Qt.MouseButton.RightButton,
+                           Qt.KeyboardModifier.NoModifier, where)
+        terminal.contextMenuEvent(QContextMenuEvent(
+            QContextMenuEvent.Reason.Mouse, where))
+        self.app.processEvents()
+
+        self.assertEqual("".join(sent), "interface Gi1/0/2",
+                         "クリップボードではなく、残っていた選択範囲を送った")
+        self.assertEqual(QApplication.clipboard().text(), "interface Gi1/0/2",
+                         "右クリックでクリップボードを書き換えた")
 
 
 if __name__ == "__main__":
