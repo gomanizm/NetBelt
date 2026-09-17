@@ -12,6 +12,13 @@ from ui import theme
 
 class TFTPServerPanel(QWidget):
     """TFTPサーバー制御パネル"""
+
+    # TFTP は認証が無く、存在しないファイルへの RRQ だけでもログと履歴が
+    # 1行ずつ増える。上限が無いと遠隔から叩き続けるだけでメモリを食い潰せる。
+    # 行数は Syslog パネル（1000件）に合わせた。
+    MAX_LOG_LINES = 1000
+    MAX_HISTORY_ROWS = 1000
+
     def __init__(self, parent=None, config_manager=None):
         """初期化。config_managerがNoneの場合は新規のConfigManagerを生成する。"""
         super().__init__(parent)
@@ -52,10 +59,10 @@ class TFTPServerPanel(QWidget):
         self.root_dir_edit = QLineEdit()
         self.root_dir_edit.setText("./tftp_root")
         root_layout.addWidget(self.root_dir_edit)
-        browse_btn = QPushButton("参照")
-        browse_btn.clicked.connect(self._on_browse_directory)
-        browse_btn.setMaximumWidth(60)
-        root_layout.addWidget(browse_btn)
+        self.browse_btn = QPushButton("参照")
+        self.browse_btn.clicked.connect(self._on_browse_directory)
+        self.browse_btn.setMaximumWidth(60)
+        root_layout.addWidget(self.browse_btn)
         settings_layout.addLayout(root_layout, 1, 1)
         settings_layout.addWidget(QLabel("転送許可:"), 2, 0)
         allow_layout = QHBoxLayout()
@@ -68,8 +75,11 @@ class TFTPServerPanel(QWidget):
         settings_layout.addLayout(allow_layout, 2, 1)
         settings_group.setLayout(settings_layout)
         layout.addWidget(settings_group)
-        # 起動中に無効化する入力群
-        self._inputs = [self.port_spin, self.root_dir_edit, self.allow_upload_check, self.allow_download_check]
+        # 起動中に無効化する入力群。参照ボタンも含める。欄だけ無効にしても
+        # setText() は効くので、起動中に参照を押すと画面のルートだけが変わり、
+        # 実際に公開しているルートと食い違う
+        self._inputs = [self.port_spin, self.root_dir_edit, self.browse_btn,
+                        self.allow_upload_check, self.allow_download_check]
         # 制御ボタン
         button_layout = QHBoxLayout()
         self.start_btn = QPushButton("▶ サーバー起動")
@@ -116,6 +126,8 @@ class TFTPServerPanel(QWidget):
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
         self.log_text.setMaximumHeight(150)
+        # 行数の上限。超えた分は Qt が先頭ブロックから捨てる
+        self.log_text.document().setMaximumBlockCount(self.MAX_LOG_LINES)
         self.log_text.setStyleSheet("font-family: Consolas, monospace; font-size: 9pt;")
         log_layout.addWidget(self.log_text)
         clear_log_btn = QPushButton("ログをクリア")
@@ -222,6 +234,7 @@ class TFTPServerPanel(QWidget):
                 self._fmt_bytes(total) if total else "—", "—", status]
         for c, v in enumerate(vals): self.history.setItem(row, c, QTableWidgetItem(v))
         self._active[key] = {"t0": self._time.time(), "total": total, "row": row}
+        self._trim_history()
         self._add_log("[%s] %s 転送開始: %s" % (ip, "取得" if direction == "download" else "受信", filename))
 
     def _on_tx_progress(self, ip, filename, done, total, direction):
@@ -251,7 +264,26 @@ class TFTPServerPanel(QWidget):
                     self._fmt_bytes(done), "—", "完了"]
             for c, v in enumerate(vals):
                 self.history.setItem(row, c, QTableWidgetItem(v))
+            self._trim_history()
         self._add_log("[%s] 転送完了: %s (%s)" % (ip, filename, self._fmt_bytes(done)))
+
+    def _trim_history(self):
+        """転送履歴の行数を上限まで切り詰める（古い行から捨てる）。
+
+        行を捨てると残りの行番号が前へずれるので、進行中の転送が覚えている
+        行番号も同じだけ繰り上げる。ずらさないと、その転送の進捗が別の
+        転送の行を上書きしてしまう。捨てられた行を指していた転送は追跡を
+        やめる（完了時にその場で新しい行を作る）。
+        """
+        excess = self.history.rowCount() - self.MAX_HISTORY_ROWS
+        if excess <= 0:
+            return
+        for _ in range(excess):
+            self.history.removeRow(0)
+        for key in [k for k, st in self._active.items() if st["row"] < excess]:
+            del self._active[key]
+        for st in self._active.values():
+            st["row"] -= excess
 
     def _on_transfer_interrupted(self, ip: str, filename: str, direction: str):
         """利用者が止めたことによる中断。エラーではないので行だけ確定させる。
@@ -295,8 +327,9 @@ class TFTPServerPanel(QWidget):
     def _on_fw_allow(self):
         """手動でファイアウォール受信許可を追加（管理者昇格）。3CDaemon方式で通らない環境の復旧用。"""
         self._add_log("ファイアウォール許可を実行します（管理者昇格）...")
-        ok, _msg = self.tftp_server.fix_firewall(self.port_spin.value())
-        self._add_log("ファイアウォール許可: %s" % ("完了" if ok else "未反映/失敗"))
+        ok, msg = self.tftp_server.fix_firewall(self.port_spin.value())
+        # 「反映待ち」等の理由を潰さず、そのまま見せる
+        self._add_log("ファイアウォール許可: %s (%s)" % ("完了" if ok else "未反映/失敗", msg))
 
     def _add_log(self, message: str):
         """ログにメッセージを追加(自動スクロール付き)"""

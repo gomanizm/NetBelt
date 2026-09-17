@@ -13,7 +13,11 @@ from ui import theme
 
 class SFTPServerPanel(QWidget):
     """SFTPサーバー制御パネル"""
-    
+
+    # 認証前の接続でもログは増える。上限が無いと遠隔から叩き続けるだけで
+    # メモリを食い潰せるため、頭打ちにする。Syslog パネル（1000件）に合わせた。
+    MAX_LOG_LINES = 1000
+
     def __init__(self, parent=None):
         """
         初期化
@@ -64,10 +68,10 @@ class SFTPServerPanel(QWidget):
         self.root_dir_edit = QLineEdit()
         self.root_dir_edit.setText("./sftp_root")
         root_layout.addWidget(self.root_dir_edit)
-        browse_btn = QPushButton("参照")
-        browse_btn.clicked.connect(self._on_browse_directory)
-        browse_btn.setMaximumWidth(60)
-        root_layout.addWidget(browse_btn)
+        self.browse_btn = QPushButton("参照")
+        self.browse_btn.clicked.connect(self._on_browse_directory)
+        self.browse_btn.setMaximumWidth(60)
+        root_layout.addWidget(self.browse_btn)
         settings_layout.addLayout(root_layout, 1, 1)
         
         # ユーザー名
@@ -133,6 +137,8 @@ class SFTPServerPanel(QWidget):
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
         self.log_text.setMaximumHeight(150)
+        # 行数の上限。超えた分は Qt が先頭ブロックから捨てる
+        self.log_text.document().setMaximumBlockCount(self.MAX_LOG_LINES)
         self.log_text.setStyleSheet("font-family: Consolas, monospace; font-size: 9pt;")
         log_layout.addWidget(self.log_text)
         
@@ -182,7 +188,10 @@ class SFTPServerPanel(QWidget):
         port = self.port_spin.value()
         root_dir = self.root_dir_edit.text().strip()
         username = self.username_edit.text().strip()
-        password = self.password_edit.text().strip()
+        # パスワードは入力そのままを使う。前後の空白も資格情報の一部で、
+        # 削ると画面に見えている文字列ではログインできない。
+        # 未入力かどうかの判定だけ strip() で行う。
+        password = self.password_edit.text()
         
         # 入力検証
         if not root_dir:
@@ -193,7 +202,7 @@ class SFTPServerPanel(QWidget):
             QMessageBox.warning(self, "入力エラー", "ユーザー名を入力してください。")
             return
         
-        if not password:
+        if not password.strip():
             QMessageBox.warning(self, "入力エラー", "パスワードを入力してください。")
             return
         
@@ -209,6 +218,9 @@ class SFTPServerPanel(QWidget):
         self.stop_btn.setVisible(True)
         self.port_spin.setEnabled(False)
         self.root_dir_edit.setEnabled(False)
+        # 参照も止める。欄だけ無効にしても setText() は効くので、起動中に
+        # 参照を押すと画面のルートだけが変わり、実公開ルートと食い違う
+        self.browse_btn.setEnabled(False)
         self.username_edit.setEnabled(False)
         self.password_edit.setEnabled(False)
     
@@ -221,6 +233,7 @@ class SFTPServerPanel(QWidget):
         self.stop_btn.setVisible(False)
         self.port_spin.setEnabled(True)
         self.root_dir_edit.setEnabled(True)
+        self.browse_btn.setEnabled(True)
         self.username_edit.setEnabled(True)
         self.password_edit.setEnabled(True)
     
@@ -270,8 +283,9 @@ class SFTPServerPanel(QWidget):
         Windows の初回プロンプトを拒否した等で通らない環境はここで直す。
         """
         self._add_log("ファイアウォール許可を実行します（管理者昇格）...")
-        ok, _msg = self.sftp_server.fix_firewall(self.port_spin.value())
-        self._add_log("ファイアウォール許可: %s" % ("完了" if ok else "未反映/失敗"))
+        ok, msg = self.sftp_server.fix_firewall(self.port_spin.value())
+        # 「反映待ち」等の理由を潰さず、そのまま見せる
+        self._add_log("ファイアウォール許可: %s (%s)" % ("完了" if ok else "未反映/失敗", msg))
 
     def _add_log(self, message: str):
         """ログにメッセージを追加"""

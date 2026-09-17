@@ -3,8 +3,11 @@
 """
 
 import os
+import sys
 import json
+import shutil
 import tempfile
+import threading
 import requests
 from typing import Optional, Dict, Callable
 from datetime import datetime
@@ -60,6 +63,66 @@ def updater_command(updater_path: str, zip_path: str, app_path: str) -> str:
     return '"{}" "{}" "{}"'.format(updater_path, zip_path, app_path)
 
 
+# ソース実行で更新を当てようとしたときに出す案内。
+# 配布 ZIP はビルド済みの exe 一式で、展開先はリポジトリ直下になる。
+SOURCE_RUN_MESSAGE = (
+    "ソースから実行しているため、更新を自動で適用できません。\n\n"
+    "配布物の ZIP はビルド済みの NetBelt.exe 一式で、展開先は\n"
+    "このリポジトリの直下になります。追跡しているファイルが\n"
+    "上書きされ、再起動も Python 本体が開くだけになります。\n\n"
+    "git pull で更新するか、README の手順で ZIP を別のフォルダへ\n"
+    "手で展開してください。")
+
+
+def running_from_source() -> bool:
+    """ソースから動いているか（凍結された exe でないか）を返す。"""
+    return not getattr(sys, 'frozen', False)
+
+
+def updater_env() -> dict:
+    """updater.bat へ渡す環境変数を組み立てる
+
+    onefile の exe から更新すると、updater.bat 経由で起動し直すのは
+    同じパスの exe になる。PyInstaller のブートローダは _PYI_ARCHIVE_FILE が
+    自分と同じなら「同一アプリの子プロセス」と見なし、親が終了時に消した
+    _MEIxxxx から python DLL を読もうとする。実測では Python が一度も
+    起動しないまま `Failed to load Python DLL` で落ちた。ブートローダ段階の
+    失敗なので、ログにも excepthook にも何も残らない。
+
+    PYINSTALLER_RESET_ENVIRONMENT=1 を立てると、子は _PYI_* を引き継がず
+    自分用の _MEI を展開し直す。ソース実行では何の影響も無い。
+    """
+    env = dict(os.environ)
+    env['PYINSTALLER_RESET_ENVIRONMENT'] = '1'
+    return env
+
+
+def sanitized_token(token: Optional[str]) -> Optional[str]:
+    """設定された GitHub トークンを、ヘッダへ載せられる形へ整える。
+
+    前後の空白は取り除き、制御文字（CR/LF を含む）が残るものは捨てる。
+    requests のヘッダ検証は、値が壊れているとヘッダ値そのもの
+    （= `token <トークン>`）を例外文へ埋める。凍結ビルドの stdout は
+    %LOCALAPPDATA%\\NetBelt\\logs\\ へ恒久的に退避されるので、その例外を
+    そのまま記録するとトークンが平文でディスクに残る。載せなければ、
+    その例外自体が起きない。
+
+    Returns:
+        使えるトークン、または None（未設定・壊れている）
+    """
+    if not token:
+        return None
+    cleaned = token.strip()
+    if not cleaned:
+        return None
+    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in cleaned):
+        # 値そのものは出さない。含まれていること自体を伝えるに留める。
+        print("[VersionManager] GitHub トークンに使えない文字が含まれるため、"
+              "認証なしで続けます")
+        return None
+    return cleaned
+
+
 class VersionManager:
     """バージョン管理とアップデート機能を提供するクラス"""
     
@@ -80,10 +143,36 @@ class VersionManager:
         Args:
             github_token: GitHub Personal Access Token（プライベートリポジトリの場合必須）
         """
-        self.github_token = github_token
-        # 更新用ディレクトリを作成
-        os.makedirs(self.UPDATE_DIR, exist_ok=True)
-    
+        self.github_token = sanitized_token(github_token)
+        # 受信中の応答。中止の要求が来たら、これを閉じて読み取りを打ち切る
+        self._response = None
+        # 更新用ディレクトリを作成。
+        # ここで例外を外へ出さない。起動時の未適用更新チェックは同期で
+        # VersionManager を作るだけなので、%TEMP%\NetBeltUpdates が通常
+        # ファイルになっている／%TEMP% に作成権限が無いといった異常で、
+        # 更新機能ではなくアプリ全体が起動できなくなっていた。
+        # 作れなかった場合は更新が使えないだけに留め、記録して続ける。
+        try:
+            os.makedirs(self.UPDATE_DIR, exist_ok=True)
+        except Exception as e:
+            print(f"[VersionManager] 更新用フォルダを用意できません（更新は使えません）: {e}")
+
+    def _redact(self, text) -> str:
+        """外へ出す文字列から、トークンの値を伏せる。
+
+        例外文はトークンを生のままでも、repr を通した形（改行が `\\n` の
+        2文字になる）でも持ちうる。どちらの形も伏字にしてから
+        print と error へ渡す。
+        """
+        text = str(text)
+        token = self.github_token
+        if not token:
+            return text
+        for form in (token, repr(token)[1:-1]):
+            if form:
+                text = text.replace(form, '***')
+        return text
+
     @staticmethod
     def compare_versions(version1: str, version2: str) -> int:
         """
@@ -228,12 +317,31 @@ class VersionManager:
             download_name = None
             assets = data.get('assets', [])
             
+            # CI が付ける配布物の名前。同じリリースに windows を名前に
+            # 含む別の ZIP が並ぶと、先頭から拾う版はそちらを掴む。
+            # その ZIP 専用の .sha256 まで揃っていれば照合も通ってしまい、
+            # 利用者は本体でないものを「更新」として入れることになる。
+            wanted_zip = f'{APP_NAME}-v{latest_version}-Windows-Portable.zip'.lower()
             for asset in assets:
-                name = asset.get('name', '').lower()
-                if 'windows' in name and name.endswith('.zip'):
+                if asset.get('name', '').lower() == wanted_zip:
                     download_url = asset.get('url')  # APIのURLを使用（プライベートリポジトリ対応）
                     download_name = asset.get('name', '')
                     break
+
+            # 正規名の資産が無いリリースを黙って切り捨てないための保険。
+            # build-release.yml はこれまでの全リビジョンで上の正規名だけを
+            # 作っており、「昔の命名」のリリースは存在しない。ここへ落ちるのは
+            # 正規の資産が欠けたリリースだけで、そのときは windows を名前に
+            # 含む最初の .zip という弱い選び方に戻る。本体でない ZIP を
+            # 掴んだ場合は、実行ファイルが無いことに updater.bat が気づいて
+            # exit 1 で止める。
+            if not download_url:
+                for asset in assets:
+                    name = asset.get('name', '').lower()
+                    if 'windows' in name and name.endswith('.zip'):
+                        download_url = asset.get('url')
+                        download_name = asset.get('name', '')
+                        break
             
             # Windows 向けの ZIP が無ければ何も選ばない。以前は「最初の ZIP」へ
             # 落ちていたが、実行可能物でない ZIP を掴む余地を残すだけで、
@@ -262,12 +370,63 @@ class VersionManager:
         except requests.exceptions.RequestException as e:
             # None を返すと呼び出し側が「更新なし」と区別できず、
             # 通信が壊れていても『最新です』と表示されてしまう。
-            print(f"[VersionManager] 更新チェックエラー: {e}")
-            return {'available': False, 'error': f"更新の確認に失敗しました: {e}"}
+            # 例外文にはヘッダ値（＝トークン）が混ざりうるので伏せてから出す
+            detail = self._redact(e)
+            print(f"[VersionManager] 更新チェックエラー: {detail}")
+            return {'available': False, 'error': f"更新の確認に失敗しました: {detail}"}
         except Exception as e:
-            print(f"[VersionManager] 予期しないエラー: {e}")
-            return {'available': False, 'error': f"更新の確認に失敗しました: {e}"}
+            detail = self._redact(e)
+            print(f"[VersionManager] 予期しないエラー: {detail}")
+            return {'available': False, 'error': f"更新の確認に失敗しました: {detail}"}
     
+    def abort(self) -> None:
+        """受信中の応答を閉じ、読み取りを直ちに終わらせる。
+
+        中止の判定はチャンクの区切りでしか行えないので、相手が黙り込むと
+        読み取りのタイムアウト（60秒）まで戻ってこない。その間スレッドが
+        残り続けるため、ソケット側から打ち切る。別のスレッドから呼ばれる。
+
+        閉じる操作自体は別スレッドへ逃がす。requests の Response.close() は
+        下の読み取りが片付くまで戻らないため、呼び出し元（GUI スレッド）で
+        待つと、打ち切るはずの60秒ぶんそのまま固まってしまう。
+        """
+        response = self._response
+        if response is None:
+            return
+
+        def _close():
+            try:
+                response.close()
+            except Exception as e:
+                print(f"[VersionManager] 受信の中断に失敗: {e}")
+
+        threading.Thread(target=_close, daemon=True,
+                         name="netbelt-update-abort").start()
+
+    @staticmethod
+    def _safe_name_part(text) -> str:
+        """ファイル名に使える文字だけを残す（版はリリースのタグ由来）。"""
+        return ''.join(c for c in str(text)
+                       if c.isalnum() or c in ('.', '_', '-'))
+
+    @classmethod
+    def _download_filename(cls, url: str, version: Optional[str] = None) -> str:
+        """ダウンロード先のファイル名を決める。
+
+        GitHub の asset は API 形式の URL（末尾は asset の番号）で取るため、
+        basename からはファイル名が分からず、どの版も同じ
+        NetBelt-update.zip を共有していた。後から来たダウンロードが、
+        別の版を表示しているダイアログの ZIP を静かに置き換えられる。
+        版が分かっているときは版ごとに分ける。
+        """
+        safe = cls._safe_name_part(version) if version else ''
+        if safe:
+            return f"{APP_NAME}-{safe}.zip"
+        filename = os.path.basename(url)
+        if not filename.endswith('.zip'):
+            filename = f"{APP_NAME}-update.zip"
+        return filename
+
     @staticmethod
     def _discard(path: str) -> None:
         """検証に失敗したダウンロードを残さない。"""
@@ -306,7 +465,7 @@ class VersionManager:
             value = first[0].strip().lower()
             return value if len(value) == 64 else None
         except Exception as e:
-            print(f"[VersionManager] チェックサム取得エラー: {e}")
+            print(f"[VersionManager] チェックサム取得エラー: {self._redact(e)}")
             return None
 
     def download_update(
@@ -331,10 +490,8 @@ class VersionManager:
         # 受信中に例外が出ても書きかけを残さないよう、外側でも掴んでおく
         part_path = None
         try:
-            # ファイル名を生成
-            filename = os.path.basename(url)
-            if not filename.endswith('.zip'):
-                filename = f"{APP_NAME}-update.zip"
+            # ファイル名を生成（版ごとに分ける）
+            filename = self._download_filename(url, version)
             
             zip_path = os.path.join(self.UPDATE_DIR, filename)
             
@@ -354,6 +511,7 @@ class VersionManager:
             
             # ダウンロード（リダイレクトに従う）
             response = requests.get(url, headers=headers, stream=True, timeout=60, allow_redirects=True)
+            self._response = response
             
             print(f"[VersionManager] レスポンスステータス: {response.status_code}")
             
@@ -364,7 +522,10 @@ class VersionManager:
             
             # 検証を通るまでは .part 名で書く。最終名(.zip)で書くと、中断した
             # 未検証ファイルが「未適用の更新」として拾われ、検証なしで適用できる。
-            part_path = zip_path + '.part'
+            # 名前はダウンロードごとに変える。共有していたときは、同時に
+            # 受信した2つが同じ .part を奪い合って両方とも失敗していた。
+            part_path = '%s.%d-%d.part' % (zip_path, os.getpid(),
+                                           threading.get_ident())
             self._discard(part_path)
             with open(part_path, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=8192):
@@ -401,34 +562,81 @@ class VersionManager:
                 return None
             print("[VersionManager] チェックサム照合 OK")
 
-            # 検証を通ったものだけを最終名にする。あわせて検証済みの証として
-            # ハッシュを傍らに残し、適用時にもう一度確かめられるようにする。
-            self._discard(zip_path)
-            os.replace(part_path, zip_path)
+            # 受信し終わっても、チェックサムの取得（別の要求。応答が遅いと
+            # 最大30秒）と照合が残る。ここを見ていなかったため、その間に
+            # 中止しても最終名の ZIP と検証記録がそのまま公開され、次回起動時に
+            # 「未適用の更新」として提示されていた。abort() が閉じられるのは
+            # 本体側の応答だけで、この窓は短くならない。
+            if cancel_check is not None and cancel_check():
+                print("[VersionManager] ダウンロードを中止しました")
+                self._discard(part_path)
+                return None
+
+            # 検証済みの証（ハッシュと版）は、最終名にする前に .part の傍らへ
+            # 書く。最終名にしてから書いていたときは、控えの書き込みが失敗しても
+            # zip_path をそのまま返していた。画面は「ダウンロード完了！」まで
+            # 進むのに、適用は is_verified_update が False で必ず拒否される。
+            # 同じ版を取り直した場合はさらに悪く、適用できていた検証済み ZIP を
+            # 先に上書きしてから控えの更新に失敗するため、使えていた更新まで
+            # 巻き添えで壊れた。版の控えは失敗を握り潰していたので、痕跡も
+            # 残らなかった（控えが無いと、次回起動時に「これは今より新しいか」を
+            # 判断できず適用を勧められない）。
+            sha_part = part_path + '.sha256'
+            ver_part = part_path + '.version'
             try:
-                # 版も控える。控えないと、次回起動時に「これは今より新しいか」を
-                # 判断できず、古い ZIP の適用を勧めてしまう。
-                if version:
-                    try:
-                        with open(zip_path + '.version', 'w', encoding='ascii') as vf:
-                            vf.write(str(version))
-                    except Exception:
-                        pass
-                with open(zip_path + '.sha256', 'w', encoding='ascii') as f:
+                with open(sha_part, 'w', encoding='ascii') as f:
                     f.write(actual.lower())
+                if version:
+                    with open(ver_part, 'w', encoding='ascii') as vf:
+                        vf.write(str(version))
             except Exception as e:
                 print(f"[VersionManager] チェックサムの控えを書けませんでした: {e}")
+                self._discard(sha_part)
+                self._discard(ver_part)
+                self._discard(part_path)
+                return None
+
+            # 最終名にする直前にも中止を見る。控えを書いている間に押された
+            # 中止を取りこぼすと、やはり検証済みの更新として公開されてしまう。
+            if cancel_check is not None and cancel_check():
+                print("[VersionManager] ダウンロードを中止しました")
+                self._discard(sha_part)
+                self._discard(ver_part)
+                self._discard(part_path)
+                return None
+
+            # 3つそろって初めて最終名にする。
+            # os.replace は宛先があっても置き換えるので、先に消さない。
+            # 消してから改名していたときは、その隙に別の受信が失敗すると
+            # 検証済みだった ZIP まで失われた。
+            try:
+                os.replace(part_path, zip_path)
+                os.replace(sha_part, zip_path + '.sha256')
+                if version:
+                    os.replace(ver_part, zip_path + '.version')
+            except Exception as e:
+                # 途中で失敗すると ZIP と控えが食い違う。中途半端な組は
+                # 「未適用の更新」として毎回弾かれ続けるだけなので残さない。
+                print(f"[VersionManager] 更新ファイルを確定できませんでした: {e}")
+                for leftover in (part_path, sha_part, ver_part, zip_path,
+                                 zip_path + '.sha256', zip_path + '.version'):
+                    self._discard(leftover)
+                return None
 
             return zip_path
         
         except Exception as e:
-            print(f"[VersionManager] ダウンロードエラー: {e}")
+            print(f"[VersionManager] ダウンロードエラー: {self._redact(e)}")
             # 受信中に切れた場合、ここまでは書きかけが残ったままだった。
             # get_pending_update_files は .zip しか拾わないので掃除にも
             # かからず、利用者が再試行しない限り temp に居座り続ける。
+            # 書きかけの控え（.part.sha256 / .part.version）も同じ扱い。
             if part_path:
-                self._discard(part_path)
+                for suffix in ('', '.sha256', '.version'):
+                    self._discard(part_path + suffix)
             return None
+        finally:
+            self._response = None
     
     @staticmethod
     def pending_version(zip_path: str) -> Optional[str]:
@@ -458,6 +666,102 @@ class VersionManager:
         except Exception as e:
             print(f"[VersionManager] 検証記録の確認に失敗: {e}")
             return False
+
+    def verify_before_apply(self, zip_path: str,
+                            expected_version: Optional[str] = None) -> Optional[str]:
+        """updater を起動する直前に、更新ファイルをもう一度確かめる
+
+        候補を選んだ時点と、利用者が確認ダイアログを閉じた時点の間には
+        間がある。その間に ZIP が消えたり、別の版へ差し替わったりしうる
+        （NetBelt を二重に起動しているときなど）。適用の直前にもう一度
+        見ないと、見せた内容と違うものがそのまま展開される。
+
+        更新ダイアログからの適用と、起動時の未適用更新の適用が同じ確認を
+        通るように、ここへまとめる。
+
+        Args:
+            zip_path: 適用しようとしている更新ファイル
+            expected_version: 利用者へ見せた版（省略時は版を確かめない）
+
+        Returns:
+            問題が無ければ None。あれば利用者へ見せる文言
+        """
+        if not zip_path or not os.path.exists(zip_path):
+            return "更新ファイルが見つかりません。"
+        if not self.is_verified_update(zip_path):
+            return ("ダウンロードした更新ファイルが、表示していた内容と\n"
+                    "一致しません。もう一度ダウンロードしてください。")
+        if expected_version and self.pending_version(zip_path) != expected_version:
+            return ("ダウンロードした更新ファイルが、表示していた内容と\n"
+                    "一致しません。もう一度ダウンロードしてください。")
+        return None
+
+    def stage_for_apply(self, zip_path: str,
+                        expected_version: Optional[str] = None):
+        """適用の直前に、あとから差し替えられない写しを用意する。
+
+        verify_before_apply が通ってから updater.bat が Expand-Archive で
+        開き直すまでには間がある（updater.bat は NetBelt が終わるのを待つ。
+        実測で約3.0〜3.5秒）。渡しているのはパス文字列だけで、写しもロックも
+        取っていなかったため、その間に同じ利用者の権限で動く別プロセスが
+        更新フォルダの「版ごとの決まった名前」の ZIP を別の有効な ZIP へ
+        置き換えると、.sha256 と一致しないバイト列がそのまま展開・
+        インストールされ、しかも「更新が完了しました」と表示された。
+
+        確かめたバイト列と展開されるバイト列を同じものにする。名前を
+        推測できない写しを作り、その写し自身をもう一度 verify_before_apply へ
+        かけ、通ったら写しのパスを updater.bat へ渡す。写している最中に
+        元が差し替えられた場合は、写しと控えが食い違うのでここで止まる。
+
+        残る制限: 写しの置き場は元と同じ更新フォルダで、そこへ書ける相手
+        （＝同じ利用者の権限で既にコードを実行できている相手）は、フォルダを
+        列挙すれば写しの名前も知れる。窓を完全に閉じるには、展開の直前に
+        updater.bat 側でも受け取った期待値とハッシュを突き合わせる必要が
+        あり、それは updater.bat 側で別に追う。
+
+        元の ZIP はここでは消さない（updater.bat が消すのは渡した写しの
+        ほう）。当たらなかったときに手元から失わせないためで、残ったぶんは
+        cleanup_old_updates が24時間で片付ける。
+
+        Args:
+            zip_path: 適用しようとしている更新ファイル
+            expected_version: 利用者へ見せた版（省略時は版を確かめない）
+
+        Returns:
+            (updater.bat へ渡すパス, 問題の文言)。
+            問題があれば (None, 文言)
+        """
+        problem = self.verify_before_apply(zip_path, expected_version)
+        if problem:
+            return None, problem
+
+        staged = None
+        try:
+            fd, staged = tempfile.mkstemp(
+                prefix='%s-apply-' % APP_NAME, suffix='.zip',
+                dir=os.path.dirname(os.path.abspath(zip_path)))
+            os.close(fd)
+            shutil.copyfile(zip_path, staged)
+            for suffix in ('.sha256', '.version'):
+                if os.path.exists(zip_path + suffix):
+                    shutil.copyfile(zip_path + suffix, staged + suffix)
+        except OSError as e:
+            print(f"[VersionManager] 更新ファイルの写しを作れませんでした: {e}")
+            if staged:
+                self._discard_staged(staged)
+            return None, ("更新の準備ができませんでした。\n"
+                          "空き容量を確かめて、もう一度お試しください。")
+
+        problem = self.verify_before_apply(staged, expected_version)
+        if problem:
+            self._discard_staged(staged)
+            return None, problem
+        return staged, None
+
+    def _discard_staged(self, staged: str) -> None:
+        """用意しかけた写しを、控えごと片付ける。"""
+        for suffix in ('', '.sha256', '.version'):
+            self._discard(staged + suffix)
 
     def get_pending_update_files(self) -> list:
         """

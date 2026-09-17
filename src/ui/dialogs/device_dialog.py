@@ -6,6 +6,8 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt
 from typing import Dict, List, Optional
+from core.config_manager import is_reserved_device_name
+from core.crypto import PasswordCrypto
 
 class DeviceDialog(QDialog):
     """機器追加/編集ダイアログ"""
@@ -171,6 +173,11 @@ class DeviceDialog(QDialog):
         self.ssh_key_btn.setEnabled(is_ssh)
         self.ssh_key_label.setEnabled(is_ssh)
 
+        # console はポート番号を使わない。欄を触れるままにしておくと、文字を
+        # 入れても _on_ok の検査（console は対象外）を通り、保存時の int() で
+        # 落ちる。値は消さない（保存済みの機器を開いただけで変えない）。
+        self.port_edit.setEnabled(protocol != "console")
+
         if protocol == "console":
             self.host_edit.setPlaceholderText("例: COM1 または /dev/ttyUSB0")
 
@@ -203,7 +210,17 @@ class DeviceDialog(QDialog):
         if not self.name_edit.text().strip():
             QMessageBox.warning(self, "入力エラー", "機器名を入力してください。")
             return
-        
+
+        # 予約語チェック（GroupDialog の「コンソール接続」と同じ扱い）。
+        # ホームタブはタブ名で見分けているので、同名の機器はタブを閉じられず
+        # ログ保存・記録・マクロ設定も断られる
+        if is_reserved_device_name(self.name_edit.text()):
+            QMessageBox.warning(
+                self, "入力エラー",
+                "「%s」はホームタブの名前と重なるため機器名に使えません。"
+                % self.name_edit.text().strip())
+            return
+
         if not self.host_edit.text().strip():
             QMessageBox.warning(self, "入力エラー", "ホストを入力してください。")
             return
@@ -226,15 +243,46 @@ class DeviceDialog(QDialog):
             except ValueError:
                 QMessageBox.warning(self, "入力エラー", "ポート番号は1-65535の範囲で入力してください。")
                 return
-        
+
+        # 保存側は "DPAPI:" のあとが base64 として妥当かでしか暗号文かを
+        # 見分けられない（core.crypto.is_encrypted）。"DPAPI:cisco123" の
+        # ような平文は「もう暗号化済み」と誤認され、config.json へ平文の
+        # まま書かれ、起動のたびに「復号できませんでした」も出る。別環境で
+        # 作られた暗号文を二重に暗号化しない契約があるので保存側では詰め
+        # られない。せめて黙って通さないことを、ここで担保する。
+        # 触っていない値（別環境の暗号文がそのまま入っている場合を含む）は
+        # 平文で保存されないので、変更されたときだけ問う。
+        password = self.password_edit.text()
+        if (password != self.device_data.get("password", "")
+                and PasswordCrypto().is_encrypted(password)):
+            answer = QMessageBox.question(
+                self, "パスワードの確認",
+                "このパスワードは暗号化済みの値と見分けがつかない形です。\n"
+                "このまま保存すると、設定ファイルに平文で書き出され、\n"
+                "起動のたびに「パスワードを復号できませんでした」と出ます。\n\n"
+                "このまま保存しますか？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+
         self.accept()
     
     def get_device_data(self) -> Dict:
         """入力された機器データを取得"""
-        port_text = self.port_edit.text()
-        port = int(port_text) if port_text else 0
-        
-        return {
+        # ssh/telnet は _on_ok で整数を確かめている。console は欄を無効に
+        # しているが、値が残っていることはあるので、ここでは決して落とさない
+        try:
+            port = int(self.port_edit.text().strip() or 0)
+        except ValueError:
+            port = 0
+
+        # 読み込んだ辞書を土台にして、このダイアログで編集できる項目だけを
+        # 上書きする。新しい辞書を組み直すと、ここに欄の無い項目
+        # （機器別マクロ、baudrate、将来足すキー）が OK を押しただけで消え、
+        # _on_device_edit がそのまま config に書き戻す。
+        data = dict(self.device_data)
+        data.update({
             "name": self.name_edit.text().strip(),
             "host": self.host_edit.text().strip(),
             "port": port,
@@ -242,8 +290,9 @@ class DeviceDialog(QDialog):
             "username": self.username_edit.text().strip(),
             "password": self.password_edit.text(),
             "ssh_key": self.ssh_key_edit.text().strip(),
-            "macros": []  # TODO: マクロ機能実装後に対応
-        }
+        })
+        data.setdefault("macros", [])  # TODO: マクロ機能実装後に対応
+        return data
     
     def get_selected_group(self) -> str:
         """選択されたグループ名を取得"""

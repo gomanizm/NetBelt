@@ -1,9 +1,53 @@
 """SSH接続管理"""
+import codecs
+import os
 import paramiko
+import tempfile
 import threading
 import time
+from pathlib import Path
 from typing import Callable, Optional
 from PyQt6.QtCore import QObject, pyqtSignal
+
+# known_hosts の保存を直列化する。同時に保存すると、あとから
+# os.replace した側が先の結果を丸ごと差し替えてしまう
+_known_hosts_save_lock = threading.Lock()
+
+
+def _save_known_hosts(client, known_hosts_path):
+    """client が持つホスト鍵を known_hosts へ書き戻す。
+
+    paramiko 4.0.0 の SSHClient.save_host_keys は保存先を "w" で開いて
+    先に切り詰めるため、書いている途中で落ちると保存済みの鍵をまとめて
+    失う。しかも保存前の再読込は load_host_keys 済みの client でしか
+    走らないので、known_hosts がまだ無い時点で始めた接続は、他の接続が
+    先に保存した鍵を上書きして消す。消された機器は次回また「未知」に
+    戻り、鍵が変わっていても確認なしで受け入れられる。
+
+    書く直前に既存のファイルを読み直して自分の鍵と合流させ、一時
+    ファイルへ書いてから os.replace で差し替える。差し替えは不可分な
+    ので、途中で落ちても前の known_hosts がそのまま残る。
+    """
+    path = Path(str(known_hosts_path))
+    with _known_hosts_save_lock:
+        if path.exists():
+            # 他の接続がこの間に保存した鍵を取り込む
+            client.load_host_keys(str(path))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # os.replace はドライブを跨げないので一時ファイルは同階層に作る
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+        os.close(fd)
+        try:
+            client.save_host_keys(tmp_path)
+            os.replace(tmp_path, str(path))
+            tmp_path = None      # 差し替え済み。後片付けの対象から外す
+        finally:
+            if tmp_path is not None:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
 
 
 class _TofuHostKeyPolicy(paramiko.MissingHostKeyPolicy):
@@ -17,9 +61,19 @@ class _TofuHostKeyPolicy(paramiko.MissingHostKeyPolicy):
     def missing_host_key(self, client, hostname, key):
         client.get_host_keys().add(hostname, key.get_name(), key)
         try:
-            client.save_host_keys(str(self._known_hosts_path))
-        except Exception:
-            pass
+            _save_known_hosts(client, self._known_hosts_path)
+        except Exception as e:
+            # 黙って続けると、次回もこの機器の鍵を検証できないまま任意の
+            # 鍵を受け入れる。接続は続けるが、そのことを画面に出す
+            on_save_error = getattr(self, "_on_save_error", None)
+            if on_save_error is not None:
+                on_save_error(
+                    "known_hosts を保存できません（%s）。次回、この機器の鍵を"
+                    "検証できません: %s" % (e, self._known_hosts_path))
+
+
+class HostKeyStoreError(Exception):
+    """既知ホスト鍵の保存場所を読めない。検証できない状態で認証へ進まない"""
 
 
 class SSHConnection(QObject):
@@ -58,20 +112,43 @@ class SSHConnection(QObject):
         self.term_cols = 80
         self.term_rows = 24
         self._read_thread: Optional[threading.Thread] = None
+        # 読み取りの停止と、接続中に後始末が走ったことを兼ねる印。
+        # connect() の入口で戻し、接続が成立したあとにもう一度見る
         self._stop_reading = False
+        # dispose() 済み（このオブジェクトは捨てられた）ことを覚えておく印。
+        # _stop_reading と違い connect() の入口で戻さないので、接続スレッドが
+        # 動き出す前に着地した dispose() でも消えない
+        self._disposed = False
     
     def _setup_host_keys(self, client):
         """既知ホスト鍵を読み込み、TOFUポリシーを設定する。
         既知ホストで鍵が変わった場合は接続時に BadHostKeyException となる。
         """
-        from .config_manager import app_data_dir
-        known_hosts_path = app_data_dir() / "known_hosts"
+        from . import config_manager
+        known_hosts_path = config_manager.app_data_dir() / "known_hosts"
+        # 旧 ~/.terminal-tool からの引き継ぎに失敗していたら、それを伏せない。
+        # 既知のはずの機器が「未知」に戻り、確認なしで受け入れられる
+        import_warning = config_manager.take_known_hosts_import_warning()
+        if import_warning:
+            self.output_received.emit(
+                "\r\n[NetBelt] 警告: %s\r\n" % import_warning)
         if known_hosts_path.exists():
             try:
                 client.load_host_keys(str(known_hosts_path))
-            except Exception:
-                pass
-        client.set_missing_host_key_policy(_TofuHostKeyPolicy(known_hosts_path))
+            except Exception as e:
+                # 握りつぶして TOFU にすると、既知の機器でも「未知」扱いになり、
+                # 鍵が変わっていても気づかずにパスワードを送る。検証できない
+                # 状態で認証へ進まない
+                raise HostKeyStoreError(
+                    "既知ホスト鍵 (known_hosts) を読めないため接続を中止しました: %s\n%s\n"
+                    "壊れた行が 1 つあるだけでも読めなくなります。該当行を修正または"
+                    "削除するか、ファイルを退避してから接続し直してください"
+                    "（退避すると全機器が初回接続の扱いになります）。"
+                    % (e, known_hosts_path))
+        policy = _TofuHostKeyPolicy(known_hosts_path)
+        policy._on_save_error = lambda message: self.output_received.emit(
+            "\r\n[NetBelt] 警告: %s\r\n" % message)
+        client.set_missing_host_key_policy(policy)
 
     def _auth_failure_message(self) -> str:
         """認証失敗の理由を、実際に使った手段に合わせて返す。
@@ -102,7 +179,7 @@ class SSHConnection(QObject):
     # 認証が通ったあとなので、機器側のログイン猶予も効かない。
     SHELL_TIMEOUT_SECONDS = 30
 
-    def _open_shell(self):
+    def _open_shell(self, client):
         """インタラクティブシェルを開く（上限まで待って開かなければ None）
 
         応答を返さない機器に当たると invoke_shell が無期限に止まり、
@@ -113,8 +190,10 @@ class SSHConnection(QObject):
         別スレッドで開かせ、上限を過ぎたら諦める。取り残されたスレッドは
         呼び出し側（_fail -> dispose）が接続を閉じた時点で例外になって
         終わる。daemon なのでアプリの終了も妨げない。
+
+        client は connect() が握っているローカル参照を受け取る。self.client を
+        見にいくと、待っている間に dispose() が走った場合に None になっている。
         """
-        client = self.client
         outcome = {}
 
         def open_it():
@@ -152,6 +231,23 @@ class SSHConnection(QObject):
         self.error_occurred.emit(message)
         return False
 
+    def _abandon(self, client, channel) -> bool:
+        """破棄済みの接続で成立してしまった分を閉じ、失敗として戻る。
+
+        利用者がタブを閉じただけなので error_occurred は出さない。ここで
+        内部例外の文面を出すと、閉じた覚えのない「接続エラー」に見える。
+        """
+        if channel is not None:
+            try:
+                channel.close()
+            except Exception:
+                pass
+        try:
+            client.close()
+        except Exception:
+            pass
+        return False
+
     def connect(self) -> bool:
         """
         SSH接続を開始
@@ -160,8 +256,22 @@ class SSHConnection(QObject):
             bool: 接続成功時True
         """
         try:
-            self.client = paramiko.SSHClient()
-            self._setup_host_keys(self.client)
+            if self._disposed:
+                # 接続スレッドが動き出す前にタブが閉じられ、dispose() が先に
+                # 走った。ここで印を無視して進むと、接続は最後まで成立する
+                # のに参照しているものが誰もいない状態になり、閉じる経路が
+                # 無いまま機器の vty 枠を掴んだままになる
+                return False
+
+            # 待っている間に dispose() が走ると self.client は None になる。
+            # 後始末は必ずこのローカル参照に対して行う
+            client = paramiko.SSHClient()
+            self.client = client
+            self._stop_reading = False
+            try:
+                self._setup_host_keys(client)
+            except HostKeyStoreError as e:
+                return self._fail(str(e))
             
             # 接続パラメータの準備
             connect_kwargs = {
@@ -221,23 +331,34 @@ class SSHConnection(QObject):
                 return self._fail("パスワードまたは秘密鍵が必要です")
             
             # SSH接続を実行
-            self.client.connect(**connect_kwargs)
+            client.connect(**connect_kwargs)
+
+            if self._stop_reading:
+                # 名前解決や TCP 接続を待っている間にタブが閉じられた。
+                # dispose() が呼んだ close() は Transport 登録前で何もして
+                # いないので、ここで閉じないと成立したセッションとスレッドが
+                # 残り、機器の vty 枠を掴んだままになる
+                return self._abandon(client, None)
             
             # インタラクティブシェルを開始 (RFC 4254 6.2 pty-req)
-            self.channel = self._open_shell()
-            if self.channel is None:
+            channel = self._open_shell(client)
+            if channel is None:
                 return self._fail(
                     "シェルを開けませんでした（%d 秒待って応答がありません）。\n"
                     "機器が混んでいる、exec 認可の応答を待っている、"
                     "vty が空いていない、などが考えられます。"
                     % self.SHELL_TIMEOUT_SECONDS)
-            self.channel.settimeout(0.1)
+            channel.settimeout(0.1)
             
+            if self._stop_reading:
+                # シェルを開いている間に閉じられた場合も同じ
+                return self._abandon(client, channel)
+
+            self.channel = channel
             self.is_connected = True
             self.connected.emit()
             
             # 読み取りスレッドを開始
-            self._stop_reading = False
             self._read_thread = threading.Thread(target=self._read_output, daemon=True)
             self._read_thread.start()
             
@@ -262,7 +383,18 @@ class SSHConnection(QObject):
         disconnected を出すと、いま処理中の切断処理が再入する。
         閉じずに参照だけ捨てると、Transport スレッド自身がオブジェクトを
         参照し続けるため GC でも回収されない。
+
+        これを呼んだあとの connect() は、何もせず False を返す。呼び出し元
+        （MainWindow._close_connection / _discard_stale）は dispose() の前に
+        接続辞書からこのオブジェクトを外しており、以後この接続を使う人は
+        いないため。同じオブジェクトで繋ぎ直す場合は disconnect() を使う。
+
+        残る制限: 接続スレッドが動き出す前の disconnect() は、繋ぎ直しの
+        ために印を消すので取り消しにならない。利用者が明示的に切断してから
+        タブを残す経路（MainWindow._on_disconnect_device）だけなので、この
+        場合は接続が成立しても同じオブジェクトが保持し続ける。
         """
+        self._disposed = True
         self._stop_reading = True
         self.is_connected = False
 
@@ -278,8 +410,12 @@ class SSHConnection(QObject):
             self.client = None
 
     def disconnect(self):
-        """SSH接続を切断"""
+        """SSH接続を切断（同じオブジェクトで繋ぎ直せる）"""
         self.dispose()
+        # dispose() の印は「このオブジェクトは捨てた」意味なので、利用者が
+        # 明示的に切断しただけの場合は消す。残すと次の connect() が
+        # 取り消し扱いになり、繋ぎ直せなくなる
+        self._disposed = False
         self.disconnected.emit()
     
     def send_command(self, command: str):
@@ -319,17 +455,19 @@ class SSHConnection(QObject):
 
     def _read_output(self):
         """バックグラウンドで出力を読み取る"""
+        # 受信の切れ目で割れた多バイト文字を、次の受信と繋いで復号する。
+        # 受信ごとに復号すると、前半と後半がそれぞれ U+FFFD になり、
+        # 画面にもセッションログにも化けたまま渡る
+        decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
         while not self._stop_reading and self.is_connected:
             try:
                 if self.channel and self.channel.recv_ready():
                     data = self.channel.recv(4096)
                     if data:
-                        try:
-                            text = data.decode('utf-8', errors='replace')
-                            # リアルタイムで出力（バッファリングなし）
+                        text = decoder.decode(data)
+                        # リアルタイムで出力（バッファリングなし）
+                        if text:
                             self.output_received.emit(text)
-                        except UnicodeDecodeError:
-                            pass
                     else:
                         # データがないのにrecv_readyがTrueの場合は接続が閉じられた
                         if self.is_connected:
@@ -350,3 +488,7 @@ class SSHConnection(QObject):
                     self.is_connected = False
                     self.disconnected.emit()
                 break
+        # 切れ目で終わった未完の文字を捨てない
+        rest = decoder.decode(b'', final=True)
+        if rest:
+            self.output_received.emit(rest)

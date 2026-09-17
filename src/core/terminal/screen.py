@@ -4,15 +4,37 @@
 メイン画面でだけ増える。動きの根拠は ECMA-48 と、標準に無い部分は
 XTerm Control Sequences。
 
-制限: 全角文字も 1 セルとして扱う (桁計算は ASCII 前提。機器 CLI の
-出力は ASCII で、ここが崩れる実害は Linux 側の全角編集のみ)。
+セルの幅は xterm と同じく unicodedata で決める: 東アジア幅 W/F は
+2 セル (2 セル目は文字 "" の継続セル)、結合文字と書式文字 (ZWJ 等) は
+幅 0 で直前のセルの文字列へ繋げる。残る制限: 曖昧幅 (A) は 1 セル、
+絵文字の ZWJ 列や肌色修飾は 1 つの書記素にまとめず幅を足す、幅 0 の
+文字が行頭に来たときは前の行へ繋げず捨てる。
+
+折り返しの印 (wrapped[r]) は行単位の近似で、論理行そのものは追って
+いない。そのため、折り返した行の一部だけを (右端まで届かない形で)
+書き直すと印が外れ、履歴・コピー・ログでは次の行との間に改行が入る。
+ECH も同じく行全体の印を外す。印字が複数回に分かれて届いた場合も、
+右端までの書き直しが途中で切れると印は外れる。
+
+DECOM (ESC[?6h) は保持しない。有効なら CUP・VPA の行番号は
+スクロール範囲の上端から数えるべきだが、ここでは常に画面の
+原点から数える。そのため DECSTBM で範囲を狭めたまま ESC[?6h を
+送る機器では、書き込まれる行が上端の分だけ上へずれる。terminfo に
+対応する capability が無く ncurses 系のアプリは送らないため、対応する
+とカーソル移動・DSR 応答・DECSTBM をまとめて触る割には見合わない。
 """
 import collections
+import unicodedata
 
 from core.terminal import parser
 from core.terminal.attrs import DEFAULT, apply_sgr
 
 BLANK = (" ", DEFAULT)
+
+# 1 セルへ繋げる幅 0 の文字の数の上限 (基底の文字を含む長さ)。書記素
+# クラスタとして現実的な長さを超えると表示の意味が無く、化けた出力を
+# UTF-8 として読んだときに可視行の 1 セルが伸び続ける
+MAX_CELL_TEXT = 8
 
 # DEC Special Graphics (ESC ( 0 で指示される罫線用文字集合)
 DEC_GRAPHICS = dict(zip(
@@ -24,6 +46,33 @@ def _param(params, i, default):
     if i < len(params) and params[i] is not None:
         return params[i]
     return default
+
+
+def _cell_width(ch):
+    """文字が占めるセル数 (0 / 1 / 2)。
+
+    結合文字 (Mn/Me) と書式文字 (Cf: ZWJ・ZWNJ 等) は 0、東アジア幅
+    W/F (漢字・かな・絵文字) は 2、それ以外は 1。xterm と同じ数え方。
+    """
+    if ch < "\u00ad":
+        # U+00AD (SOFT HYPHEN, Cf) より前は例外なく 1 セル。機器の
+        # 出力はほぼ全部ここで返る (unicodedata を 2 回引かない)
+        return 1
+    if unicodedata.category(ch) in ("Mn", "Me", "Cf"):
+        return 0
+    if unicodedata.east_asian_width(ch) in ("W", "F"):
+        return 2
+    return 1
+
+
+def _split_wide(line, i):
+    """i 番目が全角の継続セルなら、その全角 (i-1 と i) を空白にする。
+
+    全角の片側だけを書き換える・消すとき、残る半分を消す (xterm と同じ)。
+    """
+    if 0 < i < len(line) and line[i][0] == "":
+        line[i - 1] = BLANK
+        line[i] = BLANK
 
 
 class Screen(object):
@@ -53,7 +102,13 @@ class Screen(object):
         self.scroll_top = 0
         self.scroll_bottom = self.rows - 1
         self._pending_wrap = False
-        self._saved = (0, 0, DEFAULT)       # ESC 7 / ESC 8
+        # ESC 7 / ESC 8。位置・属性に加えて、VT100 と同じく
+        # 文字集合の指示 (G0/G1) と SI/SO の状態、それに xterm と
+        # 同じく右端の折り返し待ち (_pending_wrap) も持つ
+        self._saved = (0, 0, DEFAULT, {"(": "B", ")": "B"}, "(", False)
+        # 保存領域は画面ごと (xterm の screen->sc[])。裏へ回った画面の
+        # ぶんはここへ退避する
+        self._other_saved = self._saved
         self._saved_main = None             # ?1049 用
         self.autowrap = True
         self.cursor_visible = True
@@ -167,9 +222,10 @@ class Screen(object):
             main_marks.append(False)
         if self.alt_active:
             if self._saved_main:
-                self._saved_main = (min(keep_row, rows - 1),
-                                    min(self._saved_main[1], cols - 1),
-                                    self._saved_main[2])
+                # 位置だけ画面に収め、属性と文字集合はそのまま持ち越す
+                self._saved_main = ((min(keep_row, rows - 1),
+                                     min(self._saved_main[1], cols - 1))
+                                    + self._saved_main[2:])
         else:
             self.cursor_row = keep_row
 
@@ -190,25 +246,104 @@ class Screen(object):
     # ---- 印字と C0 -------------------------------------------------
 
     def _print(self, text):
+        # この印字が今の行へ入った時点の折り返しの印。書き直しが右端
+        # まで届いたときだけ残す判断に使う
+        entry_row, entry_mark = None, False
         for ch in text:
             if ch == "\x7f":            # DEL は表示しない
                 continue
+            if self._g[self._charset] == "0":
+                ch = DEC_GRAPHICS.get(ch, ch)
+            width = _cell_width(ch)
+            if width == 0:              # 結合文字・ZWJ は桁を進めない
+                self._join_previous(ch)
+                continue
+            if width == 2 and self.cols < 2:
+                continue                # 1 桁の画面に全角は置けない
+            from_wrap = False           # この文字で折り返して行が変わった
             if self._pending_wrap:      # 右端の 1 文字あとの折り返し
                 self.cursor_col = 0
                 self._linefeed(from_wrap=True)
-            if self._g[self._charset] == "0":
-                ch = DEC_GRAPHICS.get(ch, ch)
+                from_wrap = True
+            if width == 2 and self.cursor_col + 1 >= self.cols:
+                # 全角が右端の 1 セルに収まらない。xterm と同じく右端は
+                # 空けたまま丸ごと次の行へ送る (折り返し無効なら手前に重ねる)
+                if self.autowrap:
+                    # 空けたセルは印字していない。折り返し行は描画側で
+                    # 末尾を刈らずに次の行へ繋ぐので、残すとコピーと
+                    # ログへ空白が 1 つ混ざる
+                    skipped = self.lines[self.cursor_row]
+                    keep = self.cols - 1
+                    if keep < len(skipped) and skipped[keep][0] == "":
+                        keep -= 1       # 右端は全角の後ろ半分。丸ごと落とす
+                    del skipped[keep:]
+                    self.cursor_col = 0
+                    self._linefeed(from_wrap=True)
+                    from_wrap = True
+                else:
+                    self.cursor_col = self.cols - 2
+            if from_wrap:
+                entry_row = None        # 行が変わった (巻き上げも含む)
+            elif self.cursor_col == 0 and self.cursor_row:
+                # 折り返しで来たのではなく行頭から書き始めた。ここは
+                # 新しい論理行の先頭なので、前の行の古い印を落とす
+                self.wrapped[self.cursor_row - 1] = False
+            if entry_row != self.cursor_row:
+                entry_row = self.cursor_row
+                entry_mark = self.wrapped[entry_row]
             line = self.lines[self.cursor_row]
-            if self.cursor_col >= len(line):
+            end = self.cursor_col + width
+            if end > len(line):
                 # 折り返し行は埋めていないので、書くときに伸ばす
-                line.extend([BLANK] * (self.cursor_col + 1 - len(line)))
+                line.extend([BLANK] * (end - len(line)))
+            # 全角の半分に重ねて書いたら、残る半分は空白になる
+            _split_wide(line, self.cursor_col)
+            _split_wide(line, end)
             line[self.cursor_col] = (ch, self.attr)
+            if width == 2:
+                line[self.cursor_col + 1] = ("", self.attr)     # 継続セル
+            # 折り返しの印は折り返しでだけ付く。書き直しでは、右端まで
+            # 届いたときに限って元の印を残す (まだ次の行へ続いている)。
+            # 届かなければ外す。残すと、EL 無しで書き直された行が履歴で
+            # 次の行と連結される
+            self.wrapped[self.cursor_row] = (
+                entry_mark and end >= self.cols and self.autowrap)
             self.dirty.add(self.cursor_row)
-            if self.cursor_col + 1 < self.cols:
-                self.cursor_col += 1
-            elif self.autowrap:
-                self._pending_wrap = True
-            # autowrap 無効なら右端で上書きを続ける
+            if end < self.cols:
+                self.cursor_col = end
+            else:
+                self.cursor_col = self.cols - 1
+                if self.autowrap:
+                    self._pending_wrap = True
+                # autowrap 無効なら右端で上書きを続ける
+
+    def _join_previous(self, ch):
+        """幅 0 の文字 (結合文字・ZWJ 等) を直前の文字のセルへ繋げる。
+
+        右端で折り返し待ちなら今のセル、そうでなければ 1 つ左のセル。
+        折り返しが無効 (ESC[?7l) なら右端で印字してもカーソルが動かず
+        折り返し待ちも立たないので、最終桁にいるときは今のセルを選ぶ。
+        そこが全角の継続セルなら、その全角本体へ繋げる。前に文字が無い
+        (行頭) ときと、セルが MAX_CELL_TEXT まで伸びているときは捨てる。
+
+        残る制限: 折り返しが無効なとき、最終桁で印字した直後なのか、
+        最終桁へ CUP しただけなのかを区別していない。後者では 1 つ左の
+        文字へ付けるべきだが、ここでは最終桁のセルへ繋げる。
+        """
+        line = self.lines[self.cursor_row]
+        at_last_col = (not self.autowrap
+                       and self.cursor_col == self.cols - 1)
+        i = (self.cursor_col if self._pending_wrap or at_last_col
+             else self.cursor_col - 1)
+        if 0 < i < len(line) and line[i][0] == "":
+            i -= 1
+        if not 0 <= i < len(line):
+            return
+        text, attr = line[i]
+        if len(text) >= MAX_CELL_TEXT:
+            return                      # 伸びすぎたセルへはもう繋げない
+        line[i] = (text + ch, attr)
+        self.dirty.add(self.cursor_row)
 
     def _ctrl(self, ch):
         if ch == "\r":
@@ -283,7 +418,9 @@ class Screen(object):
         self.dirty.add(self.cursor_row)
 
     def _csi(self, seq):
-        if seq.private == "?" and seq.final in "hl":
+        # 中間バイト付きは別の命令 (ESC[?1049$h は h/l を持つ実在列が無い)。
+        # 最終文字だけで DECSET/DECRST と取り違えない
+        if seq.private == "?" and not seq.intermediate and seq.final in "hl":
             return self._private_mode(seq)
         if seq.private or seq.intermediate:
             return                      # DECSCUSR 等、表示に関わらない
@@ -309,10 +446,15 @@ class Screen(object):
             self._move(self.cursor_row, self.cursor_col + n)
         elif f == "D":
             self._move(self.cursor_row, self.cursor_col - n)
-        elif f == "E":
-            self._move(self.cursor_row + n, 0)
-        elif f == "F":
-            self._move(self.cursor_row - n, 0)
+        elif f == "E":                  # CNL: xterm は CUD 経由なので
+            limit = (self.scroll_bottom  # 範囲の下端で止まる
+                     if self.cursor_row <= self.scroll_bottom
+                     else self.rows - 1)
+            self._move(min(limit, self.cursor_row + n), 0)
+        elif f == "F":                  # CPL: 同じく CUU 経由
+            limit = (self.scroll_top
+                     if self.cursor_row >= self.scroll_top else 0)
+            self._move(max(limit, self.cursor_row - n), 0)
         elif f in "G`":
             self._move(self.cursor_row, _param(p, 0, 1) - 1)
         elif f == "d":
@@ -354,12 +496,22 @@ class Screen(object):
     def _esc(self, seq):
         if seq.intermediate in ("(", ")"):      # 文字集合の指示
             self._g[seq.intermediate] = seq.final
+        elif seq.intermediate:
+            # ESC # 8 (DECALN)・ESC * E (G2 指示)・ESC % G など、中間
+            # バイト付きは別の命令。最終文字だけで DECRC・NEL・RIS と
+            # 取り違えると、カーソルがずれたり画面が消えたりする
+            return
         elif seq.final == "7":
-            self._saved = (self.cursor_row, self.cursor_col, self.attr)
+            self._saved = (self.cursor_row, self.cursor_col, self.attr,
+                           dict(self._g), self._charset, self._pending_wrap)
         elif seq.final == "8":
-            row, col, attr = self._saved
+            row, col, attr, g, charset, pending = self._saved
             self.attr = attr
+            self._g = dict(g)
+            self._charset = charset
             self._move(row, col)
+            # _move が折り返し待ちを落とすので、復元はそのあと
+            self._pending_wrap = pending
         elif seq.final == "D":          # IND
             self._linefeed()
         elif seq.final == "M":          # RI: 上端では下へスクロール
@@ -372,6 +524,11 @@ class Screen(object):
             self.cursor_col = 0
             self._linefeed()
         elif seq.final == "c":          # RIS。履歴は reset が残す
+            # ED 2 と同じく、消す直前に見えていたメイン画面は履歴へ送る。
+            # 代替画面の裏に退避していたメイン画面も同じ (代替画面の
+            # 中身は記録しない)
+            self._switch_screen(False, with_cursor=False)
+            self._record_screen()
             self.reset()
         # = > \ H などは表示を変えない
 
@@ -384,7 +541,12 @@ class Screen(object):
         on = seq.final == "h"
         for mode in seq.params:
             if mode in (1049, 1047, 47):
-                self._switch_screen(on, with_cursor=(mode == 1049))
+                # 代替画面を白紙にするのは 1049 の入場と 1047 の
+                # 退場だけ (XTerm ctlseqs)。47 はどちらでも消さず、
+                # 入り直したときに前の中身がそのまま見える
+                clear = (mode == 1049) if on else (mode == 1047)
+                self._switch_screen(on, with_cursor=(mode == 1049),
+                                    clear=clear)
             elif mode == 7:
                 self.autowrap = on
                 if not on:
@@ -398,34 +560,61 @@ class Screen(object):
                 self.application_cursor_keys = on
             elif mode == 2004:
                 self.bracketed_paste = on
-            # ほかの私用モードは表示に効かないので無視
+            # ほかの私用モードは表示に効かないので無視。
+            # DECOM (?6) だけは表示に効くが保持しない (制限は
+            # このファイル冒頭の docstring)
 
-    def _switch_screen(self, to_alt, with_cursor):
+    def _switch_screen(self, to_alt, with_cursor, clear=True):
+        """代替画面と行き来する。clear は代替画面を白紙にするか。"""
         if to_alt == self.alt_active:
             return
+        pending = False                 # 1049 の復元でだけ書き換わる
         if to_alt and with_cursor:
-            self._saved_main = (self.cursor_row, self.cursor_col, self.attr)
+            # 1049 は DECSC 相当の保存・復元 (XTerm ctlseqs)。文字集合
+            # の指示まで持ち帰らないと、代替画面が ESC(0 のまま抜けた
+            # ときに以降の出力も記録も罫線文字に化け続ける
+            self._saved_main = (self.cursor_row, self.cursor_col, self.attr,
+                                dict(self._g), self._charset,
+                                self._pending_wrap)
         self.lines, self._other = self._other, self.lines
         # 折り返しの印も画面と一緒に入れ替える。裏へ回ったメイン画面の
         # 印を失うと、戻ってきたときに組み直しで繋ぎ直せなくなる
         self.wrapped, self._other_wrapped = (
             self._other_wrapped, self.wrapped)
+        # DECSC の保存領域も画面と一緒に入れ替える。共有したままだと、
+        # 代替画面のアプリの ESC 7 がメイン画面の保存位置を潰す
+        self._saved, self._other_saved = self._other_saved, self._saved
         self.alt_active = to_alt
-        if to_alt:                      # 代替画面は白紙で始まる
-            for r in range(self.rows):
-                self.lines[r] = self._blank_line()
-                self.wrapped[r] = False
-            self._move(0, 0)
-        elif with_cursor and self._saved_main:
-            row, col, attr = self._saved_main
-            self.attr = attr
-            self._move(row, col)
+        if to_alt:
+            if clear:               # 1049 の代替画面は白紙で始まる
+                # 白紙にするだけ。xterm の 1049 入場は CursorSave →
+                # ToAlternate → ClearScreen で、ClearScreen はカーソルを
+                # 動かさない (1047/47 も動かさない)
+                for r in range(self.rows):
+                    self.lines[r] = self._blank_line()
+                    self.wrapped[r] = False
+        else:
+            if clear:               # 1047 は出るときに代替画面を消す
+                for r in range(self.rows):
+                    self._other[r] = self._blank_line()
+                    self._other_wrapped[r] = False
+            if with_cursor and self._saved_main:
+                row, col, attr, g, charset, pending = self._saved_main
+                self.attr = attr
+                self._g = dict(g)
+                self._charset = charset
+                self._move(row, col)
         self.dirty.update(range(self.rows))
-        self._pending_wrap = False
+        # 1049 で持ち帰った折り返し待ちだけは残す。_move も、白紙化の
+        # あとの位置決めも落とすので、代入はいちばん最後
+        self._pending_wrap = pending
 
     def _set_margins(self, p):
-        top = _param(p, 0, 1) - 1
-        bottom = _param(p, 1, self.rows) - 1
+        # 0 は省略と同じく既定値 (xterm と同じ)。0-1 = -1 を丸めると
+        # 上端は偶然 0 になるが、下端は 0 になって top < bottom を満たさず
+        # 拒否され、直前の狭い範囲が残り続けた
+        top = (_param(p, 0, 1) or 1) - 1
+        bottom = (_param(p, 1, self.rows) or self.rows) - 1
         # xterm は画面からはみ出した指定を丸めて受理する。丸めずに捨てると、
         # 直前に受理した狭い範囲がそのまま残り続ける。ncurses は部分スクロール
         # の最適化で狭い範囲を設定し、最後に csr(0, lines-1) で全画面へ戻すが、
@@ -444,20 +633,42 @@ class Screen(object):
             # 触らない。NetBelt はセッションの記録を消さない方針なので
             # 何もしない。画面まで消すと clear -x で表示が飛ぶ
             return
+        if mode not in (0, 1, 2):
+            # ED に定義があるのは 0-3 だけ (XTerm ctlseqs)。未定義の
+            # 値を全消去として扱うと、機器が出した行が黙って消える
+            return
         # 画面全体が消えるとき (clear は ESC[H ESC[J、つまり home からの
         # mode 0 で来る) は、消す前に見えていた中身を履歴へ送る。
         # clear でセッションの記録を失わない、という v1.1.1 の方針
+        row = self.lines[self.cursor_row]
+        # ED 0 の走査の開始桁も、実際に消える範囲の左端へ合わせる。
+        # カーソルが全角の後半桁にあると _erase_line(0) は _split_wide で
+        # その全角の前半桁まで戻って払うので、丸めずに (0, 0) と比べると
+        # 画面は丸ごと空になるのに記録だけが残らない
+        col = self.cursor_col
+        if 0 < col < len(row) and row[col][0] == "":
+            col -= 1
         wipes_all = (mode >= 2 or
-                     (mode == 0 and (self.cursor_row, self.cursor_col)
-                      == (0, 0)))
-        if wipes_all and not self.alt_active:
-            last = -1
-            for r in range(self.rows):
-                if any(c != BLANK for c in self.lines[r]):
-                    last = r
-            for r, line in enumerate(self.lines[:last + 1]):
-                self.history.append(line)
-                self._new_history.append((line, self.wrapped[r]))
+                     (mode == 0 and (self.cursor_row, col) == (0, 0)))
+        # ED 1 も、カーソルより下に中身が残らなければ画面は丸ごと
+        # 空白になる。最下行の右端に限らず、機器が数行出した直後の
+        # ESC[1J (24x80 で 2 行だけ、など) が該当する。消える中身は
+        # ED 2 と同じなので、同じく履歴へ送る
+        # (消し方は下の mode == 1 の枝のまま。行が桁数より長い
+        # ことがあり、全画面消去と同じに払うと右に残る分も消える)
+        # 走査の開始桁は、実際に消える範囲の右端へ合わせる。カーソルが
+        # 全角の前半桁にあると _erase_line(1) はその継続セルまで払うが、
+        # 継続セル ("", attr) は BLANK と一致しないので、丸めずに数えると
+        # 「下に中身が残る」と誤判定して画面だけが消え記録が残らない
+        start = self.cursor_col + 1
+        if start < len(row) and row[start][0] == "":
+            start += 1
+        blank_after = mode == 1 and not any(
+            c != BLANK
+            for r in range(self.cursor_row, self.rows)
+            for c in self.lines[r][start if r == self.cursor_row else 0:])
+        if wipes_all or blank_after:
+            self._record_screen()
         if wipes_all:
             rng = range(0, self.rows)
         elif mode == 0:
@@ -472,7 +683,24 @@ class Screen(object):
         self.dirty.update(rng)
         self._pending_wrap = False
 
+    def _record_screen(self):
+        """画面全体が消える前に、最後の非空行までを履歴へ送る。"""
+        if self.alt_active:
+            return
+        last = -1
+        for r in range(self.rows):
+            if any(c != BLANK for c in self.lines[r]):
+                last = r
+        for r, line in enumerate(self.lines[:last + 1]):
+            # 呼び出し元が同じ行をその場で消すことがある (ED 1)。
+            # 履歴が巻き添えで空にならないよう写しを渡す
+            line = list(line)
+            self.history.append(line)
+            self._new_history.append((line, self.wrapped[r]))
+
     def _erase_line(self, mode):
+        if mode not in (0, 1, 2):
+            return                  # EL に定義があるのは 0-2 だけ
         line = self.lines[self.cursor_row]
         # 行の長さは桁数と一致しない。窓を縮めても切らないので長いことが
         # あり、折り返しで続く行は広げても埋めないので短いこともある。
@@ -484,9 +712,15 @@ class Screen(object):
             rng = range(0, end)
         else:
             rng = range(0, len(line))
+        # 範囲の端が全角の途中なら、その全角は丸ごと消える
+        _split_wide(line, rng.start)
+        _split_wide(line, rng.stop)
         for c in rng:
             line[c] = BLANK
-        if mode != 1:               # 行末まで消したら続きは無い
+        # 消した範囲が行の末尾まで届いたら、この行から次の行への続きは
+        # 無い。EL 0 と EL 2 は必ず届く。EL 1 は普段は届かないが、
+        # カーソルが行末にあると行が丸ごと空になるので、そこでも外す
+        if rng.stop >= len(line):
             self.wrapped[self.cursor_row] = False
         self.dirty.add(self.cursor_row)
         self._pending_wrap = False
@@ -502,11 +736,22 @@ class Screen(object):
                 self.lines.insert(self.cursor_row, self._blank_line())
                 self.wrapped.insert(self.cursor_row, False)
             else:
-                self.lines.pop(self.cursor_row)
-                self.wrapped.pop(self.cursor_row)
+                removed = self.lines.pop(self.cursor_row)
+                removed_wrap = self.wrapped.pop(self.cursor_row)
                 self.lines.insert(self.scroll_bottom, self._blank_line())
                 self.wrapped.insert(self.scroll_bottom, False)
+                # 画面の先頭を削ると、押し出された行はどこにも残らない。
+                # 上へ押し出す動きは SU と同じなので、_scroll_up と同じ
+                # 条件で履歴へ送る。条件を揃えないと、画面に残っている
+                # 行まで記録して二重に出る
+                if (not self.alt_active and self.scroll_top == 0
+                        and self.cursor_row == 0):
+                    self.history.append(removed)
+                    self._new_history.append((removed, removed_wrap))
         self.dirty.update(range(self.cursor_row, self.scroll_bottom + 1))
+        # DEC の IL/DL はカーソルを左マージンへ戻す (xterm も同じ)。
+        # 戻さないと、直後に位置指定なしで印字したとき桁がずれる
+        self.cursor_col = 0
         self._pending_wrap = False
 
     def _shift_chars(self, n, insert):
@@ -516,20 +761,37 @@ class Screen(object):
         # 続く行は広げても埋めないため)。そこで詰めても意味が無い
         if self.cursor_col >= len(line):
             return
+        _split_wide(line, self.cursor_col)     # 全角の途中で割らない
         for _ in range(n):
             if insert:
-                line.pop()
+                # 行が桁数いっぱいのときだけ右端を押し出す。折り返し行は
+                # 広げても埋めないので桁数より短いことがあり、そこで
+                # 無条件に pop すると余裕があるのに行末の文字が消える
+                if len(line) >= self.cols:
+                    if line.pop()[0] == "":     # 全角の半分だけ残さない
+                        line[-1] = BLANK
                 line.insert(self.cursor_col, BLANK)
             else:
                 line.pop(self.cursor_col)
                 line.append(BLANK)
+                if line[self.cursor_col][0] == "":
+                    line[self.cursor_col] = BLANK
+        # 詰め・押し出しで行が丸ごと空白になったら、この行から次の行への
+        # 続きは無い。EL 1 と同じ症状に DCH / ICH からも到達でき、印が
+        # 残ると空になった行が履歴・コピーで次の行と繋がる。中身が残る
+        # ときは折り返しのまま (EL 1 の判定と揃える)
+        if all(c == BLANK for c in line):
+            self.wrapped[self.cursor_row] = False
         self.dirty.add(self.cursor_row)
         self._pending_wrap = False
 
     def _erase_chars(self, n):
         line = self.lines[self.cursor_row]
-        for c in range(self.cursor_col,
-                       min(len(line), self.cursor_col + n)):
+        rng = range(self.cursor_col, min(len(line), self.cursor_col + n))
+        _split_wide(line, rng.start)            # 全角は丸ごと消える
+        _split_wide(line, rng.stop)
+        for c in rng:
             line[c] = BLANK
+        self.wrapped[self.cursor_row] = False   # 印字と同じ扱い
         self.dirty.add(self.cursor_row)
         self._pending_wrap = False

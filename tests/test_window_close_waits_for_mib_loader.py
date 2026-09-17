@@ -2,18 +2,24 @@
 
 SNMPPanel は生成時にバックグラウンドの MIBLoaderThread（QThread）を
 起動する。MainWindow.closeEvent は Trap 受信などのスレッドは止めるが、
-このスレッドは待っていなかった。ウィンドウがスレッドより先に破棄されると
+このスレッドは待っていなかった。待たないと、app.exec() が戻ったあと
+プロセスの終了が先に来て、読み込みが途中で切られる。読み込みの最後は
+mib_cache.json を一時ファイルを介さず書き直す処理なので、そこで切られた
+キャッシュは書きかけのまま残る（読む側が作り直すので落ちはしない）。
+起動直後にアプリを閉じた利用者が踏む経路。
 
-  - 実行中の QThread が破棄されて Qt が abort する
-  - 終わったスレッドの finished_signal が解放済みのパネルへ届く
+当初はここに「実行中の QThread の破棄で Qt が abort する」「終わった
+スレッドの finished_signal が解放済みのパネルへ届く」と書いていたが、
+どちらも再現しない。待ちを空実装にして閉じ・破棄しても、app.exec() を
+回す本番同様の経路で 6 秒かかる読み込みを残して終了しても、終了コードは
+0 で "Destroyed while thread is still running" も出ない。テストスイートを
+落としていた間欠 segfault の原因は SNMPManager の connect(signal.emit)
+による中継のほうだった（47ecbde）。
 
-のどちらかで、プロセスごと落ちる。起動直後にアプリを閉じた利用者が
-踏む経路で、テストスイートでは MainWindow を作っては閉じる回数が増える
-ほど当たりやすく、無関係な後続テストの processEvents() で access
-violation として現れていた（間欠 segfault の原因の 1 つ）。
-
-MIB の読み込みは数 ms で終わることが多く、素のままでは当たりにくい。
-テストでは読み込みを遅くして、待たない実装が必ず落ちるようにする。
+契約はあくまで「close() から戻った時点で読み込みスレッドが動いていない
+こと」。MIB の読み込みは数 ms で終わることが多く素のままでは差が出ない
+ので、テストでは読み込みを遅くして、待たない実装ならテストが必ず失敗
+するようにする。
 """
 import io
 import os
@@ -98,6 +104,11 @@ class WindowCloseDoesNotCrashTest(unittest.TestCase):
             f.write(self.SCRIPT % {"src": os.path.abspath("src")})
         env = dict(os.environ)
         env["QT_QPA_PLATFORM"] = "offscreen"
+        # 子の出力は下で UTF-8 として読むので、書く側もそろえる。固定しないと
+        # 子はロケールのコードページで書き、英語版 Windows（GitHub の CI は
+        # cp1252）では製品の日本語の print が UnicodeEncodeError になって、
+        # 調べたい「閉じた直後に落ちるか」を見る前に終わる
+        env["PYTHONIOENCODING"] = "utf-8"
 
         proc = subprocess.run([sys.executable, script], env=env,
                               capture_output=True, timeout=180)

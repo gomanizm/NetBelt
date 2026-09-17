@@ -11,7 +11,44 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QFont
-from core.version_manager import VersionManager, updater_command
+from core.version_manager import (
+    VersionManager, updater_command, updater_env, running_from_source,
+    SOURCE_RUN_MESSAGE)
+
+
+# 中止したダウンロードは、終わるまでここで生かしておく。実行中の QThread が
+# 破棄されると Qt はその場でプロセスを落とす（実測 0xC0000409）。ダイアログ
+# とその親の破棄に巻き込ませないよう、所有者をこちらへ移す。
+_RUNNING_DOWNLOADS = set()
+
+
+def _release_when_finished(thread):
+    """切り離したスレッドを、終わるまで見届ける。"""
+    from PyQt6.QtWidgets import QApplication
+
+    app = QApplication.instance()
+
+    def wait_briefly():
+        # アプリ終了時だけは短く待つ。ここで待たないと、後始末の最中に
+        # 実行中のまま破棄されて同じ落ち方をする
+        try:
+            thread.wait(5000)
+        except RuntimeError:
+            pass
+
+    def finished():
+        _RUNNING_DOWNLOADS.discard(thread)
+        if app is not None:
+            try:
+                app.aboutToQuit.disconnect(wait_briefly)
+            except TypeError:
+                pass
+        thread.deleteLater()
+
+    _RUNNING_DOWNLOADS.add(thread)
+    thread.finished.connect(finished)
+    if app is not None:
+        app.aboutToQuit.connect(wait_briefly)
 
 
 class DownloadThread(QThread):
@@ -61,6 +98,9 @@ class DownloadThread(QThread):
         後始末をさせてから抜けてもらう。
         """
         self._cancelled = True
+        # フラグはチャンクの区切りでしか見られない。相手が黙り込んで
+        # いると読み取りのタイムアウトまで戻ってこないので、応答も閉じる
+        self.version_mgr.abort()
 
     def _on_progress(self, progress: int, downloaded: int, total: int):
         """プログレス更新"""
@@ -295,10 +335,14 @@ class UpdateDialog(QDialog):
     def _on_download_completed(self, zip_path: str):
         """ダウンロード完了"""
         self.downloaded_zip_path = zip_path
+        self._release_download_thread()
         self._show_completed_phase()
     
     def _on_download_failed(self, error_message: str):
         """ダウンロード失敗"""
+        # 先に手放す。持ったままだと、閉じるときに「ダウンロード中です」と
+        # 聞き直すことになる
+        self._release_download_thread()
         QMessageBox.critical(
             self,
             "ダウンロードエラー",
@@ -308,14 +352,26 @@ class UpdateDialog(QDialog):
     
     def _on_apply_clicked(self):
         """更新適用ボタンがクリックされた"""
-        if not self.downloaded_zip_path or not os.path.exists(self.downloaded_zip_path):
-            QMessageBox.warning(
-                self,
-                "エラー",
-                "更新ファイルが見つかりません。"
-            )
+        # ソース実行では当てない。配布物はビルド済みの exe 一式で、
+        # 展開先はリポジトリ直下、再起動先は Python 本体になる。
+        if running_from_source():
+            QMessageBox.information(self, "更新", SOURCE_RUN_MESSAGE)
             return
-        
+
+        # 表示した版と同じものを渡す。ダウンロード先が版ごとに分かれる前は、
+        # 後から来た受信が、先に表示したダイアログの ZIP を置き換えられた。
+        # 適用時は存在確認しかしていなかったので、そのまま別の版が当たる。
+        # 同じ確認は起動時の適用経路（MainWindow._apply_pending_update）も
+        # 通る。片方だけ直る形にしないため VersionManager へまとめてある。
+        # 確認を通ってから updater.bat が ZIP を開き直すまでにも間があるので、
+        # 確かめた写しを作り、updater.bat にはそのパスを渡す
+        # （VersionManager.stage_for_apply の説明を参照）
+        staged_path, problem = VersionManager().stage_for_apply(
+            self.downloaded_zip_path, self.update_info.get('version'))
+        if problem:
+            QMessageBox.warning(self, "エラー", problem)
+            return
+
         # updater.batのパスを取得
         if getattr(sys, 'frozen', False):
             # PyInstallerでビルドされている場合
@@ -352,8 +408,9 @@ class UpdateDialog(QDialog):
             # リストで渡すと、パスの , や = で引数が途中で切れる
             # （updater_command の説明を参照）
             subprocess.Popen(
-                updater_command(updater_path, self.downloaded_zip_path, app_path),
-                creationflags=subprocess.CREATE_NEW_CONSOLE
+                updater_command(updater_path, staged_path, app_path),
+                creationflags=subprocess.CREATE_NEW_CONSOLE,
+                env=updater_env()
             )
             
             # ダイアログを閉じる
@@ -390,40 +447,64 @@ class UpdateDialog(QDialog):
     
     def _on_cancel_clicked(self):
         """キャンセルボタンがクリックされた（ダウンロード中）"""
-        reply = QMessageBox.question(
-            self,
-            "確認",
-            "ダウンロードをキャンセルしますか？",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No
-        )
-        
-        if reply == QMessageBox.StandardButton.Yes:
-            # スレッドを停止
-            if self.download_thread and self.download_thread.isRunning():
-                self.download_thread.cancel()
-                self.download_thread.wait(10000)
-            
-            self.reject()
-    
-    def closeEvent(self, event):
-        """ダイアログが閉じられる前の処理"""
-        # ダウンロード中の場合は確認
-        if self.download_thread and self.download_thread.isRunning():
+        self.reject()
+
+    def _release_download_thread(self):
+        """ダウンロードスレッドをダイアログの寿命から切り離す。
+
+        走ったままなら中止を頼むだけで、終わりは待たない。待つと GUI が
+        固まる（実測で 10 秒）。ダイアログの子のまま残すと、親が壊れる
+        ときに実行中の QThread ごと破棄されてプロセスが落ちるので、
+        親子関係も外して、終わるまで別に抱えておく。
+        """
+        thread = self.download_thread
+        self.download_thread = None
+        if thread is None:
+            return
+        # 片付けの後に完了・失敗が届いても、閉じたダイアログに触らせない
+        for signal in (thread.progress_updated, thread.download_completed,
+                       thread.download_failed):
+            try:
+                signal.disconnect()
+            except TypeError:
+                pass
+        thread.setParent(None)
+        if thread.isRunning():
+            thread.cancel()
+            _release_when_finished(thread)
+        else:
+            thread.deleteLater()
+
+    def _confirm_close(self) -> bool:
+        """閉じてよいか確かめ、よければスレッドを手放す。"""
+        thread = self.download_thread
+        if thread is not None and thread.isRunning():
             reply = QMessageBox.question(
                 self,
                 "確認",
-                "ダウンロード中です。本当に閉じますか？",
+                "ダウンロード中です。中止して閉じますか？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No
             )
-            
-            if reply == QMessageBox.StandardButton.No:
-                event.ignore()
-                return
-            
-            # スレッドを停止
-            self.download_thread.cancel()
-            self.download_thread.wait(10000)
-        
+            if reply != QMessageBox.StandardButton.Yes:
+                return False
+        self._release_download_thread()
+        return True
+
+    def reject(self):
+        """Esc・キャンセル・閉じるを1つの経路へ通す。
+
+        QDialog.reject() は closeEvent を呼ばない。そのため Esc だけが
+        確認も中止もされずに閉じ、ダウンロードスレッドが走ったまま
+        ダイアログの子として残っていた。
+        """
+        if not self._confirm_close():
+            return
+        super().reject()
+
+    def closeEvent(self, event):
+        """ダイアログが閉じられる前の処理"""
+        if not self._confirm_close():
+            event.ignore()
+            return
         event.accept()

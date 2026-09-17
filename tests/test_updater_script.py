@@ -17,6 +17,7 @@ v1.1.0 の更新で実際に起きたこと:
 更新は成功しているのに失敗と言われると、利用者は手で戻そうとする。
 嘘の失敗報告は、失敗そのものより害が大きい。
 """
+import hashlib
 import io
 import os
 import shutil
@@ -35,6 +36,12 @@ def _start_line(text):
         if line.startswith('start "" '):
             return line
     raise AssertionError("起動している行が見つからない")
+
+
+def _level_line(text):
+    """起動の直前で errorlevel を 0 に均している行を返す。"""
+    lines = text.split("\r\n")
+    return lines[lines.index(_start_line(text)) - 1]
 
 
 
@@ -59,8 +66,12 @@ class UpdaterScriptTest(unittest.TestCase):
         バッチを置くと start が cmd /K で開くため、コンソールが開いた
         まま残る。全体テストを一度回すと十数個たまって画面が埋まるので、
         引数なしで即終了する exe を借りてくる。
+        名前は NetBelt.exe。updater.bat は改名された exe を受け取ると
+        更新を当てずに中止するので、本番と同じ名前でなければならない。
+        更新後は中身が zip の本文（実行できないファイル）に変わるが、
+        start はその場で失敗を書くだけで窓も残さない。
         """
-        target = os.path.join(directory, "dummy_app.exe")
+        target = os.path.join(directory, "NetBelt.exe")
         shutil.copyfile(
             os.path.join(os.environ["SystemRoot"], "System32",
                          "rundll32.exe"), target)
@@ -137,14 +148,23 @@ class UpdaterScriptTest(unittest.TestCase):
         これが v1.1.0 で起きた不具合そのもの。start は成功しても
         errorlevel を 0 に戻さないので、直前の失敗を start の失敗として
         読んでしまう。失敗を注入した写しで確かめる。
+
+        注入するのは errorlevel を均す行の手前。均したあとに入れると、
+        守りそのものを跨いでしまい、何も確かめられない。据える exe も
+        本当に起動できるものにする。起動できない中身では、持ち越しの
+        誤判定と本当の起動失敗を見分けられない。
         """
         self._write(os.path.join(self.app_dir, "NetBelt.exe"), "old")
-        zip_path = self._make_zip({"NetBelt.exe": "new"})
+        real_exe = io.open(
+            os.path.join(os.environ["SystemRoot"], "System32",
+                         "rundll32.exe"), "rb").read()
+        zip_path = self._make_zip({"NetBelt.exe": real_exe})
 
         # updater.bat の写しに、再起動の直前で必ず失敗する行を入れる
         original = io.open(UPDATER, encoding="utf-8", newline="").read()
-        anchor = _start_line(original)
-        self.assertIn(anchor, original, "起動行の形が変わっている")
+        anchor = _level_line(original)
+        self.assertIn("cmd /d /c exit 0", anchor,
+                      "errorlevel を均す行が見つからない: %r" % anchor)
         injected = original.replace(
             anchor,
             "netbelt_no_such_command_for_test 2>nul\r\n" + anchor, 1)
@@ -156,8 +176,12 @@ class UpdaterScriptTest(unittest.TestCase):
 
         self.assertNotIn("アプリケーションの起動に失敗", out,
                          "直前の失敗を start の失敗として報告している")
+        self.assertNotIn("起動できませんでした", out,
+                         "直前の失敗を start の失敗として報告している:\n" + out)
         self.assertEqual(code, 0, out)
-        self.assertEqual(self._installed(), "new", out)
+        self.assertEqual(
+            io.open(os.path.join(self.app_dir, "NetBelt.exe"), "rb").read(),
+            real_exe, out)
 
     def test_a_folder_with_parentheses_still_updates(self):
         """括弧を含むフォルダでも更新できること。
@@ -283,6 +307,46 @@ class UpdaterScriptTest(unittest.TestCase):
 
         self.assertNotEqual(code, 0, "実行ファイルが無いのに成功と報告した\n" + out)
         self.assertIn("NetBelt.exe", out)
+
+    def test_a_zip_without_the_app_fails_even_when_an_old_exe_is_installed(self):
+        """旧 NetBelt.exe が残っていても、実行ファイルの無い zip を成功と言わないこと。
+
+        上の検査はインストール先が空の場合しか見ていない。実際の更新では旧版が
+        必ず置いてあるので、「インストール先に NetBelt.exe があるか」で判定すると、
+        展開した zip に exe が無くても通ってしまう。利用者には「更新が完了しました！」と
+        出る一方で、動くのは旧版のままになる。
+        """
+        self._write(os.path.join(self.app_dir, "NetBelt.exe"), "old")
+        zip_path = self._make_zip({"README.txt": "no exe here"})
+
+        code, out = self._run(zip_path)
+
+        self.assertNotEqual(code, 0, "実行ファイルが無いのに成功と報告した\n" + out)
+        self.assertEqual(self._installed(), "old", out)
+        self.assertNotIn("更新が完了しました", out,
+                         "旧版のままなのに完了と告げている:\n" + out)
+
+    def test_a_leftover_staged_exe_is_not_installed_as_the_update(self):
+        """前回の更新が残した NetBelt.exe.new を、新版として据えないこと。
+
+        更新は新しい exe を NetBelt.exe.new という一時名で置いてから改名する。
+        その間にコンソールを閉じられる・電源が落ちるなどで止まると、
+        インストール先に NetBelt.exe.new が残る。次の更新で「インストール先に
+        NetBelt.exe.new があるか」で判定すると、展開した zip に exe が無くても
+        残骸が条件を満たしてしまい、動いていた exe がその残骸で上書きされる。
+        """
+        self._write(os.path.join(self.app_dir, "NetBelt.exe"), "old")
+        self._write(os.path.join(self.app_dir, "NetBelt.exe.new"),
+                    "stale-garbage")
+        zip_path = self._make_zip({"README.txt": "no exe here"})
+
+        code, out = self._run(zip_path)
+
+        self.assertNotEqual(code, 0, "実行ファイルが無いのに成功と報告した\n" + out)
+        self.assertEqual(self._installed(), "old",
+                         "前回の残骸で動いている exe を上書きした\n" + out)
+        self.assertNotIn("更新が完了しました", out,
+                         "旧版のままなのに完了と告げている:\n" + out)
 
     # --- 自分自身を上書きされても壊れないこと ---------------------------
 
@@ -441,15 +505,28 @@ class UpdaterEncodingTest(unittest.TestCase):
         self.assertNotIn('set "RUNNER=!SELF!"', head,
                          "写しを作れないとき、元の場所で走る分岐が残っている")
 
-    def test_the_restart_is_not_judged_by_errorlevel(self):
-        """start の戻り値で成否を判定しないこと。
+    def test_the_restart_levels_errorlevel_before_judging_it(self):
+        """start の戻り値を見るなら、その直前で errorlevel を 0 に均すこと。
 
-        start は成功しても errorlevel を 0 に戻さない。実測で確認済み。
+        start は成功しても errorlevel を 0 に戻さない。そのまま
+        `if errorlevel 1` を書くと、直前の失敗を start の失敗として
+        読んでしまう（v1.1.0 の不具合）。長らく戻り値を一切見ない形に
+        していたが、それでは起動できない exe に差し替わっても
+        「起動しました」と表示してしまう。
+
+        実測では、直前で 0 に均しておけば両立する。
+
+            均してから 起動できない exe を start -> 216
+            均さず直前を 9 にして 起動できる exe -> 9
+            均してから 起動できる   exe を start -> 0
+
+        均す行が消えれば v1.1.0 の誤判定がそのまま戻るので、
+        「直前の行で均していること」を形として固定する。
         """
-        after = self.text[self.text.index(_start_line(self.text)):]
-        head = after.split("\r\n")[1:4]
-        self.assertNotIn("errorlevel", "\n".join(head),
-                         "start の直後で errorlevel を見ている: %r" % head)
+        level = _level_line(self.text)
+        self.assertIn("cmd /d /c exit 0", level,
+                      "start の直前で errorlevel を 0 に均していない: %r"
+                      % level)
 
 
 class UpdaterLaunchTest(unittest.TestCase):
@@ -472,13 +549,25 @@ class UpdaterLaunchTest(unittest.TestCase):
         from unittest import mock
         from ui.main_window import MainWindow
 
-        zip_path = r"C:\lab\a,b\NetBelt-update.zip"
+        # 起動時の適用経路も、直前に「検証を通った ZIP か」を確かめる
+        # （ダイアログ側と同じ門）。コンマを含むフォルダに一式を置いて通す
+        base = tempfile.mkdtemp(prefix="netbelt_pending_")
+        self.addCleanup(shutil.rmtree, base, True)
+        folder = os.path.join(base, "a,b")
+        os.makedirs(folder)
+        zip_path = os.path.join(folder, "NetBelt-update.zip")
+        io.open(zip_path, "wb").write(b"PK\x03\x04")
+        io.open(zip_path + ".sha256", "w", encoding="ascii").write(
+            hashlib.sha256(b"PK\x03\x04").hexdigest())
         with mock.patch.object(MainWindow,
                                "_check_for_updates_on_startup"):
             window = MainWindow()
         self.addCleanup(lambda: None)
 
-        with mock.patch("subprocess.Popen") as popen:
+        # 適用は凍結ビルドでしか行わない（ソース実行では、配布物が
+        # リポジトリ直下へ上書きされてしまうので案内だけを出す）
+        with mock.patch("subprocess.Popen") as popen, \
+             mock.patch.object(sys, "frozen", True, create=True):
             window._apply_pending_update(zip_path)
 
         self.assertTrue(popen.called, "updater を起動していない")
@@ -486,7 +575,13 @@ class UpdaterLaunchTest(unittest.TestCase):
         self.assertIsInstance(
             sent, str,
             "リストのまま渡している。コンマや等号で %1 が切れる")
-        self.assertIn('"%s"' % zip_path, sent,
+        # 渡すのは元の ZIP そのものではなく、適用直前に確かめた写し
+        # （VersionManager.stage_for_apply）。置き場は元と同じコンマ入りの
+        # フォルダなので、引用符の検査はそのまま成り立つ。
+        handed = sent.split('" "')[1]
+        self.assertEqual(os.path.dirname(handed), os.path.dirname(zip_path),
+                         "ZIP を元と別のフォルダから渡している: %r" % sent)
+        self.assertIn('"%s"' % handed, sent,
                       "ZIP のパスが引用符で包まれていない: %r" % sent)
         self.assertEqual(sent.count('"'), 6,
                          "3 つの引数それぞれを包むこと: %r" % sent)
@@ -575,10 +670,23 @@ class UpdaterLaunchTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, base, True)
         zip_path = os.path.join(base, "Net,Belt-update.zip")
         io.open(zip_path, "wb").write(b"PK\x03\x04")
+        # 適用は凍結ビルドでしか行わず、直前に「表示した版と同じ、
+        # 検証を通った ZIP か」を確かめる。控えと、インストール先の
+        # 一式（exe と updater.bat）を用意して、その門を通す。
+        io.open(zip_path + ".sha256", "w", encoding="ascii").write(
+            hashlib.sha256(b"PK\x03\x04").hexdigest())
+        io.open(zip_path + ".version", "w", encoding="ascii").write(
+            "9.9.9")
+        exe_path = os.path.join(base, "NetBelt.exe")
+        io.open(exe_path, "wb").write(b"MZ")
+        io.open(os.path.join(base, "updater.bat"), "w",
+                encoding="ascii").write("rem\n")
 
         dialog = self._dialog_with_a_downloaded_zip(zip_path)
         with mock.patch("subprocess.Popen") as popen, \
-             mock.patch("PyQt6.QtWidgets.QApplication.quit"):
+             mock.patch("PyQt6.QtWidgets.QApplication.quit"), \
+             mock.patch.object(sys, "frozen", True, create=True), \
+             mock.patch.object(sys, "executable", exe_path):
             dialog._on_apply_clicked()
 
         self.assertTrue(popen.called, "updater を起動していない")
@@ -586,7 +694,12 @@ class UpdaterLaunchTest(unittest.TestCase):
         self.assertIsInstance(
             sent, str,
             "リストのまま渡している。コンマや等号で引数が切れる")
-        self.assertIn('"%s"' % zip_path, sent,
+        # 渡すのは適用直前に確かめた写し（stage_for_apply）。置き場は元と
+        # 同じコンマ入りフォルダなので、引用符の検査はそのまま成り立つ。
+        handed = sent.split('" "')[1]
+        self.assertEqual(os.path.dirname(handed), os.path.dirname(zip_path),
+                         "ZIP を元と別のフォルダから渡している: %r" % sent)
+        self.assertIn('"%s"' % handed, sent,
                       "ZIP のパスが引用符で包まれていない: %r" % sent)
         self.assertEqual(sent.count('"'), 6,
                          "3 つの引数それぞれを包むこと: %r" % sent)

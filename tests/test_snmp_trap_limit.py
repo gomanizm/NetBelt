@@ -40,6 +40,14 @@ class SnmpTrapLimitTest(unittest.TestCase):
         from PyQt6.QtWidgets import QApplication
         cls.app = QApplication.instance() or QApplication([])
 
+    # 作ったウィンドウはクラス終了まで保持する。パネルもモデルもウィンドウの
+    # 子なので、ウィンドウを先に捨てると C++ 側ごと消えて触れなくなる
+    _windows = []
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._windows.clear()
+
     def _panel(self, settings=None):
         """SNMPPanel を返す（単体生成は MIB 読み込みで落ちるため MainWindow 経由）。"""
         from ui.main_window import MainWindow
@@ -51,7 +59,9 @@ class SnmpTrapLimitTest(unittest.TestCase):
         with mock.patch("ui.main_window.ConfigManager") as fake, \
              mock.patch.object(MainWindow, "_check_for_updates_on_startup"):
             fake.return_value = cm
-            return MainWindow().snmp_panel
+            window = MainWindow()
+        type(self)._windows.append(window)
+        return window.snmp_panel
 
     def _feed(self, panel, count):
         for i in range(count):

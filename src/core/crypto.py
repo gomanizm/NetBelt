@@ -11,6 +11,19 @@ import sys
 # DPAPI形式であることを示す接頭辞（base64本体の前に付与）
 _DPAPI_PREFIX = "DPAPI:"
 
+
+def _is_base64(payload: str) -> bool:
+    """DPAPI 本体として妥当な base64 か（空文字は不正とする）"""
+    if not payload:
+        return False
+    try:
+        # validate=True にしないと base64 以外の文字を黙って読み飛ばし、
+        # 平文でも「妥当」と答えてしまう
+        base64.b64decode(payload, validate=True)
+    except Exception:
+        return False
+    return True
+
 # --- DPAPI (Windows) ---
 _DPAPI_AVAILABLE = False
 if sys.platform == "win32":
@@ -86,7 +99,7 @@ class PasswordCrypto:
         """暗号化されたパスワード(または平文)を復号して返す"""
         if not encrypted_password:
             return ""
-        if encrypted_password.startswith(_DPAPI_PREFIX):
+        if self.is_encrypted(encrypted_password):
             if not _DPAPI_AVAILABLE:
                 # 別環境で作られたDPAPI値は復号できない。そのまま返す(接続は失敗する想定)
                 return encrypted_password
@@ -99,7 +112,34 @@ class PasswordCrypto:
         return encrypted_password
 
     def is_encrypted(self, password: str) -> bool:
-        """パスワードが暗号化済みか判定"""
+        """パスワードが暗号化済みか判定
+
+        接頭辞だけでは足りない。機器へ本当に "DPAPI:" で始まる
+        パスワードを設定していると、平文のまま「暗号化済み」と
+        見なされ、設定ファイルへ平文で書き出される。本体が base64 と
+        して妥当かまで見て、そうでなければ平文として扱う。
+
+        制限: 本体が base64 として妥当な平文は今も暗号文と区別できない。
+        これは珍しい形ではなく、実測で "DPAPI:pass" / "DPAPI:Secret12" /
+        "DPAPI:cisco123" / "DPAPI:AAAA" はいずれもここで True になり、
+        config.json へ平文のまま書き出される。
+
+        採らなかった案:
+        ・復号できたかどうかで判定する: 別環境で作られた復号不能な暗号文を
+          平文とみなして二重に暗号化し、原本を失う。
+        ・復号不能な値を別キーへ退避し、再暗号化の対象から外す: 判定を
+          推測から状態へ置き換えられるが、読み込みを経ずに config を組み立てて
+          保存する経路には退避情報が無く、そこで暗号文を二重に包んでしまう。
+          tests/test_password_reencrypt.py が固定している契約を壊すので、
+          ここだけを直す変更では採らない。
+        ・入力側で弾く: ui/dialogs/device_dialog.py で、変更されたパスワードが
+          この判定に当たるときは確認を出すようにした。新しく入力される平文は
+          これで黙って平文保存されることはない。ただし既に config.json に
+          ある値には効かない。FTP/SFTP サーバーの欄は、この判定に当たると
+          起動を断り理由を出すので、黙って壊れる経路にはなっていない。
+        """
         if not password:
             return False
-        return password.startswith(_DPAPI_PREFIX)
+        if not password.startswith(_DPAPI_PREFIX):
+            return False
+        return _is_base64(password[len(_DPAPI_PREFIX):])

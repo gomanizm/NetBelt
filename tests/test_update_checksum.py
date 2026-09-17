@@ -124,6 +124,74 @@ class UpdateChecksumTest(unittest.TestCase):
         self.assertEqual(info.get("download_url"), "https://api.example.com/assets/1")
         self.assertEqual(info.get("sha256_url"), "https://api.example.com/assets/2")
 
+    def test_check_for_updates_prefers_the_canonical_portable_zip(self):
+        """配布物の ZIP を、並び順に関係なく選ぶこと。
+
+        windows を名前に含む ZIP がほかにもあると、先頭から拾う版はそちらを掴む。
+        その ZIP 専用の .sha256 も並んでいれば照合も通るので、利用者は本体でない
+        ものを「更新」として入れてしまう。
+        """
+        release = {
+            "tag_name": "v99.0.0",
+            "body": "notes",
+            "published_at": "2026-08-23T00:00:00Z",
+            "assets": [
+                {"name": "NetBelt-v99.0.0-Windows-Symbols.zip",
+                 "url": "https://api.example.com/assets/9"},
+                {"name": "NetBelt-v99.0.0-Windows-Symbols.zip.sha256",
+                 "url": "https://api.example.com/assets/10"},
+                {"name": "NetBelt-v99.0.0-Windows-Portable.zip",
+                 "url": "https://api.example.com/assets/1"},
+                {"name": "NetBelt-v99.0.0-Windows-Portable.zip.sha256",
+                 "url": "https://api.example.com/assets/2"},
+            ],
+        }
+
+        class _Json(_Resp):
+            def json(self):
+                return release
+
+        with unittest.mock.patch("core.version_manager.requests.get",
+                                 return_value=_Json()):
+            info = self.mgr.check_for_updates()
+
+        self.assertIsNotNone(info)
+        self.assertEqual(info.get("download_url"),
+                         "https://api.example.com/assets/1", "配布物でない ZIP を選んだ")
+        self.assertEqual(info.get("sha256_url"),
+                         "https://api.example.com/assets/2")
+
+    def test_check_for_updates_still_takes_any_windows_zip_as_a_fallback(self):
+        """正規の名前が無いリリースでは、従来どおり windows の ZIP を拾うこと。
+
+        名前の付け方が違う古いリリースを、取りこぼさないため。
+        """
+        release = {
+            "tag_name": "v99.0.0",
+            "body": "notes",
+            "published_at": "2026-08-23T00:00:00Z",
+            "assets": [
+                {"name": "NetBelt-99.0.0-windows.zip",
+                 "url": "https://api.example.com/assets/5"},
+                {"name": "NetBelt-99.0.0-windows.zip.sha256",
+                 "url": "https://api.example.com/assets/6"},
+            ],
+        }
+
+        class _Json(_Resp):
+            def json(self):
+                return release
+
+        with unittest.mock.patch("core.version_manager.requests.get",
+                                 return_value=_Json()):
+            info = self.mgr.check_for_updates()
+
+        self.assertIsNotNone(info)
+        self.assertEqual(info.get("download_url"),
+                         "https://api.example.com/assets/5")
+        self.assertEqual(info.get("sha256_url"),
+                         "https://api.example.com/assets/6")
+
 
 if __name__ == "__main__":
     unittest.main()

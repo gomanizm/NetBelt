@@ -148,7 +148,10 @@ class SFTPPanel(QWidget):
         self.tree_view.doubleClicked.connect(self._on_item_double_clicked)
         
         # モデル作成
-        self.model = QStandardItemModel()
+        # 親を持たせる。setModel は所有権を取らないので、親が無いと
+        # このパネルの Python 参照が消えた時点でモデルだけ先に回収され、
+        # 生きているビューが解放済みのモデルを指したまま残る
+        self.model = QStandardItemModel(self)
         self.model.setHorizontalHeaderLabels(["名前", "サイズ", "パーミッション", "更新日時"])
         self.tree_view.setModel(self.model)
         
@@ -264,6 +267,11 @@ class SFTPPanel(QWidget):
         self._current_entries = {}
         self._pending_upload_names = set()
         self.current_device = device_name
+        # 前の機器の行と選択も消す。新しい一覧が届くまで残しておくと、
+        # 前の機器の file_info と新しい機器の組み合わせで削除できてしまう
+        self.tree_view.clearSelection()
+        self.model.removeRows(0, self.model.rowCount())
+        self.status_label.setText("一覧を取得しています...")
         
         # シグナル接続
         self.sftp_manager.file_list_ready.connect(self._update_file_list)
@@ -339,6 +347,14 @@ class SFTPPanel(QWidget):
             return None, None
         return manager, manager.get_current_path()
 
+    def _pinned_or_begin(self, pinned):
+        """メニューを開いた時点で固定した (manager, path) があればそれを、
+        無ければいまの状態を返す。QAction.triggered から直接呼ばれると
+        pinned には bool（checked）が入るので、組でなければ無視する。"""
+        if isinstance(pinned, tuple) and len(pinned) == 2:
+            return pinned
+        return self._begin()
+
     @staticmethod
     def _remote_path(base: str, name: str) -> str:
         """リモートのパスを組み立てる（ルート直下の // を避ける）"""
@@ -396,8 +412,11 @@ class SFTPPanel(QWidget):
             else:
                 size_item = QStandardItem(self._format_size(file_info['size']))
             
-            # パーミッション
-            perm_item = QStandardItem(file_info['permissions'])
+            # パーミッション。サーバが permissions を返さなければ None
+            # （QStandardItem(None) は TypeError になる）
+            perms = file_info['permissions']
+            perm_item = QStandardItem(
+                perms if perms is not None else self.UNKNOWN_TEXT)
             
             # 更新日時。サーバが ATTR_ACMODTIME を返さなければ None、
             # paramiko が符号付き 32bit で読むので負値にもなり得る。
@@ -500,6 +519,21 @@ class SFTPPanel(QWidget):
             new_path = f"{current_path}/{file_info['name']}" if current_path != "/" else f"/{file_info['name']}"
             self.sftp_manager.change_directory(new_path)
     
+    def _open_directory(self, file_info: dict, pinned=None):
+        """メニューの「開く」。メニューを開いた時点の相手と場所を基準に移動する。
+
+        行番号（QModelIndex）を捕捉して項目選択時にモデルを読み直すと、
+        メニューの間に一覧が差し替わったとき、同じ行に来た別のディレクトリへ
+        移動してしまう。
+        """
+        manager, base_path = self._pinned_or_begin(pinned)
+        if not manager or not file_info or not file_info.get('is_dir'):
+            return
+        if not self._still_on(manager):
+            self._abandon("ディレクトリの移動")
+            return
+        manager.change_directory(self._remote_path(base_path, file_info['name']))
+
     def _show_context_menu(self, position):
         """
         右クリックメニューを表示
@@ -509,56 +543,73 @@ class SFTPPanel(QWidget):
         """
         if not self.sftp_manager:
             return
-        
+
+        # 相手と場所はメニューを開いた時点で固定する。項目を選んでから読むと、
+        # メニューが開いている間に届いた一覧で場所が変わっていて、古い一覧で
+        # 右クリックした名前を別のディレクトリで消す
+        pinned = self._begin()
+
         # 選択されているアイテムを取得
         index = self.tree_view.indexAt(position)
-        
+
         menu = QMenu(self)
-        
+
         if index.isValid():
             # アイテムが選択されている場合
             name_item = self.model.item(index.row(), 0)
             file_info = name_item.data(Qt.ItemDataRole.UserRole)
-            
+
             if file_info['is_dir']:
                 # ディレクトリの場合
                 open_action = menu.addAction("開く")
-                open_action.triggered.connect(lambda: self._on_item_double_clicked(index))
+                open_action.triggered.connect(
+                    lambda: self._open_directory(file_info, pinned))
             else:
                 # ファイルの場合
                 download_action = menu.addAction("ダウンロード")
-                download_action.triggered.connect(lambda: self._on_download_selected(file_info))
-            
+                download_action.triggered.connect(
+                    lambda: self._on_download_selected(file_info, pinned))
+
             menu.addSeparator()
-            
+
             # 共通メニュー
             rename_action = menu.addAction("名前変更")
-            rename_action.triggered.connect(lambda: self._on_rename_selected(file_info))
-            
+            rename_action.triggered.connect(
+                lambda: self._on_rename_selected(file_info, pinned))
+
             delete_action = menu.addAction("削除")
-            delete_action.triggered.connect(lambda: self._on_delete_selected(file_info))
-            
+            delete_action.triggered.connect(
+                lambda: self._on_delete_selected(file_info, pinned))
+
             menu.addSeparator()
-            
+
             chmod_action = menu.addAction("パーミッション変更")
-            chmod_action.triggered.connect(lambda: self._on_chmod_selected(file_info))
+            chmod_action.triggered.connect(
+                lambda: self._on_chmod_selected(file_info, pinned))
         else:
             # 空白部分の場合
             upload_action = menu.addAction("ファイルをアップロード")
-            upload_action.triggered.connect(self._on_upload)
-            
+            upload_action.triggered.connect(lambda: self._on_upload(pinned))
+
             menu.addSeparator()
-            
+
             mkdir_action = menu.addAction("新規フォルダ作成")
-            mkdir_action.triggered.connect(self._on_create_directory)
+            mkdir_action.triggered.connect(lambda: self._on_create_directory(pinned))
             
             menu.addSeparator()
             
             refresh_action = menu.addAction("更新")
             refresh_action.triggered.connect(self._on_refresh)
         
-        menu.exec(self.tree_view.viewport().mapToGlobal(position))
-    
+        try:
+            menu.exec(self.tree_view.viewport().mapToGlobal(position))
+        finally:
+            # このパネルを親にしたメニューは、閉じただけでは子として残り、
+            # 右クリックのたびに QMenu 1 件と項目が積み上がる。項目は
+            # menu.addAction で作っておりメニューが所有しているので、
+            # メニューを捨てれば一緒に片付く。
+            menu.deleteLater()
+
     def _on_refresh(self):
         """更新ボタンがクリックされた"""
         if self.sftp_manager:
@@ -575,9 +626,9 @@ class SFTPPanel(QWidget):
         if self.sftp_manager:
             self.sftp_manager.change_directory(".")
     
-    def _on_upload(self):
+    def _on_upload(self, pinned=None):
         """アップロードボタンがクリックされた"""
-        manager, base_path = self._begin()
+        manager, base_path = self._pinned_or_begin(pinned)
         if not manager:
             return
 
@@ -618,6 +669,11 @@ class SFTPPanel(QWidget):
         else:
             overwrites_file = (known_is_dir is False
                                or name in self._pending_upload_names)
+        # 上書きを許すのは、利用者が承認したときか、確認しない設定のとき
+        # だけ。それ以外は SFTPManager が送る直前にリモートを確かめる。
+        # ここの判定は「最後に観測した一覧」に基づくので、ダイアログの間に
+        # 別ディレクトリの一覧が届く／初回の一覧が未到着だと既存を見落とす
+        overwrite_granted = not confirm
         if confirm and overwrites_file:
             reply = QMessageBox.question(
                 self,
@@ -628,6 +684,7 @@ class SFTPPanel(QWidget):
             )
             if reply != QMessageBox.StandardButton.Yes:
                 return
+            overwrite_granted = True
         
         # アップロード完了後に sftp_manager が一覧を取り直すが、1回のドロップで
         # 複数送る間は間に合わない。送信中の名前を別に覚えておき、同じドロップ内の
@@ -640,7 +697,10 @@ class SFTPPanel(QWidget):
         # 送り先を明示する。省略すると SFTPManager が呼ばれた時点の
         # current_path を使うので、確認ダイアログの間にディレクトリが
         # 変わっていると別の場所へ置いてしまう
-        manager.upload_file(file_path, self._remote_path(base_path, name))
+        remote = self._remote_path(base_path, name)
+        # 上書きの可否は、許すときも許さないときも必ず明示して渡す。省略すると
+        # 受け手の既定値まかせになり、「渡し忘れ」と「許していない」が区別できない
+        manager.upload_file(file_path, remote, overwrite=overwrite_granted)
     
     def _on_download(self):
         """ダウンロードボタンがクリックされた"""
@@ -660,14 +720,14 @@ class SFTPPanel(QWidget):
         
         self._on_download_selected(file_info)
     
-    def _on_download_selected(self, file_info: dict):
+    def _on_download_selected(self, file_info: dict, pinned=None):
         """
         選択されたファイルをダウンロード
         
         Args:
             file_info: ファイル情報
         """
-        manager, base_path = self._begin()
+        manager, base_path = self._pinned_or_begin(pinned)
         if not manager:
             return
 
@@ -691,9 +751,9 @@ class SFTPPanel(QWidget):
             remote_path = self._remote_path(base_path, file_info['name'])
             manager.download_file(remote_path, local_path)
     
-    def _on_create_directory(self):
+    def _on_create_directory(self, pinned=None):
         """新規ディレクトリ作成"""
-        manager, base_path = self._begin()
+        manager, base_path = self._pinned_or_begin(pinned)
         if not manager:
             return
 
@@ -724,14 +784,14 @@ class SFTPPanel(QWidget):
         
         self._on_delete_selected(file_info)
     
-    def _on_delete_selected(self, file_info: dict):
+    def _on_delete_selected(self, file_info: dict, pinned=None):
         """
         選択されたアイテムを削除
         
         Args:
             file_info: ファイル情報
         """
-        manager, base_path = self._begin()
+        manager, base_path = self._pinned_or_begin(pinned)
         if not manager:
             return
 
@@ -752,16 +812,19 @@ class SFTPPanel(QWidget):
             self._abandon("削除")
             return
         item_path = self._remote_path(base_path, file_info['name'])
-        manager.delete_item(item_path, file_info['is_dir'])
+        # is_dir はリンクの追跡先で決まっている（ダブルクリックで先へ入れる
+        # ため）。削除の相手はリンク自身なので、リンクは rmdir へ回さない
+        manager.delete_item(item_path,
+                            file_info['is_dir'] and not file_info.get('is_link'))
     
-    def _on_rename_selected(self, file_info: dict):
+    def _on_rename_selected(self, file_info: dict, pinned=None):
         """
         選択されたアイテムの名前を変更
         
         Args:
             file_info: ファイル情報
         """
-        manager, base_path = self._begin()
+        manager, base_path = self._pinned_or_begin(pinned)
         if not manager:
             return
 
@@ -780,26 +843,34 @@ class SFTPPanel(QWidget):
             manager.rename_item(self._remote_path(base_path, file_info['name']),
                                 self._remote_path(base_path, new_name))
     
-    def _on_chmod_selected(self, file_info: dict):
+    def _on_chmod_selected(self, file_info: dict, pinned=None):
         """
         選択されたアイテムのパーミッションを変更
         
         Args:
             file_info: ファイル情報
         """
-        manager, base_path = self._begin()
+        manager, base_path = self._pinned_or_begin(pinned)
         if not manager:
             return
 
-        # 現在のパーミッションを8進数で表示
-        current_mode = file_info['mode'] & 0o777
-        current_mode_str = oct(current_mode)[2:]  # '0o755' -> '755'
-        
+        # 現在のパーミッションを8進数で表示。サーバが permissions を
+        # 返さなかった項目は None なので、既定値は空にする。
+        # setuid / setgid / sticky を含む 4 桁で出す（& 0o777 で切ると、
+        # 何も書き換えずに OK を押しただけで特殊ビットが落ちる）
+        if file_info['mode'] is None:
+            current_mode_str = ""
+        else:
+            current_mode = file_info['mode'] & 0o7777
+            current_mode_str = format(current_mode, '04o')  # 0o1777 -> '1777'
+
         # 新しいパーミッションを入力
         new_mode_str, ok = QInputDialog.getText(
             self,
             "パーミッション変更",
-            f"新しいパーミッションを8進数で入力してください:\n（例: 755, 644）",
+            "新しいパーミッションを8進数で入力してください:\n"
+            "（例: 0755, 0644。先頭の桁は setuid/setgid/sticky で、\n"
+            "3桁で入力するとこれらは落ちます）",
             text=current_mode_str
         )
         

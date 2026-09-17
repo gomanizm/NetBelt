@@ -1,11 +1,28 @@
 """
 シリアルポート接続クラス
 """
+import codecs
 import serial
 import serial.tools.list_ports
-from PyQt6.QtCore import QObject, pyqtSignal, QThread
+from PyQt6.QtCore import QObject, pyqtSignal
 from typing import List, Dict, Optional
+import queue
+import threading
 import time
+
+
+class _WriterHandoff:
+    """ポートを閉じる役を、後始末と送信スレッドのどちらか一方に決める印。
+
+    join が空振りしたときだけ、閉じる役が送信スレッドへ移る。判定と印付けを
+    同じ錠の中で行うので、ちょうど一方だけが閉じる（二重 close も閉じ忘れも
+    起きない）。
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.finished = False         # 送信スレッドがループを抜けた
+        self.close_requested = False  # 閉じる役を送信スレッドへ渡した
 
 
 class SerialConnection(QObject):
@@ -30,26 +47,50 @@ class SerialConnection(QObject):
         self.port = port
         self.baudrate = baudrate
         self.serial_conn: Optional[serial.Serial] = None
-        self._read_thread: Optional[QThread] = None
+        self._read_thread: Optional[threading.Thread] = None
+        # 送信は GUI スレッドを止めないよう、専用スレッドがキューから書く
+        self._send_queue: "queue.Queue[Optional[bytes]]" = queue.Queue()
+        self._write_thread: Optional[threading.Thread] = None
+        self._write_handoff: Optional[_WriterHandoff] = None
         self._is_connected = False
         self._should_stop = False
-    
+        # dispose() 済み（このオブジェクトは捨てられた）ことを覚えておく印。
+        # _should_stop と違い connect() の入口で戻さないので、接続スレッドが
+        # 動き出す前に着地した dispose() でも消えない
+        self._disposed = False
+        # set_baudrate と「開いたポートを serial_conn へ入れる」を直列にする。
+        # 開いている最中に変えられた値を、開き終えたポートへ確実に届けるため
+        self._baud_lock = threading.Lock()
+
     def connect(self) -> bool:
         """
         シリアルポートに接続
-        
+
         Returns:
             接続に成功した場合True、失敗した場合False
         """
         try:
+            if self._disposed:
+                # 接続スレッドが動き出す前にタブが閉じられ、dispose() が先に
+                # 走った。ここで印を無視して進むと、ポートは最後まで開くのに
+                # 参照しているものが誰もいない状態になり、閉じる経路が無い
+                # まま同じ COM への再接続が Access is denied になる
+                return False
+
             # 既に接続されている場合は切断
             if self._is_connected:
                 self.disconnect()
             
-            # シリアルポートを開く
-            self.serial_conn = serial.Serial(
+            # 開いている最中に dispose() されたことを、開き終わってから
+            # 知るための印。ここで戻しておき、生成後にもう一度見る
+            self._should_stop = False
+
+            # シリアルポートを開く。開いている最中に set_baudrate されたか
+            # を後で見分けるため、開くときに使った値を控えておく
+            opened_at = self.baudrate
+            port = serial.Serial(
                 port=self.port,
-                baudrate=self.baudrate,
+                baudrate=opened_at,
                 bytesize=serial.EIGHTBITS,
                 parity=serial.PARITY_NONE,
                 stopbits=serial.STOPBITS_ONE,
@@ -58,9 +99,21 @@ class SerialConnection(QObject):
                 rtscts=False,
                 dsrdtr=False
             )
-            
+
+            if self._should_stop:
+                # 開いている間にタブが閉じられた（または後始末が走った）。
+                # このまま続けると、閉じる経路の無いポートが開いたまま残り、
+                # 同じ COM への再接続が Access is denied になる
+                port.close()
+                return False
+
+            with self._baud_lock:
+                self.serial_conn = port
+                # 開いている最中に set_baudrate されていたら、開くときに
+                # 使った値は古い。開き終えたポートへ合わせ直す
+                if self.baudrate != opened_at:
+                    self._apply_baudrate(port, self.baudrate)
             self._is_connected = True
-            self._should_stop = False
             
             # 接続成功メッセージ
             self.output_received.emit(
@@ -83,6 +136,52 @@ class SerialConnection(QObject):
             self.error_occurred.emit(error_msg)
             return False
     
+    def set_baudrate(self, baudrate: int) -> bool:
+        """ボーレートを変える。開いているポートにはその場で反映する。
+
+        機器側で `speed 115200` などを実行すると、機器のコンソールはその
+        時点で新しい速度に切り替わる。こちらが旧速度のままだと画面が
+        文字化けし、タブを閉じて繋ぎ直すしかなかった。
+
+        pyserial は開いたポートの baudrate へ代入すると SetCommState で
+        設定し直すので、ポートは開いたまま、読み取り・送信スレッドも
+        止めずに済む。
+
+        ポートが拒んだときは error_occurred を出さない。受け手の MainWindow
+        はそれを接続エラーとして扱い、まだ使える接続を捨てて再接続待ちに
+        入ってしまう。失敗は戻り値で返し、知らせ方は呼び出し側に任せる。
+
+        Returns:
+            反映できたら True。ポートが拒んだら False（値は元のまま）
+        """
+        with self._baud_lock:
+            port = self.serial_conn
+            if (port is not None and port.is_open
+                    and not self._apply_baudrate(port, baudrate)):
+                return False
+            self.baudrate = baudrate
+            return True
+
+    @staticmethod
+    def _apply_baudrate(port, baudrate: int) -> bool:
+        """開いたポートのボーレートを変える。拒まれたら元の値へ戻して False。
+
+        pyserial 3.5 は SetCommState を呼ぶ前に内部の値を書き換え、失敗しても
+        戻さない。そのままだと、実際の速度（旧）とポートが名乗る速度（新）が
+        食い違うので、元の値を代入し直す（実際の速度は変わっていない）。
+        """
+        old = port.baudrate
+        try:
+            port.baudrate = baudrate
+            return True
+        except (serial.SerialException, ValueError, OSError) as e:
+            print(f"[Serial] ボーレートを変更できませんでした: {e}")
+            try:
+                port.baudrate = old
+            except (serial.SerialException, ValueError, OSError):
+                pass   # 抜かれたポートなどは戻すのも失敗しうる
+            return False
+
     def dispose(self):
         """ポートを閉じて資源を手放す（切断の通知は出さない）
 
@@ -92,12 +191,63 @@ class SerialConnection(QObject):
 
         Windows の COM ポートは同一プロセス内でも排他なので、閉じずに
         参照だけ捨てると、同じ機器への再接続が Access is denied になる。
+
+        これを呼んだあとの connect() は、何もせず False を返す。呼び出し元
+        （タブを閉じたときの MainWindow）は dispose() の前に接続辞書から
+        このオブジェクトを外しており、以後この接続を使う人はいないため。
+        同じオブジェクトで繋ぎ直す場合は disconnect() を使う。
+
+        残る制限: 接続スレッドが動き出す前の disconnect() は、繋ぎ直しの
+        ために印を消すので取り消しにならない。利用者が明示的に切断してから
+        タブを残す経路だけなので、この場合は接続が成立しても同じ
+        オブジェクトが保持し続ける。
+
+        残る制限: 呼び出し元（タブを閉じたときは GUI スレッド）を、
+        読み取りスレッドと送信スレッドの join で最大 2 秒ずつ、合わせて
+        最大約 4 秒止める。join が空振りした場合でも、残った送信スレッドは
+        起動時のポートに束縛されているので、後の接続のポートへは書かない。
+        空振りしたときはポートをここでは閉じず、閉じる役を送信スレッドへ
+        渡すので、そのポートが閉じるのは書き込みが終わったあとになる。
         """
+        self._disposed = True
         self._should_stop = True
         self._is_connected = False
 
-        # 接続が存在する場合は閉じる
-        if self.serial_conn and self.serial_conn.is_open:
+        # 読み取りスレッドの終了を待つ（自分自身からの後始末では待てない）
+        thread = self._read_thread
+        if (thread is not None and thread.is_alive()
+                and thread is not threading.current_thread()):
+            thread.join(timeout=2)
+        self._read_thread = None
+
+        # 送信スレッドを先に終わらせる。溜まっている分は捨て、次の接続には
+        # 新しいキューを使う（古い終端印が次の送信を巻き込まないように）。
+        # ポートを閉じるより前に止めるのは、pyserial の write/flush と close
+        # の間に同期が無く、待機中のハンドルを別スレッドから閉じるのが
+        # Win32 では未定義の動作だから
+        old_queue = self._send_queue
+        self._send_queue = queue.Queue()
+        old_queue.put(None)
+        writer = self._write_thread
+        handoff = self._write_handoff
+        self._write_thread = None
+        self._write_handoff = None
+        handed_off = False
+        if (writer is not None and writer.is_alive()
+                and writer is not threading.current_thread()):
+            writer.join(timeout=2)
+            if handoff is not None:
+                with handoff.lock:
+                    if not handoff.finished:
+                        # 時間切れ。pyserial の close() は CancelIoEx を投げた
+                        # 直後にハンドルを閉じるので、write の中で待っている
+                        # スレッドの足元からハンドルが消える（Win32 では
+                        # 未定義の動作）。閉じる役は送信スレッドへ渡す
+                        handoff.close_requested = True
+                        handed_off = True
+
+        # 接続が存在する場合は閉じる（送信スレッドへ渡した場合は向こうが閉じる）
+        if not handed_off and self.serial_conn and self.serial_conn.is_open:
             try:
                 self.serial_conn.close()
             except Exception as e:
@@ -106,43 +256,54 @@ class SerialConnection(QObject):
         self.serial_conn = None
 
     def disconnect(self):
-        """シリアルポートから切断"""
+        """シリアルポートから切断（同じオブジェクトで繋ぎ直せる）"""
         self.dispose()
+        # dispose() の印は「このオブジェクトは捨てた」意味なので、利用者が
+        # 明示的に切断しただけの場合は消す。残すと次の connect() が
+        # 取り消し扱いになり、繋ぎ直せなくなる
+        self._disposed = False
         self.disconnected.emit()
     
     def _start_read_thread(self):
         """読み取りスレッドを開始"""
-        import threading
-        
-        def read_loop():
-            """データを継続的に読み取る"""
-            while self._is_connected and not self._should_stop:
-                try:
-                    if self.serial_conn and self.serial_conn.is_open and self.serial_conn.in_waiting > 0:
-                        # データを読み取り
-                        data = self.serial_conn.read(self.serial_conn.in_waiting)
-                        
-                        # デコードして出力
-                        try:
-                            text = data.decode('utf-8', errors='replace')
+        # 後始末で終了を待てるよう、スレッドを保持する
+        self._read_thread = threading.Thread(target=self._read_loop, daemon=True)
+        self._read_thread.start()
+
+    def _read_loop(self):
+        """データを継続的に読み取る"""
+        # 受信の切れ目で割れた多バイト文字を、次の受信と繋いで復号する。
+        # in_waiting > 0 で即読むので、9600bps では 3 バイト文字の途中で
+        # 読むことが多く、受信ごとに復号すると日本語が頻繁に化ける
+        decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
+        while self._is_connected and not self._should_stop:
+            try:
+                if self.serial_conn and self.serial_conn.is_open and self.serial_conn.in_waiting > 0:
+                    # データを読み取り
+                    data = self.serial_conn.read(self.serial_conn.in_waiting)
+
+                    # デコードして出力
+                    try:
+                        text = decoder.decode(data)
+                        if text:
                             self.output_received.emit(text)
-                        except Exception as e:
-                            self.error_occurred.emit(f"デコードエラー: {str(e)}")
-                    else:
-                        # データがない場合は少し待つ
-                        time.sleep(0.01)
-                        
-                except serial.SerialException as e:
-                    self.error_occurred.emit(f"読み取りエラー: {str(e)}")
-                    self._is_connected = False
-                    break
-                except Exception as e:
-                    self.error_occurred.emit(f"予期しないエラー: {str(e)}")
-                    break
-        
-        # スレッドを開始
-        thread = threading.Thread(target=read_loop, daemon=True)
-        thread.start()
+                    except Exception as e:
+                        self.error_occurred.emit(f"デコードエラー: {str(e)}")
+                else:
+                    # データがない場合は少し待つ
+                    time.sleep(0.01)
+
+            except serial.SerialException as e:
+                self.error_occurred.emit(f"読み取りエラー: {str(e)}")
+                self._is_connected = False
+                break
+            except Exception as e:
+                self.error_occurred.emit(f"予期しないエラー: {str(e)}")
+                break
+        # 切れ目で終わった未完の文字を捨てない
+        rest = decoder.decode(b'', final=True)
+        if rest:
+            self.output_received.emit(rest)
     
     def send_command(self, command: str):
         """
@@ -154,17 +315,70 @@ class SerialConnection(QObject):
         if not self._is_connected or not self.serial_conn or not self.serial_conn.is_open:
             self.error_occurred.emit("送信エラー: 接続されていません")
             return
-        
+
+        # GUI スレッドで write/flush を同期実行すると、送り終えるまで
+        # 画面が止まる（9600 baud で 512 文字 ≈ 0.5 秒、300 baud ≈ 17 秒）。
+        # 送信スレッドへ積んで、ここではすぐ戻る。順序はキューが保つ
+        # コマンドを送信（改行は含めない - ターミナル側で処理済み）
+        self._ensure_write_thread()
+        self._send_queue.put(command.encode('utf-8'))
+
+    def _ensure_write_thread(self):
+        """送信スレッドが無ければ起こす（最初の送信時、または再接続後）"""
+        thread = self._write_thread
+        if thread is not None and thread.is_alive():
+            return
+        # キューと同じく、書き込み先のポートも起動時の値で束縛する。
+        # self.serial_conn を読み直すと、join が空振りした古いスレッドが
+        # 後の接続のポートへ前の接続の残りを書いてしまう
+        self._write_handoff = _WriterHandoff()
+        self._write_thread = threading.Thread(
+            target=self._write_loop,
+            args=(self._send_queue, self.serial_conn, self._write_handoff),
+            daemon=True)
+        self._write_thread.start()
+
+    def _write_loop(self, send_queue, port, handoff):
+        """キューに積まれた送信を、起動時のポートへ順に書く。None で終わる"""
         try:
-            # コマンドを送信（改行は含めない - ターミナル側で処理済み）
-            self.serial_conn.write(command.encode('utf-8'))
-            self.serial_conn.flush()
-            
-        except serial.SerialException as e:
-            self.error_occurred.emit(f"送信エラー: {str(e)}")
-            self._is_connected = False
+            while True:
+                data = send_queue.get()
+                if data is None:
+                    break
+                if self._should_stop or port is None or not port.is_open:
+                    continue
+                try:
+                    port.write(data)
+                    port.flush()
+                except serial.SerialException as e:
+                    # 後始末で閉じられた直後の失敗は、切断済みなので知らせない
+                    if self._should_stop:
+                        continue
+                    self.error_occurred.emit(f"送信エラー: {str(e)}")
+                    self._is_connected = False
+                except Exception as e:
+                    if self._should_stop:
+                        continue
+                    self.error_occurred.emit(f"予期しないエラー: {str(e)}")
+        finally:
+            self._finish_write_loop(port, handoff)
+
+    def _finish_write_loop(self, port, handoff):
+        """送信スレッドの後始末。閉じる役を渡されていればポートを閉じる。
+
+        後始末の join が空振りした場合だけ役が回ってくる。渡されたかどうかの
+        判定は dispose() と同じ錠の中で行うので、二重に閉じることはない。
+        """
+        with handoff.lock:
+            handoff.finished = True
+            should_close = handoff.close_requested
+        if not should_close or port is None:
+            return
+        try:
+            if port.is_open:
+                port.close()
         except Exception as e:
-            self.error_occurred.emit(f"予期しないエラー: {str(e)}")
+            print(f"切断エラー: {e}")
     
     @property
     def is_connected(self) -> bool:

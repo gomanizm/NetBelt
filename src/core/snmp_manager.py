@@ -352,6 +352,11 @@ class SNMPTrapReceiver(QThread):
         self.communities = (['public'] if communities is None
                             else _clean_communities(communities))
         self.v3_users = list(v3_users or [])
+        # v3 ユーザ名 → 登録時に求めたセキュリティレベル（1=noAuthNoPriv,
+        # 2=authNoPriv, 3=authPriv）。pysnmp は Trap 受信側（非 authoritative）で
+        # 最低レベルの検査をしないため、こちらで見る
+        self._min_level = {}
+        self._warned_weak = set()
         self._running = False
         self._engine = None
         self._transport = None
@@ -427,6 +432,13 @@ class SNMPTrapReceiver(QThread):
                 user.get("auth_protocol", "none"), user.get("priv_protocol", "none"))
             auth_key = user.get("auth_password") or None
             priv_key = user.get("priv_password") or None
+            # このユーザに求めるレベル。これより弱い通知は _on_notification で捨てる
+            if user.get("priv_protocol", "none") != "none":
+                self._min_level[username] = 3
+            elif user.get("auth_protocol", "none") != "none":
+                self._min_level[username] = 2
+            else:
+                self._min_level[username] = 1
 
             # securityEngineId 無しでも1回登録する（送信用・将来の INFORM 用）。
             # 公式サンプル multiple-usm-users.py と同じ構成。
@@ -491,13 +503,50 @@ class SNMPTrapReceiver(QThread):
         ntfrcv はコールバックのアリティを例外ベースで判定し、TypeError が出ると
         「引数の数が違う」とみなして呼び直す。本体で TypeError を漏らすと
         同じ通知が二度処理されるため、ここで握りつぶす。
+
+        制限: 1件ごとにそのまま emit する（間引きは GUI 側の
+        SNMPPanel._trim_traps だけ）。GUI が止まっている間は Qt の
+        キューが上限なしに伸びる。理由と実測値は _trim_traps に書いた。
         """
         try:
+            if self._is_weaker_than_registered():
+                return
             self.trap_received.emit(self._build_trap_data(var_binds))
         except TypeError as e:
             print(f"[SNMPTrapReceiver] 通知処理エラー: {e}")
         except Exception as e:
             print(f"[SNMPTrapReceiver] 通知処理エラー: {e}")
+
+    def _is_weaker_than_registered(self) -> bool:
+        """v3 の通知が、登録時に求めたレベルより弱ければ True。
+
+        pysnmp の USM は、受信側が authoritative でない Trap では最低
+        securityLevel の検査を行わない。authPriv で登録したユーザ名に対して
+        鍵を付けない noAuthNoPriv の通知を送ると、そのまま届く（実測）。
+        ユーザ名と engineID は秘密ではないので、鍵を知らない送信者が偽の
+        Trap を一覧へ記録させられる。登録レベル未満は捨てる。
+        """
+        sec = self._last_security
+        if str(sec.get('security_model', '')) != '3':
+            return False
+        name = sec.get('security_name', '')
+        required = self._min_level.get(name)
+        if required is None:
+            return False
+        try:
+            level = int(sec.get('security_level') or 0)
+        except ValueError:
+            level = 0
+        if level >= required:
+            return False
+        # 偽の通知で画面が埋まらないよう、ユーザ名ごとに一度だけ知らせる
+        if name not in self._warned_weak:
+            self._warned_weak.add(name)
+            self.error_occurred.emit(
+                "v3 ユーザ %s に、登録より弱いセキュリティレベル（%d < %d）の"
+                "通知が届いたため捨てました（送信元 %s）"
+                % (name, level, required, sec.get('source_ip', '')))
+        return True
 
     def _build_trap_data(self, var_binds) -> dict:
         """
@@ -660,10 +709,17 @@ class SNMPManager(QObject):
             oids: OIDのリスト
             **kwargs: その他のパラメータ (port, version, community, など)
         """
-        if self.worker and self.worker.isRunning():
+        # isRunning() で判定してはいけない。result_ready は run() の中から
+        # queued で emit されるので、スレッドが終わってから結果がメイン
+        # スレッドへ届くまでの間は isRunning() == False かつ結果は未配送。
+        # そこで次の要求を受け付けると、あとから届いた前の結果が新しい要求の
+        # ものとして扱われる（呼び出し側はホストを取り違えて記録する）。
+        # 参照を手放すのは finished を受けたときなので、未配送の結果がある間は
+        # 必ず None ではない。
+        if self.worker is not None:
             self.error_occurred.emit("既に操作が実行中です")
-            return
-        
+            return False
+
         params = {
             'host': host,
             'oids': oids,
@@ -673,11 +729,18 @@ class SNMPManager(QObject):
         self.worker = SNMPWorker('get', params)
         self.worker.result_ready.connect(self._on_operation_completed)
         self.worker.finished.connect(self._on_worker_finished)
-        self.worker.progress_update.connect(self.progress_update.emit)
-        self.worker.partial_result.connect(self.operation_partial.emit)
+        # 中継は必ずシグナル同士でつなぐ（.emit を渡さない）。
+        # self.<シグナル> は参照のたびに作られるその場限りの
+        # pyqtBoundSignal で、その .emit を渡すと PyQt は受け手が
+        # この QObject だと認識できない。別スレッドから積まれた呼び出しが
+        # キューに残ったままこのオブジェクトが解放されると、次に誰かが
+        # processEvents() した時点で解放済みの C++ を叩いて落ちる（実測）。
+        self.worker.progress_update.connect(self.progress_update)
+        self.worker.partial_result.connect(self.operation_partial)
         self.worker.start()
         
         self.operation_started.emit(f"SNMP GET: {host}")
+        return True   # 受理した（実行中で断った場合は False）
     
     def snmp_walk(self, host: str, oid: str, **kwargs):
         """
@@ -688,10 +751,11 @@ class SNMPManager(QObject):
             oid: 開始OID
             **kwargs: その他のパラメータ (port, version, community, など)
         """
-        if self.worker and self.worker.isRunning():
+        # 未配送の結果がある間は受け付けない（理由は snmp_get と同じ）
+        if self.worker is not None:
             self.error_occurred.emit("既に操作が実行中です")
-            return
-        
+            return False
+
         params = {
             'host': host,
             'oid': oid,
@@ -701,14 +765,22 @@ class SNMPManager(QObject):
         self.worker = SNMPWorker('walk', params)
         self.worker.result_ready.connect(self._on_operation_completed)
         self.worker.finished.connect(self._on_worker_finished)
-        self.worker.progress_update.connect(self.progress_update.emit)
-        self.worker.partial_result.connect(self.operation_partial.emit)
+        self.worker.progress_update.connect(self.progress_update)
+        self.worker.partial_result.connect(self.operation_partial)
         self.worker.start()
         
         self.operation_started.emit(f"SNMP WALK: {host} - {oid}")
+        return True   # 受理した（実行中で断った場合は False）
     
     def cancel_operation(self):
-        """現在の操作をキャンセル"""
+        """現在の操作をキャンセル
+
+        制限: 5 秒で待つのをやめ、終わらなかったことは警告を出すだけで
+        呼び出し側へは返さない。応答しない機器への GET/WALK は既定で
+        約 6 秒かかるので、この待ちは実際に超える。超えてもスレッドは
+        self.worker が参照を持ったまま残り、終了処理を続けても実測では
+        異常終了しない（終了コード 0）。
+        """
         if self.worker and self.worker.isRunning():
             self.worker.cancel()
             # タイムアウト無しで待つと、WALK 中はキャンセルフラグを見るまでの間
@@ -771,10 +843,16 @@ class SNMPManager(QObject):
         # 停止しても消えずに残骸が増える。通らない環境は fix_firewall() で直す。
         print("[SNMP] ファイアウォール: 自動設定なし（Windowsの許可に委ねます）")
         self.trap_receiver = SNMPTrapReceiver(port, communities, v3_users)
-        self.trap_receiver.trap_received.connect(self.trap_received.emit)
-        self.trap_receiver.error_occurred.connect(self.error_occurred.emit)
-        self.trap_receiver.started.connect(self.trap_receiver_started.emit)
-        self.trap_receiver.stopped.connect(self.trap_receiver_stopped.emit)
+        # 中継は必ずシグナル同士でつなぐ（.emit を渡さない）。
+        # self.<シグナル> は参照のたびに作られるその場限りの
+        # pyqtBoundSignal で、その .emit を渡すと PyQt は受け手が
+        # この QObject だと認識できない。別スレッドから積まれた呼び出しが
+        # キューに残ったままこのオブジェクトが解放されると、次に誰かが
+        # processEvents() した時点で解放済みの C++ を叩いて落ちる（実測）。
+        self.trap_receiver.trap_received.connect(self.trap_received)
+        self.trap_receiver.error_occurred.connect(self.error_occurred)
+        self.trap_receiver.started.connect(self.trap_receiver_started)
+        self.trap_receiver.stopped.connect(self.trap_receiver_stopped)
         # スレッドを起こす前にバインドし、失敗ならここで打ち切る
         if not self.trap_receiver.bind():
             self.trap_receiver = None

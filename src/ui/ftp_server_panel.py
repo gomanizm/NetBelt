@@ -12,6 +12,13 @@ from datetime import datetime
 
 class FTPServerPanel(QWidget):
     """FTPサーバー制御パネル"""
+
+    # ログも転送履歴も、認証を通らない相手の要求だけで増やせる。上限が
+    # 無いと遠隔から叩き続けるだけでメモリを食い潰せるため、頭打ちにする。
+    # 行数は Syslog パネル（1000件）に合わせた。
+    MAX_LOG_LINES = 1000
+    MAX_HISTORY_ROWS = 1000
+
     def __init__(self, parent=None, config_manager=None):
         """初期化。config_managerがNoneの場合は新規のConfigManagerを生成する。"""
         super().__init__(parent)
@@ -47,9 +54,9 @@ class FTPServerPanel(QWidget):
         root_layout = QHBoxLayout()
         self.root_dir_edit = QLineEdit("./ftp_root")
         root_layout.addWidget(self.root_dir_edit)
-        browse_btn = QPushButton("参照")
-        browse_btn.clicked.connect(self._on_browse_directory); browse_btn.setMaximumWidth(60)
-        root_layout.addWidget(browse_btn)
+        self.browse_btn = QPushButton("参照")
+        self.browse_btn.clicked.connect(self._on_browse_directory); self.browse_btn.setMaximumWidth(60)
+        root_layout.addWidget(self.browse_btn)
         settings_layout.addLayout(root_layout, 1, 1)
         settings_layout.addWidget(QLabel("ユーザー名:"), 2, 0)
         self.username_edit = QLineEdit()
@@ -84,8 +91,10 @@ class FTPServerPanel(QWidget):
         settings_layout.addLayout(passive_layout, 6, 1)
         settings_group.setLayout(settings_layout)
         layout.addWidget(settings_group)
-        # 起動中に無効化する入力群
-        self._inputs = [self.port_spin, self.root_dir_edit, self.username_edit, self.password_edit,
+        # 起動中に無効化する入力群。参照ボタンも含める（欄だけ無効にしても
+        # setText() は効くので、画面のルートと実公開ルートが食い違う）
+        self._inputs = [self.port_spin, self.root_dir_edit, self.browse_btn,
+            self.username_edit, self.password_edit,
             self.anonymous_check, self.anonymous_write_check,
             self.passive_lo_spin, self.passive_hi_spin]
         # 制御ボタン
@@ -134,6 +143,8 @@ class FTPServerPanel(QWidget):
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
         self.log_text.setMaximumHeight(150)
+        # 行数の上限。超えた分は Qt が先頭ブロックから捨てる
+        self.log_text.document().setMaximumBlockCount(self.MAX_LOG_LINES)
         self.log_text.setStyleSheet("font-family: Consolas, monospace; font-size: 9pt;")
         log_layout.addWidget(self.log_text)
         clear_log_btn = QPushButton("ログをクリア")
@@ -157,6 +168,7 @@ class FTPServerPanel(QWidget):
         self.ftp_server.transfer_started.connect(self._on_tx_started)
         self.ftp_server.transfer_progress.connect(self._on_tx_progress)
         self.ftp_server.transfer_complete.connect(self._on_tx_complete)
+        self.ftp_server.transfer_interrupted.connect(self._on_transfer_interrupted)
 
     def _restore_settings(self):
         """保存済み設定を復元"""
@@ -189,7 +201,10 @@ class FTPServerPanel(QWidget):
         port = self.port_spin.value()
         root_dir = self.root_dir_edit.text().strip()
         username = self.username_edit.text().strip()
-        password = self.password_edit.text().strip()
+        # パスワードは入力そのままを使う。前後の空白も資格情報の一部で、
+        # 削ると画面の表示ではログインできず、削った値が保存されるので
+        # 次回以降も食い違う。未入力かどうかの判定だけ strip() で行う。
+        password = self.password_edit.text()
         anonymous = self.anonymous_check.isChecked()
         anonymous_write = anonymous and self.anonymous_write_check.isChecked()
         lo = self.passive_lo_spin.value()
@@ -197,7 +212,7 @@ class FTPServerPanel(QWidget):
         if not root_dir:
             QMessageBox.warning(self, "入力エラー", "ルートディレクトリを指定してください。")
             return
-        if not anonymous and (not username or not password):
+        if not anonymous and (not username or not password.strip()):
             QMessageBox.warning(self, "入力エラー", "匿名を許可しない場合は、ユーザー名とパスワードを入力してください。")
             return
         # 起動前に設定を保存してからサーバーを起動
@@ -227,7 +242,22 @@ class FTPServerPanel(QWidget):
         """サーバー停止時の処理"""
         self.status_label.setText("🔴 停止中")
         self.status_label.setStyleSheet("color: #f44336; font-weight: bold; font-size: 14px;")
+        # 進行中のまま残った行を確定させる。放置すると "1%" 等の表示が
+        # 止めたあとも残り続ける
+        for st in self._active.values():
+            self.history.setItem(st["row"], 5, QTableWidgetItem("中断"))
+        self._active.clear()
         self._add_log("サーバー停止")
+
+    def _on_transfer_interrupted(self, ip: str, filename: str, direction: str):
+        """未完了で終わった転送。エラーではないので行だけ確定させる。
+
+        確定させないと、途中の進捗表示のまま残り続ける。ダイアログは出さない。
+        """
+        st = self._active.pop((ip, filename, direction), None)
+        if st is not None:
+            self.history.setItem(st["row"], 5, QTableWidgetItem("中断"))
+        self._add_log("[%s] 転送中断: %s" % (ip, filename))
 
     def _on_activity_event(self, ip: str, msg: str):
         """クライアントアクティビティ通知の処理"""
@@ -249,6 +279,7 @@ class FTPServerPanel(QWidget):
                 self._fmt_bytes(total) if total else "—", "—", status]
         for c, v in enumerate(vals): self.history.setItem(row, c, QTableWidgetItem(v))
         self._active[key] = {"t0": self._time.time(), "total": total, "row": row}
+        self._trim_history()
         self._add_log("[%s] %s 転送開始: %s" % (ip, "取得" if direction == "download" else "受信", filename))
 
     def _on_tx_progress(self, ip, filename, done, total, direction):
@@ -278,7 +309,26 @@ class FTPServerPanel(QWidget):
                     self._fmt_bytes(done), "—", "完了"]
             for c, v in enumerate(vals):
                 self.history.setItem(row, c, QTableWidgetItem(v))
+            self._trim_history()
         self._add_log("[%s] 転送完了: %s (%s)" % (ip, filename, self._fmt_bytes(done)))
+
+    def _trim_history(self):
+        """転送履歴の行数を上限まで切り詰める（古い行から捨てる）。
+
+        行を捨てると残りの行番号が前へずれるので、進行中の転送が覚えている
+        行番号も同じだけ繰り上げる。ずらさないと、その転送の進捗が別の
+        転送の行を上書きしてしまう。捨てられた行を指していた転送は追跡を
+        やめる（完了時にその場で新しい行を作る）。
+        """
+        excess = self.history.rowCount() - self.MAX_HISTORY_ROWS
+        if excess <= 0:
+            return
+        for _ in range(excess):
+            self.history.removeRow(0)
+        for key in [k for k, st in self._active.items() if st["row"] < excess]:
+            del self._active[key]
+        for st in self._active.values():
+            st["row"] -= excess
 
     def _on_error(self, error_message: str):
         """エラー発生時の処理"""
@@ -291,10 +341,11 @@ class FTPServerPanel(QWidget):
     def _on_fw_allow(self):
         """手動でファイアウォール受信許可を追加（管理者昇格）。3CDaemon方式で通らない環境の復旧用。"""
         self._add_log("ファイアウォール許可を実行します（管理者昇格）...")
-        ok, _msg = self.ftp_server.fix_firewall(
+        ok, msg = self.ftp_server.fix_firewall(
             self.port_spin.value(),
             (self.passive_lo_spin.value(), self.passive_hi_spin.value()))
-        self._add_log("ファイアウォール許可: %s" % ("完了" if ok else "未反映/失敗"))
+        # 「反映待ち」等の理由を潰さず、そのまま見せる
+        self._add_log("ファイアウォール許可: %s (%s)" % ("完了" if ok else "未反映/失敗", msg))
 
     def _add_log(self, message: str):
         """ログにメッセージを追加(自動スクロール付き)"""

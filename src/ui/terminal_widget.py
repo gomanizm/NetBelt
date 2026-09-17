@@ -35,6 +35,7 @@ class InteractiveTerminal(QTextEdit):
     reconnect_requested = pyqtSignal()  # 再接続要求シグナル
     macro_execute_requested = pyqtSignal(str)  # マクロ実行要求シグナル（マクロ名）
     macro_settings_requested = pyqtSignal()  # マクロ設定画面要求シグナル
+    macro_stop_requested = pyqtSignal()  # 実行中のマクロ（コマンドリスト）停止要求シグナル
     keepalive_start_requested = pyqtSignal()  # キープアライブ開始要求シグナル
     keepalive_stop_requested = pyqtSignal()  # キープアライブ停止要求シグナル
     # Ctrl+ホイールでのフォントサイズ変更要求（回した向き: +1 / -1）
@@ -54,6 +55,7 @@ class InteractiveTerminal(QTextEdit):
         self._is_recording = False  # ログ記録中フラグ
         self._macro_list = []  # 利用可能なマクロリスト
         self._keepalive_active = False  # キープアライブ動作中フラグ
+        self._command_list_active = False  # マクロ（コマンドリスト）実行中フラグ
         # まだ送り切っていない貼り付け。まとめて送ると GUI が止まるので、
         # 区切りごとにイベントループへ譲りながら流す
         self._send_queue = []
@@ -62,6 +64,10 @@ class InteractiveTerminal(QTextEdit):
     def set_keepalive_status(self, active: bool):
         """キープアライブの状態を設定"""
         self._keepalive_active = active
+
+    def set_command_list_status(self, active: bool):
+        """マクロ（コマンドリスト）が実行中かを設定"""
+        self._command_list_active = active
     
     def set_input_enabled(self, enabled: bool):
         """入力の有効/無効を切り替え"""
@@ -130,7 +136,31 @@ class InteractiveTerminal(QTextEdit):
     # その規模なら数回で終わる。
     SEND_CHUNK = 512
 
-    def _queue_send(self, payload: str):
+    def queue_macro_send(self, payload: str):
+        """マクロ（コマンドリスト）の1行を送信列へ積む
+
+        マクロ由来という印を付けておく。停止したときに、まだ送っていない
+        ぶんだけを cancel_macro_sends で取り消せるようにするため。
+        """
+        self._queue_send(payload, from_macro=True)
+
+    def cancel_macro_sends(self):
+        """まだ送っていないマクロ由来の断片を送信列から取り除く
+
+        停止したのに、貼り付けの排出待ちで列に残っていたコマンドが
+        後から機器へ届くのを防ぐ。打鍵や貼り付けは巻き添えにしない。
+
+        すでに送り始めてしまった行（SEND_CHUNK を超える長い行の先頭ぶんが
+        機器へ届いている状態）は取り消さず、最後まで送り切る。ここで捨てると
+        機器の入力行に中途半端な文字列と行末の CR 抜けが残り、次に利用者が
+        打った文字がその続きになってしまう。
+        """
+        self._send_queue = [
+            entry for entry in self._send_queue
+            if not entry[1] or entry[2]
+        ]
+
+    def _queue_send(self, payload: str, from_macro: bool = False):
         """機器へ送るものを列の末尾へ積む
 
         機器へ向かうものは、貼り付けも打鍵も IME の確定も問い合わせへの
@@ -145,7 +175,9 @@ class InteractiveTerminal(QTextEdit):
         """
         if not payload:
             return
-        self._send_queue.append(payload)
+        # [送る文字列, マクロ由来か, 送り始めたか] の形で積む。
+        # 停止のときに由来で選り分け、送りかけの行だけは残す
+        self._send_queue.append([payload, from_macro, False])
         if not self._sending:
             self._drain_send_queue()
 
@@ -176,10 +208,13 @@ class InteractiveTerminal(QTextEdit):
             return
 
         self._sending = True
-        payload = self._send_queue[0]
+        entry = self._send_queue[0]
+        payload = entry[0]
         chunk, rest = payload[:self.SEND_CHUNK], payload[self.SEND_CHUNK:]
         if rest:
-            self._send_queue[0] = rest
+            entry[0] = rest
+            # 先頭ぶんは機器へ届いた。以降この行は取り消しの対象にしない
+            entry[2] = True
         else:
             self._send_queue.pop(0)
 
@@ -243,13 +278,13 @@ class InteractiveTerminal(QTextEdit):
         menu = QMenu(self)
         
         # コピー（選択範囲がある場合のみ有効）
-        copy_action = QAction("コピー", self)
+        copy_action = QAction("コピー", menu)
         copy_action.triggered.connect(self.copy)
         copy_action.setEnabled(self.textCursor().hasSelection())
         menu.addAction(copy_action)
         
         # 貼り付け（カスタムペースト機能を使用）
-        paste_action = QAction("貼り付け", self)
+        paste_action = QAction("貼り付け", menu)
         paste_action.triggered.connect(self.custom_paste)
         paste_action.setEnabled(self.can_send_input())
         menu.addAction(paste_action)
@@ -257,7 +292,7 @@ class InteractiveTerminal(QTextEdit):
         menu.addSeparator()
         
         # すべて選択
-        select_all_action = QAction("すべて選択", self)
+        select_all_action = QAction("すべて選択", menu)
         select_all_action.triggered.connect(self.selectAll)
         menu.addAction(select_all_action)
         
@@ -267,10 +302,10 @@ class InteractiveTerminal(QTextEdit):
         if self._input_enabled:
             # キープアライブ
             if self._keepalive_active:
-                keepalive_action = QAction("キープアライブ停止", self)
+                keepalive_action = QAction("キープアライブ停止", menu)
                 keepalive_action.triggered.connect(lambda: self.keepalive_stop_requested.emit())
             else:
-                keepalive_action = QAction("キープアライブ開始", self)
+                keepalive_action = QAction("キープアライブ開始", menu)
                 keepalive_action.triggered.connect(lambda: self.keepalive_start_requested.emit())
             menu.addAction(keepalive_action)
             
@@ -278,7 +313,7 @@ class InteractiveTerminal(QTextEdit):
             
             # マクロ実行サブメニュー
             if self._macro_list:
-                macro_menu = QMenu("マクロ実行", self)
+                macro_menu = QMenu("マクロ実行", menu)
                 for macro in self._macro_list:
                     macro_name = macro.get("name", "")
                     macro_desc = macro.get("description", "")
@@ -288,34 +323,49 @@ class InteractiveTerminal(QTextEdit):
                     else:
                         action_text = macro_name
                     
-                    macro_action = QAction(action_text, self)
+                    macro_action = QAction(action_text, macro_menu)
                     macro_action.triggered.connect(
                         lambda checked, name=macro_name: self.macro_execute_requested.emit(name)
                     )
                     macro_menu.addAction(macro_action)
                 
                 menu.addMenu(macro_menu)
+
+            # 実行中のマクロを止める。これが無いと、誤ったマクロを流し
+            # 始めたときタブを閉じる以外に中断する手段が無い
+            if self._command_list_active:
+                macro_stop_action = QAction("マクロ停止", menu)
+                macro_stop_action.triggered.connect(lambda: self.macro_stop_requested.emit())
+                menu.addAction(macro_stop_action)
             
             menu.addSeparator()
         
         # ログ機能メニュー
         # 1. 現在表示されている全ログの保存
-        save_all_log_action = QAction("全ログ保存", self)
+        save_all_log_action = QAction("全ログ保存", menu)
         save_all_log_action.triggered.connect(self._on_save_all_log)
         menu.addAction(save_all_log_action)
         
         # 2. ログ記録開始/停止（記録状態によって切り替え）
         if self._is_recording:
-            stop_log_action = QAction("ログ記録停止", self)
+            stop_log_action = QAction("ログ記録停止", menu)
             stop_log_action.triggered.connect(self._on_stop_log_recording)
             menu.addAction(stop_log_action)
         else:
-            start_log_action = QAction("ログ記録開始", self)
+            start_log_action = QAction("ログ記録開始", menu)
             start_log_action.triggered.connect(self._on_start_log_recording)
             menu.addAction(start_log_action)
         
         # メニューを表示
-        menu.exec(event.globalPos())
+        try:
+            menu.exec(event.globalPos())
+        finally:
+            # 端末を親にしたメニューは、閉じただけでは子として残る。
+            # 右クリックのたびに QMenu 1 件と項目が積み上がるので、
+            # 開き終えたら項目ごと捨てる（実測: 5 回で QMenu 5 件、
+            # QAction 40 件）。項目の親もメニューにしてあるので、
+            # メニューが消えるときに一緒に片付く。
+            menu.deleteLater()
     
     def _on_save_all_log(self):
         """現在表示されている全ログを保存"""
@@ -395,9 +445,12 @@ class InteractiveTerminal(QTextEdit):
             return
         
         if key == Qt.Key.Key_Return or key == Qt.Key.Key_Enter:
-            # 再接続モードの場合は再接続シグナルを発行
+            # 再接続モードの場合は再接続シグナルを発行。
+            # ここで待ちを解かない。解くのは接続に成功した時点
+            # （MainWindow._on_connection_success）。先に解くと、再接続に
+            # 失敗したときに待ちが戻らず、画面に残る「Enterキーを押すと
+            # 再接続します」の案内どおりに操作できなくなる
             if self._reconnect_mode:
-                self._reconnect_mode = False
                 self.reconnect_requested.emit()
                 return
             # 通常モードの場合はSSHに送信
@@ -439,6 +492,16 @@ class TerminalWidget(QWidget):
     FONT_SIZE_MIN = 6
     FONT_SIZE_MAX = 32
 
+    # 表示文書に残す最大ブロック（行）数。Screen.history（5000 行）より
+    # 多めに取り、画面領域（最大 200 行）を削らない余裕を持たせる
+    MAX_DOCUMENT_BLOCKS = 20000
+
+    # 1 ブロック (段落) に許す最大文字数。折り返しで続く履歴行は改行で
+    # 切らずに繋ぐため、改行を一度も含まない出力ではブロックが 1 個の
+    # まま伸び、MAX_DOCUMENT_BLOCKS が永久に効かない。実際の 1 行より
+    # 十分大きく、かつ伸び続けさせない所で強制的に切る
+    MAX_BLOCK_CHARS = 8192
+
     # タブが閉じられたときのシグナル（機器名を送信）
     tab_closed = pyqtSignal(str)
     # 表示中のタブが変わったことを知らせる（機器名。タブが無ければ空文字）。
@@ -450,6 +513,8 @@ class TerminalWidget(QWidget):
     font_size_change_requested = pyqtSignal(int)
     # マクロ設定画面要求シグナル（機器名）
     macro_settings_requested = pyqtSignal(str)
+    # 実行中のマクロ停止要求シグナル（機器名）
+    macro_stop_requested = pyqtSignal(str)
     # キープアライブ開始要求シグナル（機器名）
     keepalive_start_requested = pyqtSignal(str)
     # キープアライブ停止要求シグナル（機器名）
@@ -514,7 +579,21 @@ class TerminalWidget(QWidget):
         else:
             terminal = QTextEdit()
             terminal.setReadOnly(True)
-        
+
+        # Undo 履歴は持たない。機器の出力を巻き戻す用途は無く（Ctrl+Z は
+        # 機器へ送る）、画面内の上書き更新のたびに undo が積まれて
+        # メモリが単調増加していた（実測: 20 万回の上書きで +70MB）
+        terminal.setUndoRedoEnabled(False)
+        # 文書の行数にも上限を置く。Screen.history の上限は文書へ写した
+        # 後の行には効かず、受信行数のまま増え続けていた。超えた分は
+        # Qt が先頭ブロックから捨てる。画面領域は末尾なので影響しない
+        terminal.document().setMaximumBlockCount(self.MAX_DOCUMENT_BLOCKS)
+        # 一度でも上限に達した（＝古い行が捨てられた）ことを覚えておく。
+        # 「全ログ保存」の欠落警告をいまの blockCount だけで決めると、
+        # 窓を 1 行縦に縮めるだけで上限を下回り、欠けたログが完全なもの
+        # として黙って保存される
+        terminal._log_truncated = False
+
         # フォント設定（_terminal_settings を参照する。設定変更後に作られる
         # タブも同じ外観になるようにするため）
         settings = self._terminal_settings
@@ -635,14 +714,20 @@ class TerminalWidget(QWidget):
                     # 再接続は新しいセッション。前の画面はそのまま記録と
                     # して文書に残し、端末状態 (パーサ・画面) は作り直す
                     self._attach_screen(self._terminals[device_name])
+                    # 再接続待ちはここでは解かない。解くのは接続できた
+                    # 時点（MainWindow._on_connection_success）。ここで
+                    # 解くと、再接続に失敗したときに待ちが戻らず、画面の
+                    # 「Enterキーを押すと再接続します」が効かなくなる
                     return self._terminals[device_name]
         
         # 接続機器がなく、ホームタブが残っている場合は、ホームタブを再利用
         if len(self._terminals) == 0 and self.tab_widget.count() == 1:
             home_tab = self.tab_widget.widget(0)
             if isinstance(home_tab, QTextEdit) and not isinstance(home_tab, InteractiveTerminal):
-                # ホームタブを削除して新しいインタラクティブターミナルを作成
-                self.tab_widget.removeTab(0)
+                # ホームタブを削除して新しいインタラクティブターミナルを作成。
+                # ページごと捨てないと、接続と切断を繰り返すたびにホーム
+                # タブ用の QTextEdit が非表示のまま 1 個ずつ積み上がる
+                self._discard_page(0)
         
         # 新しいインタラクティブターミナルを作成
         terminal = self._create_terminal(interactive=True)
@@ -658,6 +743,9 @@ class TerminalWidget(QWidget):
         # マクロ設定画面要求シグナルを接続
         terminal.macro_settings_requested.connect(
             lambda: self.macro_settings_requested.emit(device_name)
+        )
+        terminal.macro_stop_requested.connect(
+            lambda: self.macro_stop_requested.emit(device_name)
         )
         
         # キープアライブ開始/停止要求シグナルを接続
@@ -845,6 +933,13 @@ class TerminalWidget(QWidget):
                 region.insertText(run, self._char_format(attr))
             if not wrapped:
                 region.insertText("\n", QTextCharFormat())
+            elif region.positionInBlock() >= self.MAX_BLOCK_CHARS:
+                # 改行を一度も含まない出力 (バイナリの cat など) は、
+                # 折り返し行を繋ぎ続けるかぎりブロックが 1 個のまま伸び、
+                # MAX_DOCUMENT_BLOCKS が永久に効かない。文書もメモリも
+                # 際限なく膨らみ、1 ブロックの組版が重くなって GUI が
+                # 止まる。表示上の折り返し位置は変わるが、ここで切る
+                region.insertText("\n", QTextCharFormat())
 
         cell_rows = [self._visible_cells(line) for line in screen.lines]
         # カーソルの行は、カーソルの桁まで空白を残す。プロンプト末尾の
@@ -883,8 +978,22 @@ class TerminalWidget(QWidget):
                               QTextCursor.MoveMode.KeepAnchor)
             # 書式は空で入れる。insertText は挿入位置の書式を引き継ぐので、
             # 指定しないと直前の色や反転が新しい文字へ伝染する
+            removed = _u16(old_text[prefix:len(old_text) - suffix])
+            added = _u16(new_text[prefix:len(new_text) - suffix])
+            before = terminal.document().characterCount()
             probe.insertText(new_text[prefix:len(new_text) - suffix],
                              QTextCharFormat())
+            # 文書が上限 (MAX_DOCUMENT_BLOCKS) に達していると、この挿入で
+            # Qt が文書の先頭ブロックを捨てる。QTextCursor である region や
+            # probe は自動で詰まるが、int で控えた start は古い位置を指した
+            # まま残る。そのままだと次の差し替え範囲・塗り直し位置・
+            # キャレット位置がずれ、縦にリサイズするたびにスクロール
+            # バックへ重複行と欠落が積み上がる。捨てられた文字数を
+            # 数えて詰め直す
+            dropped = (before - removed + added
+                       - terminal.document().characterCount())
+            if dropped:
+                start -= dropped
             # 下の行との突き合わせは文書の位置で行うので、単位を揃える
             touched = (_u16(new_text[:prefix]),
                        _u16(new_text[:len(new_text) - suffix]))
@@ -912,8 +1021,11 @@ class TerminalWidget(QWidget):
             pos = start
             for r in range(screen.cursor_row):
                 pos += _u16(rows[r]) + 1
-            row = rows[screen.cursor_row]
-            pos += _u16(row[:min(screen.cursor_col, len(row))])
+            # 桁ではなくセルで数える。全角は 2 セルで文書上は 1 文字、
+            # 結合文字は 0 セルで文書上は 1 文字ぶん増えるので、文字列を
+            # 桁で切るとキャレットがずれる
+            row = cell_rows[screen.cursor_row][:screen.cursor_col]
+            pos += _u16("".join(cell[0] for cell in row))
             caret = QTextCursor(terminal.document())
             caret.setPosition(pos)
             terminal.setTextCursor(caret)
@@ -923,6 +1035,11 @@ class TerminalWidget(QWidget):
         # 画面の上半分しか窓に入らない
         bar = terminal.verticalScrollBar()
         bar.setValue(bar.maximum())
+
+        # 上限に達していたら「切り詰めた」を立てたままにする。この後で
+        # 窓を縮めて blockCount が下回っても、捨てた行は戻らない
+        if terminal.document().blockCount() >= self.MAX_DOCUMENT_BLOCKS:
+            terminal._log_truncated = True
 
     def show_notice(self, device_name: str, text: str) -> None:
         """アプリ自身の案内 (切断バナー・エラー文) を画面へ出す。
@@ -968,9 +1085,60 @@ class TerminalWidget(QWidget):
                     self._log_files[device_name].write(logged)
                     self._log_files[device_name].flush()
                 except Exception as e:
-                    import sys
-                    print(f"[ERROR] ログ書き込みエラー: {str(e)}", file=sys.stderr)
+                    self._abort_log_recording(device_name, e)
+
+    def _discard_log_dialog(self, dialog) -> None:
+        """記録中ダイアログを閉じて、捨てる。
+
+        LogRecordingDialog は TerminalWidget を親にしているので、close() だけ
+        だと親子関係からは外れず、1 秒ごとのタイマーを持ったまま子として残る。
+        記録の開始と停止を繰り返すたびに 1 件ずつ積み上がる（実測: 3 回で 3 件）。
+        呼ぶ側は必ず _log_dialogs から外してから渡すこと。
+
+        deleteLater() は今のイベントループへ戻ったところで効くので、停止ボタン
+        （ダイアログ自身のスロット）から呼ばれても、その場で足元を消さない。
+        """
+        dialog.close()
+        dialog.deleteLater()
+
+    def _abort_log_recording(self, device_name: str, error: Exception) -> None:
+        """書き込みに失敗した記録を止めて、知らせる。
+
+        stderr へ print するだけだと、ディスク満杯や共有フォルダの切断のあとも
+        「記録中」の表示とフラグが残り、利用者は記録できていると思って作業を
+        続ける。console=False の exe では stderr の出力先も無い。
+        ハンドルを先に外すので、警告は失敗のたびではなく一度だけ出る。
+        """
+        from PyQt6.QtWidgets import QMessageBox
+
+        from core import log_recording
+        log_recording.stop(device_name)
+        handle = self._log_files.pop(device_name, None)
+        if handle is not None:
+            try:
+                handle.close()
+            except Exception:
+                pass   # 壊れたハンドルは閉じるのも失敗しうる
+        terminal = self._terminals.get(device_name)
+        if isinstance(terminal, InteractiveTerminal):
+            terminal._is_recording = False
+        dialog = self._log_dialogs.pop(device_name, None)
+        if dialog is not None:
+            self._discard_log_dialog(dialog)
+        QMessageBox.warning(
+            self, "ログ記録",
+            "%s のログ記録を停止しました。書き込みに失敗しました:\n%s\n\n"
+            "記録は失敗する前の行までです。保存先の空きや接続を確認してから、"
+            "記録を始め直してください。" % (device_name, error))
     
+    def has_terminal(self, device_name: str) -> bool:
+        """その機器名のターミナルタブが開いているかを返す
+
+        Args:
+            device_name: 機器名
+        """
+        return device_name in self._terminals
+
     def enable_reconnect(self, device_name: str, reconnect_callback):
         """
         再接続モードを有効にする
@@ -989,6 +1157,23 @@ class TerminalWidget(QWidget):
                 pass
             terminal.reconnect_requested.connect(lambda: reconnect_callback(device_name))
     
+
+    def _discard_page(self, index: int) -> None:
+        """タブを外し、そのページを親から外して捨てる
+
+        QTabWidget.removeTab はページを内部の QStackedWidget から外さない。
+        残されたページは文書（受信した全出力・ウェルカム文）ごと非表示の
+        まま生き続け、タブを閉じるたび・ホームタブを置き換えるたびに
+        積み上がる。親から外して deleteLater で捨てる。
+
+        Args:
+            index: 外すタブのインデックス
+        """
+        widget = self.tab_widget.widget(index)
+        self.tab_widget.removeTab(index)
+        if widget is not None:
+            widget.setParent(None)
+            widget.deleteLater()
 
     def _close_tab(self, index: int) -> None:
         """
@@ -1017,9 +1202,9 @@ class TerminalWidget(QWidget):
         if tab_name in self._terminals:
             del self._terminals[tab_name]
 
-        # タブを削除
-        self.tab_widget.removeTab(index)
-        
+        # タブを削除（ページごと捨てる）
+        self._discard_page(index)
+
         # すべての接続が閉じられた場合、ホームタブを再作成
         if self.tab_widget.count() == 0:
             welcome_terminal = self._create_terminal()
@@ -1031,6 +1216,46 @@ class TerminalWidget(QWidget):
             )
             self.tab_widget.addTab(welcome_terminal, "ホーム")
     
+    @staticmethod
+    def _default_log_dir() -> str:
+        """保存先ダイアログの初期ディレクトリ（cwd/logs。作れなければ別の場所）
+
+        読み取り専用の場所から起動した、logs という名前のファイルが既に
+        ある、といった理由で cwd/logs を作れないことがある。ここで例外に
+        すると保存先ダイアログが一度も出ず、書ける場所を選ぶ手段が無い。
+        作れないときはホームへ落とす（保存先自体はダイアログで選べる）。
+        """
+        import os
+        logs_dir = os.path.join(os.getcwd(), "logs")
+        try:
+            os.makedirs(logs_dir, exist_ok=True)
+        except OSError:
+            return os.path.expanduser("~")
+        return logs_dir
+
+    def _recording_device_using(self, file_path: str):
+        """file_path を記録先にしている機器名を返す（無ければ None）
+
+        記録中のファイルを別の記録や全ログ保存の保存先に選ぶと、open('w')
+        で記録済みの内容が消え、以降は両者の書き込みが混在する。保存先を
+        決めた直後にここで見て拒否する。
+
+        判定そのものは core.log_recording に置いてある。端末以外の画面
+        （SNMP のエクスポートなど）も同じ判定を使う必要があるため。
+        """
+        from core import log_recording
+        return log_recording.device_using(file_path)
+
+    def _warn_log_file_in_use(self, title: str, file_path: str, device_name: str):
+        """記録中のファイルが選ばれたことを知らせる"""
+        from PyQt6.QtWidgets import QMessageBox
+        QMessageBox.warning(
+            self,
+            title,
+            f"このファイルは {device_name} のログ記録に使用中です:\n{file_path}\n"
+            "別のファイルを選ぶか、先にそのログ記録を停止してください。"
+        )
+
     def save_current_log(self):
         """現在アクティブなターミナルのログを保存"""
         from PyQt6.QtWidgets import QFileDialog, QMessageBox
@@ -1066,14 +1291,35 @@ class TerminalWidget(QWidget):
                 )
                 return
             
+            # 表示文書は MAX_DOCUMENT_BLOCKS 行で頭から切り詰められる。
+            # 保存するのはその toPlainText() なので、切り詰められた分は
+            # 「全ログ保存」でも出てこない。黙って落とさず先に断る
+            # いまの行数だけで決めない。上限に達して古い行を捨てた後でも、
+            # 窓を縦に 1 行縮めれば blockCount は上限を下回る。捨てた事実の
+            # ほうを見る
+            blocks = current_widget.document().blockCount()
+            if (blocks >= self.MAX_DOCUMENT_BLOCKS
+                    or getattr(current_widget, "_log_truncated", False)):
+                answer = QMessageBox.warning(
+                    self,
+                    "ログ保存",
+                    f"画面に残っているのは直近 {blocks} 行だけです。\n"
+                    "それより古い出力は表示から消えているため、保存されません。\n\n"
+                    "全量が必要なときは「ログ記録」を使ってください。"
+                    "受信のたびにファイルへ書き出すので、表示の上限に影響されません。\n\n"
+                    "残っている分だけを保存しますか？",
+                    QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+                    QMessageBox.StandardButton.Ok
+                )
+                if answer != QMessageBox.StandardButton.Ok:
+                    return
+
             # デフォルトのファイル名を生成（機器名_日時.log）
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             default_filename = f"{tab_name}_{timestamp}.log"
-            
-            # logsフォルダのパスを取得（存在しない場合は作成）
-            logs_dir = os.path.join(os.getcwd(), "logs")
-            os.makedirs(logs_dir, exist_ok=True)
-            
+
+            logs_dir = self._default_log_dir()
+
             # ファイル保存ダイアログを表示
             file_path, _ = QFileDialog.getSaveFileName(
                 self,
@@ -1083,6 +1329,11 @@ class TerminalWidget(QWidget):
             )
             
             if file_path:
+                in_use_by = self._recording_device_using(file_path)
+                if in_use_by is not None:
+                    self._warn_log_file_in_use("ログ保存", file_path, in_use_by)
+                    return
+
                 # プログレスダイアログを表示してログを保存
                 from .dialogs.log_save_dialog import LogSaveProgressDialog
                 
@@ -1129,11 +1380,9 @@ class TerminalWidget(QWidget):
         # デフォルトのファイル名を生成（機器名_日時.log）
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         default_filename = f"{tab_name}_{timestamp}.log"
-        
-        # logsフォルダのパスを取得（存在しない場合は作成）
-        logs_dir = os.path.join(os.getcwd(), "logs")
-        os.makedirs(logs_dir, exist_ok=True)
-        
+
+        logs_dir = self._default_log_dir()
+
         # ファイル保存ダイアログを表示
         file_path, _ = QFileDialog.getSaveFileName(
             self,
@@ -1143,10 +1392,17 @@ class TerminalWidget(QWidget):
         )
         
         if file_path:
+            in_use_by = self._recording_device_using(file_path)
+            if in_use_by is not None:
+                self._warn_log_file_in_use("ログ記録", file_path, in_use_by)
+                return
+
             try:
                 # ファイルを開く
                 log_file = open(file_path, 'w', encoding='utf-8', buffering=1)  # 行バッファリング
                 self._log_files[tab_name] = log_file
+                from core import log_recording
+                log_recording.start(tab_name, file_path)
                 
                 # ターミナルの記録フラグを設定
                 if isinstance(current_widget, InteractiveTerminal):
@@ -1202,32 +1458,40 @@ class TerminalWidget(QWidget):
 
         # ログファイルを閉じる
         if tab_name in self._log_files:
-            try:
-                self._log_files[tab_name].close()
-                del self._log_files[tab_name]
-                
-                # ターミナルの記録フラグをクリア
-                if isinstance(current_widget, InteractiveTerminal):
-                    current_widget._is_recording = False
-                
-                # ダイアログを閉じる。停止ボタン経由だと相手は自分でも
-                # close() を呼んでいるので、二度閉じても平気にしておく
-                dialog = self._log_dialogs.pop(tab_name, None)
-                if dialog is not None:
-                    dialog.close()
+            # 後始末は close() より先に済ませる。close() は残った書き込みを
+            # 吐き出すので、ディスク満杯・共有フォルダの切断で失敗しうる。
+            # 後始末を close() の後ろに置くと、失敗したときだけ記録フラグと
+            # ハンドルと「記録中」ダイアログが残り、記録を始め直そうとしても
+            # 「既にログ記録中です。」で断られる（止める手段が無くなる）。
+            handle = self._log_files.pop(tab_name)
+            from core import log_recording
+            log_recording.stop(tab_name)
 
-                if notify:
-                    QMessageBox.information(
-                        self,
-                        "ログ記録停止",
-                        "ログ記録を停止しました。"
-                    )
-                
+            # ターミナルの記録フラグをクリア
+            if isinstance(current_widget, InteractiveTerminal):
+                current_widget._is_recording = False
+
+            # ダイアログを閉じる。停止ボタン経由だと相手は自分でも
+            # close() を呼んでいるので、二度閉じても平気にしておく
+            dialog = self._log_dialogs.pop(tab_name, None)
+            if dialog is not None:
+                self._discard_log_dialog(dialog)
+
+            try:
+                handle.close()
             except Exception as e:
                 QMessageBox.warning(
                     self,
                     "エラー",
                     f"ログファイルを閉じる際にエラーが発生しました:\n{str(e)}"
+                )
+                return
+
+            if notify:
+                QMessageBox.information(
+                    self,
+                    "ログ記録停止",
+                    "ログ記録を停止しました。"
                 )
     
     def _on_current_tab_changed(self, index: int) -> None:
@@ -1267,3 +1531,14 @@ class TerminalWidget(QWidget):
         """
         if device_name in self._terminals:
             self._terminals[device_name].set_keepalive_status(active)
+
+    def set_command_list_status(self, device_name: str, active: bool):
+        """
+        指定した機器のマクロ（コマンドリスト）実行状態を設定
+
+        Args:
+            device_name: 機器名
+            active: 実行中かどうか
+        """
+        if device_name in self._terminals:
+            self._terminals[device_name].set_command_list_status(active)

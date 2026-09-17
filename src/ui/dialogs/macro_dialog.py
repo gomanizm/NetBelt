@@ -22,12 +22,17 @@ class MacroDialog(QDialog):
     command_list_stop_requested = pyqtSignal()
     
     def __init__(self, parent=None, device_name: str = "", 
-                 keepalive_active: bool = False, 
+                 keepalive_active: bool = False,
                  command_list_active: bool = False,
-                 config_manager=None):
+                 config_manager=None,
+                 keepalive_interval: int = 60):
         super().__init__(parent)
         self.device_name = device_name
         self.keepalive_active = keepalive_active
+        # いま動いている（または前回使った）送信間隔。_create_ui より前に
+        # 退避しておかないと、送信間隔の欄が既定値のままになり、
+        # 動作中の表示も次の開始も実間隔とずれる
+        self.keepalive_interval = keepalive_interval
         self.command_list_active = command_list_active
         self.config_manager = config_manager
         
@@ -80,7 +85,7 @@ class MacroDialog(QDialog):
         self.keepalive_interval_spin = QSpinBox()
         self.keepalive_interval_spin.setMinimum(10)
         self.keepalive_interval_spin.setMaximum(3600)
-        self.keepalive_interval_spin.setValue(60)
+        self.keepalive_interval_spin.setValue(self.keepalive_interval)
         self.keepalive_interval_spin.setSuffix(" 秒")
         interval_layout.addWidget(self.keepalive_interval_spin)
         interval_layout.addStretch()
@@ -361,12 +366,18 @@ class PresetEditDialog(QDialog):
             return
         
         if self.is_new:
-            # 新規作成
-            if self.config_manager.add_global_macro(name, commands, description):
+            # 新規作成。add_global_macro は重複でも保存失敗でも False を返すので、
+            # 重複はここで先に確かめる（保存失敗を名前のせいだと伝えない）
+            if self.config_manager.get_macro_by_name(name):
+                QMessageBox.warning(self, "エラー", f"プリセット '{name}' は既に存在します。")
+            elif self.config_manager.add_global_macro(name, commands, description):
                 QMessageBox.information(self, "成功", f"プリセット '{name}' を作成しました。")
                 self.accept()
             else:
-                QMessageBox.warning(self, "エラー", f"プリセット '{name}' は既に存在します。")
+                QMessageBox.warning(
+                    self, "エラー",
+                    f"プリセット '{name}' を保存できませんでした。\n"
+                    "設定ファイル (config.json) に書き込めるか確認してください。")
         else:
             # 更新
             if self.config_manager.update_global_macro(name, commands, description):

@@ -15,6 +15,47 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QFont
 
+from core.sockets import set_exclusive_bind
+
+
+def _local_port(local_address: str):
+    """netstat のローカルアドレス列（例 0.0.0.0:135, [::]:135）からポート番号を取り出す。"""
+    _, sep, port = local_address.rpartition(":")
+    if not sep or not port.isdigit():
+        return None
+    return int(port)
+
+
+def select_netstat_lines(output: str, port, protocol: str,
+                         listening_only: bool = False) -> list:
+    """netstat -ano の出力から、条件に合う行だけを返す。
+
+    findstr :{port} のような部分文字列の判定は、80 で 8080 やリモート側の
+    :80 まで拾い、別プロセスを原因として表示してしまう。列に分けて、
+    ローカルアドレス列のポート番号を完全一致で比べる。
+
+    Args:
+        output: netstat -ano の出力全体
+        port: ポート番号。None なら全ポート
+        protocol: 'TCP' または 'UDP'（行頭のプロトコル列と比べる。IPv6 の
+            行も同じ列名なので一緒に拾う）
+        listening_only: True なら TCP の状態列が LISTENING の行だけ。
+            UDP は状態列を持たないのでそのまま
+    """
+    selected = []
+    for line in output.splitlines():
+        parts = line.split()
+        # 列: プロトコル, ローカル, 外部, [状態], PID（UDP は状態列が無い）
+        if len(parts) < 4 or parts[0].upper() != protocol.upper():
+            continue
+        if port is not None and _local_port(parts[1]) != port:
+            continue
+        if listening_only and protocol.upper() == "TCP" and \
+                (len(parts) < 5 or parts[3].upper() != "LISTENING"):
+            continue
+        selected.append(line)
+    return selected
+
 
 class PortCheckThread(QThread):
     """ポートチェックを別スレッドで実行"""
@@ -27,8 +68,26 @@ class PortCheckThread(QThread):
         self.protocol = protocol  # 'UDP' or 'TCP'
     
     def run(self):
+        """チェックを実行し、どう転んでも result_ready を 1 回 emit する。
+
+        netstat や tasklist を起動できない環境では、以前は OSError が
+        run() を突き抜けてスレッドごと死に、result_ready が一度も
+        emit されなかった。利用者から見ると押したボタンが無反応に
+        なるだけで、失敗した事実さえ伝わらない。想定外の例外も
+        ここで受け止め、「確認できていません」と伝える。
+        """
+        try:
+            result = self._build_result()
+        except Exception as e:
+            result = ("ポートチェック中に想定外のエラーが発生しました: "
+                      f"{e!r}\n"
+                      "→ このポートの使用状況は確認できていません\n")
+        self.result_ready.emit(result)
+
+    def _build_result(self):
+        """チェック結果の文字列を組み立てて返す。"""
         result = ""
-        
+
         # ポートバインドテスト
         if self.check_type in ["all", "bind"]:
             result += "=" * 60 + "\n"
@@ -40,21 +99,33 @@ class PortCheckThread(QThread):
                 else:  # TCP
                     test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 
-                test_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                # SO_REUSEADDR を立ててはいけない。Windows では占有側も
+                # SO_REUSEADDR を持っていると同じポートへの bind が通り、
+                # 使用中なのに「バインド可能」と出る。排他バインドなら、
+                # 占有側の設定や 127.0.0.1 固定の bind に関係なく 10048 で
+                # 断られる
+                set_exclusive_bind(test_socket)
                 test_socket.bind(('', self.port))
                 
                 if self.protocol == "TCP":
                     test_socket.listen(1)
                 
                 test_socket.close()
+                # テストソケットは AF_INET 固定なので、分かるのは IPv4 の空き
+                # だけ。IPv6 専用（IPV6_V6ONLY）の待ち受けとは競合せず bind が
+                # 通るため、プロトコル全体を空きと断定しない
                 result += f"✓ ポート {self.port}/{self.protocol} はバインド可能です\n"
-                result += f"  → 現在このポートは使用されていません\n"
+                result += f"  → IPv4 (0.0.0.0) では使用されていません\n"
+                result += f"  → IPv6 専用の待ち受けはこの試験では分かりません（netstat の結果も確認してください）\n"
                 if self.protocol == "UDP":
                     result += f"  → SNMPTrapリスナーを起動できます\n\n"
                 else:
                     result += f"  → サーバーアプリケーションを起動できます\n\n"
             except OSError as e:
-                if e.errno == 10048:  # Windows: Address already in use
+                # 10048: Address already in use。10013 (errno 13): 占有側が
+                # SO_REUSEADDR 無しで、こちらが SO_REUSEADDR 付きのときに
+                # 出る「アクセス許可で禁じられた方法」。どちらも使用中
+                if e.errno in (10048, 13) or getattr(e, "winerror", None) in (10048, 10013):
                     result += f"✗ ポート {self.port}/{self.protocol} は既に使用されています\n"
                     result += f"  → 別のプログラムがこのポートを使用中です\n"
                     result += f"  → 下記のプロセス情報を確認してください\n\n"
@@ -66,22 +137,34 @@ class PortCheckThread(QThread):
             result += "=" * 60 + "\n"
             result += "【ポート使用状況（netstat）】\n"
             result += "=" * 60 + "\n"
+            # Windows netstat コマンド。findstr で絞らず、行を列に分けて
+            # ローカル側のポート番号とプロトコルを完全一致で選ぶ
+            # 取得に失敗したときは output = "" にしない。0 件（＝本当に空き）と
+            # 区別が付かなくなり、確認できていないポートを「使用されていません」
+            # と言い切ってしまうため
             try:
-                # Windows netstat コマンド
-                cmd = f"netstat -ano | findstr :{self.port}"
-                output = subprocess.check_output(cmd, shell=True, text=True, 
+                output = subprocess.check_output("netstat -ano", shell=True, text=True, 
                                                stderr=subprocess.STDOUT)
-                result += f"ポート {self.port} を使用している接続:\n\n"
-                result += output + "\n"
+            except (subprocess.CalledProcessError, OSError) as e:
+                error, lines = e, []
+            else:
+                error, lines = None, select_netstat_lines(output, self.port, self.protocol)
+            if error is not None:
+                result += f"{self.protocol}接続情報の取得に失敗しました: {error}\n"
+                result += "→ このポートの使用状況は確認できていません\n\n"
+            elif not lines:
+                result += f"ポート {self.port}/{self.protocol} を使用している接続は見つかりませんでした\n"
+                result += "→ このポートは現在使用されていません\n\n"
+            else:
+                result += f"ポート {self.port}/{self.protocol} を使用している接続:\n\n"
+                result += "\n".join(lines) + "\n\n"
                 
                 # PIDを抽出してプロセス名を取得
                 pids = set()
-                for line in output.strip().split('\n'):
-                    parts = line.split()
-                    if parts:
-                        pid = parts[-1]
-                        if pid.isdigit():
-                            pids.add(pid)
+                for line in lines:
+                    pid = line.split()[-1]
+                    if pid.isdigit():
+                        pids.add(pid)
                 
                 if pids:
                     result += "\n関連プロセス情報:\n"
@@ -98,12 +181,11 @@ class PortCheckThread(QThread):
                             if len(parts) >= 2:
                                 proc_name = parts[0]
                                 result += f"  PID {pid}: {proc_name}\n"
-                        except subprocess.CalledProcessError:
+                        except (subprocess.CalledProcessError, OSError):
+                            # tasklist を起動できない環境（OSError）でも、
+                            # 取れている netstat の結果ごと捨てない
                             result += f"  PID {pid}: プロセス情報取得失敗\n"
                     result += "\n"
-            except subprocess.CalledProcessError:
-                result += f"ポート {self.port} を使用している接続は見つかりませんでした\n"
-                result += "→ このポートは現在使用されていません\n\n"
         
         # ポートをリスニングしているプロセスを表示
         if self.check_type in ["all", "listening"]:
@@ -111,20 +193,16 @@ class PortCheckThread(QThread):
             result += f"【{self.protocol}リスニングポート一覧】\n"
             result += "=" * 60 + "\n"
             try:
-                if self.protocol == "UDP":
-                    cmd = "netstat -ano -p UDP"
-                else:  # TCP
-                    cmd = "netstat -ano -p TCP"
-                
+                # -p TCP は IPv4 だけなので、全体を取ってプロトコル列で選ぶ
+                cmd = "netstat -ano"
                 output = subprocess.check_output(cmd, shell=True, text=True,
                                                stderr=subprocess.STDOUT)
                 
-                lines = output.strip().split('\n')
-                # ヘッダーをスキップして指定ポートに関連する行を探す
-                relevant_lines = []
-                for line in lines[3:]:  # 最初の3行はヘッダー
-                    if f':{self.port}' in line:
-                        relevant_lines.append(line)
+                # 指定ポートを待ち受けている行を探す。TCP は状態列が
+                # LISTENING のものだけ（ESTABLISHED だけの対は待ち受けではない）
+                relevant_lines = select_netstat_lines(
+                    output, self.port, self.protocol,
+                    listening_only=(self.protocol == "TCP"))
                 
                 if relevant_lines:
                     result += f"{self.protocol}ポート {self.port} を使用している接続:\n\n"
@@ -133,11 +211,14 @@ class PortCheckThread(QThread):
                 else:
                     # すべてのポートを表示（最大20行）
                     result += f"{self.protocol}接続の一覧（最大20件）:\n\n"
-                    for line in lines[3:23]:
+                    for line in select_netstat_lines(output, None, self.protocol)[:20]:
                         result += line + "\n"
                 result += "\n"
-            except subprocess.CalledProcessError:
-                result += f"{self.protocol}接続情報の取得に失敗しました\n\n"
+            except (subprocess.CalledProcessError, OSError) as e:
+                # netstat を起動できない環境（OSError）も失敗として扱う。
+                # netstat 経路と同じく、確認できていないことを明示する
+                result += f"{self.protocol}接続情報の取得に失敗しました: {e}\n"
+                result += "→ このポートの使用状況は確認できていません\n\n"
         
         # ファイアウォール情報
         if self.check_type in ["all", "firewall"]:
@@ -210,7 +291,7 @@ class PortCheckThread(QThread):
                 result += f"ポート {self.port}/{self.protocol} の情報:\n"
                 result += f"  カスタムポートまたは非標準ポートです\n\n"
         
-        self.result_ready.emit(result)
+        return result
 
 
 class PortCheckerGUI(QMainWindow):

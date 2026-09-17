@@ -19,6 +19,9 @@ class DeviceTree(QWidget):
     group_edit_requested = pyqtSignal(str)  # グループ編集要求（グループ名）
     group_delete_requested = pyqtSignal(str)  # グループ削除要求（グループ名）
     hide_requested = pyqtSignal()  # このエリアを隠す要求（戻すのは表示メニュー）
+    # 自動検出ポートのボーレート変更（ポート名, ボーレート）。ツリーの外に
+    # ある再接続用の写しへ届けるために出す
+    serial_baudrate_changed = pyqtSignal(str, int)
     
     # 一般的なボーレート値
     BAUD_RATES = [300, 1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600]
@@ -131,7 +134,12 @@ class DeviceTree(QWidget):
                 'protocol': 'serial',  # 接続プロトコルを明示
                 'port': port_name,
                 'baudrate': baudrate,
-                'description': description
+                'description': description,
+                # config 由来ではなく、その場で検出した項目だという印。
+                # 機器名の一意性検査は config しか見ないので、ここの名前は
+                # 登録機器と同じになりうる。印が無いと、同名の機器が属する
+                # グループの自動実行コマンドがコンソールへ流れる
+                'source': 'autodetect'
             }
             
             # デバイスデータを保存
@@ -140,6 +148,28 @@ class DeviceTree(QWidget):
         # グループを展開
         console_group.setExpanded(True)
     
+    def detected_port_names(self) -> Set[str]:
+        """いまツリーに並んでいる自動検出ポートの名前を返す
+
+        自動検出のCOMポートは config に無いので、機器名の一意性検査が使う
+        find_device_group には掛からない。検査側から第4の名前空間として
+        参照できるよう、ツリーの実体を見て答える。
+
+        Returns:
+            自動検出項目の機器名の集合（無ければ空集合）
+        """
+        names: Set[str] = set()
+        root = self.tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            group_item = root.child(i)
+            for j in range(group_item.childCount()):
+                data = group_item.child(j).data(0, Qt.ItemDataRole.UserRole)
+                if isinstance(data, dict) and data.get('source') == 'autodetect':
+                    name = data.get('name')
+                    if name:
+                        names.add(name)
+        return names
+
     def _check_serial_ports(self):
         """シリアルポートの変化を定期的にチェック"""
         # 現在のシリアルポート一覧を取得
@@ -182,6 +212,21 @@ class DeviceTree(QWidget):
         """
         menu.addSeparator()
         return menu.addAction("接続先リストを非表示")
+
+    @staticmethod
+    def _discard_menu(menu):
+        """開き終えた右クリックメニューを項目ごと捨てる。
+
+        このウィジェットを親にした QMenu は、閉じただけでは子として残る。
+        右クリックのたびに QMenu 1 件と項目が積み上がる（実測: 空欄メニューを
+        5 回開いて QMenu 5 件 / QAction 20 件）。項目は menu.addAction で
+        作っておりメニューが所有しているので、メニューを捨てれば一緒に
+        片付く。
+
+        Args:
+            menu: 表示し終えた QMenu
+        """
+        menu.deleteLater()
 
     def _show_context_menu(self, position):
         """
@@ -250,7 +295,10 @@ class DeviceTree(QWidget):
         hide_action = self._add_hide_action(menu)
 
         # メニュー実行
-        action = menu.exec(self.tree.viewport().mapToGlobal(position))
+        try:
+            action = menu.exec(self.tree.viewport().mapToGlobal(position))
+        finally:
+            self._discard_menu(menu)
 
         # アクション処理
         if action == hide_action:
@@ -303,7 +351,10 @@ class DeviceTree(QWidget):
         add_group_action = menu.addAction("グループを追加")
         hide_action = self._add_hide_action(menu)
 
-        action = menu.exec(self.tree.viewport().mapToGlobal(position))
+        try:
+            action = menu.exec(self.tree.viewport().mapToGlobal(position))
+        finally:
+            self._discard_menu(menu)
 
         if action == add_group_action:
             self.group_add_requested.emit()
@@ -330,7 +381,10 @@ class DeviceTree(QWidget):
                 delete_action = menu.addAction("グループを削除")
         hide_action = self._add_hide_action(menu)
 
-        action = menu.exec(self.tree.viewport().mapToGlobal(position))
+        try:
+            action = menu.exec(self.tree.viewport().mapToGlobal(position))
+        finally:
+            self._discard_menu(menu)
 
         if action == hide_action:
             self.hide_requested.emit()
@@ -353,6 +407,11 @@ class DeviceTree(QWidget):
         
         # リストを更新（表示には影響しないが、内部データを更新）
         self.refresh_serial_ports()
+
+        # ツリーの外にも同じ値を持っている相手がいる。MainWindow は初回接続
+        # 時の機器データを再接続用に写しており、そこを更新しないと Enter に
+        # よる再接続だけ旧ボーレートのまま繋がる
+        self.serial_baudrate_changed.emit(port, baudrate)
     
     def _on_item_double_clicked(self, item: QTreeWidgetItem, column: int):
         """

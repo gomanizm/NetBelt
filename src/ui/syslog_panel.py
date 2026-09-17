@@ -10,6 +10,43 @@ from PyQt6.QtCore import Qt, QAbstractTableModel, QModelIndex, QSortFilterProxyM
 from PyQt6.QtGui import QColor, QBrush, QAction, QStandardItemModel, QStandardItem
 from datetime import datetime
 import json
+import os
+import tempfile
+
+
+def _write_text_file_atomically(filename, write_body):
+    """保存先を壊さずにテキストを書き出す
+
+    保存先を直接 open('w') すると、その時点で旧内容は失われ、書き込み中の
+    失敗（満杯・共有切断・USB 取り外し）では新旧どちらでもない部分ファイルが
+    残る。利用者が既存ファイルを保存先に選んで上書きを承諾した場合、
+    旧内容が黙って消えることになる。
+    同じディレクトリの一時ファイルへ書き切ってから os.replace で差し替え、
+    書き切れなかったときは一時ファイルを消して保存先には触れない。
+    （全ログ保存 ui/dialogs/log_save_dialog.py と同じ作法）
+
+    Args:
+        filename: 保存先のパス
+        write_body: 開いたファイルオブジェクトを受け取って中身を書く関数
+    """
+    tmp_path = None
+    try:
+        target = os.path.abspath(filename)
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=os.path.basename(target) + ".", suffix=".tmp",
+            dir=os.path.dirname(target))
+        with open(fd, 'w', encoding='utf-8') as f:
+            write_body(f)
+
+        # 閉じてから差し替える（Windows では開いたままだと置き換えられない）
+        os.replace(tmp_path, target)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass   # 消せなくても保存先は無傷。残骸は .tmp なので見分けがつく
 
 
 class CheckableComboBox(QComboBox):
@@ -93,8 +130,8 @@ class SyslogTableModel(QAbstractTableModel):
         "Debug": QColor(128, 128, 128),      # グレー
     }
     
-    def __init__(self, max_messages: int = 1000):
-        super().__init__()
+    def __init__(self, max_messages: int = 1000, parent=None):
+        super().__init__(parent)
         self.messages = []
         self.max_messages = max_messages
         self.headers = ["タイムスタンプ", "送信元 (プロトコル/ポート)", "レベル", "メッセージ"]
@@ -180,8 +217,8 @@ class SyslogTableModel(QAbstractTableModel):
 class SyslogFilterProxyModel(QSortFilterProxyModel):
     """Syslogメッセージフィルタプロキシモデル"""
     
-    def __init__(self):
-        super().__init__()
+    def __init__(self, parent=None):
+        super().__init__(parent)
         self.enabled_levels = set(SyslogTableModel.LEVEL_COLORS.keys())
         self.hostname_filter = ""
         self.keyword_filter = ""
@@ -242,8 +279,9 @@ class SyslogPanel(QWidget):
         self._load_config()
         
         # モデルの初期化
-        self.model = SyslogTableModel(self.max_messages)
-        self.proxy_model = SyslogFilterProxyModel()
+        # 親を持たせる（setModel / setSourceModel は所有権を取らない）
+        self.model = SyslogTableModel(self.max_messages, self)
+        self.proxy_model = SyslogFilterProxyModel(self)
         self.proxy_model.setSourceModel(self.model)
         
         self._init_ui()
@@ -421,9 +459,10 @@ class SyslogPanel(QWidget):
             self.status_label.setText("受信器がまだ用意されていません")
             return
         self.status_label.setText("ファイアウォール許可を実行します（管理者昇格）...")
-        ok, _msg = self.syslog_receiver.fix_firewall()
+        ok, msg = self.syslog_receiver.fix_firewall()
+        # 「反映待ち」等の理由を潰さず、そのまま見せる
         self.status_label.setText(
-            "ファイアウォール許可: %s" % ("完了" if ok else "未反映/失敗"))
+            "ファイアウォール許可: %s (%s)" % ("完了" if ok else "未反映/失敗", msg))
 
     def _protocol_port(self, proto):
         """指定プロトコルの待受ポート"""
@@ -543,6 +582,70 @@ class SyslogPanel(QWidget):
             self.model.clear_messages()
             self._update_status()
     
+    @staticmethod
+    def _escape_for_export(text: str) -> str:
+        """保存・コピー時に1件が1行へ収まるよう、改行・復帰・タブを表記へ置き換える
+
+        本文やホスト名の改行をそのまま書くと、続きの行が別機器の独立した記録に
+        見える。認証なしで届く 1 件の Syslog に「別日時 別IP 別ホスト
+        [Emergency] 偽の記録」を仕込めば、保存した証跡へ任意の記録を混ぜられる
+        （画面のテーブルでは 1 行のままなので突き合わせても気づけない）。
+        バックスラッシュ自身も置き換えないと、元から \\n と書かれていた本文と
+        改行由来の表記を区別できない。
+        """
+        return (str(text)
+                .replace("\\", "\\\\")
+                .replace("\r", "\\r")
+                .replace("\n", "\\n")
+                .replace("\t", "\\t"))
+
+    @classmethod
+    def _export_line(cls, msg: SyslogMessage) -> str:
+        """保存用の1行を作る（画面と同じく送信元を含め、機器を区別できるようにする）"""
+        hostname = cls._escape_for_export(msg.hostname)
+        message = cls._escape_for_export(msg.message)
+        return f"{msg.timestamp} {msg.source_ip} {hostname} [{msg.level}] {message}"
+
+    def _refuse_if_recording(self, title: str, file_path: str) -> bool:
+        """保存先が端末のログ記録に使われていたら断る（断ったら True）
+
+        保存は保存先を別の内容へ作り直す（_write_text_file_atomically が
+        一時ファイルへ書き切ってから os.replace で置き換える）。記録中の
+        ファイルを選ばれると、置き換えが通れば記録済みの内容は失われ、端末は
+        開いたままのハンドルで自分のオフセットから書き続けるので、双方の
+        ファイルが壊れる。置き換えが Windows の共有違反で弾かれた場合も、
+        利用者に出るのは汎用の保存失敗になり理由が分からない。
+        （SNMPPanel._refuse_if_recording と同じ判定）
+        """
+        from core import log_recording
+        device_name = log_recording.device_using(file_path)
+        if device_name is None:
+            return False
+        QMessageBox.warning(
+            self, title,
+            "このファイルは %s のログ記録に使用中です:\n%s\n"
+            "別のファイルを選ぶか、先にそのログ記録を停止してください。"
+            % (device_name, file_path))
+        return True
+
+    @staticmethod
+    def _export_format(file_path: str) -> str:
+        """保存先の拡張子から書き出す形式を決める（"json" / "txt"）
+
+        大文字小文字は区別しない。区別すると out.JSON がテキストの中身で
+        書かれたうえ「エクスポートしました」と成功扱いになり、中身と拡張子
+        の食い違ったファイルが残る（SNMPPanel._export_format と同じ理由）。
+        ダイアログは選んだフィルタの拡張子を小文字で補うので普段は当たるが、
+        利用者が自分で .JSON と打った場合と、大文字名の既存ファイルを選び
+        直した場合に外れる。
+
+        当てはまらない拡張子は従来どおり TXT（既定の形式）。
+        """
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext == '.json':
+            return 'json'
+        return 'txt'
+
     def _export_messages(self):
         """メッセージをエクスポート"""
         filename, _ = QFileDialog.getSaveFileName(
@@ -550,29 +653,36 @@ class SyslogPanel(QWidget):
             f"syslog_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
             "テキストファイル (*.txt);;JSONファイル (*.json);;すべてのファイル (*.*)"
         )
-        
+
         if filename:
+            if self._refuse_if_recording("メッセージをエクスポート", filename):
+                return
             try:
                 messages = self.model.get_all_messages()
-                if filename.endswith('.json'):
-                    # JSON形式でエクスポート
+                if self._export_format(filename) == 'json':
+                    # JSON形式でエクスポート（送信元と受信生データも残す）
                     data = [
                         {
                             "timestamp": msg.timestamp,
+                            "source": msg.source_ip,
                             "hostname": msg.hostname,
                             "level": msg.level,
-                            "message": msg.message
+                            "message": msg.message,
+                            "raw": msg.raw
                         }
                         for msg in messages
                     ]
-                    with open(filename, 'w', encoding='utf-8') as f:
-                        json.dump(data, f, ensure_ascii=False, indent=2)
+                    _write_text_file_atomically(
+                        filename,
+                        lambda f: json.dump(data, f, ensure_ascii=False, indent=2))
                 else:
                     # テキスト形式でエクスポート
-                    with open(filename, 'w', encoding='utf-8') as f:
+                    def write_lines(f):
                         for msg in messages:
-                            f.write(f"{msg.timestamp} {msg.hostname} [{msg.level}] {msg.message}\n")
-                
+                            f.write(self._export_line(msg) + "\n")
+
+                    _write_text_file_atomically(filename, write_lines)
+
                 QMessageBox.information(self, "成功", f"メッセージを {filename} にエクスポートしました。")
             except Exception as e:
                 QMessageBox.critical(self, "エラー", f"エクスポートに失敗しました: {e}")
@@ -597,23 +707,29 @@ class SyslogPanel(QWidget):
         menu = QMenu(self)
         
         # コピー
-        copy_action = QAction("コピー", self)
+        copy_action = QAction("コピー", menu)
         copy_action.triggered.connect(self._copy_selected)
         menu.addAction(copy_action)
-        
+
         # 選択行をログ保存
-        save_action = QAction("選択行をログ保存", self)
+        save_action = QAction("選択行をログ保存", menu)
         save_action.triggered.connect(self._save_selected)
         menu.addAction(save_action)
-        
+
         menu.addSeparator()
-        
+
         # 全てクリア
-        clear_action = QAction("全てクリア", self)
+        clear_action = QAction("全てクリア", menu)
         clear_action.triggered.connect(self._clear_messages)
         menu.addAction(clear_action)
-        
-        menu.exec(self.table_view.viewport().mapToGlobal(pos))
+
+        try:
+            menu.exec(self.table_view.viewport().mapToGlobal(pos))
+        finally:
+            # このパネルを親にしたメニューは、閉じただけでは子として残り、
+            # 右クリックのたびに QMenu 1 件と項目が積み上がる。項目の親も
+            # メニューにしてあるので、メニューが消えるときに一緒に片付く。
+            menu.deleteLater()
     
     def _copy_selected(self):
         """選択行をコピー"""
@@ -629,7 +745,7 @@ class SyslogPanel(QWidget):
             source_row = self.proxy_model.mapToSource(index).row()
             msg = self.model.get_message(source_row)
             if msg:
-                lines.append(f"{msg.timestamp} {msg.hostname} [{msg.level}] {msg.message}")
+                lines.append(self._export_line(msg))
         
         QApplication.clipboard().setText("\n".join(lines))
     
@@ -639,22 +755,32 @@ class SyslogPanel(QWidget):
         if not selected_rows:
             QMessageBox.warning(self, "警告", "保存する行を選択してください。")
             return
-        
+
+        # ダイアログを開いている間に受信で先頭行が押し出されると行番号がずれるので、
+        # 保存対象のメッセージはダイアログを出す前に確定しておく
+        messages = []
+        for index in selected_rows:
+            source_row = self.proxy_model.mapToSource(index).row()
+            msg = self.model.get_message(source_row)
+            if msg:
+                messages.append(msg)
+
         filename, _ = QFileDialog.getSaveFileName(
             self, "選択行を保存",
             f"syslog_selected_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
             "テキストファイル (*.txt);;すべてのファイル (*.*)"
         )
-        
+
         if filename:
+            if self._refuse_if_recording("選択行を保存", filename):
+                return
             try:
-                with open(filename, 'w', encoding='utf-8') as f:
-                    for index in selected_rows:
-                        source_row = self.proxy_model.mapToSource(index).row()
-                        msg = self.model.get_message(source_row)
-                        if msg:
-                            f.write(f"{msg.timestamp} {msg.hostname} [{msg.level}] {msg.message}\n")
-                
+                def write_lines(f):
+                    for msg in messages:
+                        f.write(self._export_line(msg) + "\n")
+
+                _write_text_file_atomically(filename, write_lines)
+
                 QMessageBox.information(self, "成功", f"選択行を {filename} に保存しました。")
             except Exception as e:
                 QMessageBox.critical(self, "エラー", f"保存に失敗しました: {e}")

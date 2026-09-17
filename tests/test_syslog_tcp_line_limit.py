@@ -146,6 +146,28 @@ class SyslogTcpLineLimitTest(unittest.TestCase):
             self._wait(lambda: any(body in m.message for m in self.seen)),
             "上限に満たない行が失われている")
 
+    def test_a_limit_sized_line_split_between_cr_and_lf_is_not_cut(self):
+        """CRLF が CR と LF に分かれて届いても、上限ちょうどの行は切らないこと。
+
+        改行待ちの長さ判定は末尾の CR を数えていた。CR まで届いた時点では
+        「上限 + 1 バイト」に見えるので、同じ中身でも CRLF が 1 回の recv に
+        収まれば通り、TCP の切れ目が CR と LF の間に来たときだけ切られる。
+        """
+        limit = self.recv.max_line_bytes
+        body = b"<134>" + b"B" * (limit - 5)     # 本文ちょうど上限
+        c = self._client()
+        c.sendall(body + b"\r")
+        time.sleep(0.3)                          # CR だけで判定させる
+        c.sendall(b"\n")
+
+        self.assertTrue(
+            self._wait(lambda: any(m.message.startswith("BBB")
+                                   for m in self.seen)),
+            "上限ちょうどの行が届いていない: %s"
+            % [m.message[:40] for m in self.seen])
+        self.assertFalse(any("切断" in m.message for m in self.seen),
+                         "上限ちょうどの行が CR の分だけ超過と数えられて切られた")
+
     def test_finished_client_threads_are_not_remembered_forever(self):
         """終わった接続のスレッドを溜め込まないこと。
 

@@ -86,6 +86,34 @@ class ClampingTest(unittest.TestCase):
         self.assertEqual((s.scroll_top, s.scroll_bottom), (0, 23))
 
 
+class ZeroMeansDefaultTest(unittest.TestCase):
+    """DECSTBM の 0 は「既定値」(xterm と同じ)。
+
+    下端に 0 を送ると 0-1 = -1 が 0 へ丸められ、上端 < 下端 を満たさず
+    黙って拒否されていた。直前の狭い範囲がそのまま残り、押し出された
+    行は履歴にも入らない。
+    """
+
+    def test_zero_zero_restores_the_full_screen(self):
+        s = feed(Screen(rows=24, cols=80), "\x1b[2;3r")
+        self.assertEqual((s.scroll_top, s.scroll_bottom), (1, 2))
+        feed(s, "\x1b[0;0r")
+        self.assertEqual((s.scroll_top, s.scroll_bottom), (0, 23),
+                         "ESC[0;0r で全画面へ戻っていない")
+
+    def test_a_zero_bottom_means_the_last_row(self):
+        s = feed(Screen(rows=24, cols=80), "\x1b[2;3r")
+        feed(s, "\x1b[1;0r")
+        self.assertEqual((s.scroll_top, s.scroll_bottom), (0, 23),
+                         "下端 0 が最終行として扱われていない")
+
+    def test_history_resumes_after_a_zero_reset(self):
+        s = feed(Screen(rows=24, cols=80), "\x1b[2;3r\x1b[0;0r")
+        feed(s, lines(30))
+        self.assertGreater(len(s.history), 0,
+                           "全画面へ戻したのに記録が止まったまま")
+
+
 class HistoryFromATopAnchoredRegionTest(unittest.TestCase):
     """上端が画面の先頭なら、押し出された行は記録する。"""
 
@@ -126,6 +154,31 @@ class HistoryFromATopAnchoredRegionTest(unittest.TestCase):
         feed(s, lines(40))
         self.assertEqual(len(s.history), 0,
                          "代替画面の内容が記録に混ざっている")
+
+
+class NextAndPreviousLineTest(unittest.TestCase):
+    """CNL (CSI E) / CPL (CSI F) も範囲で止まること。
+
+    xterm の CursorNextLine / CursorPrevLine は CursorDown / CursorUp を
+    通るので、CUD / CUU と同じ頭打ちが効く。
+    """
+
+    def test_cnl_stops_at_the_bottom_of_the_region(self):
+        s = feed(Screen(rows=24, cols=80), "\x1b[5;10r\x1b[8;3H\x1b[20E")
+        self.assertEqual((s.cursor_row, s.cursor_col), (9, 0))
+
+    def test_cpl_stops_at_the_top_of_the_region(self):
+        s = feed(Screen(rows=24, cols=80), "\x1b[5;10r\x1b[8;3H\x1b[20F")
+        self.assertEqual((s.cursor_row, s.cursor_col), (4, 0))
+
+    def test_cnl_from_below_the_region_still_stops_at_the_screen(self):
+        # 範囲の外にいるカーソルは、CUD と同じく画面の端まで動ける
+        s = feed(Screen(rows=24, cols=80), "\x1b[5;10r\x1b[12;3H\x1b[20E")
+        self.assertEqual((s.cursor_row, s.cursor_col), (23, 0))
+
+    def test_cpl_from_above_the_region_still_stops_at_the_screen(self):
+        s = feed(Screen(rows=24, cols=80), "\x1b[5;10r\x1b[2;3H\x1b[20F")
+        self.assertEqual((s.cursor_row, s.cursor_col), (0, 0))
 
 
 if __name__ == "__main__":
