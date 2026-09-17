@@ -870,10 +870,12 @@ class TerminalWidget(QWidget):
         for attr, parts in pending:
             region.insertText("".join(parts), self._char_format(attr))
 
-    def _trim_document(self, terminal: QTextEdit) -> None:
-        """上限を超えた先頭の行を、1 回の編集でまとめて捨てる。"""
+    def _trim_document(self, terminal: QTextEdit, keep: int = None) -> None:
+        """上限（keep を渡せばその行数）を超えた先頭の行を、1 回の編集でまとめて捨てる。"""
         document = terminal.document()
-        excess = document.blockCount() - self.MAX_DOCUMENT_BLOCKS
+        if keep is None:
+            keep = self.MAX_DOCUMENT_BLOCKS
+        excess = document.blockCount() - keep
         if excess <= 0:
             return
         cut = QTextCursor(document)
@@ -894,7 +896,6 @@ class TerminalWidget(QWidget):
         行を記録側へ差し込み、画面領域は変わった範囲だけ描き直す。
         """
         screen = terminal._screen
-        region = terminal._region
 
         # 上へスクロールして過去の出力を読んでいるなら、描き終えたあとも
         # 同じ行を見せる。スクロールバーの値だけを控えると、上限で先頭の
@@ -902,6 +903,7 @@ class TerminalWidget(QWidget):
         # QTextCursor で持つ（手前が消えれば自動で詰まる）
         bar = terminal.verticalScrollBar()
         anchor = None
+        anchor_offset = 0
         if not getattr(terminal, "_follow_output", True):
             from PyQt6.QtCore import QPoint
             anchor = terminal.cursorForPosition(QPoint(0, 0))
@@ -912,6 +914,29 @@ class TerminalWidget(QWidget):
         # 近道は使えない (使うと押し出された行が書かれずに消える)
         reflowed = screen.take_reflowed()
 
+        # 文書の末尾側への書き込み（押し出し行・画面領域の差し替え・塗り
+        # 直し）を 1 つの編集にまとめる。QTextEdit は編集のたびに変更通知と
+        # 組版を行うので、行ごと・区間ごとに走らせると重い。編集の途中でも
+        # 文字と位置はすぐ反映されるが、組版は終わるまで古いままなので、
+        # 組版を使う処理（キャレット・スクロール）は外で行う。先頭の切り
+        # 捨ても外で行う。同じ編集に入れると、変更範囲が文書全体になって
+        # 全行を組み直すことになる
+        edit = QTextCursor(terminal.document())
+        edit.beginEditBlock()
+        try:
+            written = self._write_screen(terminal, reflowed)
+        finally:
+            # 例外で抜けても閉じる。閉じ忘れると以後の変更が画面に出ない
+            edit.endEditBlock()
+        self._settle_screen(terminal, bar, anchor, anchor_offset, *written)
+
+    def _write_screen(self, terminal: QTextEdit, reflowed: bool):
+        """押し出された行と画面領域を文書へ書く（_render_screen の編集の内側）。
+
+        戻り値: (押し出し行を書いた直後の行数, 画面の各行のセル, 各行の文字列)
+        """
+        screen = terminal._screen
+        region = terminal._region
         # 押し出された行は、属性が同じ区間を改行ごと 1 回の insertText に
         # まとめて書く。行ごと・区間ごとに書くと挿入のたびに文書の更新が
         # 走り、大量出力で描画が追いつかない（Qt 単体の実測: 70 行を行ごとに
@@ -979,11 +1004,12 @@ class TerminalWidget(QWidget):
             column = 0
         self._insert_pending(region, pending)
 
-        # 上限を超えた先頭の行は、超えた時点で捨てる（ここと描き終えた後）。
-        # 画面領域の先頭を int (start) で控えている間は捨てないこと。控えた
-        # 後で捨てると start が古い位置を指したまま残り、差し替え範囲・
-        # 塗り直し位置・キャレット位置がずれる
-        self._trim_document(terminal)
+        # 上限を超えた先頭の行は、描き終えた後で 1 回にまとめて捨てる
+        # （_settle_screen）。ここでの行数はその計算に使う。画面領域の先頭を
+        # int (start) で控えている間は捨てないこと。控えた後で捨てると
+        # start が古い位置を指したまま残り、差し替え範囲・塗り直し位置・
+        # キャレット位置がずれる
+        after_history = terminal.document().blockCount()
 
         cell_rows = [self._visible_cells(line) for line in screen.lines]
         # カーソルの行は、カーソルの桁まで空白を残す。プロンプト末尾の
@@ -1044,11 +1070,31 @@ class TerminalWidget(QWidget):
             if r in dirty:
                 self._paint_row(terminal, offset, cell_rows[r])
             offset += _u16(rows[r]) + 1
+        return after_history, cell_rows, rows
+
+    def _settle_screen(self, terminal: QTextEdit, bar, anchor, anchor_offset,
+                       after_history, cell_rows, rows) -> None:
+        """書き終えた文書で、先頭の切り捨て・キャレット・スクロールを整える。"""
+        screen = terminal._screen
+        # 上限を超えた先頭の行を捨てる。
+        # 先頭の削除は、以降の全行の位置を組版し直すので文書の大きさに
+        # 比例して重い（20000 行で 1 回約 10ms）。押し出し行を書いた時点と
+        # 画面領域を差し替えた後の 2 回に分けて切ったのと同じ行数を、
+        # 1 回で捨てる。差し替えで行が減った（窓を縦に縮めた）ぶんは
+        # 上限まで埋め戻さず、上限を下回らせる。
+        # キャレットより先に切る。範囲選択が捨てる行の中にあると、後で
+        # 切ったのでは、選択が残っているのでキャレットを動かさず、その直後に
+        # 選択ごと消えてキャレットが文書の先頭に残る
+        limit = self.MAX_DOCUMENT_BLOCKS
+        grown = terminal.document().blockCount() - after_history
+        self._trim_document(terminal, min(limit,
+                                          min(limit, after_history) + grown))
 
         # キャレット (点滅カーソル) を画面カーソルの位置へ。範囲選択の
         # 最中に動かすと選択が消えるので、そのときは触らない
         if not terminal.textCursor().hasSelection():
-            pos = start
+            # 画面領域の先頭。切り捨てで手前が詰まっても region は追従する
+            pos = terminal._region.position()
             for r in range(screen.cursor_row):
                 pos += _u16(rows[r]) + 1
             # 桁ではなくセルで数える。全角は 2 セルで文書上は 1 文字、
@@ -1059,8 +1105,6 @@ class TerminalWidget(QWidget):
             caret = QTextCursor(terminal.document())
             caret.setPosition(pos)
             terminal.setTextCursor(caret)
-        # 画面領域の差し替えで増えた分。start はもう使わない
-        self._trim_document(terminal)
 
         # 最下部を見ていたなら下端へ寄せる。画面は文書の末尾 rows 行
         # なので、ここを見せることが「いま端末に映っているもの」を
