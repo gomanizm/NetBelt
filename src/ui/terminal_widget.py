@@ -878,6 +878,12 @@ class TerminalWidget(QWidget):
         excess = document.blockCount() - keep
         if excess <= 0:
             return
+        # 遅れている組版を先に済ませてから削る。描画を 1 回の編集にまとめたので、
+        # 空の文書（新しいタブ）への最初の 1 片が上限を超えると、編集が文書全体を
+        # 覆い、Qt は組版を少しずつ遅れて進める。その途中で先頭を削ると、残りの
+        # ブロックが組版されないまま残り、記録が見えずスクロールの範囲も狂った
+        # まま直らない（検証役が確認。ESC[nS が並ぶと本番の上限でも起きる）
+        document.documentLayout().blockBoundingRect(document.lastBlock())
         cut = QTextCursor(document)
         cut.movePosition(QTextCursor.MoveOperation.NextBlock,
                          QTextCursor.MoveMode.KeepAnchor, excess)
