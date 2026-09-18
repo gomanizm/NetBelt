@@ -14,6 +14,7 @@ Paul Williams の DEC 互換パーサ状態遷移図
 - CAN/SUB で中断した OSC/DCS は、途中までの中身を届けず捨てる。
 """
 import collections
+import re
 
 Print = collections.namedtuple("Print", "text")
 Ctrl = collections.namedtuple("Ctrl", "char")
@@ -31,6 +32,17 @@ Dcs = collections.namedtuple("Dcs", "private params intermediate final text")
 MAX_PARAMS = 256      # 暴走した列でメモリを食わないための上限
 MAX_STRING = 4096
 MAX_INTERMEDIATE = 32
+
+# GROUND で 1 文字ずつ印字へ足すだけの文字 (C0 以外) の連なり。状態を
+# 変える ESC・CAN・SUB は C0 なので、この連なりには入らない
+_PRINTABLE_RUN = re.compile(r"[^\x00-\x1f]+")
+# 中間バイト・制御文字・DEL・0x7E 超えを挟まず最終文字まで届いている
+# CSI。私用文字は CSI_ENTRY が受ける先頭の 1 文字だけ、数字と ; は
+# CSI_PARAM が受け付ける MAX_PARAMS 文字まで。ほかの形は状態機械へ回す
+_SIMPLE_CSI = re.compile(r"\x1b\[([<-?]?)([0-9;]{0,%d})([@-~])"
+                         % MAX_PARAMS)
+# C0 の Ctrl は文字 1 つで決まる値なので、作り置きを使い回す
+_C0_CTRL = {chr(c): Ctrl(chr(c)) for c in range(0x20)}
 
 
 class Parser(object):
@@ -76,7 +88,35 @@ class Parser(object):
             self.state = GROUND
             printable.append(ch)
 
-        for ch in text:
+        i = 0
+        stop = len(text)
+        while i < stop:
+            if self.state == GROUND:
+                # 下の GROUND の枝で 1 文字ずつ printable へ足すだけの
+                # 区間は、まとめて足す。flush で繋ぐので出る Print は同じ
+                run = _PRINTABLE_RUN.match(text, i)
+                if run is not None:
+                    printable.append(run.group())
+                    i = run.end()
+                    if i == stop:
+                        break
+                if text[i] == "\x1b":
+                    # SGR などの素直な CSI は、ESC → ESCAPE → CSI_ENTRY →
+                    # CSI_PARAM と 1 文字ずつ回したのと同じ状態と命令を
+                    # まとめて作る (GROUND の ESC は文字列列を空にするだけ)
+                    csi = _SIMPLE_CSI.match(text, i)
+                    if csi is not None:
+                        flush()
+                        self._string = []
+                        self._hook = None
+                        self._private, self._params, final = csi.groups()
+                        self._intermediate = ""
+                        out.append(Csi(self._private, self._split_params(),
+                                       self._intermediate, final))
+                        i = csi.end()
+                        continue
+            ch = text[i]
+            i += 1
             code = ord(ch)
 
             # anywhere: どの状態でも同じ扱い
@@ -100,7 +140,7 @@ class Parser(object):
                     printable.append(ch)
                 else:
                     flush()
-                    out.append(Ctrl(ch))
+                    out.append(_C0_CTRL[ch])
                 continue
             flush()
 

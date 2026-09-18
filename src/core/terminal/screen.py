@@ -24,6 +24,8 @@ DECOM (ESC[?6h) は保持しない。有効なら CUP・VPA の行番号は
 とカーソル移動・DSR 応答・DECSTBM をまとめて触る割には見合わない。
 """
 import collections
+import itertools
+import re
 import unicodedata
 
 from core.terminal import parser
@@ -40,6 +42,11 @@ MAX_CELL_TEXT = 8
 DEC_GRAPHICS = dict(zip(
     "`abcdefghijklmnopqrstuvwxyz{|}~",
     "◆▒␉␌␍␊°±␤␋┘┐┌└┼⎺⎻─⎼⎽├┤┴┬│≤≥π≠£·"))
+
+# 印字を、_cell_width が必ず 1 を返す DEL 以外の文字 (U+00AD より前) の
+# 連なり (1 つ目の組) と、それ以外の文字の連なり (2 つ目の組) に分ける。
+# 前者は _print_narrow でまとめて書き込める
+_PRINT_RUNS = re.compile(r"([\x00-\x7e\x80-\xac]+)|([^\x00-\x7e\x80-\xac]+)")
 
 
 def _param(params, i, default):
@@ -249,6 +256,23 @@ class Screen(object):
         # この印字が今の行へ入った時点の折り返しの印。書き直しが右端
         # まで届いたときだけ残す判断に使う
         entry_row, entry_mark = None, False
+        # 文字集合を変える命令 (ESC ( と SI/SO) は別の命令なので、1 つの
+        # 印字の途中では変わらない。罫線は 1 文字ずつ置き換えながら書く
+        if self._g[self._charset] == "0":
+            self._print_chars(text, entry_row, entry_mark)
+            return
+        # 幅 1 と決まっている文字の連なりはまとめて書き、それ以外
+        # (全角・結合文字・DEL など) は 1 文字ずつ書く
+        for narrow, other in _PRINT_RUNS.findall(text):
+            if narrow:
+                entry_row, entry_mark = self._print_narrow(
+                    narrow, entry_row, entry_mark)
+            else:
+                entry_row, entry_mark = self._print_chars(
+                    other, entry_row, entry_mark)
+
+    def _print_chars(self, text, entry_row, entry_mark):
+        """text を 1 文字ずつ書く。(entry_row, entry_mark) を更新して返す。"""
         for ch in text:
             if ch == "\x7f":            # DEL は表示しない
                 continue
@@ -316,6 +340,52 @@ class Screen(object):
                 if self.autowrap:
                     self._pending_wrap = True
                 # autowrap 無効なら右端で上書きを続ける
+        return entry_row, entry_mark
+
+    def _print_narrow(self, text, entry_row, entry_mark):
+        """幅 1 の文字だけの text を、今の行に収まる分ずつまとめて書く。
+
+        _print_chars で 1 文字ずつ書いたのと同じ結果にする。1 文字ずつ
+        だと、折り返し待ちの始末と行頭で前の行の印を落とす処理は区切りの
+        1 文字目でしか起きず (2 文字目からは桁が 0 より右)、全角の片割れ
+        の始末は区切りの両端しか効かず (内側はすぐ上書きされる)、折り返し
+        の印とカーソルは最後の文字の結果が残る。(entry_row, entry_mark)
+        を更新して返す。
+        """
+        cols = self.cols
+        cell_attr = itertools.repeat(self.attr)
+        start, stop = 0, len(text)
+        while start < stop:
+            if self._pending_wrap:      # 右端の 1 文字あとの折り返し
+                self.cursor_col = 0
+                self._linefeed(from_wrap=True)
+                entry_row = None        # 行が変わった (巻き上げも含む)
+            elif self.cursor_col == 0 and self.cursor_row:
+                # 行頭から書き始めた。前の行の古い印を落とす (_print_chars)
+                self.wrapped[self.cursor_row - 1] = False
+            row, col = self.cursor_row, self.cursor_col
+            if entry_row != row:
+                entry_row = row
+                entry_mark = self.wrapped[row]
+            # 右端までに収まる分。桁が右端にあっても 1 文字は書く
+            count = max(1, min(stop - start, cols - col))
+            end = col + count
+            line = self.lines[row]
+            if end > len(line):
+                line.extend([BLANK] * (end - len(line)))
+            _split_wide(line, col)
+            _split_wide(line, end)
+            line[col:end] = zip(text[start:start + count], cell_attr)
+            start += count
+            self.wrapped[row] = entry_mark and end >= cols and self.autowrap
+            self.dirty.add(row)
+            if end < cols:
+                self.cursor_col = end
+            else:
+                self.cursor_col = cols - 1
+                if self.autowrap:
+                    self._pending_wrap = True
+        return entry_row, entry_mark
 
     def _join_previous(self, ch):
         """幅 0 の文字 (結合文字・ZWJ 等) を直前の文字のセルへ繋げる。
