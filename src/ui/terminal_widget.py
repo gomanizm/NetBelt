@@ -923,11 +923,20 @@ class TerminalWidget(QWidget):
         # 全行を組み直すことになる
         edit = QTextCursor(terminal.document())
         edit.beginEditBlock()
+        written = None
         try:
             written = self._write_screen(terminal, reflowed)
         finally:
             # 例外で抜けても閉じる。閉じ忘れると以後の変更が画面に出ない
             edit.endEditBlock()
+            if written is None:
+                # 書く途中で例外が出ると、_settle_screen の切り捨てまで届か
+                # ない。excepthook（src/main.py）は例外のあとも動き続けるので、
+                # ここで切らないと以後の受信で文書が上限を超えて伸び続ける
+                self._trim_document(terminal)
+                if (terminal.document().blockCount()
+                        >= self.MAX_DOCUMENT_BLOCKS):
+                    terminal._log_truncated = True
         self._settle_screen(terminal, bar, anchor, anchor_offset, *written)
 
     def _write_screen(self, terminal: QTextEdit, reflowed: bool):
