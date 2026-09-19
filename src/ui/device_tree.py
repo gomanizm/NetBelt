@@ -472,15 +472,24 @@ class DeviceTree(QWidget):
         """
         # ボーレート設定を保存
         self._serial_port_baudrates[port] = baudrate
-        print(f"[INFO] {port} のボーレートを {baudrate} baud に設定しました")
-        
-        # リストを更新（表示には影響しないが、内部データを更新）
-        self.refresh_serial_ports()
 
         # ツリーの外にも同じ値を持っている相手がいる。MainWindow は初回接続
         # 時の機器データを再接続用に写しており、そこを更新しないと Enter に
-        # よる再接続だけ旧ボーレートのまま繋がる
+        # よる再接続だけ旧ボーレートのまま繋がる。開いているポートがこの値を
+        # 拒んだ場合は、MainWindow が restore_baudrate() で実際の値を書き戻す
         self.serial_baudrate_changed.emit(port, baudrate)
+
+        # 受け付けられたと分かってから記録する。要求した時点で「設定しました」
+        # と出すと、拒まれたときにログだけが実際の値と食い違う
+        applied = self._serial_port_baudrates.get(port, baudrate)
+        if applied == baudrate:
+            print(f"[INFO] {port} のボーレートを {baudrate} baud に設定しました")
+        else:
+            print(f"[INFO] {port} のボーレートを {baudrate} baud に"
+                  f"変更できませんでした（{applied} baud のままです）")
+
+        # リストを更新（表示には影響しないが、内部データを更新）
+        self.refresh_serial_ports()
 
     def restore_baudrate(self, port: str, baudrate: int):
         """ポートが拒んだボーレートの表示を、実際の値へ戻す
