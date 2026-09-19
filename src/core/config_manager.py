@@ -366,6 +366,33 @@ class ConfigManager:
                 and isinstance(device.get("name"), str) and bool(device["name"])
                 and isinstance(device.get("host"), str) and bool(device["host"]))
 
+    @staticmethod
+    def _normalize_password(device) -> Optional[str]:
+        """機器のパスワード欄を文字列にそろえる。直したら種別を返す。
+
+        手編集や他ツールの config.json には "password": 1234 のような値が
+        混ざる。復号は文字列を前提にしていて（startswith）、真値の非文字列
+        は AttributeError になり、_load_config の全体の例外処理が掴んで
+        設定全体を既定値へ差し替えてしまう。機器 1 台の型のために全機器と
+        全マクロを失うのは割に合わないので、ここで型だけそろえて残す。
+
+        数値は入力されたパスワードとして読めるので str() で文字列にする
+        （保存時は他と同じく暗号化される）。bool は数値として扱わない
+        （"True" はパスワードではない）。null は空文字と同じ「パスワード
+        なし」なので、黙ってそろえるだけで警告しない。
+        """
+        password = device.get("password", "")
+        if isinstance(password, str):
+            return None
+        if password is None:
+            device["password"] = ""
+            return None
+        if isinstance(password, (int, float)) and not isinstance(password, bool):
+            device["password"] = str(password)
+            return "numeric"
+        device["password"] = ""
+        return "emptied"
+
     # name の無いグループに与える表示名。グループごと捨てると中の正常な
     # 機器まで消えるので、名前だけ補って中身は残す
     UNNAMED_GROUP_NAME = "(名前なし)"
@@ -408,6 +435,8 @@ class ConfigManager:
         renamed_groups = 0
         dropped_groups = 0
         emptied_groups = 0
+        numeric_passwords = []   # 文字列に直した機器名
+        emptied_passwords = []   # パスワードを空にした機器名
         kept_groups = []
         # 手で付けられた名前とも衝突させない
         used_names = {g["name"] for g in config.get("groups", [])
@@ -431,6 +460,11 @@ class ConfigManager:
                     elif is_reserved_device_name(d["name"]):
                         reserved += 1
                     else:
+                        fixed = self._normalize_password(d)
+                        if fixed == "numeric":
+                            numeric_passwords.append(d["name"])
+                        elif fixed == "emptied":
+                            emptied_passwords.append(d["name"])
                         kept.append(d)
                 group["devices"] = kept
             else:
@@ -444,7 +478,7 @@ class ConfigManager:
         if dropped_groups:
             config["groups"] = kept_groups
         if not (removed or reserved or renamed_groups or dropped_groups
-                or emptied_groups):
+                or emptied_groups or numeric_passwords or emptied_passwords):
             return
         self._backup_corrupted_config()
         parts = []
@@ -467,6 +501,15 @@ class ConfigManager:
         if emptied_groups:
             parts.append(f"設定ファイル (config.json) に機器一覧の形が壊れたグループが"
                          f"{emptied_groups}件あり、機器の無いグループとして扱います。")
+        if numeric_passwords:
+            parts.append("設定ファイル (config.json) でパスワードが数値になっていた"
+                         "機器があり、そのまま文字列として扱います: "
+                         + "、".join(numeric_passwords))
+        if emptied_passwords:
+            parts.append("設定ファイル (config.json) でパスワードが文字列でない"
+                         "機器があり、パスワードを空にしました。"
+                         "機器の編集で入れ直してください: "
+                         + "、".join(emptied_passwords))
         message = "\n".join(parts)
         if self.backup_path:
             message += f"\n\n元のファイルはバックアップしました:\n  {self.backup_path}"
@@ -474,7 +517,9 @@ class ConfigManager:
         print(f"[Config] 機器{removed + reserved}件を除外 "
               f"(name/host 無し={removed}, 予約語={reserved})、"
               f"グループ{renamed_groups}件を改名、グループ{dropped_groups}件を除外、"
-              f"グループ{emptied_groups}件の機器一覧を空にしました")
+              f"グループ{emptied_groups}件の機器一覧を空にしました "
+              f"(パスワードを文字列化={len(numeric_passwords)}, "
+              f"空にした={len(emptied_passwords)})")
 
     def _backup_corrupted_config(self) -> None:
         """
