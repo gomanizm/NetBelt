@@ -272,7 +272,43 @@ REM 事実と違う失敗を出していた。
 REM 残る制限: 同梱の他のファイルは名前を変えられない（配布物の
 REM 一部そのもの）ため、同じインストール先へ同時に更新をかけると、
 REM どちらの版のファイルが残るかは混ざったままになる。
-if exist "!SOURCE_DIR!\NetBelt.exe" ren "!SOURCE_DIR!\NetBelt.exe" "!STAGED_NAME!"
+REM 更新に実行ファイルが入っているかは、インストール先へ何か書く前に
+REM 確かめる。見るのはコピー先ではなくコピー元。コピー先を見ると、
+REM 前回の更新が改名の直前で止まって残した一時名の exe が条件を
+REM 満たしてしまう。以前はこの判定を xcopy の後に置いていたため、
+REM exe の無い更新でも同梱の他のファイルだけが置き換わっていた。
+if not exist "!SOURCE_DIR!\NetBelt.exe" (
+    echo エラー: 更新ファイルに NetBelt.exe が含まれていません
+    echo   場所: !SOURCE_DIR!
+    echo   インストール先のファイルは何も変えていません。
+    rd /s /q "!TEMP_DIR!" 2>nul
+    pause
+    exit /b 1
+)
+REM 改名の結果は必ず確かめる。展開した exe をウイルス対策ソフトや
+REM インデクサが削除共有なしで開いていると、ren だけが失敗する。
+REM 確かめずに進んだ以前の版は、xcopy が元の名前のまま exe を
+REM インストール先へ直接上書きし、途中で止まると起動できない exe
+REM だけが残った（実測）。そのうえ「含まれていません」と事実と逆の
+REM 報告をしていた。走査は短いので少し待ってやり直し、それでも
+REM 移せなければ、インストール先へ何も書かずに止める。
+set "REN_TRY=0"
+:stage_exe
+set /a REN_TRY+=1
+ren "!SOURCE_DIR!\NetBelt.exe" "!STAGED_NAME!" >nul 2>&1
+if exist "!SOURCE_DIR!\!STAGED_NAME!" goto :staged
+if !REN_TRY! lss 5 (
+    ping -n 2 127.0.0.1 >nul 2>&1
+    goto :stage_exe
+)
+echo エラー: 展開した NetBelt.exe を一時名へ移せませんでした
+echo   ウイルス対策ソフトなど、別のプログラムが展開したファイルを
+echo   開いている可能性があります。インストール先のファイルは
+echo   何も変えていません。しばらく待ってから、もう一度更新してください。
+rd /s /q "!TEMP_DIR!" 2>nul
+pause
+exit /b 1
+:staged
 
 REM ファイルをコピー（上書き）
 xcopy "!SOURCE_DIR!\*" "!APP_DIR!" /E /I /Y /Q >nul 2>&1
@@ -282,22 +318,6 @@ if errorlevel 1 (
     echo   NetBelt.exe は旧版のままですが、同梱の他のファイルは
     echo   一部またはすべてが新しい版に置き換わっている場合があります。
     del "!STAGED_PATH!" 2>nul
-    rd /s /q "!TEMP_DIR!" 2>nul
-    pause
-    exit /b 1
-)
-
-REM 更新に実行ファイルが入っていたかを確かめる。xcopy の戻り値
-REM だけでは分からない。見るのはコピー先ではなくコピー元。上の改名を
-REM 実行できたときだけ一時名の exe ができるから。コピー先を
-REM 見ると、前回の更新が改名の直前で止まって残した
-REM 一時名の exe が条件を満たし、exe を含まない zip でも
-REM 動いている exe をその残骸で上書きしてしまう。
-if not exist "!SOURCE_DIR!\!STAGED_NAME!" (
-    echo エラー: 更新ファイルに NetBelt.exe が含まれていません
-    echo   場所: !SOURCE_DIR!
-    echo   NetBelt.exe は旧版のままですが、同梱の他のファイルは
-    echo   既に新しい版へ置き換わっています。
     rd /s /q "!TEMP_DIR!" 2>nul
     pause
     exit /b 1
