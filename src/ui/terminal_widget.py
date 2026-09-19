@@ -1323,6 +1323,7 @@ class TerminalWidget(QWidget):
 
     def _write_logs(self, device_name: str, logs) -> None:
         """描いた受信を記録へ書く。停止した記録は、境目まで書いたら閉じる。"""
+        failed = []
         for target, events in logs:
             handle = (self._log_files.get(device_name) if target is None
                       else target[0])
@@ -1343,10 +1344,12 @@ class TerminalWidget(QWidget):
                 if target is None:
                     self._abort_log_recording(device_name, e)
                 else:
-                    # 閉じて知らせる。区間は残しておき、その受信を次の記録へ
-                    # 回さない（以後は捨てる）
+                    # 区間は残しておき、その受信を次の記録へ回さない（以後は
+                    # 捨てる）。閉じて知らせるのは、この片を全部書き終えてから。
+                    # 警告はモーダルで、出ている間に次の片が描かれて記録中の
+                    # ファイルへ先に書かれると、中身の順序が入れ替わる
                     target[0] = None
-                    self._close_stopped_log(device_name, handle, target[1], e)
+                    failed.append((handle, target[1], e))
         closing = self._closing_logs.get(device_name, [])
         while closing and closing[0][2] <= 0:
             handle, path, _ = closing.pop(0)
@@ -1354,6 +1357,8 @@ class TerminalWidget(QWidget):
                 self._close_stopped_log(device_name, handle, path)
         if not closing:
             self._closing_logs.pop(device_name, None)
+        for handle, path, error in failed:
+            self._close_stopped_log(device_name, handle, path, error)
 
     def _close_stopped_log(self, device_name: str, handle, path,
                            error=None) -> None:
