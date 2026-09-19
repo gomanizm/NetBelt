@@ -11,7 +11,7 @@ from typing import Dict, Optional
 # MIB 解析器の版。抽出・解決の規則を変えたら上げる。mib_cache.json は
 # この値も鍵にするので、古い解析器が作ったキャッシュがアプリの更新後に
 # そのまま使われることがなくなる。
-MIB_PARSER_VERSION = '2026-09-19.1'
+MIB_PARSER_VERSION = '2026-09-19.2'
 
 
 def app_dir() -> str:
@@ -59,6 +59,26 @@ def _custom_mibs_fingerprint() -> str:
             return hashlib.sha1(f.read()).hexdigest()
     except OSError:
         return ''
+
+
+def _mib_file_stamp(path: str) -> dict:
+    """mibs/ のファイルが変わったかを見るための印（mtime・大きさ・sha1）。
+
+    mtime だけだと、中身を差し替えても mtime が保たれたとき（固定日時で
+    作られた配布アーカイブを展開し直す、mtime を保つコピー）に古い
+    キャッシュが使われ続ける（実測）。中身の sha1 まで見る。費用は中身を
+    読む分（合成 MIB 45MB・150 ファイルで、キャッシュが効く起動が 0.075 秒
+    から 0.11 秒）で、読み込みはバックグラウンドのスレッドで動く。中身を
+    読めない（排他ロックなど）ときは sha1 を None にする。
+    """
+    import hashlib
+    stat = os.stat(path)
+    try:
+        with open(path, 'rb') as f:
+            sha1 = hashlib.sha1(f.read()).hexdigest()
+    except OSError:
+        sha1 = None
+    return {'mtime': stat.st_mtime, 'size': stat.st_size, 'sha1': sha1}
 
 
 class MIBResolver:
@@ -266,7 +286,7 @@ class MIBResolver:
             cached_files = {}
             cache_needs_update = True
         
-        # MIBファイルのタイムスタンプをチェック
+        # MIBファイルの変更をチェック（mtime・大きさ・中身の sha1）
         current_files = {}
         for filename in os.listdir(mibs_dir):
             # 拡張子は大小を無視して判定する。Windows はファイル名の大小を
@@ -276,11 +296,18 @@ class MIBResolver:
             # ファイルを開く経路は変えない。
             if filename.lower().endswith(('.mib', '.txt', '.my')):
                 filepath = os.path.join(mibs_dir, filename)
-                mtime = os.path.getmtime(filepath)
-                current_files[filename] = mtime
-                
+                stamp = _mib_file_stamp(filepath)
+                cached = cached_files.get(filename)
+                if (stamp['sha1'] is None and isinstance(cached, dict)
+                        and cached.get('mtime') == stamp['mtime']
+                        and cached.get('size') == stamp['size']):
+                    # 今は中身を読めない（排他ロックなど）が、日時と大きさは
+                    # 記録どおり。これまでどおり前回の解析結果を使う
+                    stamp = cached
+                current_files[filename] = stamp
+
                 # キャッシュと比較
-                if filename not in cached_files or cached_files[filename] != mtime:
+                if filename not in cached_files or cached != stamp:
                     cache_needs_update = True
         
         # ファイルが削除された場合もキャッシュ更新
