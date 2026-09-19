@@ -280,14 +280,17 @@ class InteractiveTerminal(QTextEdit):
         取り消せないので、そのときだけ送る内容を見せて確かめる。改行の無い
         1 行は Enter を押すまで実行されないので、そのまま送る。ただし制御文字
         （Ctrl+Z など。IOS の設定モードでは入力中の行を実行して抜ける）を
-        含むときも確かめる。タブは補完に使うだけなので除く。
+        含むときも確かめる。タブは補完に使うだけなので除く。DEL（0x7f）は
+        この端末が Backspace として送る文字で、入力中の文字を消すので含める。
+        C1（0x80-0x9f）も 8 ビットの制御として読む機器があるので含める。
         """
         from PyQt6.QtWidgets import QApplication, QDialog
 
         text = QApplication.clipboard().text()
         if not text or not self.can_send_input():
             return
-        if any(ord(ch) < 0x20 and ch != "\t" for ch in text):
+        if any((ord(ch) < 0x20 and ch != "\t") or 0x7f <= ord(ch) <= 0x9f
+               for ch in text):
             from .dialogs.paste_confirm_dialog import PasteConfirmDialog
             dialog = PasteConfirmDialog(text, self)
             try:

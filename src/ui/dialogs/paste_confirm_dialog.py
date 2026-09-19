@@ -3,7 +3,7 @@ from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
 
 
 class PasteConfirmDialog(QDialog):
-    """改行を含む貼り付けを、送る前に見せて確かめるダイアログ
+    """改行や制御文字を含む貼り付けを、送る前に見せて確かめるダイアログ
 
     機器は改行ごとにコマンドとして実行するので、誤って貼ると取り消せない。
     Enter の押し癖で送らないよう、既定のボタンはキャンセルにする。
@@ -19,8 +19,15 @@ class PasteConfirmDialog(QDialog):
         lines = len(shown.splitlines())
 
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel(
-            f"次の {lines} 行を機器へ送ります。改行ごとにコマンドとして実行されます。"))
+        if "\r" in text or "\n" in text:
+            message = (f"次の {lines} 行を機器へ送ります。"
+                       "改行ごとにコマンドとして実行されます。")
+        else:
+            # 改行が無くても確かめるのは制御文字を含むとき。「改行ごとに実行」
+            # と書くと、何も実行されないと読めてしまう
+            message = ("次の文字列を機器へ送ります。制御文字（Ctrl+Z・DEL など）を"
+                       "含むため、入力中の行が消えたり実行されたりすることがあります。")
+        layout.addWidget(QLabel(message))
 
         view = QPlainTextEdit()
         view.setReadOnly(True)
