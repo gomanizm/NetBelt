@@ -600,16 +600,9 @@ class Screen(object):
             # 取り違えると、カーソルがずれたり画面が消えたりする
             return
         elif seq.final == "7":
-            self._saved = (self.cursor_row, self.cursor_col, self.attr,
-                           dict(self._g), self._charset, self._pending_wrap)
+            self._save_cursor()
         elif seq.final == "8":
-            row, col, attr, g, charset, pending = self._saved
-            self.attr = attr
-            self._g = dict(g)
-            self._charset = charset
-            self._move(row, col)
-            # _move が折り返し待ちを落とすので、復元はそのあと
-            self._pending_wrap = pending
+            self._restore_cursor()
         elif seq.final == "D":          # IND
             self._linefeed()
         elif seq.final == "M":          # RI: 上端では下へスクロール
@@ -630,6 +623,21 @@ class Screen(object):
             self.reset()
         # = > \ H などは表示を変えない
 
+    def _save_cursor(self):
+        """DECSC (ESC 7) と ?1048h の保存。xterm も同じ保存領域を使う。"""
+        self._saved = (self.cursor_row, self.cursor_col, self.attr,
+                       dict(self._g), self._charset, self._pending_wrap)
+
+    def _restore_cursor(self):
+        """DECRC (ESC 8) と ?1048l の復元。"""
+        row, col, attr, g, charset, pending = self._saved
+        self.attr = attr
+        self._g = dict(g)
+        self._charset = charset
+        self._move(row, col)
+        # _move が折り返し待ちを落とすので、復元はそのあと
+        self._pending_wrap = pending
+
     def _osc(self, text):
         num, _, rest = text.partition(";")
         if num in ("0", "2"):
@@ -645,6 +653,14 @@ class Screen(object):
                 clear = (mode == 1049) if on else (mode == 1047)
                 self._switch_screen(on, with_cursor=(mode == 1049),
                                     clear=clear)
+            elif mode == 1048:
+                # 画面は切り替えず、DECSC / DECRC と同じ保存・復元だけ
+                # を行う (XTerm ctlseqs)。1049 = 1048 + 1047 なので、
+                # 保存領域も DECSC と共通の _saved を使う
+                if on:
+                    self._save_cursor()
+                else:
+                    self._restore_cursor()
             elif mode == 7:
                 self.autowrap = on
                 if not on:
