@@ -577,6 +577,18 @@ class SyslogReceiver(QObject):
             SyslogMessage(message_str, client_ip, "TCP", listen_port))
         self.message_count += 1
 
+    def _flush_tcp_residual(self, buffer, client_ip, listen_port):
+        """受信バッファに残った終端なしの 1 行を配信する（後始末の共通処理）。
+
+        改行区切りは終端（LF / NUL）が来るまで行を配信しないので、終端を
+        付けずに黙る送り手の最後の 1 件は、この接続を畳むときに配信しないと
+        消える。長さは受信のたびに上限（max_line_bytes）と照合済みなので、
+        上限を超えた行はここまで来ない。宣言した長さに足りない
+        octet-counting のフレームは、欠けた本文なので配信しない。
+        """
+        if buffer and not self._OCTET_COUNT_RE.match(buffer):
+            self._emit_tcp_line(buffer, client_ip, listen_port)
+
     def _handle_tcp_client(self, client_socket, client_ip, stop_event, listen_port=None):
         """TCPクライアントからのメッセージを処理
 
@@ -584,6 +596,11 @@ class SyslogReceiver(QObject):
         どちらかはバッファ先頭で判定し、混在も許す。
 
         最後に受信してから tcp_idle_timeout_seconds を過ぎた接続は切断する。
+
+        相手が閉じた・無通信で切った・停止要求で抜けた、のいずれで終わる
+        場合も、残った終端なしの 1 行を配信してから畳む。1 行が上限を
+        超えて切断した場合だけは配信しない（切り捨てたことを通知した
+        直後に、その切れ端を 1 件として出すことになるため）。
         """
         try:
             client_socket.settimeout(1.0)
@@ -595,12 +612,9 @@ class SyslogReceiver(QObject):
                     if not data:
                         # 相手が閉じた。LF の無い最後の 1 行も 1 件として配信する
                         # （捨てると、終端を付けずに閉じる送り手の最後の 1 件が
-                        # 消える）。長さは受信のたびに上限と照合済み。宣言した
-                        # 長さに足りない octet-counting のフレームは欠けた本文
-                        # なので、従来どおり配信しない
-                        if buffer and not self._OCTET_COUNT_RE.match(buffer):
-                            self._emit_tcp_line(buffer, client_ip, listen_port)
-                        break
+                        # 消える）
+                        self._flush_tcp_residual(buffer, client_ip, listen_port)
+                        return
                     last_activity = time.monotonic()
                     buffer += data
                     too_long = False
@@ -661,18 +675,24 @@ class SyslogReceiver(QObject):
                                self.max_line_bytes),
                             client_ip, "TCP", listen_port))
                         self.message_count += 1
-                        break
+                        # 切り捨てた残りは配信しない（切断を伝えた直後に
+                        # 切れ端を 1 件として出すことになる）
+                        return
                 except socket.timeout:
                     # 無通信のまま上限を過ぎた接続は切って枠を返す
                     idle = self.tcp_idle_timeout_seconds
                     if idle and time.monotonic() - last_activity > idle:
                         print("[Syslog] TCP client idle for %ds, closing: %s"
                               % (idle, client_ip))
-                        break
+                        self._flush_tcp_residual(buffer, client_ip, listen_port)
+                        return
                     continue
                 except Exception as e:
                     print("[Syslog] TCP receive error: %s" % e)
-                    break
+                    return
+            # 停止要求で待受ループを抜けた。相手は閉じていないので、
+            # ここでも残りを配信してから畳む
+            self._flush_tcp_residual(buffer, client_ip, listen_port)
         finally:
             try:
                 client_socket.close()
