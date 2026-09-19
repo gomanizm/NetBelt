@@ -143,6 +143,9 @@ class SFTPPanel(QWidget):
         
         # ファイルリストビュー
         self.tree_view = QTreeView()
+        # セルの直接編集は機器へ反映されない（表示だけが変わり、改名や権限の
+        # 変更が効いたように見える）。改名・権限変更は右クリックメニューから
+        self.tree_view.setEditTriggers(QTreeView.EditTrigger.NoEditTriggers)
         self.tree_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree_view.customContextMenuRequested.connect(self._show_context_menu)
         self.tree_view.doubleClicked.connect(self._on_item_double_clicked)
