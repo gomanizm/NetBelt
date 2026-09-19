@@ -2455,6 +2455,11 @@ for details.
             except Exception as e:
                 print(f"[Main] MIB 読み込みの待機エラー: {e}")
 
+        # 受信済みでまだ描いていない出力を記録し切ってから、記録を止めて
+        # ファイルを閉じる。記録へ書くのは描くときなので、ここで済ませないと
+        # 画面が流れている最中に閉じた分が記録から欠ける
+        self.terminal_widget.finish_log_recordings()
+
         # すべてのマクロをクリーンアップ
         for device_name in list(self.connections.keys()):
             self.macro_manager.cleanup_device(device_name)

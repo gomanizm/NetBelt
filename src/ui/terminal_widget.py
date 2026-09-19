@@ -1179,6 +1179,10 @@ class TerminalWidget(QWidget):
         for response in terminal._screen.take_responses():
             terminal._queue_send(response)
 
+        self._write_log(device_name, events)
+
+    def _write_log(self, device_name: str, events) -> None:
+        """パーサの出した文字と改行・タブを、記録中ならその機器の記録へ書く"""
         if device_name in self._log_files:
             # タブは桁を作る文字なので落とすと表が潰れる
             logged = "".join(
@@ -1192,6 +1196,23 @@ class TerminalWidget(QWidget):
                     self._log_files[device_name].flush()
                 except Exception as e:
                     self._abort_log_recording(device_name, e)
+
+    def finish_log_recordings(self) -> None:
+        """記録中の全機器について、描いていない受信分を記録し切ってから記録を止める
+
+        アプリを閉じるときに呼ぶ。記録へ書くのは append_output の中（描いた
+        あと）なので、queue_output に溜まったままの分はまだファイルに無く、
+        閉じるとそのまま捨てられていた（実測: 1.46MB を受信して 300ms 後に
+        閉じると 45% が欠けた）。閉じる間際なので画面へは描かず、パーサだけに
+        通して記録へ書く（描くと 3MB で約 2.2 秒、パーサだけなら約 0.05 秒）。
+        """
+        for device_name in list(self._log_files):
+            chunks = self._pending_output.pop(device_name, None)
+            terminal = self._terminals.get(device_name)
+            if chunks and terminal is not None:
+                self._write_log(device_name,
+                                terminal._parser.feed("".join(chunks)))
+            self._stop_log_recording_for(device_name)
 
     def queue_output(self, device_name: str, text: str) -> None:
         """受信した出力を溜め、イベントループへ戻ってから描く
