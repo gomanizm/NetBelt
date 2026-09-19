@@ -235,6 +235,10 @@ class MacroDialog(QDialog):
                 self._load_presets()
                 QMessageBox.information(self, "成功", f"プリセット '{preset_name}' を削除しました。")
             else:
+                # 一覧にだけ残ったプリセット（設定からは既に消えている）を
+                # 選んだ場合、案内だけでは利用者が一覧から消せない。
+                # 設定に合わせて読み直してから知らせる
+                self._load_presets()
                 QMessageBox.warning(self, "エラー", "プリセットの削除に失敗しました。")
     
     def _on_keepalive_start(self):

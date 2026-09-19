@@ -1655,6 +1655,11 @@ class MainWindow(QMainWindow):
                 self.status_bar.showMessage(f"グループ '{group_name}' を削除しました")
             else:
                 # remove_group は「元からグループが無かった」場合も False
+                if group is None:
+                    # 設定に無いグループがツリーにだけ残っていた。案内だけで
+                    # 済ませると、何度試しても「失敗しました」が出るだけで、
+                    # 利用者は表示から消せない。設定に合わせて作り直す
+                    self._load_devices()
                 self._warn_change_failed(
                     "グループの削除", self.config_manager.last_save_failed)
     
