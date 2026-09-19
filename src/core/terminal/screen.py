@@ -118,6 +118,7 @@ class Screen(object):
         self._other_saved = self._saved
         self._saved_main = None             # ?1049 用
         self.autowrap = True
+        self.insert_mode = False                # IRM (ESC[4h / ESC[4l)
         self.cursor_visible = True
         self.application_cursor_keys = False    # ?1 DECCKM (入力側が見る)
         self.bracketed_paste = False            # ?2004 (入力側が見る)
@@ -257,8 +258,9 @@ class Screen(object):
         # まで届いたときだけ残す判断に使う
         entry_row, entry_mark = None, False
         # 文字集合を変える命令 (ESC ( と SI/SO) は別の命令なので、1 つの
-        # 印字の途中では変わらない。罫線は 1 文字ずつ置き換えながら書く
-        if self._g[self._charset] == "0":
+        # 印字の途中では変わらない。罫線は 1 文字ずつ置き換えながら書く。
+        # 挿入モードも、1 文字ごとに右を送りながら書く
+        if self._g[self._charset] == "0" or self.insert_mode:
             self._print_chars(text, entry_row, entry_mark)
             return
         # 幅 1 と決まっている文字の連なりはまとめて書き、それ以外
@@ -319,6 +321,10 @@ class Screen(object):
             if entry_row != self.cursor_row:
                 entry_row = self.cursor_row
                 entry_mark = self.wrapped[entry_row]
+            if self.insert_mode:
+                # IRM: 書く前に、カーソルから右を文字の幅ぶん右へ送る。
+                # 右端からあふれた文字は消える (ICH と同じ。xterm も同じ)
+                self._shift_chars(width, insert=True)
             line = self.lines[self.cursor_row]
             end = self.cursor_col + width
             if end > len(line):
@@ -557,6 +563,9 @@ class Screen(object):
             self._scroll_down(rows_n)
         elif f == "r":
             self._set_margins(p)
+        elif f in "hl":                 # SM / RM。表示に効くのは IRM だけ
+            if 4 in p:
+                self.insert_mode = f == "h"
         elif f == "m":
             self.attr = apply_sgr(self.attr, p)
         elif f == "n":
