@@ -544,14 +544,20 @@ class SyslogReceiver(QObject):
         octet_counted=True（RFC 6587 §3.4.1）は宣言された長さぶんがそのまま
         本文なので、末尾の空白・タブ・NEL(U+0085)・NBSP(U+00A0) も原文のまま
         残す。両端を落とすと raw_message が受信原文と一致しなくなる。
-        改行区切り（§3.4.2）は終端の CR/LF を落とす必要があるので、そちらは
-        従来どおり strip する。
+        改行区切り（§3.4.2）の LF は切り出しの時点で落ちているので、落とすのは
+        CRLF の CR 1 個だけにし、本文末尾の空白は残す。先頭の空白は、PRI の
+        解釈を変えないよう従来どおり落とす。
         """
         decoded = self._decode_bytes(line)
         # 空行かどうかの判定だけは、どちらの方式でも strip 済みの値で行う
         if not decoded.strip():
             return
-        message_str = decoded if octet_counted else decoded.strip()
+        if octet_counted:
+            message_str = decoded
+        else:
+            if decoded.endswith("\r"):
+                decoded = decoded[:-1]
+            message_str = decoded.lstrip()
         self._emit_message(
             SyslogMessage(message_str, client_ip, "TCP", listen_port))
         self.message_count += 1
