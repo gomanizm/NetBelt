@@ -134,10 +134,10 @@ class UpdaterApplyCopyCleanupTest(unittest.TestCase):
     def _updates(self):
         return sorted(os.listdir(self.upd))
 
-    def _run(self, command):
+    def _run(self, command, temp=None):
         env = dict(os.environ)
-        env["TEMP"] = self.temp
-        env["TMP"] = self.temp
+        env["TEMP"] = temp or self.temp
+        env["TMP"] = temp or self.temp
         out_path = os.path.join(self.base, "out.txt")
         with io.open(out_path, "wb") as out:
             code = subprocess.Popen(
@@ -146,9 +146,9 @@ class UpdaterApplyCopyCleanupTest(unittest.TestCase):
         with io.open(out_path, encoding="utf-8", errors="replace") as f:
             return code, f.read()
 
-    def _run_updater(self, zip_path, app_path=None):
+    def _run_updater(self, zip_path, app_path=None, temp=None):
         return self._run('"%s" "%s" "%s"' % (
-            self.updater, zip_path, app_path or self.app_path))
+            self.updater, zip_path, app_path or self.app_path), temp=temp)
 
     def _assert_aborted_untouched(self, code, out):
         self.assertNotEqual(code, 0, "中止したのに成功と報告した:\n" + out)
@@ -245,6 +245,43 @@ class UpdaterApplyCopyCleanupTest(unittest.TestCase):
 
         self._assert_aborted_untouched(code, out)
         self.assertIn("ZIPファイルが見つかりません", out, out)
+        self._assert_only_the_original_is_left(out)
+
+    def test_a_temp_that_cannot_hold_the_work_folder_drops_the_apply_copy(self):
+        """作業フォルダを TEMP に作れずに中止したときも、写しを控えごと消すこと。
+
+        ここは再入（--utf8）より前の中止で、:drop_apply_copy を call できない
+        区間にある。TEMP をファイルにすると md が 20 回とも失敗し、:nowork
+        から exit 1 で止まる。実測（検査役 cx5c-verify-release の
+        b_parent_abort.py、8b0c94e）: exit 1・インストール先は元のままで、
+        更新フォルダに NetBelt-apply-k3j9x2.zip と控え 2 つが残った。
+        """
+        copy = self._put_set(APPLY_NAME, self.good_zip)
+        temp_is_a_file = os.path.join(self.base, "temp-is-a-file")
+        with io.open(temp_is_a_file, "wb") as f:
+            f.write(b"x")
+
+        code, out = self._run_updater(copy, temp=temp_is_a_file)
+
+        self._assert_aborted_untouched(code, out)
+        self.assertIn("could not create a work folder", out, out)
+        self._assert_only_the_original_is_left(out)
+
+    def test_a_bang_in_temp_drops_the_apply_copy(self):
+        """TEMP に '!' があって中止したときも、写しを控えごと消すこと。
+
+        同じく再入より前の中止。遅延展開を入れる前に消すので、写しの
+        名前が '!' で崩れることはない（NetBelt が渡す ZIP のパスに '!' が
+        あれば updater_command が先に拒む）。
+        """
+        copy = self._put_set(APPLY_NAME, self.good_zip)
+        bang_temp = os.path.join(self.base, "te" + chr(33) + "mp")
+        os.makedirs(bang_temp)
+
+        code, out = self._run_updater(copy, temp=bang_temp)
+
+        self._assert_aborted_untouched(code, out)
+        self.assertIn("exclamation mark", out, out)
         self._assert_only_the_original_is_left(out)
 
     def test_a_zip_handed_over_by_hand_is_kept(self):

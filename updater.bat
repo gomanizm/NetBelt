@@ -13,6 +13,25 @@ rem "could not copy the updater", which points at the wrong cause.
 set "BANG="
 echo."%~f0" "%~1" "%~2" "%TEMP%"| findstr /C:"!" >nul && set "BANG=1"
 
+rem This run stops without writing anything into the install folder, so the
+rem copy NetBelt made for it (the update folder's NetBelt-apply-*.zip and
+rem its .sha256 / .version) is dead weight: the original ZIP is still there,
+rem and the copy would otherwise be offered as a pending update of its own.
+rem Do it here, while delayed expansion is still off - below this point a
+rem '!' in the path is eaten before del could ever see it. The routine at
+rem the end of the file does the same thing, but cannot be called from this
+rem half: everything above :run must stay ASCII (see the note at the top).
+rem The message and the exit stay further down, after the re-entry check.
+if not defined BANG goto :bang_checked
+if "%~3"=="--utf8" goto :bang_checked
+set "ZIP_NAME=x"
+for %%z in ("%~1") do set "ZIP_NAME=%%~nxz"
+if /i not "%ZIP_NAME:~0,14%"=="NetBelt-apply-" goto :bang_checked
+del "%~1" 2>nul
+del "%~1.sha256" 2>nul
+del "%~1.version" 2>nul
+:bang_checked
+
 setlocal enabledelayedexpansion
 if "%~3"=="--utf8" goto :run
 rem Stop here, not after :run. With '!' in the path the re-entry itself
@@ -80,6 +99,16 @@ rem experiment behind it never replaced the parent file.)
 cmd /d /c ""!TMPRUNNER!" "!A1!" "!A2!" --utf8 "!HOME_DIR!" "!WORK_DIR!"" & set "RC=!errorlevel!" & rd /s /q "!WORK_DIR!" >nul 2>&1 & exit /b !RC!
 
 :nowork
+rem Nothing in the install folder has been written, so drop the apply copy
+rem (see the note beside the '!' check above for why it is spelled out here
+rem instead of calling :drop_apply_copy).
+set "ZIP_NAME=x"
+for %%z in ("!A1!") do set "ZIP_NAME=%%~nxz"
+if /i "!ZIP_NAME:~0,14!"=="NetBelt-apply-" (
+    del "!A1!" 2>nul
+    del "!A1!.sha256" 2>nul
+    del "!A1!.version" 2>nul
+)
 echo ERROR: could not create a work folder in TEMP.
 echo   Twenty names were tried, so TEMP is most likely full, read-only
 echo   or missing. The update has not been applied. Fix TEMP, or
@@ -89,6 +118,14 @@ exit /b 1
 
 :nocopy
 rd /s /q "!WORK_DIR!" 2>nul
+rem Same as :nowork: nothing in the install folder has been written yet.
+set "ZIP_NAME=x"
+for %%z in ("!A1!") do set "ZIP_NAME=%%~nxz"
+if /i "!ZIP_NAME:~0,14!"=="NetBelt-apply-" (
+    del "!A1!" 2>nul
+    del "!A1!.sha256" 2>nul
+    del "!A1!.version" 2>nul
+)
 echo ERROR: could not copy the updater to TEMP.
 echo   The update has not been applied. Free some space in TEMP, or
 echo   extract the new ZIP over this folder by hand.
