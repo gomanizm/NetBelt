@@ -537,6 +537,10 @@ class TerminalWidget(QWidget):
         super().__init__()
         self._terminals: Dict[str, InteractiveTerminal] = {}  # 機器名 -> ターミナル
         self._log_files: Dict[str, object] = {}  # 機器名 -> ログファイルハンドル
+        # 停止したが、停止より前に受信してまだ描いていない分を書き終えていない
+        # 記録（機器名 -> [[ハンドル, パス, 残りの文字数], ...]、停止した順）。
+        # 各項目の文字数は、描き待ちの先頭から前の項目のぶんに続く区間
+        self._closing_logs: Dict[str, list] = {}
         self._log_dialogs: Dict[str, object] = {}  # 機器名 -> ログ記録ダイアログ
         # ターミナルの外観設定。_create_terminal が参照するので _create_ui より先に持つ
         self._terminal_settings = dict(self.DEFAULT_TERMINAL_SETTINGS)
@@ -1230,8 +1234,14 @@ class TerminalWidget(QWidget):
             return
         terminal = self._terminals[device_name]
 
-        events = terminal._parser.feed(text)
-        terminal._screen.apply(events)
+        # 描き待ちから取り出した分は、書き込む記録ごとに区切ってパーサへ通す
+        # （停止した記録が書き終えていない区間があるため。_split_for_logs）
+        logs = []
+        for target, piece in (self._split_for_logs(device_name, text)
+                              if from_flush else [(None, text)]):
+            events = terminal._parser.feed(piece)
+            terminal._screen.apply(events)
+            logs.append((target, events))
         self._render_screen(terminal)
 
         # 機器からの問い合わせ (カーソル位置・装置識別) に答える。
@@ -1239,23 +1249,76 @@ class TerminalWidget(QWidget):
         for response in terminal._screen.take_responses():
             terminal._queue_send(response)
 
-        self._write_log(device_name, events)
+        self._write_logs(device_name, logs)
 
-    def _write_log(self, device_name: str, events) -> None:
-        """パーサの出した文字と改行・タブを、記録中ならその機器の記録へ書く"""
-        if device_name in self._log_files:
+    def _split_for_logs(self, device_name: str, text: str) -> list:
+        """描き待ちから取り出した text を、書き込む記録ごとに区切る。
+
+        停止した記録（_closing_logs）には、停止より前に受信した分が残って
+        いる。先頭からその文字数ぶんをその記録へ、残りを記録中のファイルへ回す。
+        戻り値: [(停止した記録の項目。記録中のファイルなら None, 文字列), ...]
+        """
+        pieces = []
+        for entry in self._closing_logs.get(device_name, ()):
+            size = min(entry[2], len(text))
+            if size:
+                pieces.append((entry, text[:size]))
+                entry[2] -= size
+                text = text[size:]
+        if text:
+            pieces.append((None, text))
+        return pieces
+
+    def _write_logs(self, device_name: str, logs) -> None:
+        """描いた受信を記録へ書く。停止した記録は、境目まで書いたら閉じる。"""
+        for target, events in logs:
+            handle = (self._log_files.get(device_name) if target is None
+                      else target[0])
+            if handle is None:
+                continue
             # タブは桁を作る文字なので落とすと表が潰れる
             logged = "".join(
                 e.text if isinstance(e, vt.Print) else e.char
                 for e in events
                 if isinstance(e, vt.Print)
                 or (isinstance(e, vt.Ctrl) and e.char in "\n\t"))
-            if logged:
-                try:
-                    self._log_files[device_name].write(logged)
-                    self._log_files[device_name].flush()
-                except Exception as e:
+            if not logged:
+                continue
+            try:
+                handle.write(logged)
+                handle.flush()
+            except Exception as e:
+                if target is None:
                     self._abort_log_recording(device_name, e)
+                else:
+                    # 閉じて知らせる。区間は残しておき、その受信を次の記録へ
+                    # 回さない（以後は捨てる）
+                    target[0] = None
+                    self._close_stopped_log(device_name, handle, target[1], e)
+        closing = self._closing_logs.get(device_name, [])
+        while closing and closing[0][2] <= 0:
+            handle, path, _ = closing.pop(0)
+            if handle is not None:
+                self._close_stopped_log(device_name, handle, path)
+        if not closing:
+            self._closing_logs.pop(device_name, None)
+
+    def _close_stopped_log(self, device_name: str, handle, path,
+                           error=None) -> None:
+        """停止した記録のファイルを閉じ、使用中の登録を外す。"""
+        from PyQt6.QtWidgets import QMessageBox
+        from core import log_recording
+        log_recording.stop(device_name, path)
+        try:
+            handle.close()
+        except Exception as e:
+            error = error or e
+        if error is not None:
+            QMessageBox.warning(
+                self, "ログ記録",
+                "%s の停止したログ記録の、停止より前に受信した分を書き終えられ"
+                "ませんでした:\n%s\n\n記録は失敗する前の行までです。"
+                % (device_name, error))
 
     def finish_log_recordings(self) -> None:
         """記録中の全機器について、描いていない受信分を記録し切ってから記録を止める
@@ -1266,13 +1329,14 @@ class TerminalWidget(QWidget):
         閉じると 45% が欠けた）。閉じる間際なので画面へは描かず、パーサだけに
         通して記録へ書く（描くと 3MB で約 2.2 秒、パーサだけなら約 0.05 秒）。
         """
-        for device_name in list(self._log_files):
-            chunks = self._pending_output.pop(device_name, None)
-            terminal = self._terminals.get(device_name)
-            if chunks and terminal is not None:
-                self._write_log(device_name,
-                                terminal._parser.feed("".join(chunks)))
-            self._stop_log_recording_for(device_name)
+        for device_name in list(self._log_files) + [
+                name for name in self._closing_logs
+                if name not in self._log_files]:
+            # タブを閉じるときと同じく、描いていない受信を記録へだけ書き、
+            # 停止して書き終えていない記録も書き終えて閉じる
+            self._log_pending_on_close(device_name)
+            if device_name in self._log_files:
+                self._stop_log_recording_for(device_name)
 
     def queue_output(self, device_name: str, text: str) -> None:
         """受信した出力を溜め、イベントループへ戻ってから描く
@@ -1345,8 +1409,9 @@ class TerminalWidget(QWidget):
         from PyQt6.QtWidgets import QMessageBox
 
         from core import log_recording
-        log_recording.stop(device_name)
         handle = self._log_files.pop(device_name, None)
+        # 停止して書き終えていない前の記録の登録は残す
+        log_recording.stop(device_name, getattr(handle, "name", None))
         if handle is not None:
             try:
                 handle.close()
@@ -1440,7 +1505,9 @@ class TerminalWidget(QWidget):
         
         # 記録中なら止めてから閉じる。放っておくとファイルハンドルが
         # 開いたまま残り（Windows ではファイルがロックされたままになる）、
-        # 宙に浮いたダイアログの停止ボタンが以後は別の機器を止めてしまう
+        # 宙に浮いたダイアログの停止ボタンが以後は別の機器を止めてしまう。
+        # 描いていない受信は捨てるが、その前に記録へだけは書く
+        self._log_pending_on_close(tab_name)
         self._stop_log_recording_for(tab_name)
 
         # 辞書から削除
@@ -1462,6 +1529,21 @@ class TerminalWidget(QWidget):
             )
             self.tab_widget.addTab(welcome_terminal, "ホーム")
     
+    def _log_pending_on_close(self, device_name: str) -> None:
+        """閉じるタブの描いていない受信を、画面へは描かずに記録へだけ書く。
+
+        停止して書き終えていない記録も、ここで書き終えて閉じる。
+        """
+        pending = self._pending_output.pop(device_name, None)
+        terminal = self._terminals.get(device_name)
+        if pending and terminal is not None:
+            self._write_logs(device_name, [
+                (target, terminal._parser.feed(piece)) for target, piece
+                in self._split_for_logs(device_name, pending.take())])
+        for handle, path, _ in self._closing_logs.pop(device_name, []):
+            if handle is not None:
+                self._close_stopped_log(device_name, handle, path)
+
     @staticmethod
     def _default_log_dir() -> str:
         """保存先ダイアログの初期ディレクトリ（cwd/logs。作れなければ別の場所）
@@ -1710,7 +1792,17 @@ class TerminalWidget(QWidget):
             # 「既にログ記録中です。」で断られる（止める手段が無くなる）。
             handle = self._log_files.pop(tab_name)
             from core import log_recording
-            log_recording.stop(tab_name)
+            # 停止より前に受信して、まだ描いていない分がある（受信が描画を
+            # 上回って溜まっている最中の停止）。受信した分は記録に入れるので、
+            # 描き進んでそこへ届くまで閉じずに預ける（_write_logs が書いて
+            # 閉じる）。後から始めた記録には、その後ろだけが入る
+            waiting = len(self._pending_output.get(tab_name, ())) - sum(
+                entry[2] for entry in self._closing_logs.get(tab_name, ()))
+            if waiting > 0:
+                self._closing_logs.setdefault(tab_name, []).append(
+                    [handle, getattr(handle, "name", None), waiting])
+            else:
+                log_recording.stop(tab_name, getattr(handle, "name", None))
 
             # ターミナルの記録フラグをクリア
             if isinstance(current_widget, InteractiveTerminal):
@@ -1722,6 +1814,8 @@ class TerminalWidget(QWidget):
             if dialog is not None:
                 self._discard_log_dialog(dialog)
 
+            if waiting > 0:
+                return
             try:
                 handle.close()
             except Exception as e:

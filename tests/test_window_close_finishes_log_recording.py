@@ -135,8 +135,8 @@ class WindowCloseFinishesLogRecordingTest(unittest.TestCase):
         payload = "".join(line + "\r\n" for line in lines)
         for i in range(0, len(payload), 4096):
             conn.output_received.emit(payload[i:i + 4096])
-        pending = sum(len(c) for c in
-                      window.terminal_widget._pending_output.get("dev", []))
+        # 描いていない文字数（溜まり分は _PendingOutput。len で残りの文字数）
+        pending = len(window.terminal_widget._pending_output.get("dev", ()))
         self.assertGreater(pending, 100000, "前提: 描いていない出力が溜まっている")
 
         window.close()   # イベントループを回さずに閉じる
