@@ -1039,13 +1039,18 @@ class ConfigManager:
         return False
 
     def remove_device(self, group_name: str, device_name: str) -> bool:
-        """機器を削除"""
+        """機器を削除（対象の機器が無いときも False）"""
         group = self.get_group(group_name)
         if not group:
             return False
 
         before = list(group["devices"])
-        group["devices"] = [d for d in group["devices"] if d["name"] != device_name]
+        remaining = [d for d in before if d["name"] != device_name]
+        if len(remaining) == len(before):
+            # 何も消していないので保存もしない。保存結果の True を返すと、
+            # 呼び出し側が「削除しました」と案内してしまう（remove_group と同じ）
+            return False
+        group["devices"] = remaining
         if self.save_config():
             self.undecryptable_devices.pop(device_name, None)
             return True
@@ -1187,14 +1192,19 @@ class ConfigManager:
             macro_name: マクロ名
             
         Returns:
-            削除成功時True、失敗時False
+            削除成功時True、失敗時False（対象のマクロが無いときも False）
         """
         if "global_macros" not in self.config:
             return False
         
         macros = self.config["global_macros"]
         before = list(macros)
-        self.config["global_macros"] = [m for m in macros if m.get("name") != macro_name]
+        remaining = [m for m in before if m.get("name") != macro_name]
+        if len(remaining) == len(before):
+            # 何も消していないので保存もしない。保存結果の True を返すと、
+            # 呼び出し側が「削除しました」と案内してしまう（remove_group と同じ）
+            return False
+        self.config["global_macros"] = remaining
         if self.save_config():
             return True
         # 保存できなかったのにメモリから消すと、次の無関係な保存で
