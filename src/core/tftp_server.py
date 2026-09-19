@@ -132,6 +132,11 @@ class TFTPServer:
         # くれないので、キューに滞留させても再送とタイムアウトを増やすだけ。
         # 機器を数台まとめて扱う実運用なら 16 で足りる。
         self.max_workers = 16
+        # 最終 ACK の後の待ち（_dally）に入ったスレッド。転送は済んでいるので
+        # 上の枠からは外してここへ移す（1 台から 0.2 秒おきに置くと約 30 本）。
+        # これにも上限を設け、埋まっていれば待たずに閉じる
+        self._dallying = []
+        self.max_dallying = 64
 
     def start(self):
         os.makedirs(self.root_dir, exist_ok=True)
@@ -161,7 +166,7 @@ class TFTPServer:
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=3)   # 待受の1秒に対する余裕
         with self._workers_lock:
-            workers = list(self._workers)
+            workers = list(self._workers) + list(self._dallying)
         for worker in workers:
             if worker.is_alive():
                 # 転送側は _timeout 秒で必ず戻ってくるので、その少し先まで待つ
@@ -207,6 +212,8 @@ class TFTPServer:
                 with self._workers_lock:
                     if thread in self._workers:
                         self._workers.remove(thread)
+                    if thread in self._dallying:
+                        self._dallying.remove(thread)
 
         thread = None
         with self._workers_lock:
@@ -386,8 +393,10 @@ class TFTPServer:
                 else:
                     xs.sendto(struct.pack("!HH", OP_ACK, block), addr)  # 重複 DATA へ再 ACK
             self.on_event("transfer_complete", addr[0], (filename, received, total, "upload"))
-            # 最終 ACK が落ちたときの再送に応えられるよう、閉じる前に少し待つ
-            self._dally(xs, addr, last_ack, expected, blksize, timeout)
+            # 最終 ACK が落ちたときの再送に応えられるよう、閉じる前に少し待つ。
+            # 待つ間は同時転送の枠を空ける（待ちの枠が埋まっていれば待たない）
+            if self._enter_dally():
+                self._dally(xs, addr, last_ack, expected, blksize, timeout)
         except socket.timeout:
             self.on_event("protocol_error", addr[0],
                           (filename, "アップロードがタイムアウト", "upload"))
@@ -419,6 +428,25 @@ class TFTPServer:
     DALLY_MIN_SECONDS = 6.0
     DALLY_MAX_SECONDS = 30.0
 
+    def _enter_dally(self):
+        """このスレッドを同時転送の枠から待ちの一覧へ移す。待ってよければ True。
+
+        _dally は転送が済んだ後の待ちなので、同時転送の枠（max_workers）に
+        数えたままだと、1 台から小さいファイルを続けて置くだけで枠が埋まり、
+        次の要求を 'server busy' で断る。待ちの一覧にも上限（max_dallying）を
+        設け、埋まっていれば False を返す（待たずに閉じる。失うのは最終 ACK が
+        落ちたときの再 ACK だけ）。_spawn を通らずに呼ばれたときはそのまま待つ。
+        """
+        me = threading.current_thread()
+        with self._workers_lock:
+            if me not in self._workers:
+                return True
+            if len(self._dallying) >= self.max_dallying:
+                return False
+            self._workers.remove(me)
+            self._dallying.append(me)
+            return True
+
     def _dally(self, xs, addr, last_ack, final_block, blksize, timeout):
         """最終 ACK 送信後しばらく待ち、再送された最終 DATA へ再 ACK する。
 
@@ -432,7 +460,8 @@ class TFTPServer:
         落ちた場合に間に合わない。再 ACK を返すたびに締切も延ばす（回数は
         _retries まで）。長い timeout（最大 255 秒）では DALLY_MAX_SECONDS で
         頭打ちにするが、従来の timeout 1 回分より短くはしない。
-        この間もワーカー枠（max_workers）を 1 つ占有する点に注意。
+        この間はワーカー枠（max_workers）ではなく、_enter_dally で移した
+        待ちの枠（max_dallying）を使う。
         """
         window = max(timeout, min(max(timeout * 3, self.DALLY_MIN_SECONDS),
                                   self.DALLY_MAX_SECONDS))
