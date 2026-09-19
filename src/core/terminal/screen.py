@@ -504,6 +504,11 @@ class Screen(object):
         # 最終文字だけで DECSET/DECRST と取り違えない
         if seq.private == "?" and not seq.intermediate and seq.final in "hl":
             return self._private_mode(seq)
+        if not seq.private and seq.intermediate == "!" and seq.final == "p":
+            # DECSTR (ソフトリセット)。表示に効くモードのうち IRM だけを
+            # 既定 (上書き) へ戻す。画面の中身とカーソルには触らない
+            self.insert_mode = False
+            return
         if seq.private or seq.intermediate:
             return                      # DECSCUSR 等、表示に関わらない
         p = seq.params
