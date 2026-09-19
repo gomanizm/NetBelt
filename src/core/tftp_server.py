@@ -415,15 +415,29 @@ class TFTPServer:
         xs.settimeout(min(1.0, timeout))
         return timeout
 
+    # 最終 ACK の後に待つ長さの下限と、長い timeout を受諾したときの上限（秒）
+    DALLY_MIN_SECONDS = 6.0
+    DALLY_MAX_SECONDS = 30.0
+
     def _dally(self, xs, addr, last_ack, final_block, blksize, timeout):
-        """最終 ACK 送信後、timeout 秒ほど待って再送された最終 DATA へ再 ACK する。
+        """最終 ACK 送信後しばらく待ち、再送された最終 DATA へ再 ACK する。
 
         RFC 1350 の「最終 ACK を送った側はしばらく待つ」。即座に閉じると、
         最終 ACK が落ちたときの再送に誰も応えず（Windows では ICMP Port
         Unreachable が返る）、ファイルは保存済みなのに機器側だけが失敗と
         判定する。停止要求にすぐ気づけるよう、短い待ちを繰り返す。
+
+        待つのは timeout の 3 倍（最低 DALLY_MIN_SECONDS）。timeout 1 回分
+        だけだと、それより長い間隔で再送するクライアントや、再 ACK まで
+        落ちた場合に間に合わない。再 ACK を返すたびに締切も延ばす（回数は
+        _retries まで）。長い timeout（最大 255 秒）では DALLY_MAX_SECONDS で
+        頭打ちにするが、従来の timeout 1 回分より短くはしない。
+        この間もワーカー枠（max_workers）を 1 つ占有する点に注意。
         """
-        deadline = time.monotonic() + timeout
+        window = max(timeout, min(max(timeout * 3, self.DALLY_MIN_SECONDS),
+                                  self.DALLY_MAX_SECONDS))
+        deadline = time.monotonic() + window
+        reacks = 0
         while not self._stopping:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -440,6 +454,10 @@ class TFTPServer:
             op, block = struct.unpack("!HH", data[:4])
             if op == OP_DATA and block == final_block:
                 xs.sendto(last_ack, addr)
+                reacks += 1
+                if reacks <= self._retries:
+                    # この再 ACK も落ちたときの次の再送に備える
+                    deadline = time.monotonic() + window
 
     def _send_and_wait_ack(self, xs, packet, addr, expect_block, timeout=None):
         """packet を送り、block=expect_block の ACK を待つ。来なければ最大 _retries 回まで再送。
