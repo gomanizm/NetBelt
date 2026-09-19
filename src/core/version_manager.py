@@ -124,6 +124,22 @@ def sanitized_token(token: Optional[str]) -> Optional[str]:
     return cleaned
 
 
+# 最終名ごとの確定のロック（download_update の確定の手順を参照）。
+# 版ごとに 1 つ増えるだけなので、使い終えても消さない。
+_finalize_locks_guard = threading.Lock()
+_finalize_locks: Dict[str, threading.Lock] = {}
+
+
+def _finalize_lock(zip_path: str) -> threading.Lock:
+    """同じ最終名の確定を、同じプロセスの中で 1 本ずつにするロックを返す。"""
+    key = os.path.normcase(os.path.abspath(zip_path))
+    with _finalize_locks_guard:
+        lock = _finalize_locks.get(key)
+        if lock is None:
+            lock = _finalize_locks[key] = threading.Lock()
+        return lock
+
+
 class VersionManager:
     """バージョン管理とアップデート機能を提供するクラス"""
     
@@ -618,34 +634,39 @@ class VersionManager:
             moves = [(part_path, zip_path), (sha_part, zip_path + '.sha256')]
             if version:
                 moves.append((ver_part, zip_path + '.version'))
-            stash = part_path[:-len('.part')] + '.prev.part'
-            saved = []   # (退避名, 元の名前)
-            placed = []  # 今回置いた最終名
-            try:
-                for _, dst in moves:
-                    if os.path.exists(dst):
-                        kept = stash + dst[len(zip_path):]
-                        os.replace(dst, kept)
-                        saved.append((kept, dst))
-                for src, dst in moves:
-                    os.replace(src, dst)
-                    placed.append(dst)
-            except Exception as e:
-                # 中途半端な組は「未適用の更新」として毎回弾かれ続けるだけ
-                # なので、今回の分は残さず、以前の組を元へ戻す。
-                print(f"[VersionManager] 更新ファイルを確定できませんでした: {e}")
-                for leftover in placed + [part_path, sha_part, ver_part]:
-                    self._discard(leftover)
-                for kept, dst in saved:
-                    try:
-                        os.replace(kept, dst)
-                    except Exception as e2:
-                        print(f"[VersionManager] 以前の更新ファイルを戻せませんでした: {e2}")
-                        self._discard(kept)
-                return None
+            # 同じ版のダウンロード 2 本が同時にここへ来ると、互いの組を退避したり、
+            # 失敗の後始末で相手が置いた最終名を消したりする。実測では、片方が
+            # 成功を返したのに ZIP が無く控えだけが残った（600 回中 4 回）。
+            # 同じプロセスの中では 1 本ずつにする（別プロセスとの重なりは防げない）。
+            with _finalize_lock(zip_path):
+                stash = part_path[:-len('.part')] + '.prev.part'
+                saved = []   # (退避名, 元の名前)
+                placed = []  # 今回置いた最終名
+                try:
+                    for _, dst in moves:
+                        if os.path.exists(dst):
+                            kept = stash + dst[len(zip_path):]
+                            os.replace(dst, kept)
+                            saved.append((kept, dst))
+                    for src, dst in moves:
+                        os.replace(src, dst)
+                        placed.append(dst)
+                except Exception as e:
+                    # 中途半端な組は「未適用の更新」として毎回弾かれ続けるだけ
+                    # なので、今回の分は残さず、以前の組を元へ戻す。
+                    print(f"[VersionManager] 更新ファイルを確定できませんでした: {e}")
+                    for leftover in placed + [part_path, sha_part, ver_part]:
+                        self._discard(leftover)
+                    for kept, dst in saved:
+                        try:
+                            os.replace(kept, dst)
+                        except Exception as e2:
+                            print(f"[VersionManager] 以前の更新ファイルを戻せませんでした: {e2}")
+                            self._discard(kept)
+                    return None
 
-            for kept, _ in saved:
-                self._discard(kept)
+                for kept, _ in saved:
+                    self._discard(kept)
             return zip_path
         
         except Exception as e:
