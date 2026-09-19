@@ -692,6 +692,24 @@ class SFTPManager(QObject):
         # バックグラウンドスレッドで実行
         threading.Thread(target=upload_thread, daemon=True).start()
     
+    # 進行中のダウンロードの保存先（_download_target_key の鍵）。機器ごとに
+    # マネージャは別なので、インスタンスをまたいでプロセス全体で共有する
+    _download_targets = set()
+    _download_targets_lock = threading.Lock()
+
+    @staticmethod
+    def _download_target_key(local_path: str) -> str:
+        """保存先を比べるための鍵。realpath で短縮名（8.3 形式）を解き、
+        normcase で大文字小文字と区切り文字の違いをならす（まだ無い
+        ファイルでも、あるところまでのフォルダは解かれる）"""
+        return os.path.normcase(os.path.realpath(local_path))
+
+    @classmethod
+    def _release_download_target(cls, key: str):
+        """保存先の予約を外す（何度呼んでもよい）"""
+        with cls._download_targets_lock:
+            cls._download_targets.discard(key)
+
     def download_file(self, remote_path: str, local_path: str):
         """
         ファイルをダウンロード（バックグラウンド）
@@ -699,11 +717,28 @@ class SFTPManager(QObject):
         Args:
             remote_path: リモートファイルパス
             local_path: ローカルファイルパス
+
+        同じ保存先へのダウンロードが進行中（順番待ちを含む）なら、断って
+        何もしない。保存ダイアログの上書き確認はその時点で有るものしか
+        見ないので、まだ無い同じ保存先へ 2 件落とすと、後から終わった方の
+        置き換えで先の方が確認なしに消える。予約は転送が終わったとき
+        （成功・失敗・中断）に外す。
         """
         if not self.is_connected or not self.sftp_client:
             self.error_occurred.emit("SFTP接続がありません")
             return
         
+        target_key = self._download_target_key(local_path)
+        with self._download_targets_lock:
+            busy = target_key in self._download_targets
+            if not busy:
+                self._download_targets.add(target_key)
+        if busy:
+            self.error_occurred.emit(
+                "同じ保存先へのダウンロードが進行中です。終わってからやり直すか、"
+                f"別の保存先を選んでください: {local_path}")
+            return
+
         # 最終の保存先へ直接書かない。paramiko の get() はリモートを読む前に
         # ローカルを 'wb' で開くので、リモート側で消えていただけでも既存の
         # 正常なバックアップが 0 バイトになり、途中で切れれば部分ファイルが
@@ -717,6 +752,8 @@ class SFTPManager(QObject):
                 dir=os.path.dirname(os.path.abspath(local_path)))
             os.close(fd)
         except OSError as e:
+            # 始まらなかったので予約も外す
+            self._release_download_target(target_key)
             # ここは GUI スレッド。例外を上げるとスロットの外へ抜けるので、
             # 転送の失敗と同じ経路で知らせる
             self.error_occurred.emit(f"ダウンロードエラー: {str(e)}")
@@ -742,6 +779,8 @@ class SFTPManager(QObject):
                 
                 # 全部落とせてから最終名へ（同じディレクトリなので原子的）
                 os.replace(tmp_local, local_path)
+                # 予約は通知より先に外す（完了を見てすぐ落とし直しても断られない）
+                self._release_download_target(target_key)
                 # 完了通知
                 self.transfer_complete.emit(f"ダウンロード完了: {os.path.basename(remote_path)}")
                 
@@ -751,6 +790,7 @@ class SFTPManager(QObject):
                     os.remove(tmp_local)
                 except OSError:
                     pass
+                self._release_download_target(target_key)
                 self._fail("ダウンロードエラー", e)
         
         # バックグラウンドスレッドで実行

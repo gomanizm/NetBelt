@@ -131,8 +131,13 @@ class SftpTransferAtomicityTest(unittest.TestCase):
         self.assertFalse(put_target.startswith("/"),
                          "相対名なのに一時名が絶対パス: %s" % put_target)
 
-    def test_two_downloads_to_the_same_local_path_both_succeed(self):
-        """同じ保存先へ続けて落としても、片方が誤って失敗にならないこと。"""
+    def test_two_downloads_to_the_same_local_path_do_not_both_run(self):
+        """同じ保存先へ続けて落とすと、2 件目は断られ、1 件目は誤って失敗しないこと。
+
+        以前は両方とも成功することを確かめていたが、両方を走らせると後から
+        終わった方の置き換えで先の方が確認なしに消える。利用者の決定
+        （2026-09-20）により、進行中の同じ保存先への 2 件目は断る。
+        """
         m = self._manager()
         local = os.path.join(self.dir, "backup.cfg")
 
@@ -145,8 +150,12 @@ class SftpTransferAtomicityTest(unittest.TestCase):
         m.download_file("/etc/one.cfg", local)
         m.download_file("/etc/two.cfg", local)
 
-        self.assertTrue(self._wait(lambda: len(self.done) + len(self.errors) >= 2))
-        self.assertEqual(self.errors, [], "同じ一時名の取り合いで誤って失敗している")
+        self.assertTrue(self._wait(lambda: self.done), "1 件目が終わらない: %s" % self.errors)
+        self.assertEqual(len(self.errors), 1, "2 件目の扱いが違う: %s" % self.errors)
+        self.assertIn("同じ保存先へのダウンロードが進行中です", self.errors[0],
+                      "同じ一時名の取り合いで誤って失敗している")
+        with io.open(local, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "/etc/one.cfg")
         self.assertEqual(os.listdir(self.dir), ["backup.cfg"], "一時ファイルが残っている")
 
     def test_the_fallback_renames_first_and_removes_only_when_needed(self):
