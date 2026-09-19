@@ -1585,13 +1585,22 @@ class TerminalWidget(QWidget):
         """閉じるタブの描いていない受信を、画面へは描かずに記録へだけ書く。
 
         停止して書き終えていない記録も、ここで書き終えて閉じる。
+        どの記録にも入らない分はパーサへ通さずに捨てる。通しても書く先が
+        無く、記録していないタブでも全部通すと GUI が止まっていた（実測:
+        色付きの 70 文字前後の行で 16MiB が 1.0 秒、64MiB が 4.6 秒）。
         """
         pending = self._pending_output.pop(device_name, None)
         terminal = self._terminals.get(device_name)
         if pending and terminal is not None:
+            if device_name in self._log_files:
+                text = pending.take()
+            else:
+                # 停止した記録だけが残っているなら、その区間の分だけ
+                text = pending.take(sum(
+                    entry[2] for entry in self._closing_logs.get(device_name, ())))
             self._write_logs(device_name, [
                 (target, terminal._parser.feed(piece)) for target, piece
-                in self._split_for_logs(device_name, pending.take())])
+                in self._split_for_logs(device_name, text)])
         for handle, path, _ in self._closing_logs.pop(device_name, []):
             if handle is not None:
                 self._close_stopped_log(device_name, handle, path)
