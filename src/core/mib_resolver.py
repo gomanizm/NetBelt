@@ -301,6 +301,16 @@ class MIBResolver:
                 # なり、キャッシュに記録されないまま起動のたびに全ファイルを
                 # 解析し直していた（実測）
                 if not os.path.isfile(filepath):
+                    # os.path.isfile は壊れたリンクや MAX_PATH を超える
+                    # パスでも False になる。フォルダ以外の理由で外れた
+                    # ものは、名前が合っているのに黙って消えて見えるので
+                    # 名前を 1 行出す。フォルダは利用者にできることが
+                    # 無いので、これまでどおり黙って外す
+                    if not os.path.isdir(filepath):
+                        print(f"[MIBResolver] {filename} はファイルとして"
+                              f"開けないので読み込みから外します"
+                              f"（壊れたリンク、またはパスが長すぎる"
+                              f"可能性があります）")
                     continue
                 stamp = _mib_file_stamp(filepath)
                 cached = cached_files.get(filename)
@@ -371,7 +381,16 @@ class MIBResolver:
                     json.dump(cache_data, f, indent=2, ensure_ascii=False)
                 print(f"[MIBResolver] キャッシュを更新しました")
             except Exception as e:
-                print(f"[MIBResolver] キャッシュ保存エラー: {str(e)}")
+                # 読めない MIB ファイルと同じ考えで、何が起きているか・
+                # 次の起動でもやり直すこと・止め方を伝える。例外だけだと、
+                # 書き込めない場所へ Portable 版を置いた利用者に、起動が
+                # 毎回遅い理由も直し方も分からない
+                print(f"[MIBResolver] キャッシュを保存できません（{e}）。"
+                      f"解析した結果は今回の起動でしか使われず、次の起動でも"
+                      f"MIB をすべて解析し直します。止めるには、"
+                      f"{cache_file} へ書き込めるようにする（アクセス権や、"
+                      f"同じ名前のフォルダ・読み取り専用のファイルが無いかを"
+                      f"確かめる）か、書き込める場所へアプリを移してください")
         
         return cached_mibs
     
