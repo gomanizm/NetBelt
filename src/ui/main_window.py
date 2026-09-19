@@ -751,18 +751,31 @@ class MainWindow(QMainWindow):
             device_data: 機器データ
         """
         device_name = device_data['name']
-        
+        password = device_data.get('password', '')
+
+        # 読み込み時に復号できなかったパスワードは、暗号文のままメモリに
+        # 残っている。そのまま接続すると "DPAPI:..." を認証のパスワードと
+        # して機器へ送り、認証失敗になる。繋ぎ直すたびに同じ値で試すので、
+        # 機器側の認証失敗回数（AAA のロックアウトなど）にも数えられうる。
+        # 接続を始める前に断り、機器側へは何も送らない。
+        # Telnet は自動ログインをしないので対象外
+        if self.config_manager.has_undecryptable_password(device_name, password):
+            QMessageBox.warning(
+                self, "接続できません",
+                f"{device_name} のパスワードを復号できません。\n"
+                "機器の編集で入れ直してください。")
+            return
+
         # ステータスバーに接続メッセージを表示
         self.status_bar.showMessage(f"{device_name} に接続します...")
-        
+
         # 新しいターミナルタブを作成
         terminal = self.terminal_widget.create_terminal_tab(device_name)
-        
+
         # 接続情報を取得
         host = device_data.get('host', 'unknown')
         port = device_data.get('port', 22)
         username = device_data.get('username', '')
-        password = device_data.get('password', '')
         ssh_key = device_data.get('ssh_key', '')
         
         # SSH接続を作成

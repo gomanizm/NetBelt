@@ -11,6 +11,10 @@ import sys
 # DPAPI形式であることを示す接頭辞（base64本体の前に付与）
 _DPAPI_PREFIX = "DPAPI:"
 
+# CryptProtectData が返す blob の先頭 20 バイト（version 1 + プロバイダ GUID）。
+# 実測: encrypt() の出力を base64 復号すると、長さによらず常にこれで始まる。
+_DPAPI_BLOB_HEADER = bytes.fromhex("01000000d08c9ddf0115d1118c7a00c04fc297eb")
+
 
 def _is_base64(payload: str) -> bool:
     """DPAPI 本体として妥当な base64 か（空文字は不正とする）"""
@@ -110,6 +114,26 @@ class PasswordCrypto:
                 return encrypted_password
         # 平文
         return encrypted_password
+
+    def is_dpapi_ciphertext(self, password) -> bool:
+        """本当に DPAPI で包まれた値か（他の PC・アカウントのものも含む）。
+
+        is_encrypted() は「"DPAPI:" + base64 らしさ」までしか見ないので、
+        "DPAPI:cisco123" のような平文の合言葉も True になる。復号できな
+        かった機器を覚えて接続を断る用途では、それを暗号文と取り違えると
+        本当のパスワードを持つ機器へ繋げなくなる。base64 の中身が DPAPI の
+        blob ヘッダで始まるかまで見て区別する。
+
+        ヘッダが変わる環境があっても、ここが False に倒れるだけで、
+        暗号文をそのまま送る従来どおりの動きに戻るだけにとどまる。
+        """
+        if not isinstance(password, str) or not self.is_encrypted(password):
+            return False
+        try:
+            raw = base64.b64decode(password[len(_DPAPI_PREFIX):])
+        except Exception:
+            return False
+        return raw.startswith(_DPAPI_BLOB_HEADER)
 
     def is_encrypted(self, password: str) -> bool:
         """パスワードが暗号化済みか判定

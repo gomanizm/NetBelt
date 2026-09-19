@@ -142,6 +142,9 @@ class ConfigManager:
         self.load_error = None  # 読み込みエラー情報
         self.load_warning = None  # 読み込めたが一部を除外したときの警告文
         self.backup_path = None  # バックアップファイルパス
+        # 読み込み時に復号できなかった機器: 機器名 -> そのとき残った暗号文。
+        # 接続の入口がここを見て、暗号文をパスワードとして送らないようにする
+        self.undecryptable_devices: Dict[str, str] = {}
         self.config = self._load_config()
     
     def _load_config(self) -> Dict:
@@ -284,6 +287,13 @@ class ConfigManager:
                 # （原本の保護は _encrypt_passwords 側で行う）
                 if self.crypto.is_encrypted(decrypted):
                     self._undecryptable_count += 1
+                    # 本物の DPAPI 暗号文だけを覚える。"DPAPI:cisco123" の
+                    # ような平文の合言葉まで覚えると、接続の入口がそれを
+                    # 暗号文とみなして、正しいパスワードの機器を断る
+                    name = device.get("name")
+                    if (isinstance(name, str) and name
+                            and self.crypto.is_dpapi_ciphertext(decrypted)):
+                        self.undecryptable_devices[name] = decrypted
                 device["password"] = decrypted
 
         # トークンは件数に数えない。復号できないときの案内は
@@ -310,13 +320,44 @@ class ConfigManager:
             section["password"] = decrypted
     
     def _notify_undecryptable(self) -> None:
-        """復号できなかったパスワードがあれば知らせる。"""
+        """復号できなかったパスワードがあれば知らせる。
+
+        print だけだと、exe から起動した利用者には何も見えない。接続を
+        断られてから理由を探すことになるので、起動時の警告（load_warning）
+        にも載せて画面に出す。
+        """
         n = getattr(self, "_undecryptable_count", 0)
-        if n:
-            print(f"[Config] {n}件のパスワードを復号できませんでした。"
-                  "別の Windows アカウント/PC で保存された設定の可能性があります。"
-                  "該当機器のパスワードは再入力してください。"
-                  "（設定ファイル内の元の値は保護されており、上書きされません）")
+        if not n:
+            return
+        message = (f"{n}件のパスワードを復号できませんでした。"
+                   "別の Windows アカウント/PC で保存された設定の可能性があります。"
+                   "該当機器のパスワードは、機器の編集で入れ直してください。"
+                   "（設定ファイル内の元の値は保護されており、上書きされません）")
+        print(f"[Config] {message}")
+        self.load_warning = (f"{self.load_warning}\n\n{message}"
+                             if self.load_warning else message)
+
+    def has_undecryptable_password(self, device_name, password) -> bool:
+        """その機器のパスワードが、読み込み時に復号できなかった暗号文のままか。
+
+        接続の入口が使う。is_encrypted の推測ではなく読み込み時の記録で
+        見分けるので、機器へ本当に "DPAPI:..." を設定している場合や、
+        この画面で入れ直したばかりの値を断ることはない。
+        """
+        recorded = self.undecryptable_devices.get(device_name)
+        return bool(recorded) and password == recorded
+
+    def _refresh_undecryptable(self, old_name: str, device_info: Dict) -> None:
+        """機器を差し替えたあとの記録を合わせる。
+
+        パスワードを入れ直していれば記録を外す。名前だけ変えて暗号文を
+        そのまま残した場合は、新しい名前へ付け替える。
+        """
+        recorded = self.undecryptable_devices.pop(old_name, None)
+        new_name = device_info.get("name")
+        if (recorded is not None and isinstance(new_name, str) and new_name
+                and device_info.get("password") == recorded):
+            self.undecryptable_devices[new_name] = recorded
 
     @staticmethod
     def _is_valid_device(device) -> bool:
@@ -786,6 +827,9 @@ class ConfigManager:
         before = list(group["devices"])
         group["devices"].append(device_info)
         if self.save_config():
+            # 同じ名前を作り直した場合に、前の機器の「復号できない」記録を
+            # 引きずらない
+            self._refresh_undecryptable(device_info.get("name", ""), device_info)
             return True
         group["devices"][:] = before   # 保存できなかったらメモリも戻す
         return False
@@ -799,6 +843,7 @@ class ConfigManager:
         before = list(group["devices"])
         group["devices"] = [d for d in group["devices"] if d["name"] != device_name]
         if self.save_config():
+            self.undecryptable_devices.pop(device_name, None)
             return True
         # 保存できなかったのにメモリから消したままだと、次の無関係な保存で
         # 機器がディスクから消える
@@ -845,6 +890,7 @@ class ConfigManager:
             del source["devices"][index]
             target["devices"].append(device_info)
         if self.save_config():
+            self._refresh_undecryptable(old_name, device_info)
             return True
         source["devices"][:] = source_before
         target["devices"][:] = target_before
