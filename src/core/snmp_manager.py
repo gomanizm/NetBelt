@@ -147,6 +147,9 @@ class SNMPWorker(QThread):
     # WALK が途中で途切れたときの理由。取れた分は result_ready で普通に
     # 渡すので、不完全であることはこちらで伝える
     partial_result = pyqtSignal(str)
+    # 取り消されて終わったときに、そこまでに取れた行を渡す。
+    # result_ready とはどちらか一方だけが出る
+    cancelled = pyqtSignal(object)
 
     def __init__(self, operation: str, params: dict):
         super().__init__()
@@ -154,7 +157,9 @@ class SNMPWorker(QThread):
         self.params = params
         self._cancelled = False
         self._partial_reason = None
-    
+        # 取り消されたときに渡す、そこまでに取れた行（WALK が貯めていく）
+        self._collected = []
+
     def run(self):
         """スレッドのメイン処理"""
         try:
@@ -169,18 +174,30 @@ class SNMPWorker(QThread):
                 self.result_ready.emit(False, f"不明な操作: {self.operation}")
                 return
             
-            if not self._cancelled:
+            if self._cancelled:
+                # 利用者が止めた。取れた分は途中までとして渡す
+                self.cancelled.emit(result)
+            else:
                 if self._partial_reason:
                     # 表には出すが、全部ではないことを先に伝える
                     self.partial_result.emit(self._partial_reason)
                 self.result_ready.emit(True, result)
-        
+
         except Exception as e:
-            if not self._cancelled:
+            if self._cancelled:
+                # 止めたあとの失敗（応答待ちのタイムアウト等）はエラーに
+                # しない。そこまでの行（GET なら空）を途中までとして渡す
+                self.cancelled.emit(list(self._collected))
+            else:
                 self.result_ready.emit(False, str(e))
-    
+
     def cancel(self):
-        """操作をキャンセル"""
+        """操作をキャンセル
+
+        待っている応答を切ることはできないので、効くのは次の応答を
+        受け取ったところ（応答しない機器では最大約 6 秒後）。
+        終わったら result_ready ではなく cancelled が出る。
+        """
         self._cancelled = True
     
     def _perform_get(self) -> List[Tuple[str, str, str]]:
@@ -232,8 +249,9 @@ class SNMPWorker(QThread):
         # 認証情報の準備
         auth_data = self._prepare_auth_data(version)
         
-        # SNMP WALK実行
-        results = []
+        # SNMP WALK実行。取り消されたときに run() がそこまでの行を
+        # 渡せるよう、self._collected へ直接貯める
+        results = self._collected
         count = 0
         
         for (errorIndication, errorStatus, errorIndex, varBinds) in nextCmd(
@@ -687,6 +705,9 @@ class SNMPManager(QObject):
     # WALK が途中で途切れたときの理由。結果は operation_completed で
     # 普通に届くので、不完全であることだけをこちらで伝える
     operation_partial = pyqtSignal(str)
+    # 利用者が止めた GET/WALK の、そこまでに取れた行。この操作では
+    # operation_completed は出ない
+    operation_cancelled = pyqtSignal(object)
     error_occurred = pyqtSignal(str)  # エラーメッセージ
     trap_received = pyqtSignal(dict)  # Trap受信
     trap_receiver_started = pyqtSignal()  # Trap受信開始
@@ -737,8 +758,9 @@ class SNMPManager(QObject):
         # processEvents() した時点で解放済みの C++ を叩いて落ちる（実測）。
         self.worker.progress_update.connect(self.progress_update)
         self.worker.partial_result.connect(self.operation_partial)
+        self.worker.cancelled.connect(self.operation_cancelled)
         self.worker.start()
-        
+
         self.operation_started.emit(f"SNMP GET: {host}")
         return True   # 受理した（実行中で断った場合は False）
     
@@ -767,11 +789,31 @@ class SNMPManager(QObject):
         self.worker.finished.connect(self._on_worker_finished)
         self.worker.progress_update.connect(self.progress_update)
         self.worker.partial_result.connect(self.operation_partial)
+        self.worker.cancelled.connect(self.operation_cancelled)
         self.worker.start()
-        
+
         self.operation_started.emit(f"SNMP WALK: {host} - {oid}")
         return True   # 受理した（実行中で断った場合は False）
-    
+
+    def request_cancel(self) -> bool:
+        """実行中の GET/WALK に取り消しを頼む（待たずに戻る）
+
+        画面の停止操作から呼ぶ。cancel_operation() は終了処理用で、
+        スレッドの終了を最大 5 秒待つので GUI が固まる。
+        取り消しは次の応答を受けたところで効き（応答しない機器では最大
+        約 6 秒）、そこまでに取れた行が operation_cancelled で届く。
+        それまでは self.worker を持ったままなので、新しい要求は実行中と
+        同じく断られる。
+
+        Returns:
+            頼めたら True。何も走っていない、または結果が既に配送待ちなら False
+        """
+        worker = self.worker
+        if worker is None or not worker.isRunning():
+            return False
+        worker.cancel()
+        return True
+
     def cancel_operation(self):
         """現在の操作をキャンセル
 
