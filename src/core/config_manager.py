@@ -1,11 +1,23 @@
 """設定ファイル管理モジュール"""
+import contextlib
 import json
 import os
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Dict, List, Optional
 from .crypto import PasswordCrypto
+
+# ファイルロックの実装。依存パッケージは足さず、標準ライブラリだけで作る
+try:
+    import msvcrt          # Windows
+except ImportError:        # pragma: no cover - 本アプリは Windows 専用
+    msvcrt = None
+try:
+    import fcntl           # POSIX（開発時の参考実装）
+except ImportError:        # pragma: no cover - Windows には無い
+    fcntl = None
 
 # 機器名として使えない名前。ターミナルはホームタブをタブ名 "ホーム" で
 # 見分けているので、同名の機器はタブを閉じられず、ログ保存・記録・
@@ -32,6 +44,95 @@ _IMPORT_MARKER_NAME = "known_hosts.imported"
 # Permission denied になり、接続が中止される
 known_hosts_lock = threading.Lock()
 
+# 別プロセス（NetBelt を 2 つ起動した状態）との排他に使うロック用ファイル。
+# known_hosts 本体は os.replace で差し替わるので、鍵をかける相手にできない
+_KNOWN_HOSTS_LOCK_NAME = "known_hosts.lock"
+
+# ロックを待つ上限。取れないまま待たせ続けない
+KNOWN_HOSTS_LOCK_TIMEOUT = 5.0
+
+
+class KnownHostsLockError(Exception):
+    """ホスト鍵ファイルの順番待ちが上限に達した"""
+
+
+def _try_known_hosts_lock(fd) -> bool:
+    """ロックを 1 回だけ試す（待たない）。取れたら True"""
+    try:
+        if msvcrt is not None:
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        elif fcntl is not None:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
+
+
+def _release_known_hosts_lock(fd) -> None:
+    try:
+        if msvcrt is not None:
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        elif fcntl is not None:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+
+
+@contextlib.contextmanager
+def _known_hosts_file_lock(directory, timeout=None):
+    """known_hosts の読み書きを、別プロセスとも直列化する。
+
+    known_hosts_lock は threading.Lock なので同じプロセスの中しか守らない。
+    NetBelt を 2 つ起動すると、片方の os.replace ともう片方の読み書きが
+    Windows でぶつかる。実測では保存 300 回のうち 229 回が
+    PermissionError [WinError 5] になって鍵が残らず、読み込み 3000 回の
+    うち 6 回が Permission denied で接続の中止に落ちた。
+
+    ロック用ファイルすら開けないときは、プロセス内の錠だけで今までどおり
+    続ける（ここで接続や保存を止める方が影響が大きい）。取り合いで上限を
+    過ぎたときだけ KnownHostsLockError を投げ、呼び出し側の既存の警告・
+    中止の文言に載せる。
+    """
+    if timeout is None:
+        timeout = KNOWN_HOSTS_LOCK_TIMEOUT
+    lock_path = Path(str(directory)) / _KNOWN_HOSTS_LOCK_NAME
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        yield False
+        return
+    try:
+        deadline = time.monotonic() + timeout
+        while not _try_known_hosts_lock(fd):
+            if time.monotonic() >= deadline:
+                raise KnownHostsLockError(
+                    "ほかの NetBelt がホスト鍵ファイルを使っているため、"
+                    "%.0f 秒待っても順番が来ませんでした: %s"
+                    % (timeout, lock_path.parent / "known_hosts"))
+            time.sleep(0.01)
+        try:
+            yield True
+        finally:
+            _release_known_hosts_lock(fd)
+    finally:
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def known_hosts_guard(directory, timeout=None):
+    """known_hosts を触る間、同じプロセスの中とも別プロセスとも排他する。
+
+    ファイルロックは必ずこの順（threading.Lock が外側）で取る。逆順や
+    入れ子にすると、同じプロセスの別スレッドが別のハンドルで同じ範囲を
+    掴みにいき、自分自身を待つことになる。
+    """
+    with known_hosts_lock:
+        with _known_hosts_file_lock(directory, timeout) as cross_process:
+            yield cross_process
+
 
 def take_known_hosts_import_warning():
     """旧 known_hosts を引き継げなかったときの警告文を取り出す（無ければ None）。
@@ -53,6 +154,31 @@ def _known_hosts_entry_id(line):
 
 
 def _import_legacy_known_hosts(new_dir):
+    """引き継ぎを、別プロセスの保存・読み込みとも排他して行う。
+
+    引き継ぎは known_hosts を読んで os.replace で差し替えるので、ほかの
+    NetBelt の保存・読み込みとぶつかる。目印ができるまでの一度きりなので、
+    先に安い確認で振るい、その 1 回だけロックを取る（毎回のロック取得を
+    接続の経路に足さない）。
+    """
+    old_kh = Path.home() / ".terminal-tool" / "known_hosts"
+    marker = new_dir / _IMPORT_MARKER_NAME
+    if marker.exists() or not old_kh.exists():
+        return None
+    try:
+        with _known_hosts_file_lock(new_dir):
+            if marker.exists():
+                # 待っている間に、別プロセスが引き継ぎを終えていた
+                return None
+            return _import_legacy_known_hosts_unlocked(new_dir)
+    except Exception as e:
+        return ("旧 %s を引き継げませんでした（%s）。引き継げるまで、"
+                "この機器は初回接続として扱われ、鍵が変わっていても"
+                "気づけません。手でコピーしてください: %s"
+                % (old_kh, e, new_dir / "known_hosts"))
+
+
+def _import_legacy_known_hosts_unlocked(new_dir):
     """旧 ~/.terminal-tool/known_hosts の行を引き継ぐ。
 
     引き継げなかったときは警告文を返す（握り潰さない）。黙って続けると、

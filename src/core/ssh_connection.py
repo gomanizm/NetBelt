@@ -9,10 +9,11 @@ from pathlib import Path
 from typing import Callable, Optional
 from PyQt6.QtCore import QObject, pyqtSignal
 
-# known_hosts の保存を直列化する。同時に保存すると、あとから
+# known_hosts の読み書きを直列化する。同時に保存すると、あとから
 # os.replace した側が先の結果を丸ごと差し替えてしまう。旧 known_hosts の
-# 引き継ぎと接続前の読み込みも同じ錠を使うので、config_manager 側に置く
-from .config_manager import known_hosts_lock as _known_hosts_save_lock
+# 引き継ぎと接続前の読み込みも同じ錠を使うので、config_manager 側に置く。
+# NetBelt を 2 つ起動した場合に備えて、プロセスをまたぐ錠も兼ねる
+from .config_manager import known_hosts_guard as _known_hosts_guard
 
 
 def _save_known_hosts(client, known_hosts_path):
@@ -30,7 +31,7 @@ def _save_known_hosts(client, known_hosts_path):
     ので、途中で落ちても前の known_hosts がそのまま残る。
     """
     path = Path(str(known_hosts_path))
-    with _known_hosts_save_lock:
+    with _known_hosts_guard(path.parent):
         if path.exists():
             # 他の接続がこの間に保存した鍵を取り込む
             client.load_host_keys(str(path))
@@ -134,21 +135,22 @@ class SSHConnection(QObject):
             self.output_received.emit(
                 "\r\n[NetBelt] 警告: %s\r\n" % import_warning)
         # 他の接続の保存や引き継ぎが差し替えている最中に読まない。Windows では
-        # Permission denied になり、下の中止に落ちる
-        with _known_hosts_save_lock:
-            if known_hosts_path.exists():
-                try:
+        # Permission denied になり、下の中止に落ちる。NetBelt を 2 つ起動して
+        # いると別プロセスの保存ともぶつかるので、錠はプロセスをまたぐ
+        try:
+            with _known_hosts_guard(known_hosts_path.parent):
+                if known_hosts_path.exists():
                     client.load_host_keys(str(known_hosts_path))
-                except Exception as e:
-                    # 握りつぶして TOFU にすると、既知の機器でも「未知」扱いになり、
-                    # 鍵が変わっていても気づかずにパスワードを送る。検証できない
-                    # 状態で認証へ進まない
-                    raise HostKeyStoreError(
-                        "既知ホスト鍵 (known_hosts) を読めないため接続を中止しました: %s\n%s\n"
-                        "壊れた行が 1 つあるだけでも読めなくなります。該当行を修正または"
-                        "削除するか、ファイルを退避してから接続し直してください"
-                        "（退避すると全機器が初回接続の扱いになります）。"
-                        % (e, known_hosts_path))
+        except Exception as e:
+            # 握りつぶして TOFU にすると、既知の機器でも「未知」扱いになり、
+            # 鍵が変わっていても気づかずにパスワードを送る。検証できない
+            # 状態で認証へ進まない
+            raise HostKeyStoreError(
+                "既知ホスト鍵 (known_hosts) を読めないため接続を中止しました: %s\n%s\n"
+                "壊れた行が 1 つあるだけでも読めなくなります。該当行を修正または"
+                "削除するか、ファイルを退避してから接続し直してください"
+                "（退避すると全機器が初回接続の扱いになります）。"
+                % (e, known_hosts_path))
         policy = _TofuHostKeyPolicy(known_hosts_path)
         policy._on_save_error = lambda message: self.output_received.emit(
             "\r\n[NetBelt] 警告: %s\r\n" % message)
