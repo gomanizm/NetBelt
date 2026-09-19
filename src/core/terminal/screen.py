@@ -811,7 +811,9 @@ class Screen(object):
             # 履歴が巻き添えで空にならないよう写しを渡す
             line = list(line)
             self.history.append(line)
-            self._new_history.append((line, self.wrapped[r]))
+            # 最後の行の続き (空白の行) は記録しないので、次へ続く印を
+            # 渡すと、描画側が消去のあとに来た出力と 1 行に繋げる
+            self._new_history.append((line, self.wrapped[r] and r < last))
 
     def _erase_line(self, mode):
         if mode not in (0, 1, 2):
