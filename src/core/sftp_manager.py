@@ -634,6 +634,17 @@ class SFTPManager(QObject):
                         except IOError:
                             try:
                                 self.sftp_client.remove(remote_path)
+                            except TimeoutError:   # socket.timeout の別名
+                                # IOError の仲間なので先に受ける。消せたかは
+                                # 分からず、チャンネルも以後使えない。2 本目の
+                                # rename へ進まず、抜けてから接続を畳む
+                                keep_tmp[0] = True
+                                probe_timed_out[0] = True
+                                timed_out_note[0] = (
+                                    "（最終名を消せたか確かめられませんでした。"
+                                    "転送した内容は一時名 %s に残っています）"
+                                    % tmp_remote)
+                                return
                             except IOError:
                                 pass
                             try:
