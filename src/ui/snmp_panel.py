@@ -881,6 +881,11 @@ class SNMPPanel(QWidget):
             if reason:
                 # 途中までの結果であることを、見出しの前に残す
                 f.write("# 途中まで: %s のため中断。全部ではありません\n" % reason)
+            if host:
+                # どの機器から採った結果かを、見出しの前に残す。JSON の
+                # "host"・TXT の「対象ホスト:」に当たるものが CSV だけ
+                # 抜けていて、ファイルを並べると取り違えても気づけなかった
+                f.write("# 対象ホスト: %s\n" % host)
             writer = csv.writer(f)
             writer.writerow(["OID", "Type", "Value"])
             for row in results:
