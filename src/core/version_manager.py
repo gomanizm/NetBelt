@@ -905,6 +905,31 @@ class VersionManager:
         except Exception as e:
             print(f"[VersionManager] 書きかけの確認エラー: {e}")
 
+        # 本体の ZIP を失った控え（<版>.zip.sha256 / .version）も片付ける。
+        # 確定の手順は、取り直しのときに既存の組をいったん退避名へ移す。
+        # ZIP だけを退避したところで終わると、控え 2 つが本体の無いまま
+        # 残る。名前が '.zip' でも '.part' でもないので、上のどちらの段でも
+        # 拾われない（実測: 退避の2回目で終わらせると、48時間前の日付でも
+        # <版>.zip.sha256 と <版>.zip.version が残り続けた）。
+        # 保持期間を過ぎたものだけを対象にする。確定の最中は、本体が
+        # 退避名へ移っている一瞬だけ控えが孤児に見えるため。
+        try:
+            for filename in os.listdir(self.UPDATE_DIR):
+                if not filename.endswith(('.zip.sha256', '.zip.version')):
+                    continue
+                side_path = os.path.join(self.UPDATE_DIR, filename)
+                if os.path.exists(side_path.rsplit('.', 1)[0]):
+                    continue
+                try:
+                    if current_time - os.path.getmtime(side_path) > max_age_seconds:
+                        os.remove(side_path)
+                        print(f"[VersionManager] 本体の無い検証記録を削除: {side_path}")
+                        deleted_count += 1
+                except Exception as e:
+                    print(f"[VersionManager] ファイル削除エラー: {e}")
+        except Exception as e:
+            print(f"[VersionManager] 検証記録の確認エラー: {e}")
+
         return deleted_count
     
     @staticmethod

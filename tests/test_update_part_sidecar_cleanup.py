@@ -144,6 +144,51 @@ class PartSidecarCleanupTest(unittest.TestCase):
 
         self.assertEqual(self._names(), before)
 
+    def test_orphaned_sidecars_of_an_interrupted_finalize_are_swept_up(self):
+        """本体の .zip を失った控えも、保持期間を過ぎたら片付くこと。
+
+        実測（検査役 cx5c-verify-release の c_leftover_sweep.py、8b0c94e）:
+        取り直しの退避の 2 回目（.sha256）でプロセスが終わったことにすると、
+        本体の ZIP だけが退避名へ移り、NetBelt-1.3.2.zip.sha256 と
+        NetBelt-1.3.2.zip.version が本体の無いまま残った。48 時間前の日付に
+        して cleanup_old_updates(24) を呼んでも、名前が '.zip' でも '.part'
+        でもないので拾われず、このあと誰も消さない。
+        """
+        zip_path = self._download()
+        self.assertIsNotNone(zip_path)
+        # 退避 1 回目（ZIP）の直後、.sha256 の退避で終わる
+        self._die_at_replace(2)
+        base = os.path.basename(zip_path)
+        left = self._names()
+        self.assertNotIn(base, left,
+                         "前提が崩れている（本体がまだある）: %s" % left)
+        self.assertIn(base + ".sha256", left,
+                      "前提が崩れている（孤児の控えができていない）: %s" % left)
+        self.assertIn(base + ".version", left,
+                      "前提が崩れている（孤児の控えができていない）: %s" % left)
+
+        self._age_everything(48)
+        with unittest.mock.patch("builtins.print"):
+            self.mgr.cleanup_old_updates(24)
+
+        self.assertEqual(self._names(), [],
+                         "本体の .zip が無い控えが残った")
+
+    def test_recent_orphaned_sidecars_are_left_alone(self):
+        """本体を失った控えでも、まだ新しいうちは触れないこと。
+
+        確定の最中は、本体が退避名へ移っている一瞬だけ控えが孤児に見える。
+        そこで消すと、確定しようとしている更新の控えを奪ってしまう。
+        """
+        self.assertIsNotNone(self._download())
+        self._die_at_replace(2)
+        before = self._names()
+
+        with unittest.mock.patch("builtins.print"):
+            self.mgr.cleanup_old_updates(24)
+
+        self.assertEqual(self._names(), before)
+
     def test_the_sidecars_of_a_kept_update_are_not_swept(self):
         """掃除の対象を広げても、残している更新の控えには触れないこと。"""
         zip_path = self._download()
