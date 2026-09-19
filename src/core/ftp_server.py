@@ -110,7 +110,7 @@ class FTPServerManager(QObject):
             self.client_activity.emit(ip, message)
 
     def _on_notice_delivered(self, *_args):
-        """GUI が client_activity を 1 件処理したので配送待ちを戻す（GUI スレッドで動く）"""
+        """GUI が通知を 1 件処理したので配送待ちを戻す（GUI スレッドで動く）"""
         with self._notice_lock:
             if self._pending_notices > 0:
                 self._pending_notices -= 1
