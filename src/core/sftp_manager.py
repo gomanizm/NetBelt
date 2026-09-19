@@ -6,6 +6,8 @@ import uuid
 from typing import List, Dict, Optional, Callable
 from PyQt6.QtCore import QObject, pyqtSignal
 import paramiko
+from paramiko.sftp import (CMD_HANDLE, CMD_OPEN, SFTP_FLAG_CREATE, SFTP_FLAG_EXCL,
+                           SFTP_FLAG_WRITE)
 
 
 class SFTPManager(QObject):
@@ -363,6 +365,13 @@ class SFTPManager(QObject):
         どおりサーバの既定になる）。ハンドルへの chmod を受け付けない機器
         でも転送は止めない（最終名の mode は _carry_over_mode が当てる）。
         期限切れはチャンネルが使えない印なので、握りつぶさずに上へ送る。
+
+        作るときの OPEN にも既存の mode を付ける。paramiko の open() は属性の
+        無い OPEN を送るので、作ってから chmod するまでのあいだは一時名が
+        サーバの既定（0644 など）になる。OpenSSH の sftp-server は OPEN の
+        permissions を open(2) の mode に渡すので、最初から既存と同じ mode で
+        作られる。umask で落ちたビットは続くハンドルへの chmod で当て直す。
+        mode 付きの OPEN を断る機器では、これまでどおり属性なしで開く。
         """
         try:
             mode = getattr(self.sftp_client.stat(remote_path), "st_mode", None)
@@ -372,7 +381,13 @@ class SFTPManager(QObject):
             return
         if not isinstance(mode, int):
             return
-        handle = self.sftp_client.open(tmp_remote, "wb")
+        try:
+            handle = self._open_new_with_mode(tmp_remote, mode & 0o7777)
+        except TimeoutError:
+            raise
+        except Exception:
+            # mode 付きの OPEN（や EXCL）を受け付けない機器
+            handle = self.sftp_client.open(tmp_remote, "wb")
         try:
             handle.chmod(mode & 0o7777)
         except TimeoutError:
@@ -380,6 +395,22 @@ class SFTPManager(QObject):
         except Exception:
             pass
         handle.close()
+
+    def _open_new_with_mode(self, path: str, mode: int):
+        """permissions 属性を付けた OPEN で新しいファイルを作って開く（ロック内で呼ぶ）
+
+        paramiko の公開 API（open()）では OPEN に属性を付けられないので、
+        open() と同じ要求を属性付きで直接送る。既にある名前は開かない（EXCL）。
+        """
+        client = self.sftp_client
+        attr = paramiko.SFTPAttributes()
+        attr.st_mode = mode
+        t, msg = client._request(
+            CMD_OPEN, client._adjust_cwd(path),
+            SFTP_FLAG_WRITE | SFTP_FLAG_CREATE | SFTP_FLAG_EXCL, attr)
+        if t != CMD_HANDLE:
+            raise paramiko.SFTPError("Expected handle")
+        return paramiko.SFTPFile(client, msg.get_binary(), "wb")
 
     def upload_file(self, local_path: str, remote_path: str = None,
                     overwrite: bool = False):
