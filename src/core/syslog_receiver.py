@@ -580,6 +580,13 @@ class SyslogReceiver(QObject):
                 try:
                     data = client_socket.recv(4096)
                     if not data:
+                        # 相手が閉じた。LF の無い最後の 1 行も 1 件として配信する
+                        # （捨てると、終端を付けずに閉じる送り手の最後の 1 件が
+                        # 消える）。長さは受信のたびに上限と照合済み。宣言した
+                        # 長さに足りない octet-counting のフレームは欠けた本文
+                        # なので、従来どおり配信しない
+                        if buffer and not self._OCTET_COUNT_RE.match(buffer):
+                            self._emit_tcp_line(buffer, client_ip, listen_port)
                         break
                     last_activity = time.monotonic()
                     buffer += data
