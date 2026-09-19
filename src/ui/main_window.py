@@ -352,6 +352,7 @@ class MainWindow(QMainWindow):
         self.terminal_widget.terminal_resized.connect(self._on_terminal_resized)
         # 接続先リストの機器メニュー「ツール」（キープアライブ・マクロ）
         self.device_tree.set_tools_state_provider(self._tools_state_for)
+        self.device_tree.set_tools_target_check(self._tools_target_matches)
         self.device_tree.macro_execute_requested.connect(
             self._on_macro_execute_requested)
         self.device_tree.macro_stop_requested.connect(
@@ -1156,6 +1157,39 @@ class MainWindow(QMainWindow):
         if not isinstance(device_data, dict):
             return False
         return device_data.get('source') == 'autodetect'
+
+    @staticmethod
+    def _endpoint_of(device_data):
+        """機器データが指す接続先を、比べられる形で返す（辞書でなければ None）
+
+        自動検出か登録か・プロトコル・ホストとポート（シリアルはポート名）。
+        _on_connect_requested と _connect_ssh / _connect_telnet /
+        _connect_serial が実際に使う値と同じ読み方をする。
+        """
+        if not isinstance(device_data, dict):
+            return None
+        autodetect = device_data.get('source') == 'autodetect'
+        protocol = device_data.get('protocol', 'ssh')
+        if protocol in ('serial', 'console'):
+            if protocol == 'console':
+                return (autodetect, 'serial', device_data.get('host', ''))
+            return (autodetect, 'serial', str(device_data.get('port', '')))
+        default_port = 23 if protocol == 'telnet' else 22
+        return (autodetect, 'telnet' if protocol == 'telnet' else 'ssh',
+                device_data.get('host', 'unknown'),
+                str(device_data.get('port', default_port)))
+
+    def _tools_target_matches(self, device_name: str, device_data: dict) -> bool:
+        """「ツール」を開いた項目が、その名前のセッションと同じ接続先かを返す
+
+        「ツール」は機器名でセッションを引く。名前が同じでも接続先が違う
+        項目（後から挿した自動検出の COM3 と、登録機器の「COM3」など）から
+        操作させると、別の機器へマクロが送られる。セッションの接続先は、
+        接続したときの機器データの写し（device_info）で見る。
+        """
+        session = self.device_info.get(device_name)
+        return (session is not None
+                and self._endpoint_of(session) == self._endpoint_of(device_data))
 
     def _on_serial_baudrate_changed(self, port: str, baudrate: int):
         """自動検出COMポートのボーレート変更を、開いている接続と再接続用の写しへ反映する

@@ -35,6 +35,8 @@ class DeviceTree(QWidget):
         super().__init__()
         # 機器名 -> そのセッションの状態（set_tools_state_provider を参照）
         self._tools_state_provider = None
+        # (機器名, 項目の機器データ) -> 接続先が同じか（set_tools_target_check を参照）
+        self._tools_target_check = None
         self._create_ui()
         
         # シリアルポート監視用
@@ -220,19 +222,33 @@ class DeviceTree(QWidget):
         """
         self._tools_state_provider = provider
 
-    def _add_tools_menu(self, menu, device_name):
+    def set_tools_target_check(self, check):
+        """項目の接続先が、その名前のセッションの接続先と同じかを答える関数を登録する
+
+        状態は機器名で引くので、名前だけが同じ別の接続先の項目（後から挿した
+        自動検出の COM3 と、登録機器の「COM3」など）からも、そのセッションを
+        操作できてしまう。check(機器名, 項目の機器データ) が False なら
+        「ツール」を灰色にする。
+        """
+        self._tools_target_check = check
+
+    def _add_tools_menu(self, menu, device_name, device_data=None):
         """機器メニューに「ツール」を足す（選ばれた項目は要求のシグナルを出す）
 
         キープアライブとマクロは、以前は端末の右クリックにあった。端末の
         右クリックは貼り付けにしたので、ここへ移した。接続していない機器では
         灰色にして選べないようにする（隠すと、どこにあるのか分からなくなる）。
+        項目の接続先がセッションの接続先と違うときも灰色にする。
         ログの保存・記録はメニューバーの「ログ」にあるので入れない。
         """
         state = {}
         if self._tools_state_provider is not None:
             state = self._tools_state_provider(device_name) or {}
+        enabled = bool(state.get("connected"))
+        if enabled and self._tools_target_check is not None:
+            enabled = bool(self._tools_target_check(device_name, device_data))
         tools = menu.addMenu("ツール")
-        tools.setEnabled(bool(state.get("connected")))
+        tools.setEnabled(enabled)
 
         if state.get("keepalive_active"):
             tools.addAction("キープアライブ停止").triggered.connect(
@@ -315,7 +331,7 @@ class DeviceTree(QWidget):
         menu = QMenu(self)
         
         connect_action = menu.addAction("接続")
-        self._add_tools_menu(menu, device_data["name"])
+        self._add_tools_menu(menu, device_data["name"], device_data)
         
         # コンソール接続の場合はボーレート設定メニューを追加
         if is_serial:
