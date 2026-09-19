@@ -684,6 +684,11 @@ class Screen(object):
             self._saved_main = (self.cursor_row, self.cursor_col, self.attr,
                                 dict(self._g), self._charset,
                                 self._pending_wrap)
+        elif to_alt:
+            # 47h / 1047h は保存しない。前の 1049 の保存を残すと、この
+            # 代替画面から 1049l で出たときに古い位置・属性・文字集合へ
+            # 戻り、set_size も残す行をその古い位置で選んでしまう
+            self._saved_main = None
         self.lines, self._other = self._other, self.lines
         # 折り返しの印も画面と一緒に入れ替える。裏へ回ったメイン画面の
         # 印を失うと、戻ってきたときに組み直しで繋ぎ直せなくなる
