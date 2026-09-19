@@ -595,7 +595,7 @@ class ConfigManager:
             group_name: グループ名
             
         Returns:
-            削除成功時True、失敗時False
+            削除成功時True、失敗時False（対象のグループが無いときも False）
         """
         # 消すのは get_group() が返すのと同じ 1 件だけ。同名のグループが
         # あるとき全部消すと、UI が「機器が含まれていません」と確認した
@@ -605,6 +605,10 @@ class ConfigManager:
             if group.get("name") == group_name:
                 del groups[index]
                 break
+        else:
+            # 何も消していないので保存もしない。保存結果の True を返すと、
+            # 呼び出し側が「削除しました」と案内してしまう
+            return False
         return self.save_config()
     
     def rename_group(self, old_name: str, new_name: str) -> bool:

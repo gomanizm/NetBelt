@@ -1569,8 +1569,10 @@ class MainWindow(QMainWindow):
                 self.status_bar.showMessage(f"グループ '{group_name}' を削除しました")
             else:
                 # remove_group も save_config() の前に in-memory から消す。
-                # 保存だけ失敗した場合は、実行中の設定から既に消えている
-                applied = self.config_manager.get_group(group_name) is None
+                # 保存だけ失敗した場合は、実行中の設定から既に消えている。
+                # 元からグループが無かった場合（False）は何も適用されていない
+                applied = (group is not None
+                           and self.config_manager.get_group(group_name) is None)
                 self._warn_change_failed("グループの削除", applied)
     
     def _on_save_log(self):
