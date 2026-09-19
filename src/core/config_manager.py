@@ -145,6 +145,10 @@ class ConfigManager:
         # 読み込み時に復号できなかった機器: 機器名 -> そのとき残った暗号文。
         # 接続の入口がここを見て、暗号文をパスワードとして送らないようにする
         self.undecryptable_devices: Dict[str, str] = {}
+        # 直前のグループ操作が「保存だけ失敗した」のか「そもそも受け付け
+        # られなかった（同名・対象なし）」のか。戻り値の False だけでは
+        # 区別できず、呼び出し側が案内を書き分けられない
+        self.last_save_failed = False
         self.config = self._load_config()
     
     def _load_config(self) -> Dict:
@@ -660,18 +664,27 @@ class ConfigManager:
         Returns:
             追加成功時True、失敗時False
         """
+        self.last_save_failed = False
         # 同名グループが存在しないかチェック
         if self.get_group(group_name):
             return False
-        
+
         new_group = {
             "name": group_name,
             "auto_commands": auto_commands or [],
             "devices": []
         }
-        
-        self.config["groups"].append(new_group)
-        return self.save_config()
+
+        groups = self.config["groups"]
+        groups.append(new_group)
+        if self.save_config():
+            return True
+        # 保存できなかったのにメモリへ残すと、次の無関係な保存（終了時の
+        # レイアウト保存など）で、失敗と案内した追加がディスクに確定する
+        if groups and groups[-1] is new_group:
+            groups.pop()
+        self.last_save_failed = True
+        return False
     
     def remove_group(self, group_name: str) -> bool:
         """
@@ -686,6 +699,7 @@ class ConfigManager:
         # 消すのは get_group() が返すのと同じ 1 件だけ。同名のグループが
         # あるとき全部消すと、UI が「機器が含まれていません」と確認した
         # グループを消したつもりで、同名の別グループの機器まで消える
+        self.last_save_failed = False
         groups = self.config.get("groups", [])
         for index, group in enumerate(groups):
             if group.get("name") == group_name:
@@ -695,7 +709,11 @@ class ConfigManager:
             # 何も消していないので保存もしない。保存結果の True を返すと、
             # 呼び出し側が「削除しました」と案内してしまう
             return False
-        return self.save_config()
+        if self.save_config():
+            return True
+        groups.insert(index, group)   # 保存できなかったらメモリも戻す
+        self.last_save_failed = True
+        return False
     
     def rename_group(self, old_name: str, new_name: str) -> bool:
         """
@@ -708,26 +726,30 @@ class ConfigManager:
         Returns:
             変更成功時True、失敗時False
         """
+        self.last_save_failed = False
         # 変更対象のグループを取得
         group = self.get_group(old_name)
         if not group:
             print(f"エラー: グループ '{old_name}' が見つかりません")
             return False
-        
+
         # 新しい名前が既に存在しないかチェック
         if self.get_group(new_name):
             print(f"エラー: グループ '{new_name}' は既に存在します")
             return False
-        
+
         # グループ名を変更
         group["name"] = new_name
-        
+
         # 設定を保存
-        result = self.save_config()
-        if result:
+        if self.save_config():
             print(f"[INFO] グループ名を '{old_name}' から '{new_name}' に変更しました")
-        
-        return result
+            return True
+        # 保存できなかったらメモリも戻す。旧名のまま残るので、その
+        # グループの自動実行コマンドも付いたまま残る
+        group["name"] = old_name
+        self.last_save_failed = True
+        return False
     
     def set_group_auto_commands(self, group_name: str, commands: List[str]) -> bool:
         """
@@ -743,10 +765,21 @@ class ConfigManager:
         Returns:
             設定成功時True、グループが無ければFalse
         """
+        self.last_save_failed = False
+        missing = object()
         for group in self.config.get("groups", []):
             if group.get("name") == group_name:
+                before = group.get("auto_commands", missing)
                 group["auto_commands"] = list(commands)
-                return self.save_config()
+                if self.save_config():
+                    return True
+                # 保存できなかったらメモリも戻す（元から無ければ無い状態へ）
+                if before is missing:
+                    del group["auto_commands"]
+                else:
+                    group["auto_commands"] = before
+                self.last_save_failed = True
+                return False
 
         print(f"エラー: グループ '{group_name}' が見つかりません")
         return False

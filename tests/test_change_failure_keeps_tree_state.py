@@ -1,10 +1,10 @@
 """設定が何も変わっていない失敗で、ツリーの状態を捨てないこと。
 
-_warn_change_failed は applied_in_memory に関係なく _load_devices() を
-呼んでいた。「同名グループが既にある」だけの拒否では実行中の設定は何も
-変わっていないのに、ツリーが作り直されて畳んでいたグループが開き直り、
-選択も外れる。ツリーと実行中の設定が食い違うのは in-memory に適用された
-場合だけなので、作り直しはその場合に限る。
+_warn_change_failed は引数に関係なく _load_devices() を呼んでいた。
+「同名グループが既にある」だけの拒否では実行中の設定は何も変わって
+いないのに、ツリーが作り直されて畳んでいたグループが開き直り、選択も
+外れる。2026-09-20 の決定でグループの変更も保存失敗時に巻き戻すように
+なり、どちらの失敗でも実行中の設定は変わらないので、作り直さない。
 """
 import os
 import sys
@@ -51,25 +51,31 @@ class ChangeFailureKeepsTreeStateTest(unittest.TestCase):
                 return item
         self.fail("グループ '%s' がツリーに見つからない" % group_name)
 
-    def test_unapplied_failure_does_not_reload_the_tree(self):
-        """実行中の設定が変わっていないなら、ツリーはそのまま。"""
+    def test_a_rejected_change_does_not_reload_the_tree(self):
+        """受け付けられなかった変更では、ツリーはそのまま。"""
         from unittest import mock
         w = self._window()
         with mock.patch("ui.main_window.QMessageBox.warning") as warn, \
              mock.patch.object(w, "_load_devices") as reload_tree:
             w._warn_change_failed("グループの追加", False)
         warn.assert_called_once()
+        self.assertNotIn("反映していません", warn.call_args[0][2])
         reload_tree.assert_not_called()
 
-    def test_applied_failure_still_reloads_the_tree(self):
-        """保存だけ失敗した場合は、これまでどおり合わせ直す。"""
+    def test_a_save_failure_does_not_reload_the_tree_either(self):
+        """保存だけ失敗した分も in-memory ごと巻き戻るので、作り直さない。
+
+        以前は in-memory に変更が残っていたので合わせ直していた
+        （2026-09-20 の決定で巻き戻しに変更）。
+        """
         from unittest import mock
         w = self._window()
         with mock.patch("ui.main_window.QMessageBox.warning") as warn, \
              mock.patch.object(w, "_load_devices") as reload_tree:
             w._warn_change_failed("グループの追加", True)
         warn.assert_called_once()
-        reload_tree.assert_called_once()
+        self.assertIn("反映していません", warn.call_args[0][2])
+        reload_tree.assert_not_called()
 
     def test_duplicate_group_add_keeps_expansion_and_selection(self):
         """同名グループの追加を断られても、畳み具合と選択が残ること。"""

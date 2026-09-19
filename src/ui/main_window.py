@@ -1529,48 +1529,38 @@ class MainWindow(QMainWindow):
             group_name = dialog.get_group_name()
             auto_commands = dialog.get_auto_commands()
 
-            # add_group は save_config() の前に in-memory へ追加し、保存に
-            # 失敗しても巻き戻さない。「失敗しました」とだけ案内してツリーを
-            # 放置すると、実行中の設定とツリーが食い違ったまま残り、次の
-            # 無関係な保存でこの追加がそのまま永続化される
-            existed_before = self.config_manager.get_group(group_name) is not None
-
             # 設定に追加
             if self.config_manager.add_group(group_name, auto_commands):
                 # ツリーを再読み込み
                 self._load_devices()
                 self.status_bar.showMessage(f"グループ '{group_name}' を追加しました")
             else:
-                # add_group は「同名が既にある」場合も False を返す。
-                # 実行中の設定に追加されたかどうかで見分ける
-                applied = (not existed_before
-                           and self.config_manager.get_group(group_name) is not None)
-                self._warn_change_failed("グループの追加", applied)
+                # add_group は「同名が既にある」場合も False を返す
+                self._warn_change_failed(
+                    "グループの追加", self.config_manager.last_save_failed)
 
-    def _warn_change_failed(self, what: str, applied_in_memory: bool):
+    def _warn_change_failed(self, what: str, save_failed: bool):
         """
         設定の変更に失敗したことを知らせる
 
-        ConfigManager の各 mutator は save_config() の前に in-memory の設定を
-        書き換えるため、戻り値の False だけでは「保存だけ失敗した（実行中の
-        状態は変更済み）」と「そもそも変更が適用されなかった」を区別できない。
-        呼び出し側が事後状態を見て判定し、ここへ渡す。
+        ConfigManager の各 mutator は、保存に失敗したら in-memory の設定も
+        元へ戻す（機器・マクロと同じ）。どちらの失敗でも実行中の設定は
+        変わっていないので、ツリーは作り直さない。作り直すと、設定は
+        変わっていないのに畳んでいたグループが開き直り、選択も外れる。
 
-        ツリーと実行中の設定が食い違うのは in-memory に適用された場合だけ
-        なので、ツリーの作り直しもその場合に限る。何も適用されていない失敗
-        （同名グループが既にある等）で作り直すと、設定は変わっていないのに
-        畳んでいたグループが開き直り、選択も外れてしまう。
+        戻り値の False だけでは「保存だけ失敗した」と「そもそも受け付け
+        られなかった（同名グループが既にある等）」を区別できないので、
+        ConfigManager.last_save_failed を渡してもらって文面を分ける。
 
         Args:
             what: 失敗した操作の名前（例: "グループ名の変更"）
-            applied_in_memory: 実行中の設定には変更が適用されているか
+            save_failed: 設定ファイルへの保存に失敗したか
         """
-        if applied_in_memory:
-            self._load_devices()
+        if save_failed:
             QMessageBox.warning(
                 self, "エラー",
                 f"{what}を設定ファイルへ保存できませんでした。\n"
-                "変更はこのセッション中のみ有効で、アプリを終了すると失われます。")
+                "保存できなかったので、変更は反映していません。")
         else:
             QMessageBox.warning(self, "エラー", f"{what}に失敗しました。")
 
@@ -1601,22 +1591,16 @@ class MainWindow(QMainWindow):
         if new_group_name != group_name:
             if not self.config_manager.rename_group(group_name, new_group_name):
                 # rename_group は「保存失敗」のほか「対象が無い」「新名が重複」でも
-                # False を返す。実行中の設定に改名が反映されているかで見分ける。
-                renamed = (self.config_manager.get_group(group_name) is None
-                           and self.config_manager.get_group(new_group_name) is not None)
-                self._warn_change_failed("グループ名の変更", renamed)
+                # False を返す。保存に失敗した分は巻き戻っているので、同じ
+                # ダイアログで変えた自動実行コマンドも当てずにここで止める
+                self._warn_change_failed(
+                    "グループ名の変更", self.config_manager.last_save_failed)
                 return
 
         # 自動実行コマンドは改名後の名前で保存する
         if not self.config_manager.set_group_auto_commands(new_group_name, new_auto_commands):
-            # こちらも「対象が無い」場合と「保存失敗」の両方で False になる。
-            group_now = self.config_manager.get_group(new_group_name)
-            # 元から同じ値なら、保存に失敗しても失われる変更は無い。
-            # 「セッション中のみ有効」と案内しないよう、値が実際に変わったかも見る。
-            applied = (auto_commands != new_auto_commands
-                       and group_now is not None
-                       and group_now.get("auto_commands") == new_auto_commands)
-            if new_group_name != group_name and not applied:
+            save_failed = self.config_manager.last_save_failed
+            if new_group_name != group_name:
                 # 改名は上の rename_group で保存できている。ツリーを旧名の
                 # まま残すと、そこからの機器の編集・削除・移動が旧名で
                 # グループを探して失敗するので、作り直してから知らせる
@@ -1624,9 +1608,10 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(
                     self, "エラー",
                     "グループ名の変更は保存しました。\n"
-                    "自動実行コマンドの保存に失敗しました。")
+                    + ("自動実行コマンドは保存できなかったので、反映していません。"
+                       if save_failed else "自動実行コマンドの保存に失敗しました。"))
                 return
-            self._warn_change_failed("自動実行コマンドの保存", applied)
+            self._warn_change_failed("自動実行コマンドの変更", save_failed)
             return
 
         self._load_devices()
@@ -1669,12 +1654,9 @@ class MainWindow(QMainWindow):
                 self._load_devices()
                 self.status_bar.showMessage(f"グループ '{group_name}' を削除しました")
             else:
-                # remove_group も save_config() の前に in-memory から消す。
-                # 保存だけ失敗した場合は、実行中の設定から既に消えている。
-                # 元からグループが無かった場合（False）は何も適用されていない
-                applied = (group is not None
-                           and self.config_manager.get_group(group_name) is None)
-                self._warn_change_failed("グループの削除", applied)
+                # remove_group は「元からグループが無かった」場合も False
+                self._warn_change_failed(
+                    "グループの削除", self.config_manager.last_save_failed)
     
     def _on_save_log(self):
         """ログ保存メニューがクリックされたときの処理"""
