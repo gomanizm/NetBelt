@@ -172,6 +172,7 @@ REM ZIPファイルの存在確認
 if not exist "!ZIP_FILE!" (
     echo エラー: ZIPファイルが見つかりません
     echo   パス: !ZIP_FILE!
+    call :drop_apply_copy
     pause
     exit /b 1
 )
@@ -190,6 +191,7 @@ if /i not "!EXE_NAME!"=="NetBelt.exe" (
     echo   進めても !EXE_NAME! は旧版のまま残り、別名の NetBelt.exe が
     echo   増えるだけになるため、更新を当てずに中止しました。
     echo   名前を NetBelt.exe へ戻すか、新しい ZIP を手で展開してください。
+    call :drop_apply_copy
     pause
     exit /b 1
 )
@@ -207,6 +209,7 @@ echo [3/6] 一時ディレクトリを作成中...
 mkdir "!TEMP_DIR!" 2>nul
 if not exist "!TEMP_DIR!" (
     echo エラー: 一時ディレクトリの作成に失敗しました
+    call :drop_apply_copy
     pause
     exit /b 1
 )
@@ -223,6 +226,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "try { Expand-Archive -Li
 if errorlevel 1 (
     echo エラー: ZIPファイルの展開に失敗しました
     rd /s /q "!TEMP_DIR!" 2>nul
+    call :drop_apply_copy
     pause
     exit /b 1
 )
@@ -282,6 +286,7 @@ if not exist "!SOURCE_DIR!\NetBelt.exe" (
     echo   場所: !SOURCE_DIR!
     echo   インストール先のファイルは何も変えていません。
     rd /s /q "!TEMP_DIR!" 2>nul
+    call :drop_apply_copy
     pause
     exit /b 1
 )
@@ -306,6 +311,7 @@ echo   ウイルス対策ソフトなど、別のプログラムが展開した�
 echo   開いている可能性があります。インストール先のファイルは
 echo   何も変えていません。しばらく待ってから、もう一度更新してください。
 rd /s /q "!TEMP_DIR!" 2>nul
+call :drop_apply_copy
 pause
 exit /b 1
 :staged
@@ -411,4 +417,23 @@ if defined LAUNCH_FAILED (
 )
 ping -n 4 127.0.0.1 >nul 2>&1
 
+exit /b 0
+
+REM ================================================================
+REM 適用用の写しを片付ける（call で呼ぶ）
+REM ================================================================
+REM NetBelt は適用の直前に、検証した ZIP の写し（更新フォルダの
+REM NetBelt-apply-*.zip）と控え（.sha256 / .version）を作り、写しを
+REM 渡してくる。元の ZIP は更新フォルダに残っているので、写しは当て直しの
+REM 材料にもならない。以前は更新を当て終えたときしか消しておらず、
+REM インストール先へ何も書く前に中止するたびに、配布 ZIP 1 個分の写しが
+REM 検証記録つきの .zip として溜まり、未適用の更新の候補にも並んでいた。
+REM インストール先へ何か書く前の中止だけがここを呼ぶ。消すのは、渡された
+REM ZIP の名前が NetBelt-apply- で始まるときだけ（手で渡した ZIP は消さない）。
+:drop_apply_copy
+for %%z in ("!ZIP_FILE!") do set "ZIP_NAME=%%~nxz"
+if /i not "!ZIP_NAME:~0,14!"=="NetBelt-apply-" exit /b 0
+del "!ZIP_FILE!" 2>nul
+del "!ZIP_FILE!.sha256" 2>nul
+del "!ZIP_FILE!.version" 2>nul
 exit /b 0
