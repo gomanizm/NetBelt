@@ -665,20 +665,56 @@ class TFTPServerManager(QObject):
         self._pending_notices = 0
         self._dropped_notices = 0
         # 自分の信号を自分でも受ける。ワーカーから emit した分はキュー経由で
-        # GUI スレッドへ届くので、呼ばれたことが「GUI が 1 件処理した」の合図
-        self.protocol_event.connect(self._on_notice_delivered)
+        # GUI スレッドへ届くので、呼ばれたことが「GUI が 1 件処理した」の合図。
+        # 転送の通知も同じカウンタに数える（存在する小さいファイルへの
+        # RRQ→即 ACK を連打されると、成功した転送の通知だけで積み上がる）
+        for signal in (self.protocol_event, self.transfer_started,
+                       self.transfer_progress, self.transfer_complete,
+                       self.transfer_interrupted):
+            signal.connect(self._on_notice_delivered)
 
-    def _emit_protocol_event(self, ip, filename, reason, direction):
-        """protocol_event を 1 件渡す。配送待ちが上限に達している間は数えるだけ。"""
+    def _take_notice(self, force=False, count_drop=True):
+        """配送待ちを 1 件ぶん確保する。確保できたら True（呼び出し側が emit する）。
+
+        上限に達している間は False。count_drop なら省略件数へ足す（進捗は
+        次の進捗か完了で置き換わるので足さない）。force は上限を超えても
+        確保する（開始を届けた転送の行を閉じる通知。捨てると行が残る）
+        """
         with self._notice_lock:
-            if self._pending_notices >= self.max_pending_notices:
-                self._dropped_notices += 1
-                return
+            if not force and self._pending_notices >= self.max_pending_notices:
+                if count_drop:
+                    self._dropped_notices += 1
+                return False
             self._pending_notices += 1
-        self.protocol_event.emit(ip, filename, reason, direction)
+            return True
+
+    def _take_closing_notice(self, st):
+        """完了・中断を渡すかを決める（_tx_lock の中で呼ぶ）。
+
+        開始を届けた行を閉じる最初の 1 件は必ず渡す。開始を省いた転送の
+        ものは渡さずに省略件数へ足す。行の無いもの（台帳に無い・行を閉じた後）
+        は上限の範囲でだけ渡す
+        """
+        row = st["row"] if st is not None else None
+        if row == "shown":
+            st["row"] = "closed"
+            return self._take_notice(force=True)
+        if row == "hidden":
+            with self._notice_lock:
+                self._dropped_notices += 1
+            return False
+        return self._take_notice()
+
+    def _emit_protocol_event(self, ip, filename, reason, direction, force=False):
+        """protocol_event を 1 件渡す。配送待ちが上限に達している間は数えるだけ。
+
+        force は開始を届けた行をこの通知で閉じるとき（_take_notice を参照）
+        """
+        if self._take_notice(force=force):
+            self.protocol_event.emit(ip, filename, reason, direction)
 
     def _on_notice_delivered(self, *_args):
-        """GUI が protocol_event を 1 件処理したので配送待ちを戻す（GUI スレッドで動く）"""
+        """GUI が通知を 1 件処理したので配送待ちを戻す（GUI スレッドで動く）"""
         with self._notice_lock:
             if self._pending_notices > 0:
                 self._pending_notices -= 1
@@ -740,19 +776,26 @@ class TFTPServerManager(QObject):
             # 方向まで含める。同じ機器が同名ファイルを送受で同時に扱うと、
             # 方向を落としたキーでは片方が他方を潰す。
             key = (ip, fn, d)
+            # row: 開始を届けた（shown）／配送待ちの上限で省いた（hidden）／
+            # 行を閉じる完了・中断を届けた後（closed）
             with self._tx_lock:
                 first = key not in self._tx
+                shown = False
                 if first:
-                    self._tx[key] = {"count": 1, "done": False}
+                    shown = self._take_notice()
+                    self._tx[key] = {"count": 1, "done": False,
+                                     "row": "shown" if shown else "hidden"}
                 else:
                     self._tx[key]["count"] += 1  # 再送で増えた重複は行を増やさない
-            if first:
+            if shown:
                 self.transfer_started.emit(ip, fn, int(total), d)
         elif kind == "transfer_progress":
             fn, done, total, d = payload
             with self._tx_lock:
-                active = (ip, fn, d) in self._tx
-            if active:
+                st = self._tx.get((ip, fn, d))
+                show = (st is not None and st["row"] == "shown"
+                        and self._take_notice(count_drop=False))
+            if show:
                 self.transfer_progress.emit(ip, fn, int(done), int(total), d)
         elif kind == "transfer_complete":
             fn, done, total, d = payload
@@ -764,21 +807,26 @@ class TFTPServerManager(QObject):
                     st["count"] -= 1
                     if st["count"] <= 0:
                         self._tx.pop(key, None)
-            self.transfer_complete.emit(ip, fn, int(done), int(total), d)
+                show = self._take_closing_notice(st)
+            if show:
+                self.transfer_complete.emit(ip, fn, int(done), int(total), d)
         elif kind == "interrupted":
             # 利用者が止めたことによる中断。エラーではないので別の口へ流す。
             # 併せて台帳から降ろす（transfer_complete が来ないため、
             # 放置すると「進行中」の行が残る）。
             filename, direction = payload
             with self._tx_lock:
-                self._tx.pop((ip, filename, direction), None)
-            self.transfer_interrupted.emit(ip, filename, direction)
+                st = self._tx.pop((ip, filename, direction), None)
+                show = self._take_closing_notice(st)
+            if show:
+                self.transfer_interrupted.emit(ip, filename, direction)
         elif kind == "protocol_error":
             # 重複RRQ/WRQ の敗者が出すタイムアウトは、その転送が成功済み or
             # まだ生存兄弟がいる間は握り潰す。全滅（兄弟ゼロ・未完了）なら
             # 本物の失敗として通す。
             filename, reason, direction = payload
             suppress = False
+            closing = False
             # 台帳から降ろす処理と、握り潰すかどうかの判定は分けて行う。
             # 理由文字列で降ろす／降ろさないを分けると、タイムアウト以外の
             # 失敗（保存できない・I/O エラー等）で項目が残り続け、以後その
@@ -797,7 +845,13 @@ class TFTPServerManager(QObject):
                             suppress = st["done"] or st["count"] > 0
                         if st["count"] <= 0:
                             self._tx.pop((ip, filename, direction), None)
+                        # パネルはこの通知で行を「エラー」に閉じる。完了と同じく、
+                        # 開始を届けた行を閉じる通知は上限を超えても渡す
+                        if not suppress and st["row"] == "shown":
+                            st["row"] = "closed"
+                            closing = True
             if not suppress:
-                self._emit_protocol_event(ip, filename, reason, direction)
+                self._emit_protocol_event(ip, filename, reason, direction,
+                                          force=closing)
         else:
             self.client_activity.emit(ip, payload)
