@@ -831,8 +831,9 @@ class Screen(object):
         # 消した範囲が行の末尾まで届いたら、この行から次の行への続きは
         # 無い。EL 0 と EL 2 は必ず届く。EL 1 は普段は届かないが、
         # カーソルが行末 (行末の全角の前半を含む) にあると行が丸ごと
-        # 空になるので、そこでも外す
-        if stop >= len(line):
+        # 空になるので、そこでも外す。消した範囲の右に印字された空白
+        # しか残らないときも行は空なので外す (_shift_chars と同じ基準)
+        if stop >= len(line) or all(c == BLANK for c in line):
             self.wrapped[self.cursor_row] = False
         self.dirty.add(self.cursor_row)
         self._pending_wrap = False
