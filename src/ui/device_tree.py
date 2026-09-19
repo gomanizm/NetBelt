@@ -37,6 +37,8 @@ class DeviceTree(QWidget):
         self._tools_state_provider = None
         # (機器名, 項目の機器データ) -> 接続先が同じか（set_tools_target_check を参照）
         self._tools_target_check = None
+        # _set_baudrate の最中か（restore_baudrate の作り直しを 1 回にまとめる）
+        self._applying_baudrate = False
         self._create_ui()
         
         # シリアルポート監視用
@@ -477,7 +479,12 @@ class DeviceTree(QWidget):
         # 時の機器データを再接続用に写しており、そこを更新しないと Enter に
         # よる再接続だけ旧ボーレートのまま繋がる。開いているポートがこの値を
         # 拒んだ場合は、MainWindow が restore_baudrate() で実際の値を書き戻す
-        self.serial_baudrate_changed.emit(port, baudrate)
+        # （その作り直しは下の 1 回にまとめる）
+        self._applying_baudrate = True
+        try:
+            self.serial_baudrate_changed.emit(port, baudrate)
+        finally:
+            self._applying_baudrate = False
 
         # 受け付けられたと分かってから記録する。要求した時点で「設定しました」
         # と出すと、拒まれたときにログだけが実際の値と食い違う
@@ -499,11 +506,18 @@ class DeviceTree(QWidget):
         実際の値で呼び直す。serial_baudrate_changed は出さない（出すと
         開いている接続へもう一度同じ値を設定しにいく）。
 
+        _set_baudrate から呼ばれている間は値を書くだけにする。一覧の作り直しは
+        実機のポート列挙を伴い、「コンソール接続」を作り直すたびに折りたたみ
+        状態も戻るので、拒否 1 回につき 1 度で済ませる（_set_baudrate が
+        最後に行う）。接続できたときの経路はここで作り直す。
+
         Args:
             port: ポート名
             baudrate: 実際に使っているボーレート
         """
         self._serial_port_baudrates[port] = baudrate
+        if self._applying_baudrate:
+            return
         self.refresh_serial_ports()
 
     def _on_item_double_clicked(self, item: QTreeWidgetItem, column: int):
