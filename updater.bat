@@ -353,6 +353,49 @@ pause
 exit /b 1
 :staged
 
+REM ここから先はインストール先を書き換える。その前に、同じインストール先を
+REM 指す別の更新と重ならないよう、インストール先に目印フォルダを作って
+REM 排他を取る。md は既にある名前で失敗するので、これが排他になる。
+REM TEMP の作業場所は既に md で確保しているが、守られているのは TEMP 側
+REM だけだった。実測（cx5b-release の r02_shared_appdir.py）: A を move の
+REM 直後で止めて B を最後まで走らせると、A は A の版を承認したのに [6/6] で
+REM 起動したのは B の exe で、両方が「更新が完了しました！」を出した。
+REM 自然に重ねた試験では A の exe と B の同梱ファイルが混在し、B は
+REM 「NetBelt.exe は旧版のまま」と事実と違う案内を出していた。
+REM 目印は :release_lock で必ず外す（成功・失敗・中止のどれでも）。
+REM 目印の中へ holder.txt を書くので、フォルダの更新日時＝確保した時刻に
+REM なる。異常終了（コンソールを閉じられた等）で残った目印は、10分より
+REM 古ければ取り除いて続ける。
+REM 目印を作れない理由が重なり以外（インストール先へ書けない等）でも、
+REM その場合はどのみち更新を当てられないので、同じ中止でよい。
+set "LOCK_DIR=!APP_DIR!NetBelt-update-lock"
+set "LOCK_HELD="
+set "LOCK_TRY=0"
+:claim_lock
+set /a LOCK_TRY+=1
+md "!LOCK_DIR!" 2>nul
+if not errorlevel 1 goto :lock_claimed
+if !LOCK_TRY! geq 2 goto :lock_busy
+set "PS_LOCK=!LOCK_DIR!"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "try { $d = Get-Item -LiteralPath $env:PS_LOCK -Force -ErrorAction Stop; if ($d.LastWriteTime -lt (Get-Date).AddMinutes(-10)) { Remove-Item -LiteralPath $env:PS_LOCK -Recurse -Force -ErrorAction Stop; exit 0 } } catch { }; exit 1"
+if errorlevel 1 goto :lock_busy
+echo   前の更新が残した目印を取り除きました
+goto :claim_lock
+
+:lock_busy
+echo エラー: 別の更新が進行中です
+echo   同じインストール先への更新が既に動いています。インストール先の
+echo   ファイルは何も変えていません。先の更新が終わるのを待ってから、
+echo   もう一度お試しください。
+rd /s /q "!TEMP_DIR!" 2>nul
+call :drop_apply_copy
+pause
+exit /b 1
+
+:lock_claimed
+set "LOCK_HELD=1"
+echo held>"!LOCK_DIR!\holder.txt" 2>nul
+
 REM ファイルをコピー（上書き）
 xcopy "!SOURCE_DIR!\*" "!APP_DIR!" /E /I /Y /Q >nul 2>&1
 if errorlevel 1 (
@@ -362,6 +405,7 @@ if errorlevel 1 (
     echo   一部またはすべてが新しい版に置き換わっている場合があります。
     del "!STAGED_PATH!" 2>nul
     rd /s /q "!TEMP_DIR!" 2>nul
+    call :release_lock
     pause
     exit /b 1
 )
@@ -385,6 +429,7 @@ echo   既に新しい版へ置き換わっています。アプリを終了し�
 echo   もう一度更新してください。
 del "!STAGED_PATH!" 2>nul
 rd /s /q "!TEMP_DIR!" 2>nul
+call :release_lock
 pause
 exit /b 1
 :swapped
@@ -392,6 +437,7 @@ if not exist "!APP_DIR!NetBelt.exe" (
     echo エラー: 更新後の NetBelt.exe が見つかりません
     echo   場所: !APP_DIR!
     rd /s /q "!TEMP_DIR!" 2>nul
+    call :release_lock
     pause
     exit /b 1
 )
@@ -412,6 +458,7 @@ if not exist "!APP_PATH!" (
     echo エラー: 実行ファイルが見つかりません
     echo   パス: !APP_PATH!
     rd /s /q "!TEMP_DIR!" 2>nul
+    call :release_lock
     pause
     exit /b 1
 )
@@ -432,6 +479,9 @@ REM 当て直す材料も、何を当てたのかを確かめる材料も無く�
 echo クリーンアップ中...
 ping -n 2 127.0.0.1 >nul 2>&1
 rd /s /q "!TEMP_DIR!" 2>nul
+REM 目印はここで外す。下の LAUNCH_FAILED の道は pause で止まるので、
+REM その手前で外しておかないと、次の更新が読まれるまで待たされる。
+call :release_lock
 if not defined LAUNCH_FAILED del "!ZIP_FILE!" 2>nul
 if not defined LAUNCH_FAILED del "!ZIP_FILE!.sha256" 2>nul
 if not defined LAUNCH_FAILED del "!ZIP_FILE!.version" 2>nul
@@ -473,4 +523,15 @@ if /i not "!ZIP_NAME:~0,14!"=="NetBelt-apply-" exit /b 0
 del "!ZIP_FILE!" 2>nul
 del "!ZIP_FILE!.sha256" 2>nul
 del "!ZIP_FILE!.version" 2>nul
+exit /b 0
+
+REM ================================================================
+REM インストール先の目印を外す（call で呼ぶ）
+REM ================================================================
+REM 自分が確保したときだけ外す。目印を取れずに中止した側がここを通っても、
+REM 動いているほうの目印を消してしまわないようにするため。
+:release_lock
+if not defined LOCK_HELD exit /b 0
+set "LOCK_HELD="
+rd /s /q "!LOCK_DIR!" 2>nul
 exit /b 0
