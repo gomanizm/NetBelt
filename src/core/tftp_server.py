@@ -664,7 +664,8 @@ class TFTPServerManager(QObject):
     transfer_started = pyqtSignal(str, str, object, str)       # ip, filename, total, direction
     transfer_progress = pyqtSignal(str, str, object, object, str)  # ip, filename, done, total, direction
     transfer_complete = pyqtSignal(str, str, object, object, str)  # ip, filename, done, total, direction
-    # 利用者が止めたことによる中断。エラーではないので別の口にする
+    # 未完了で終わった転送（利用者の停止・機器の打ち切り）。
+    # エラーではないので別の口にする
     transfer_interrupted = pyqtSignal(str, str, str)         # ip, filename, direction
     # 転送ごとのプロトコル事象。サーバ障害ではないのでモーダルにはしない
     protocol_event = pyqtSignal(str, str, str, str)          # ip, filename, reason, direction
@@ -835,7 +836,8 @@ class TFTPServerManager(QObject):
             if show:
                 self.transfer_complete.emit(ip, fn, int(done), int(total), d)
         elif kind == "interrupted":
-            # 利用者が止めたことによる中断。エラーではないので別の口へ流す。
+            # 未完了で終わった転送（利用者の停止・機器の打ち切り）。
+            # エラーではないので別の口へ流す。
             # 併せて台帳から降ろす（transfer_complete が来ないため、
             # 放置すると「進行中」の行が残る）。
             filename, direction = payload

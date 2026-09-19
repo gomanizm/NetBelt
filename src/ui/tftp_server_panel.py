@@ -286,14 +286,18 @@ class TFTPServerPanel(QWidget):
             st["row"] -= excess
 
     def _on_transfer_interrupted(self, ip: str, filename: str, direction: str):
-        """利用者が止めたことによる中断。エラーではないので行だけ確定させる。
+        """未完了で終わった転送。エラーではないので行だけ確定させる。
 
         確定させないと「転送中」の表示が残り続ける。ダイアログは出さない。
+
+        利用者が止めた場合と、機器が ERROR を送って打ち切った場合の
+        どちらもここへ来る。見分ける手がかりは通知に無いので、文言は
+        理由に踏み込まない（FTP パネルと同じ「転送中断」）。
         """
         st = self._active.pop((ip, filename, direction), None)
         if st is not None:
             self.history.setItem(st["row"], 5, QTableWidgetItem("中断"))
-        self._add_log("[%s] 停止により中断: %s" % (ip, filename))
+        self._add_log("[%s] 転送中断: %s" % (ip, filename))
 
     def _on_protocol_event(self, ip: str, filename: str, reason: str,
                            direction: str = ""):
