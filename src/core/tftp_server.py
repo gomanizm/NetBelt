@@ -34,6 +34,10 @@ class _ServerStopped(Exception):
     """停止要求により転送を打ち切った（タイムアウトとは区別する）"""
 
 
+class _PeerAborted(Exception):
+    """相手が ERROR を送って転送を打ち切った（タイムアウトとは区別する）"""
+
+
 class _NetasciiDecoder:
     """netascii（RFC 1350）の受信バイト列を復号する。CR LF → LF、CR NUL → CR。
 
@@ -501,6 +505,7 @@ class TFTPServer:
     def _send_and_wait_ack(self, xs, packet, addr, expect_block, timeout=None):
         """packet を送り、block=expect_block の ACK を待つ。来なければ最大 _retries 回まで再送。
         古い/重複 ACK は無視。全再送失敗で socket.timeout を送出（呼び出し側が中断処理）。
+        相手の TID からの ERROR は _PeerAborted を送出する。
         timeout は 1 回の待ち秒数（省略時は既定の _timeout）。"""
         if timeout is None:
             timeout = self._timeout
@@ -526,6 +531,12 @@ class TFTPServer:
                     if deadline_tries > 8:
                         break
                     continue
+                if len(ack) >= 4 and struct.unpack("!H", ack[:2])[0] == OP_ERROR:
+                    # 相手（TID は照合済み）が転送を打ち切った。読み捨てると
+                    # タイムアウトまで DATA を再送し続け、その間ワーカーの枠と
+                    # ファイルを掴んだままになる。WRQ 側と同じく、中断の経路で
+                    # 終えられるよう呼び出し側へ伝える
+                    raise _PeerAborted()
                 if len(ack) >= 4 and struct.unpack("!H", ack[:2])[0] == OP_ACK \
                         and struct.unpack("!H", ack[2:4])[0] == expect_block:
                     return  # 期待 ACK 受領
@@ -574,8 +585,8 @@ class TFTPServer:
                         self._send_and_wait_ack(xs, _oack(neg), addr, 0, timeout)  # OACKにACK(0)。再送付き
                     except socket.timeout:
                         return  # 未確立: 重複RRQの孤児。started/error とも出さない
-                    except _ServerStopped:
-                        return  # 未確立のまま停止。何も出さない
+                    except (_ServerStopped, _PeerAborted):
+                        return  # 未確立のまま停止/打ち切り。何も出さない
                     established = True
                     self.on_event("transfer_started", addr[0], (filename, total, "download"))
                 block = 1
@@ -601,7 +612,10 @@ class TFTPServer:
                         if not established:
                             return  # block1 の ACK すら来ない = 孤児。黙って撤退
                         raise      # 確立後の中断は本物のエラー
-                    except _ServerStopped:
+                    except (_ServerStopped, _PeerAborted):
+                        # 停止要求と、相手の ERROR による打ち切り。どちらも
+                        # 失敗ではないので、確立済みなら中断として通知する
+                        # （未確立＝重複 RRQ の敗者は黙って撤退）
                         if established:
                             self.on_event("interrupted", addr[0],
                                           (filename, "download"))
