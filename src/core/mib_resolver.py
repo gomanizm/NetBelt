@@ -11,7 +11,7 @@ from typing import Dict, Optional
 # MIB 解析器の版。抽出・解決の規則を変えたら上げる。mib_cache.json は
 # この値も鍵にするので、古い解析器が作ったキャッシュがアプリの更新後に
 # そのまま使われることがなくなる。
-MIB_PARSER_VERSION = '2026-09-20.1'
+MIB_PARSER_VERSION = '2026-09-20.2'
 
 
 def app_dir() -> str:
@@ -471,6 +471,8 @@ class MIBResolver:
     # 連結すると各モジュールの先頭に BOM が残り、見出しを見落として
     # 複数のモジュールが 1 つに混ざる（実測）。utf-8-sig で開いても
     # 消えるのはファイル先頭の BOM だけなので、ここで許す。
+    # 読み込み時に BOM は改行へ正規化してあるので、ここに残る BOM は
+    # もう無いはずだが、この式だけを使う経路が増えても壊れないよう残す。
     _MIB_MODULE_HEADER = r'^[ \t\ufeff]*([\w-]+)\s+DEFINITIONS\b'
 
     def _extract_mib_definitions(self, filepath: str) -> list:
@@ -498,7 +500,15 @@ class MIBResolver:
         definitions = []
         try:
             with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-                content = self._blank_comments_and_strings(f.read())
+                # BOM（U+FEFF）は改行へ置き換えて正規化する。BOM 付きの MIB を
+                # `copy /b A.my+B.my` のように生のまま連結すると、A.my に末尾の
+                # 改行が無ければ `END` の直後に次の BOM が来る。見出しの
+                # 正規表現は行頭の BOM を読み飛ばすが、これは行頭ではないので
+                # 当たらず、モジュールを区切れないまま同じ名前が後勝ちで
+                # 混ざる（実測: A の Trap が B の enterprise の下に付いた）。
+                # 1 文字→1 文字の置換なので、あとで位置を使う処理がずれない。
+                content = self._blank_comments_and_strings(
+                    f.read().replace('\ufeff', '\n'))
             # 1 ファイルに複数のモジュールを連結して配る MIB があるので、
             # 見出しの位置ごとに本文を区切り、区間ごとにそのモジュール名を
             # 付ける。ファイル全体に最初の見出しの名前を付けると、2 つの
