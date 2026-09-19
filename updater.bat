@@ -396,6 +396,20 @@ exit /b 1
 set "LOCK_HELD=1"
 echo held>"!LOCK_DIR!\holder.txt" 2>nul
 
+REM 前の実行が置き去りにした一時名の exe を片付ける。差し替えが 5 回とも
+REM 失敗すると、後始末の del も同じ理由（削除共有なしで掴まれている）で
+REM 失敗する。実測（cx5c-verify-release の a_leftover_staged.py）: exit 1 の
+REM あともインストール先に NetBelt.exe.NetBeltUpdate_1_697.new が残り、
+REM 掴みを手放しても誰も消さなかった。一時名は実行ごとに変わるので、
+REM 失敗のたびに配布物 1 個ぶんが積まれていく。
+REM 自分の一時名はまだ展開先（TEMP）にあり、目印を持っている間は他の更新が
+REM インストール先へ置くこともないので、ここにあるのは前の実行のぶんだけ。
+REM 掴まれたままのものは消せないが、黙って飛ばして続ける（次の更新が拾う）。
+REM 拡張子を見直すのは、ワイルドカードが 8.3 形式の短い名前にも当たるため。
+for %%s in ("!APP_DIR!NetBelt.exe.*.new") do (
+    if /i "%%~xs"==".new" del "%%~fs" 2>nul
+)
+
 REM ファイルをコピー（上書き）
 xcopy "!SOURCE_DIR!\*" "!APP_DIR!" /E /I /Y /Q >nul 2>&1
 if errorlevel 1 (
