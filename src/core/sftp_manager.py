@@ -686,6 +686,15 @@ class SFTPManager(QObject):
                         with self._sftp_lock:
                             if self.is_connected and self.sftp_client is not None:
                                 self.sftp_client.remove(tmp_remote)
+                    except TimeoutError:   # socket.timeout の別名
+                        # 後始末まで期限切れなら、以後このチャンネルは要求と
+                        # 応答がずれたまま使えない。元の失敗を伝えたうえで、
+                        # 期限切れの経路と同じように畳む（ロックの中では
+                        # 畳めない。畳むのは finally）
+                        probe_timed_out[0] = True
+                        timed_out_note[0] = (
+                            "（送りかけの一時名 %s を片づけられませんでした）"
+                            % tmp_remote)
                     except Exception:
                         pass
                 self._fail("アップロードエラー", e)
