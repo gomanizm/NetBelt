@@ -169,10 +169,14 @@ class KeepaliveStopCancelsQueuedCrTest(unittest.TestCase):
                          % [(len(s), s[:4]) for s in conn.sent])
 
     def test_stopping_a_macro_leaves_a_running_keepalive_alone(self):
-        """マクロの停止で、動いているキープアライブの CR まで消えないこと。"""
+        """マクロの停止で、動いているキープアライブの CR まで消えないこと。
+
+        打ちかけ（最後の行送りより後ろに送った分がある）の間はキープアライブを
+        送らない（利用者の決定 2026-09-20）ので、行送りで終わる貼り付けにする。
+        """
         window, terminal, conn = self._ssh()
         chunk = terminal.SEND_CHUNK
-        terminal.send_text("x" * (chunk * 2))
+        terminal.send_text("x" * (chunk * 2 - 1) + "\n")
         window._start_keepalive("dev", 60)
         window.macro_manager._send_keepalive("dev")
         window.macro_manager.start_command_list("dev", ["cmd1"], 50)
@@ -180,7 +184,8 @@ class KeepaliveStopCancelsQueuedCrTest(unittest.TestCase):
         window.macro_manager.stop_command_list("dev")
         self._pump()
 
-        self.assertEqual(conn.sent, ["x" * chunk, "x" * chunk, "\r"],
+        self.assertEqual(conn.sent,
+                         ["x" * chunk, "x" * (chunk - 1) + "\r", "\r"],
                          "マクロの停止でキープアライブの CR が消えた: %r"
                          % [(len(s), s[:4]) for s in conn.sent])
         window._stop_keepalive("dev")

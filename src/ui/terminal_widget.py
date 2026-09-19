@@ -100,6 +100,9 @@ class InteractiveTerminal(QTextEdit):
         self._input_enabled = False
         self._reconnect_mode = False  # 再接続待機モード
         self._is_recording = False  # ログ記録中フラグ
+        # 利用者が打ちかけ（最後に送った行送りより後ろに何か送っている）か。
+        # キープアライブの CR を送るかどうかの判断に使う（_note_typed）
+        self._typing_unsent = False
         self._macro_list = []  # 利用可能なマクロリスト
         self._keepalive_active = False  # キープアライブ動作中フラグ
         self._command_list_active = False  # マクロ（コマンドリスト）実行中フラグ
@@ -139,6 +142,8 @@ class InteractiveTerminal(QTextEdit):
     def set_reconnect_mode(self, enabled: bool):
         """再接続モードを切り替え"""
         self._reconnect_mode = enabled
+        # 打ちかけの行は切れた接続のもの。繋ぎ直したら残っていない
+        self._typing_unsent = False
         if enabled:
             self._input_enabled = True  # 再接続モードではEnterキーを受け付ける
             # 送りかけの貼り付けは、切れた接続宛てのもの。残しておくと
@@ -233,10 +238,18 @@ class InteractiveTerminal(QTextEdit):
         由来（origin: "macro" / "keepalive"）の印を付けておく。停止したときに、
         まだ送っていないぶんだけを cancel_macro_sends で取り消せるようにするため。
 
+        利用者が打ちかけ（まだ Enter を押していない入力がある）の間は、
+        キープアライブの CR を積まずに飛ばす。打ちかけの行の後ろに付くと、
+        利用者が Enter を押していないコマンドが実行されるため（実測:
+        'reload' を打鍵したところへ発火して 'reload\\r' が送られた）。溜めて
+        後から送ることはしない。次の間隔でまた判断する。
+
         on_sent は、その行を機器へ送り出したとき（シリアルは送信スレッドが
         書き終えたとき）に呼ぶ。積んだ時点ではなくここから次の行までの
         遅延を数えないと、長い貼り付けの後ろで待つ間に遅延が過ぎてしまう。
         """
+        if origin == "keepalive" and self._typing_unsent:
+            return
         self._queue_send(payload, origin=origin, on_sent=on_sent)
 
     def cancel_macro_sends(self, origin: str = "macro"):
@@ -493,7 +506,27 @@ class InteractiveTerminal(QTextEdit):
         """
         bar = self.verticalScrollBar()
         bar.setValue(bar.maximum())
+        self._note_typed(payload)
         self._queue_send(payload)
+
+    # 送ると行が無くなる文字。行送り（CR / LF）と、行を捨てる
+    # Ctrl+C (0x03) / Ctrl+U (0x15)
+    LINE_ENDERS = ("\r", "\n", "\x03", "\x15")
+
+    def _note_typed(self, payload: str) -> None:
+        """いま送った利用者の入力から、打ちかけの行が残っているかを覚える
+
+        最後の行送りより後ろに何か送っていれば打ちかけ。行が残っているか
+        判断できない操作（Backspace で消した、矢印で動かした、など）は
+        打ちかけのままにして、キープアライブを送らない側へ倒す。
+        ここを通るのは利用者の打鍵・貼り付け・IME 確定だけで、マクロと
+        キープアライブ自身の送信（queue_macro_send）と機器の問い合わせへの
+        応答は数えない。
+        """
+        if not payload:
+            return
+        cut = max(payload.rfind(char) for char in self.LINE_ENDERS)
+        self._typing_unsent = cut < len(payload) - 1
 
     def keyPressEvent(self, event: QKeyEvent):
         """キーイベントを処理"""
