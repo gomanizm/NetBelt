@@ -279,3 +279,16 @@ def ensure_self_program_allow():
         return False, "自exe受信許可を要求したが反映を確認できず: " + name
     except Exception as e:
         return False, "自exe受信許可の設定エラー: " + str(e)
+
+
+def combine_results(results, success_message=None):
+    """複数の許可操作の結果 [(ok, msg), ...] を 1 つの (ok, msg) にまとめる。
+
+    失敗した操作があれば、その msg を返す（複数なら " / " で連結）。成功した
+    操作の msg を返すと、失敗の理由が画面に出ず print にしか残らない。
+    すべて成功したときは success_message（省略時は最初の操作の msg）を返す。
+    """
+    failed = [msg for ok, msg in results if not ok]
+    if failed:
+        return False, " / ".join(failed)
+    return True, (results[0][1] if success_message is None else success_message)

@@ -428,12 +428,13 @@ class SFTPServerManager(QObject):
         押したときだけ昇格する。
         """
         try:
-            from .firewall import ensure_inbound_allow, ensure_self_program_allow
+            from .firewall import (combine_results, ensure_inbound_allow,
+                                   ensure_self_program_allow)
             ok, msg = ensure_inbound_allow("SFTP Server", "TCP", port)
             print(f"[SFTP Server] ファイアウォール: {msg}")
             ok2, msg2 = ensure_self_program_allow()
             print(f"[SFTP Server] ファイアウォール(自exe): {msg2}")
-            return (ok and ok2), msg
+            return combine_results([(ok, msg), (ok2, msg2)])
         except Exception as e:
             print(f"[SFTP Server] ファイアウォール設定エラー: {e}")
             return False, str(e)

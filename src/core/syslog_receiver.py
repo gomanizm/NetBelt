@@ -397,18 +397,20 @@ class SyslogReceiver(QObject):
         押したときだけ昇格する。稼働中のプロトコルぶんだけ足す。
         """
         try:
-            from .firewall import ensure_inbound_allow, ensure_self_program_allow
+            from .firewall import (combine_results, ensure_inbound_allow,
+                                   ensure_self_program_allow)
             if not self._servers:
                 return False, "受信していません"
             results = []
             for proto, server in list(self._servers.items()):
                 ok, msg = ensure_inbound_allow("Syslog", proto, server.get("port"))
                 print("[Syslog] ファイアウォール(%s): %s" % (proto, msg))
-                results.append(ok)
+                results.append((ok, msg))
             ok2, msg2 = ensure_self_program_allow()
             print("[Syslog] ファイアウォール(自exe): %s" % msg2)
-            results.append(ok2)
-            return all(results), msg2
+            results.append((ok2, msg2))
+            # すべて成功したときの文言は従来どおり自exe の結果
+            return combine_results(results, success_message=msg2)
         except Exception as e:
             print("[Syslog] ファイアウォール設定エラー: %s" % e)
             return False, str(e)

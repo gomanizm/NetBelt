@@ -360,7 +360,8 @@ class FTPServerManager(QObject):
         """手動: Windows FW 受信許可を追加（制御/passive/自exe、管理者昇格/UAC）。
         3CDaemon 方式で通らない環境の復旧用。押した時だけ昇格する。"""
         try:
-            from .firewall import ensure_inbound_allow, ensure_self_program_allow
+            from .firewall import (combine_results, ensure_inbound_allow,
+                                   ensure_self_program_allow)
             ok, msg = ensure_inbound_allow("FTP Server", "TCP", port)
             self._emit_activity("", "ファイアウォール(制御): %s" % msg)
             lo, hi = passive_ports
@@ -368,7 +369,7 @@ class FTPServerManager(QObject):
             self._emit_activity("", "ファイアウォール(passive): %s" % msg2)
             ok3, msg3 = ensure_self_program_allow()
             self._emit_activity("", "ファイアウォール(自exe): %s" % msg3)
-            return (ok and ok2 and ok3), msg
+            return combine_results([(ok, msg), (ok2, msg2), (ok3, msg3)])
         except Exception as e:
             self.error_occurred.emit("ファイアウォール設定エラー: %s" % e)
             return False, str(e)

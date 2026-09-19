@@ -692,12 +692,13 @@ class TFTPServerManager(QObject):
         """手動: Windows FW 受信許可を追加（管理者昇格/UAC）。3CDaemon 方式で通らない
         環境（過去のプロンプト拒否でブロック残り／FW通知が無効）の復旧用。押した時だけ昇格する。"""
         try:
-            from .firewall import ensure_inbound_allow, ensure_self_program_allow
+            from .firewall import (combine_results, ensure_inbound_allow,
+                                   ensure_self_program_allow)
             ok, msg = ensure_inbound_allow("TFTP Server", "UDP", port)
             self.client_activity.emit("", "ファイアウォール: %s" % msg)
             ok2, msg2 = ensure_self_program_allow()
             self.client_activity.emit("", "ファイアウォール(自exe): %s" % msg2)
-            return (ok and ok2), msg
+            return combine_results([(ok, msg), (ok2, msg2)])
         except Exception as e:
             self.error_occurred.emit("ファイアウォール設定エラー: %s" % e)
             return False, str(e)
