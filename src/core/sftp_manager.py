@@ -344,6 +344,37 @@ class SFTPManager(QObject):
             # 権限を引き継げないことは、転送そのものの失敗にはしない
             pass
 
+    def _create_tmp_with_mode(self, remote_path: str, tmp_remote: str):
+        """中身を送る前に、置き換え先の mode を当てた空の一時名を作る（ロック内で呼ぶ）
+
+        put() は mode を付けずに開くので、一時名はサーバの既定（OpenSSH なら
+        0666 & ~umask = 0644 など）で作られる。_carry_over_mode が当て直すのは
+        全部送ったあとなので、転送中や途中で切れて残った一時名は、0600 の
+        設定ファイルの中身を他のユーザーが読める状態になる。先に空で作って
+        mode を当てておけば、put() が O_TRUNC で開き直しても mode は残る。
+
+        既存の mode が読めない（新しい名前など）ときは作らない（これまで
+        どおりサーバの既定になる）。ハンドルへの chmod を受け付けない機器
+        でも転送は止めない（最終名の mode は _carry_over_mode が当てる）。
+        期限切れはチャンネルが使えない印なので、握りつぶさずに上へ送る。
+        """
+        try:
+            mode = getattr(self.sftp_client.stat(remote_path), "st_mode", None)
+        except TimeoutError:   # socket.timeout の別名
+            raise
+        except Exception:
+            return
+        if not isinstance(mode, int):
+            return
+        handle = self.sftp_client.open(tmp_remote, "wb")
+        try:
+            handle.chmod(mode & 0o7777)
+        except TimeoutError:
+            raise   # 閉じにいっても、さらに期限ぶん待つだけ
+        except Exception:
+            pass
+        handle.close()
+
     def upload_file(self, local_path: str, remote_path: str = None,
                     overwrite: bool = False):
         """
@@ -490,6 +521,9 @@ class SFTPManager(QObject):
                                 f"リモートに '{remote_name}' があるか確かめられませんでした"
                                 f"（{why}）。上書きになる恐れがあるので送りませんでした")
                             return
+                    else:
+                        # 置き換えなら、転送中の一時名も既存より緩くしない
+                        self._create_tmp_with_mode(remote_path, tmp_remote)
                     self.sftp_client.put(local_path, tmp_remote,
                                          callback=progress_callback)
                     if not overwrite:
