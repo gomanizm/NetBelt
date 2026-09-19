@@ -50,29 +50,64 @@ class FTPServerManager(QObject):
         # path は実ファイルのパス（省略時は filename）、値はその転送の表示名。basename で
         # 束ねると、別ディレクトリの同名ファイルの並行転送が1本にまとめられる
         self._tx = {}
-        # GUI へ渡したまま、まだ処理されていない client_activity の件数の上限。
+        # 同じ鍵で持つ行の状態: 開始を届けた（shown）／配送待ちの上限で
+        # 省いた（hidden）。_tx の値は表示名なので、そこへは混ぜられない
+        self._tx_row = {}
+        # GUI へ渡したまま、まだ処理されていない通知の件数の上限。
         # 接続と切断のたびに 1 件出るので、認証の要らない相手が接続して即切断を
         # 繰り返すと、GUI が他の処理で塞がっている間に Qt の配送キューへ際限なく
         # 積み上がる（パネルのログの行数上限が効くのは配送の後）。TFTP の
         # protocol_event と同じく、超過中は数えるだけにして、はけた時点で
         # 省略した件数を 1 行だけ出す。数え違えないよう、この信号はすべて
-        # _emit_activity から出す
+        # _emit_activity から出す。
+        # 転送の通知（開始・進捗・完了・中断）も同じカウンタに数える。
+        # 数えないと、機器が小さいファイルの RETR を連打するだけで、
+        # 接続・切断と同じようにキューへ積み上がる
         self.max_pending_notices = 1000
         self._notice_lock = threading.Lock()
         self._pending_notices = 0
         self._dropped_notices = 0
         # 自分の信号を自分でも受ける。待受スレッドから emit した分はキュー経由で
         # GUI スレッドへ届くので、呼ばれたことが「GUI が 1 件処理した」の合図
-        self.client_activity.connect(self._on_notice_delivered)
+        for signal in (self.client_activity, self.transfer_started,
+                       self.transfer_progress, self.transfer_complete,
+                       self.transfer_interrupted):
+            signal.connect(self._on_notice_delivered)
+
+    def _take_notice(self, force=False, count_drop=True):
+        """配送待ちを 1 件ぶん確保する。確保できたら True（呼び出し側が emit する）。
+
+        上限に達している間は False。count_drop なら省略件数へ足す（進捗は
+        次の進捗か完了で置き換わるので足さない）。force は上限を超えても
+        確保する（開始を届けた転送の行を閉じる通知。捨てると行が残る）
+        """
+        with self._notice_lock:
+            if not force and self._pending_notices >= self.max_pending_notices:
+                if count_drop:
+                    self._dropped_notices += 1
+                return False
+            self._pending_notices += 1
+            return True
+
+    def _take_closing_notice(self, row):
+        """完了・中断を渡すかを決める。
+
+        開始を届けた行を閉じる 1 件は必ず渡す。開始を省いた転送のものは
+        渡さずに省略件数へ足す。行の無いもの（台帳に無い＝束ねた相手が
+        先に閉じた）は上限の範囲でだけ渡す
+        """
+        if row == "shown":
+            return self._take_notice(force=True)
+        if row == "hidden":
+            with self._notice_lock:
+                self._dropped_notices += 1
+            return False
+        return self._take_notice()
 
     def _emit_activity(self, ip, message):
         """client_activity を 1 件渡す。配送待ちが上限に達している間は数えるだけ。"""
-        with self._notice_lock:
-            if self._pending_notices >= self.max_pending_notices:
-                self._dropped_notices += 1
-                return
-            self._pending_notices += 1
-        self.client_activity.emit(ip, message)
+        if self._take_notice():
+            self.client_activity.emit(ip, message)
 
     def _on_notice_delivered(self, *_args):
         """GUI が client_activity を 1 件処理したので配送待ちを戻す（GUI スレッドで動く）"""
@@ -102,21 +137,32 @@ class FTPServerManager(QObject):
                                  if i == ip and d == direction]:
             name = ftp_path
         self._tx[key] = name
-        self.transfer_started.emit(ip, name, int(total), direction)
+        shown = self._take_notice()
+        self._tx_row[key] = "shown" if shown else "hidden"
+        if shown:
+            self.transfer_started.emit(ip, name, int(total), direction)
         return name
 
     # 以下の display は、その接続が開始時に受け取った表示名（無ければ None）。
     # 台帳に鍵が無いときは basename より先にこれを使う
     def _emit_progress(self, ip, filename, done, total, direction, path=None,
                        display=None):
-        name = self._tx.get((ip, path or filename, direction), display or filename)
-        self.transfer_progress.emit(ip, name, int(done), int(total), direction)
+        key = (ip, path or filename, direction)
+        name = self._tx.get(key, display or filename)
+        # 開始を省いた転送の進捗は出さない（行が片側だけになる）。進捗は
+        # 次の進捗か完了で置き換わるので、省略件数には数えない
+        if self._tx_row.get(key) == "hidden":
+            return
+        if self._take_notice(count_drop=False):
+            self.transfer_progress.emit(ip, name, int(done), int(total), direction)
 
     def _emit_complete(self, ip, filename, done, total, direction, path=None,
                        display=None):
         # 完了で解放し次の転送は新規行に
-        name = self._tx.pop((ip, path or filename, direction), display or filename)
-        self.transfer_complete.emit(ip, name, int(done), int(total), direction)
+        key = (ip, path or filename, direction)
+        name = self._tx.pop(key, display or filename)
+        if self._take_closing_notice(self._tx_row.pop(key, None)):
+            self.transfer_complete.emit(ip, name, int(done), int(total), direction)
 
     def _emit_interrupted(self, ip, filename, direction, path=None, display=None):
         """未完了で終わった転送（ABOR・接続断・停止）を通知する。
@@ -124,8 +170,10 @@ class FTPServerManager(QObject):
         完了と同じく鍵を解放する。残したままにすると、進行中の表示が
         そのまま残り、同じファイルの再試行が開始として通知されない。
         """
-        name = self._tx.pop((ip, path or filename, direction), display or filename)
-        self.transfer_interrupted.emit(ip, name, direction)
+        key = (ip, path or filename, direction)
+        name = self._tx.pop(key, display or filename)
+        if self._take_closing_notice(self._tx_row.pop(key, None)):
+            self.transfer_interrupted.emit(ip, name, direction)
 
     # 匿名に与える権限。認証ユーザー用の "elradfmwMT" を使い回すと、
     # 資格情報なしでルート配下を上書き・削除・改名・フォルダ作成できる。
@@ -396,6 +444,7 @@ class FTPServerManager(QObject):
                 self._thread = thread
         self.is_running = False
         self._tx.clear()
+        self._tx_row.clear()
         self.stopped.emit()
 
     def fix_firewall(self, port=21, passive_ports=(50100, 50150)):
