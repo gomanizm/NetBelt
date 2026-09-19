@@ -141,6 +141,36 @@ class TFTPServer:
         # これにも上限を設け、埋まっていれば待たずに閉じる
         self._dallying = []
         self.max_dallying = 64
+        # 書き込み中の保存先（正規化した実パス）。同じ保存先へ 2 本の WRQ が
+        # 同時に走ると、各ワーカーが独立に open(target, "wb") して 1 つの
+        # ファイルへ交互に書き込み、どちらの機器にも「成功」を返しながら
+        # 中身だけが混ざる。後から確立しようとした方はここで断る
+        self._wrq_targets = set()
+        self._targets_lock = threading.Lock()
+
+    @staticmethod
+    def _target_key(target):
+        """保存先を比べるための鍵。
+
+        _safe_join が realpath 済みの実パスを渡してくる（リンク・ジャンクションと、
+        既存ファイルの 8.3 形式の短縮名はそこで解決される）。Windows は
+        大文字小文字を区別しないので normcase で揃える。
+        """
+        return os.path.normcase(target)
+
+    def _reserve_target(self, target):
+        """保存先を 1 本の WRQ に予約する。取れたら True、先客がいれば False"""
+        key = self._target_key(target)
+        with self._targets_lock:
+            if key in self._wrq_targets:
+                return False
+            self._wrq_targets.add(key)
+            return True
+
+    def _release_target(self, target):
+        """保存先の予約を外す（取れていなくても呼んでよい）"""
+        with self._targets_lock:
+            self._wrq_targets.discard(self._target_key(target))
 
     def start(self):
         os.makedirs(self.root_dir, exist_ok=True)
@@ -320,6 +350,7 @@ class TFTPServer:
         last_ack = first_ack
         last_prog = 0.0
         established = False
+        reserved = False
         f = None
         # netascii は回線上の CR LF / CR NUL を復号して保存する（octet は素通し）
         decoder = _NetasciiDecoder() if mode == "netascii" else None
@@ -374,6 +405,21 @@ class TFTPServer:
                 chunk = data[4:]
                 if block == expected:
                     if not established:
+                        # 予約は確立時（最初の DATA を受けたとき）に取る。
+                        # 要求を受けた時点で取ると、機器が WRQ を再送した
+                        # ときの敗者スレッドまで断ってしまう（敗者には
+                        # DATA が来ないので、ここまで来ない）
+                        if not self._reserve_target(target):
+                            _err(xs, addr, 0,
+                                 "File busy: another upload is writing it")
+                            # ファイル名は空で渡す。同じ (ip, filename, 方向)
+                            # で走っている本物の転送の行を、この通知で
+                            # 閉じてしまわないようにする
+                            self.on_event("protocol_error", addr[0],
+                                          ("", "他の転送が書き込み中のため断りました: %s"
+                                           % filename, "upload"))
+                            return
+                        reserved = True
                         established = True
                         f = open(target, "wb")
                         self.on_event("transfer_started", addr[0], (filename, total, "upload"))
@@ -406,6 +452,11 @@ class TFTPServer:
                     expected = (expected + 1) & 0xFFFF
                 else:
                     xs.sendto(struct.pack("!HH", OP_ACK, block), addr)  # 重複 DATA へ再 ACK
+            # 書き込みは終わっている。最終 ACK の後の待ち（_dally）まで
+            # 予約を握ると、同じファイルをすぐ置き直す機器を断ってしまう
+            if reserved:
+                self._release_target(target)
+                reserved = False
             self.on_event("transfer_complete", addr[0], (filename, received, total, "upload"))
             # 最終 ACK が落ちたときの再送に応えられるよう、閉じる前に少し待つ。
             # 待つ間は同時転送の枠を空ける（待ちの枠が埋まっていれば待たない）
@@ -424,6 +475,10 @@ class TFTPServer:
         finally:
             if f:
                 f.close()
+            # 成功・失敗・停止・相手の ERROR・タイムアウトのどれで終わっても
+            # 必ず外す。残すと、その保存先へ二度と書けなくなる
+            if reserved:
+                self._release_target(target)
             xs.close()
 
     def _transfer_timeout(self, xs, neg):
