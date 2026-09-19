@@ -11,7 +11,7 @@ from typing import Dict, Optional
 # MIB 解析器の版。抽出・解決の規則を変えたら上げる。mib_cache.json は
 # この値も鍵にするので、古い解析器が作ったキャッシュがアプリの更新後に
 # そのまま使われることがなくなる。
-MIB_PARSER_VERSION = '2026-09-19.2'
+MIB_PARSER_VERSION = '2026-09-20.1'
 
 
 def app_dir() -> str:
@@ -453,8 +453,12 @@ class MIBResolver:
                 i += 1
         return ''.join(out)
 
-    # モジュール名。`FOO-MIB DEFINITIONS ::= BEGIN` の FOO-MIB
-    _MIB_MODULE_HEADER = r'^[ \t]*([\w-]+)\s+DEFINITIONS\b'
+    # モジュール名。`FOO-MIB DEFINITIONS ::= BEGIN` の FOO-MIB。
+    # 行頭の BOM（U+FEFF）も空白と同じく読み飛ばす。BOM 付きの MIB を
+    # 連結すると各モジュールの先頭に BOM が残り、見出しを見落として
+    # 複数のモジュールが 1 つに混ざる（実測）。utf-8-sig で開いても
+    # 消えるのはファイル先頭の BOM だけなので、ここで許す。
+    _MIB_MODULE_HEADER = r'^[ \t\ufeff]*([\w-]+)\s+DEFINITIONS\b'
 
     def _extract_mib_definitions(self, filepath: str) -> list:
         """
