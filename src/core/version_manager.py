@@ -866,9 +866,12 @@ class VersionManager:
         # わけにはいかない（検証を通っていないものを適用してしまう）。
         # 掃除だけはここで面倒を見る。まだ書いている最中かもしれないので、
         # ZIP と同じく古くなったものだけを対象にする。
+        # 書きかけの傍らの控え（.part.sha256 / .part.version）と、取り直しの
+        # 退避名（.prev.part とその控え）も同じ扱い。確定の途中でプロセスが
+        # 終わると残り、'.part' だけを見ていた以前は控えが残り続けていた。
         try:
             for filename in os.listdir(self.UPDATE_DIR):
-                if not filename.endswith('.part'):
+                if not filename.endswith(('.part', '.part.sha256', '.part.version')):
                     continue
                 part_path = os.path.join(self.UPDATE_DIR, filename)
                 try:
