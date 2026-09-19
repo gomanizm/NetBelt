@@ -11,7 +11,7 @@ from typing import Dict, Optional
 # MIB 解析器の版。抽出・解決の規則を変えたら上げる。mib_cache.json は
 # この値も鍵にするので、古い解析器が作ったキャッシュがアプリの更新後に
 # そのまま使われることがなくなる。
-MIB_PARSER_VERSION = '2026-09-15.1'
+MIB_PARSER_VERSION = '2026-09-19.1'
 
 
 def app_dir() -> str:
@@ -430,7 +430,8 @@ class MIBResolver:
         ここでは OID へ解決しない。親が別のファイルで定義されていることが
         普通にあるため、解決は全ファイルを読み終えてからまとめて行う。
 
-        モジュール名は `X DEFINITIONS ::= BEGIN` の X。無いファイルは
+        モジュール名は `X DEFINITIONS ::= BEGIN` の X（見出しが複数ある
+        ファイルは、その定義が書かれた区間の X）。無いファイルは
         ファイル名をモジュール名の代わりにする（ファイル単位の名前空間）。
 
         Args:
@@ -445,16 +446,30 @@ class MIBResolver:
         try:
             with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
                 content = self._blank_comments_and_strings(f.read())
-            header = re.search(self._MIB_MODULE_HEADER, content, re.MULTILINE)
-            module = header.group(1) if header else os.path.basename(filepath)
-            for pattern in self._MIB_DEFINITION_PATTERNS:
-                # DOTALL が要る。定義は複数行にまたがるので、`.` が改行を
-                # 拾わないと型キーワードから ::= まで届かない
-                for match in re.finditer(pattern, content,
-                                         re.MULTILINE | re.DOTALL):
-                    definitions.append(
-                        (match.group(1), match.group(2), match.group(3),
-                         module))
+            # 1 ファイルに複数のモジュールを連結して配る MIB があるので、
+            # 見出しの位置ごとに本文を区切り、区間ごとにそのモジュール名を
+            # 付ける。ファイル全体に最初の見出しの名前を付けると、2 つの
+            # モジュールが同じ名前を定義したとき同じモジュールの同名として
+            # 後勝ちになり、片方の子がもう一方の親に付く（実測）。最初の
+            # 見出しより前は、これまでどおり最初のモジュールに含める。
+            headers = list(re.finditer(self._MIB_MODULE_HEADER, content,
+                                       re.MULTILINE))
+            if headers:
+                bounds = ([0] + [h.start() for h in headers[1:]]
+                          + [len(content)])
+                sections = [(h.group(1), content[bounds[i]:bounds[i + 1]])
+                            for i, h in enumerate(headers)]
+            else:
+                sections = [(os.path.basename(filepath), content)]
+            for module, text in sections:
+                for pattern in self._MIB_DEFINITION_PATTERNS:
+                    # DOTALL が要る。定義は複数行にまたがるので、`.` が改行を
+                    # 拾わないと型キーワードから ::= まで届かない
+                    for match in re.finditer(pattern, text,
+                                             re.MULTILINE | re.DOTALL):
+                        definitions.append(
+                            (match.group(1), match.group(2), match.group(3),
+                             module))
         except Exception as e:
             print(f"[MIBResolver] MIBファイル解析エラー: {str(e)}")
 
