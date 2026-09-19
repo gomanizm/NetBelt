@@ -97,13 +97,29 @@ class PendingUpdateQuitTest(unittest.TestCase):
         return zip_path
 
     def _run_event_loop_with_watchdog(self, seconds=2.0):
-        """exec() を回し、上限を過ぎたら 42 で抜ける。戻り値と経過秒を返す。"""
-        from PyQt6.QtCore import QTimer
+        """exec() を回し、上限を過ぎたら 42 で抜ける。戻り値と経過秒を返す。
+
+        見張りは戻る前に止める。singleShot で仕掛けたままにすると、exec() が
+        先に 0 で戻っても上限の時刻に exec() の外で app.exit(42) が呼ばれ、
+        同じプロセスでそのあとに回す QEventLoop.exec() がすぐ戻ってしまう。
+        exec() の中で積まれて残った終了要求（表示中のウィンドウが閉じられる
+        と Qt がもう 1 つ積む）も、あとで捌かれると同じことになるので取り除く
+        （tests/test_pending_update_watchdog_timer.py）。
+        """
+        from PyQt6.QtCore import QCoreApplication, QEvent, QTimer
         app = self.app
-        QTimer.singleShot(int(seconds * 1000), lambda: app.exit(42))
+        watchdog = QTimer()
+        watchdog.setSingleShot(True)
+        watchdog.timeout.connect(lambda: app.exit(42))
+        watchdog.start(int(seconds * 1000))
         started = time.monotonic()
-        code = app.exec()
-        return code, time.monotonic() - started
+        try:
+            code = app.exec()
+        finally:
+            watchdog.stop()
+        elapsed = time.monotonic() - started
+        QCoreApplication.removePostedEvents(app, QEvent.Type.Quit)
+        return code, elapsed
 
     def test_applying_before_exec_still_ends_the_event_loop(self):
         """exec() の前に「はい」と答えても、exec() に入った直後に終わること。
