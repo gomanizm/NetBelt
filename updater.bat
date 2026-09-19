@@ -322,18 +322,29 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
+REM 差し替えも ren と同じく待ってやり直す。xcopy が置いたばかりの
+REM 一時名の exe も、ウイルス対策ソフトなどが削除共有なしで短く開く。
+REM 1 回きりだった以前の版は、走査が 1.5 秒で終わる場合でも失敗し、
+REM 同梱の他のファイルだけが新しい版になった状態で止まっていた（実測）。
+set "MOVE_TRY=0"
+:swap_exe
+set /a MOVE_TRY+=1
 move /y "!STAGED_PATH!" "!APP_DIR!NetBelt.exe" >nul 2>&1
-if errorlevel 1 (
-    echo エラー: NetBelt.exe を差し替えられませんでした
-    echo   アプリがまだ起動したままだと、差し替えられません
-    echo   NetBelt.exe は旧版のままですが、同梱の他のファイルは
-    echo   既に新しい版へ置き換わっています。アプリを終了してから
-    echo   もう一度更新してください。
-    del "!STAGED_PATH!" 2>nul
-    rd /s /q "!TEMP_DIR!" 2>nul
-    pause
-    exit /b 1
+if not errorlevel 1 goto :swapped
+if !MOVE_TRY! lss 5 (
+    ping -n 2 127.0.0.1 >nul 2>&1
+    goto :swap_exe
 )
+echo エラー: NetBelt.exe を差し替えられませんでした
+echo   アプリがまだ起動したままだと、差し替えられません
+echo   NetBelt.exe は旧版のままですが、同梱の他のファイルは
+echo   既に新しい版へ置き換わっています。アプリを終了してから
+echo   もう一度更新してください。
+del "!STAGED_PATH!" 2>nul
+rd /s /q "!TEMP_DIR!" 2>nul
+pause
+exit /b 1
+:swapped
 if not exist "!APP_DIR!NetBelt.exe" (
     echo エラー: 更新後の NetBelt.exe が見つかりません
     echo   場所: !APP_DIR!
