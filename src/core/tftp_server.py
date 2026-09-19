@@ -354,7 +354,17 @@ class TFTPServer:
                     continue
                 retries = 0
                 deadline = time.monotonic() + timeout
-                if struct.unpack("!H", data[:2])[0] != OP_DATA:
+                op = struct.unpack("!H", data[:2])[0]
+                if op == OP_ERROR:
+                    # 相手（TID は照合済み）が転送を打ち切った。読み捨てると
+                    # タイムアウトまで ACK を再送し、ファイルも開いたままになる。
+                    # 停止要求と同じ中断の経路で終える（ACK 済みの分は finally で
+                    # 書き出す。確立前なら何も通知しない）
+                    if established:
+                        self.on_event("interrupted", addr[0],
+                                      (filename, "upload"))
+                    return
+                if op != OP_DATA:
                     continue
                 block = struct.unpack("!H", data[2:4])[0]
                 chunk = data[4:]
