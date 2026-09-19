@@ -107,6 +107,8 @@ class InteractiveTerminal(QTextEdit):
         # 区切りごとにイベントループへ譲りながら流す
         self._send_queue = []
         self._sending = False
+        # 渡した送信を接続がまだ書き終えていないかを返す関数（set_send_backlog）
+        self._send_backlog = None
         # テキストのドロップは受け付けない。選択範囲をうっかりドラッグした
         # だけで、改行ごと機器へ送られて各行が実行されていた（利用者報告）
         self.setAcceptDrops(False)
@@ -268,6 +270,22 @@ class InteractiveTerminal(QTextEdit):
         if not self._sending:
             self._drain_send_queue()
 
+    def set_send_backlog(self, backlog) -> None:
+        """接続の「まだ書き終えていない送信があるか」を返す関数を設定する（None で外す）
+
+        シリアルは送信スレッドが書くので、key_pressed で渡した時点ではまだ
+        送れていない。続けて渡すと未送信の分が接続側の列へ移り、マクロの
+        停止などで取り消せなくなる。書き終えるまで次の区切りを渡さず、
+        未送信の分をこの端末の列に残す。書き終えたら resume_send_queue を
+        呼んでもらう。
+        """
+        self._send_backlog = backlog
+
+    def resume_send_queue(self) -> None:
+        """接続が書き終えた。待たせていた送信があれば続ける"""
+        if self._sending:
+            self._drain_send_queue()
+
     def _drain_send_queue(self):
         """溜めた送信を、区切りごとにイベントループへ譲りながら流す。
 
@@ -295,6 +313,10 @@ class InteractiveTerminal(QTextEdit):
             return
 
         self._sending = True
+        # 接続がまだ前の区切りを書き終えていない（シリアルの送信スレッド）。
+        # 書き終えた知らせ（resume_send_queue）が来たら続きを渡す
+        if self._send_backlog is not None and self._send_backlog():
+            return
         entry = self._send_queue[0]
         payload = entry[0]
         chunk, rest = payload[:self.SEND_CHUNK], payload[self.SEND_CHUNK:]
@@ -743,6 +765,9 @@ class TerminalWidget(QWidget):
                     # 再接続は新しいセッション。前の画面はそのまま記録と
                     # して文書に残し、端末状態 (パーサ・画面) は作り直す
                     self._attach_screen(self._terminals[device_name])
+                    # 送信の待ち方は、これから繋ぐ接続が決める（シリアルなら
+                    # MainWindow._connect_serial が設定し直す）
+                    self._terminals[device_name].set_send_backlog(None)
                     # 再接続待ちはここでは解かない。解くのは接続できた
                     # 時点（MainWindow._on_connection_success）。ここで
                     # 解くと、再接続に失敗したときに待ちが戻らず、画面の

@@ -34,6 +34,10 @@ class SerialConnection(QObject):
     disconnected = pyqtSignal()        # 切断
     error_occurred = pyqtSignal(str)   # エラー発生
     
+    # 送信スレッドが、渡された送信を全部書き終えた（has_pending_sends が
+    # False になった）。送信スレッドから出すので、受け手へはキュー接続で届く
+    send_drained = pyqtSignal()
+    
     def __init__(self, port: str, baudrate: int = 9600, parent: Optional[QObject] = None):
         """
         初期化
@@ -333,6 +337,15 @@ class SerialConnection(QObject):
         self._ensure_write_thread()
         self._send_queue.put(command.encode('utf-8'))
 
+    def has_pending_sends(self) -> bool:
+        """送信スレッドへ渡して、まだ書き終えていない送信があるか
+
+        端末はこれが False になるまで次の区切りを渡さない。渡した分は
+        こちらの列に移って取り消せなくなるので、未送信の分を端末の送信列に
+        残しておくため（マクロやキープアライブの停止で取り除けるように）。
+        """
+        return self._send_queue.unfinished_tasks > 0
+
     def _ensure_write_thread(self):
         """送信スレッドが無ければ起こす（最初の送信時、または再接続後）"""
         thread = self._write_thread
@@ -355,23 +368,35 @@ class SerialConnection(QObject):
                 data = send_queue.get()
                 if data is None:
                     break
-                if self._should_stop or port is None or not port.is_open:
-                    continue
-                try:
-                    port.write(data)
-                    port.flush()
-                except serial.SerialException as e:
-                    # 後始末で閉じられた直後の失敗は、切断済みなので知らせない
-                    if self._should_stop:
-                        continue
-                    self.error_occurred.emit(f"送信エラー: {str(e)}")
-                    self._is_connected = False
-                except Exception as e:
-                    if self._should_stop:
-                        continue
-                    self.error_occurred.emit(f"予期しないエラー: {str(e)}")
+                self._write_one(port, data)
+                # 書き終えた（書けなかった場合も）ことを数え、列が空になったら
+                # 知らせる。端末はこれを待って次の区切りを渡す
+                send_queue.task_done()
+                if not send_queue.unfinished_tasks:
+                    try:
+                        self.send_drained.emit()
+                    except RuntimeError:
+                        pass   # 捨てられた接続（C++ 側が消えている）
         finally:
             self._finish_write_loop(port, handoff)
+
+    def _write_one(self, port, data):
+        """1 件をポートへ書く。失敗は知らせるだけで、送信スレッドは続ける"""
+        if self._should_stop or port is None or not port.is_open:
+            return
+        try:
+            port.write(data)
+            port.flush()
+        except serial.SerialException as e:
+            # 後始末で閉じられた直後の失敗は、切断済みなので知らせない
+            if self._should_stop:
+                return
+            self.error_occurred.emit(f"送信エラー: {str(e)}")
+            self._is_connected = False
+        except Exception as e:
+            if self._should_stop:
+                return
+            self.error_occurred.emit(f"予期しないエラー: {str(e)}")
 
     def _finish_write_loop(self, port, handoff):
         """送信スレッドの後始末。閉じる役を渡されていればポートを閉じる。

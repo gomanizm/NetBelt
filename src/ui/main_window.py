@@ -846,6 +846,10 @@ class MainWindow(QMainWindow):
         except TypeError:
             pass
         terminal.key_pressed.connect(serial_conn.send_command)
+        # シリアルは送信スレッドが書く。書き終えるまで端末は次を渡さず、
+        # 未送信の分を端末の列に残す（マクロの停止などで取り消せるように）
+        terminal.set_send_backlog(serial_conn.has_pending_sends)
+        serial_conn.send_drained.connect(terminal.resume_send_queue)
         
         # 接続と機器情報を保存
         self.connections[device_name] = serial_conn
