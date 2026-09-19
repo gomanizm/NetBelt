@@ -481,7 +481,22 @@ class DeviceTree(QWidget):
         # 時の機器データを再接続用に写しており、そこを更新しないと Enter に
         # よる再接続だけ旧ボーレートのまま繋がる
         self.serial_baudrate_changed.emit(port, baudrate)
-    
+
+    def restore_baudrate(self, port: str, baudrate: int):
+        """ポートが拒んだボーレートの表示を、実際の値へ戻す
+
+        _set_baudrate は選んだ値を先に覚えて表示し直す。ポートがその値を
+        拒むと、チェックと次の接続が使えない値のまま残るので、MainWindow が
+        実際の値で呼び直す。serial_baudrate_changed は出さない（出すと
+        開いている接続へもう一度同じ値を設定しにいく）。
+
+        Args:
+            port: ポート名
+            baudrate: 実際に使っているボーレート
+        """
+        self._serial_port_baudrates[port] = baudrate
+        self.refresh_serial_ports()
+
     def _on_item_double_clicked(self, item: QTreeWidgetItem, column: int):
         """
         アイテムがダブルクリックされたときの処理

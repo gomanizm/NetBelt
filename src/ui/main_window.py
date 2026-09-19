@@ -1059,6 +1059,9 @@ class MainWindow(QMainWindow):
         # 再接続に失敗したときに待ちが戻らず、画面に残る「Enterキーを
         # 押すと再接続します」の案内どおりに操作できなくなる
         terminal.set_reconnect_mode(False)
+        # 開いている途中に変えたボーレートをポートが拒んでいたら、ツリーと
+        # 再接続用の写しを実際の速度へ戻す
+        self._restore_serial_baudrate(device_name, conn)
         # グループの自動実行コマンドをGUIスレッドで送信する
         self.run_auto_commands_requested.emit(device_name)
         
@@ -1252,10 +1255,34 @@ class MainWindow(QMainWindow):
             else:
                 # 接続は生きているので切らない。ポートが拒むのは、アダプタが
                 # その速度に対応していないか、抜かれた場合で、どちらも繋ぎ
-                # 直して直るとは限らないので、起きたことだけを伝える
+                # 直して直るとは限らないので、起きたことだけを伝える。
+                # ツリーと再接続用の写しは、接続が使っている値へ戻す
+                self._restore_serial_baudrate(device_name, conn)
                 self.status_bar.showMessage(
                     f"{device_name}: ボーレートを {baudrate} baud に変更できませんでした"
                     "（接続は元のボーレートのままです）")
+
+    def _restore_serial_baudrate(self, device_name: str, conn) -> None:
+        """自動検出の機器のツリーと再接続用の写しを、接続が使っている速度へ戻す
+
+        ポートがボーレートの変更を拒むと、接続は元の速度のまま（conn.baudrate
+        も元の値）なのに、ツリーのチェックと device_info は選んだ値のまま
+        残る。Enter の再接続はその値で開こうとして失敗する。開いている途中の
+        変更が拒まれた場合は、connect() が conn.baudrate を開いたときの値へ
+        戻しているので、接続できたときにも呼ぶ。
+
+        Args:
+            device_name: 機器名
+            conn: その機器の接続（baudrate を持たない接続では何もしない）
+        """
+        actual = getattr(conn, 'baudrate', None)
+        device_data = self.device_info.get(device_name)
+        if (actual is None or not isinstance(device_data, dict)
+                or device_data.get('source') != 'autodetect'
+                or device_data.get('baudrate') == actual):
+            return
+        device_data['baudrate'] = actual
+        self.device_tree.restore_baudrate(device_data.get('port'), actual)
 
     def _run_auto_commands(self, device_name: str):
         """接続先グループの自動実行コマンドを送信する(GUIスレッドで実行)"""
