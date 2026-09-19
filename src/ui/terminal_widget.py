@@ -1600,9 +1600,17 @@ class TerminalWidget(QWidget):
             if device_name in self._log_files:
                 text = pending.take()
             else:
-                # 停止した記録だけが残っているなら、その区間の分だけ
-                text = pending.take(sum(
-                    entry[2] for entry in self._closing_logs.get(device_name, ())))
+                # 停止した記録だけが残っているなら、その区間の分だけ。
+                # 書き込みに失敗した区間（handle を外した「死んだ」区間）が
+                # 末尾にあるなら、そこは誰も受け取らないので通さない。
+                # 死んだ区間を数から単に除くのは誤り。_split_for_logs は
+                # 先頭から順に配るので、死んだ区間が前にあると後ろの生きた
+                # 区間ぶんの文字をそれが食ってしまう。生きている最後の区間
+                # までの合計を取り出す
+                entries = self._closing_logs.get(device_name, ())
+                last = max((i for i, entry in enumerate(entries)
+                            if entry[0] is not None), default=-1)
+                text = pending.take(sum(e[2] for e in entries[:last + 1]))
             self._write_logs(device_name, [
                 (target, terminal._parser.feed(piece)) for target, piece
                 in self._split_for_logs(device_name, text)])
