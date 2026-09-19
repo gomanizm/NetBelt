@@ -868,6 +868,19 @@ class TerminalWidget(QWidget):
             painter.setCharFormat(self._char_format(attr))
             offset += _u16(text)
 
+    @staticmethod
+    def _has_format(terminal: QTextEdit, start: int, length: int) -> bool:
+        """文書の start から length 文字に、書式（色・太字など）の付いた文字があるか。"""
+        fragments = terminal.document().findBlock(start).begin()
+        while not fragments.atEnd():
+            fragment = fragments.fragment()
+            if (fragment.position() < start + length
+                    and fragment.position() + fragment.length() > start
+                    and not fragment.charFormat().isEmpty()):
+                return True
+            fragments += 1
+        return False
+
     def _insert_pending(self, region: QTextCursor, pending) -> None:
         """溜めた (属性, [文字列, ...]) を、区間ごとに 1 回ずつ region へ書く。"""
         for attr, parts in pending:
@@ -995,6 +1008,15 @@ class TerminalWidget(QWidget):
                 if skip is not None and probe_text == text:
                     self._insert_pending(region, pending)
                     pending = []
+                    # 文字が同じでも書式まで同じとは限らない（同じ受信片の中で
+                    # 色を変えてから押し出した行）。色のある行か、文書側に色が
+                    # 残っている行だけ、書式を塗り直す。文字の位置は動かない
+                    # ので範囲選択は消えない。通常色どうしは塗らない（大量
+                    # 出力で毎回塗ると描画が 1 割ほど遅くなった）
+                    if (any(attr != DEFAULT for attr, _ in runs)
+                            or self._has_format(terminal, region.position(),
+                                                _u16(text))):
+                        self._paint_row(terminal, region.position(), cells)
                     region.setPosition(region.position() + skip)
                     column = 0
                     probe_text = None
