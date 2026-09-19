@@ -888,6 +888,10 @@ class TerminalWidget(QWidget):
         cut.movePosition(QTextCursor.MoveOperation.NextBlock,
                          QTextCursor.MoveMode.KeepAnchor, excess)
         cut.removeSelectedText()
+        # 捨てた事実は、捨てたここで覚える（「全ログ保存」の欠落警告に使う）。
+        # 描き終えた後の blockCount で決めていたときは、上限の手前で窓を
+        # 縦に縮めると、先頭を捨てたのに行数が上限を下回って印が立たなかった
+        terminal._log_truncated = True
 
     @staticmethod
     def _block_top(terminal: QTextEdit, cursor: QTextCursor) -> int:
@@ -940,9 +944,6 @@ class TerminalWidget(QWidget):
                 # ない。excepthook（src/main.py）は例外のあとも動き続けるので、
                 # ここで切らないと以後の受信で文書が上限を超えて伸び続ける
                 self._trim_document(terminal)
-                if (terminal.document().blockCount()
-                        >= self.MAX_DOCUMENT_BLOCKS):
-                    terminal._log_truncated = True
         self._settle_screen(terminal, bar, anchor, anchor_offset, *written)
 
     def _write_screen(self, terminal: QTextEdit, reflowed: bool):
@@ -1130,11 +1131,6 @@ class TerminalWidget(QWidget):
             bar.setValue(bar.maximum())
         else:
             bar.setValue(self._block_top(terminal, anchor) + anchor_offset)
-
-        # 上限に達していたら「切り詰めた」を立てたままにする。この後で
-        # 窓を縮めて blockCount が下回っても、捨てた行は戻らない
-        if terminal.document().blockCount() >= self.MAX_DOCUMENT_BLOCKS:
-            terminal._log_truncated = True
 
     def show_notice(self, device_name: str, text: str) -> None:
         """アプリ自身の案内 (切断バナー・エラー文) を画面へ出す。
