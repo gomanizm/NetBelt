@@ -286,11 +286,22 @@ class SyslogPanel(QWidget):
         
         self._init_ui()
     
+    def _syslog_settings(self):
+        """settings.syslog を dict で返す。
+
+        config.json は手で編集できるので、settings や syslog が null などの
+        dict でない値になっていることがある。そのまま .get を呼ぶと
+        AttributeError でパネル（ひいては MainWindow）の構築が失敗するので、
+        dict でなければ既定値（空の設定）として扱う。
+        """
+        settings = self.config_manager.config.get("settings", {})
+        section = settings.get("syslog", {}) if isinstance(settings, dict) else {}
+        return section if isinstance(section, dict) else {}
+
     def _load_config(self):
         """設定の読み込み"""
         if self.config_manager:
-            settings = self.config_manager.config.get("settings", {})
-            syslog_config = settings.get("syslog", {})
+            syslog_config = self._syslog_settings()
             self.max_messages = syslog_config.get("max_messages", 1000)
             self.auto_scroll = syslog_config.get("auto_scroll", True)
         else:
@@ -559,8 +570,7 @@ class SyslogPanel(QWidget):
     def _get_listen_port(self):
         """設定から待ち受けポートを取得"""
         if self.config_manager:
-            config = self.config_manager.config
-            return config.get("settings", {}).get("syslog", {}).get("listen_port", 514)
+            return self._syslog_settings().get("listen_port", 514)
         return 514
     
     def _toggle_pause(self):
