@@ -86,9 +86,15 @@ class FTPServerManager(QObject):
             self._emit_activity("", "表示が追いつかず %d 件の通知を省略しました" % dropped)
 
     def _emit_started(self, ip, filename, total, direction, path=None, ftp_path=None):
+        """開始を通知し、この転送の表示名を返す（束ねたときは既存の行の表示名）。
+
+        接続側はこれを覚えて、後の進捗・完了・中断に display として渡す。
+        束ねた接続の片方が先に終わると台帳の鍵が外れるので、残った接続の
+        通知を basename に戻すと、別フォルダの同名ファイルの行へ付いてしまう
+        """
         key = (ip, path or filename, direction)
         if key in self._tx:
-            return  # 既に行がある（機器の複数接続を1行に束ねる）
+            return self._tx[key]  # 既に行がある（機器の複数接続を1行に束ねる）
         # パネルは表示名で行を追跡する。同じ相手・同じ方向で別の場所の同名
         # ファイルが転送中なら、取り違えないようルートからのパスで見せる
         name = filename
@@ -97,23 +103,28 @@ class FTPServerManager(QObject):
             name = ftp_path
         self._tx[key] = name
         self.transfer_started.emit(ip, name, int(total), direction)
+        return name
 
-    def _emit_progress(self, ip, filename, done, total, direction, path=None):
-        name = self._tx.get((ip, path or filename, direction), filename)
+    # 以下の display は、その接続が開始時に受け取った表示名（無ければ None）。
+    # 台帳に鍵が無いときは basename より先にこれを使う
+    def _emit_progress(self, ip, filename, done, total, direction, path=None,
+                       display=None):
+        name = self._tx.get((ip, path or filename, direction), display or filename)
         self.transfer_progress.emit(ip, name, int(done), int(total), direction)
 
-    def _emit_complete(self, ip, filename, done, total, direction, path=None):
+    def _emit_complete(self, ip, filename, done, total, direction, path=None,
+                       display=None):
         # 完了で解放し次の転送は新規行に
-        name = self._tx.pop((ip, path or filename, direction), filename)
+        name = self._tx.pop((ip, path or filename, direction), display or filename)
         self.transfer_complete.emit(ip, name, int(done), int(total), direction)
 
-    def _emit_interrupted(self, ip, filename, direction, path=None):
+    def _emit_interrupted(self, ip, filename, direction, path=None, display=None):
         """未完了で終わった転送（ABOR・接続断・停止）を通知する。
 
         完了と同じく鍵を解放する。残したままにすると、進行中の表示が
         そのまま残り、同じファイルの再試行が開始として通知されない。
         """
-        name = self._tx.pop((ip, path or filename, direction), filename)
+        name = self._tx.pop((ip, path or filename, direction), display or filename)
         self.transfer_interrupted.emit(ip, name, direction)
 
     # 匿名に与える権限。認証ユーザー用の "elradfmwMT" を使い回すと、
@@ -202,8 +213,9 @@ class FTPServerManager(QObject):
                     except Exception: total = 0
                     self._tx_name = os.path.basename(file); self._tx_total = int(total)
                     self._tx_dir = "download"; self._tx_last = 0.0; self._tx_path = file
-                    mgr._emit_started(self.remote_ip, self._tx_name, self._tx_total, "download",
-                                      file, self.fs.fs2ftp(file))
+                    self._tx_display = mgr._emit_started(
+                        self.remote_ip, self._tx_name, self._tx_total, "download",
+                        file, self.fs.fs2ftp(file))
                 return result
 
             def ftp_STOR(self, file, mode="w"):
@@ -211,9 +223,16 @@ class FTPServerManager(QObject):
                 if result is not None:
                     self._tx_name = os.path.basename(file); self._tx_total = 0  # アップロードは総サイズ不明
                     self._tx_dir = "upload"; self._tx_last = 0.0; self._tx_path = file
-                    mgr._emit_started(self.remote_ip, self._tx_name, 0, "upload",
-                                      file, self.fs.fs2ftp(file))
+                    self._tx_display = mgr._emit_started(
+                        self.remote_ip, self._tx_name, 0, "upload",
+                        file, self.fs.fs2ftp(file))
                 return result
+
+            def _display_for(self, file):
+                """file の転送について開始時に受け取った表示名。別の転送なら None"""
+                if file is not None and getattr(self, "_tx_path", None) == file:
+                    return getattr(self, "_tx_display", None)
+                return None
 
             def _emit_tx_progress(self, done):
                 name = getattr(self, "_tx_name", None)
@@ -221,24 +240,29 @@ class FTPServerManager(QObject):
                 now = time.monotonic()
                 if now - getattr(self, "_tx_last", 0.0) < 0.2: return  # 約200msに間引き
                 self._tx_last = now
+                path = getattr(self, "_tx_path", None)
                 mgr._emit_progress(self.remote_ip, name, int(done),
                                    int(getattr(self, "_tx_total", 0)), getattr(self, "_tx_dir", "download"),
-                                   getattr(self, "_tx_path", None))
+                                   path, self._display_for(path))
 
             def on_file_sent(self, file):
                 try: total = os.path.getsize(file)
                 except OSError: total = 0
-                mgr._emit_complete(self.remote_ip, os.path.basename(file), total, total, "download", file)
+                mgr._emit_complete(self.remote_ip, os.path.basename(file), total, total, "download",
+                                   file, self._display_for(file))
             def on_file_received(self, file):
                 try: total = os.path.getsize(file)
                 except OSError: total = 0
-                mgr._emit_complete(self.remote_ip, os.path.basename(file), total, total, "upload", file)
+                mgr._emit_complete(self.remote_ip, os.path.basename(file), total, total, "upload",
+                                   file, self._display_for(file))
             # 未完了で終わったとき（ABOR・データ接続の切断・サーバ停止）。
             # pyftpdlib が DTP を閉じる際に必ずどちらかを呼ぶ
             def on_incomplete_file_sent(self, file):
-                mgr._emit_interrupted(self.remote_ip, os.path.basename(file), "download", file)
+                mgr._emit_interrupted(self.remote_ip, os.path.basename(file), "download",
+                                      file, self._display_for(file))
             def on_incomplete_file_received(self, file):
-                mgr._emit_interrupted(self.remote_ip, os.path.basename(file), "upload", file)
+                mgr._emit_interrupted(self.remote_ip, os.path.basename(file), "upload",
+                                      file, self._display_for(file))
             def on_connect(self):
                 mgr._emit_activity(self.remote_ip, "接続")
             def on_disconnect(self):
