@@ -2,6 +2,7 @@ from PyQt6.QtWidgets import QWidget, QVBoxLayout, QTextEdit, QTabWidget
 from PyQt6.QtGui import (QFont, QColor, QPalette, QKeyEvent, QContextMenuEvent,
                          QTextCursor, QTextCharFormat)
 from PyQt6.QtCore import Qt, pyqtSignal
+from collections import deque
 from itertools import groupby
 from operator import itemgetter
 from typing import Dict, Optional
@@ -38,6 +39,44 @@ ANSI_COLOURS = (
     "#0000ee", "#cd00cd", "#00cdcd", "#e5e5e5",
     "#7f7f7f", "#ff0000", "#00ff00", "#ffff00",
     "#5c5cff", "#ff00ff", "#00ffff", "#ffffff")
+
+
+class _PendingOutput:
+    """まだ描いていない受信出力。かたまりの列と、先頭のかたまりの読み始め位置で持つ。
+
+    以前は取り出すたびに全部をつなぎ、残り全体を切り出して戻していたので、
+    溜まった N 文字を描き切るまでのコピー量が N の 2 乗に比例した（実測: 32MiB で
+    4.6 秒、64MiB で 18 秒）。先頭から要る分だけを取り出す。
+    """
+
+    def __init__(self):
+        self.chunks = deque()
+        self.offset = 0     # 先頭のかたまりのうち、取り出し済みの文字数
+        self.size = 0       # まだ取り出していない文字数
+
+    def __len__(self) -> int:
+        return self.size
+
+    def append(self, text: str) -> None:
+        self.chunks.append(text)
+        self.size += len(text)
+
+    def take(self, limit: Optional[int] = None) -> str:
+        """先頭から limit 文字（省略時は全部）を取り出す"""
+        want = self.size if limit is None else min(limit, self.size)
+        self.size -= want
+        parts = []
+        while want > 0:
+            head = self.chunks[0]
+            piece = head[self.offset:self.offset + want]
+            parts.append(piece)
+            want -= len(piece)
+            if self.offset + len(piece) == len(head):
+                self.chunks.popleft()
+                self.offset = 0
+            else:
+                self.offset += len(piece)
+        return "".join(parts)
 
 
 class InteractiveTerminal(QTextEdit):
@@ -508,8 +547,8 @@ class TerminalWidget(QWidget):
         self._resize_timer.setSingleShot(True)
         self._resize_timer.setInterval(200)
         self._resize_timer.timeout.connect(self._apply_pending_resizes)
-        # まだ描いていない受信出力（機器名 -> かたまりの並び）
-        self._pending_output: Dict[str, list] = {}
+        # まだ描いていない受信出力（機器名 -> _PendingOutput。空になったら外す）
+        self._pending_output: Dict[str, _PendingOutput] = {}
         # _flush_pending_output が 1 片を渡している機器（append_output が
         # 溜まり分の後ろへ並べずに描くための目印）
         self._flushing_device = None
@@ -1246,26 +1285,26 @@ class TerminalWidget(QWidget):
         """
         if device_name not in self._terminals:
             return
-        self._pending_output.setdefault(device_name, []).append(text)
+        self._pending_output.setdefault(device_name, _PendingOutput()).append(text)
         if not self._output_timer.isActive():
             self._output_timer.start()
 
     def _flush_pending_output(self) -> None:
         """溜めた出力を機器ごとに OUTPUT_SLICE 文字まで描き、残りは次の回へ回す"""
         for device_name in list(self._pending_output):
-            chunks = self._pending_output.pop(device_name, None)
-            if not chunks or device_name not in self._terminals:
+            pending = self._pending_output.get(device_name)
+            if not pending or device_name not in self._terminals:
+                self._pending_output.pop(device_name, None)
                 continue
-            text = "".join(chunks)
-            rest = text[self.OUTPUT_SLICE:]
-            if rest:
-                # 描く前に戻しておく。描いている最中（警告のモーダルなどで
-                # イベントループが回ったとき）に届いた出力や案内は、この
-                # 描き残しの後ろに並ぶ
-                self._pending_output[device_name] = [rest]
+            text = pending.take(self.OUTPUT_SLICE)
+            if not pending:
+                # 描き残しがあれば残しておく。描いている最中（警告のモーダル
+                # などでイベントループが回ったとき）に届いた出力や案内は、
+                # この描き残しの後ろに並ぶ
+                del self._pending_output[device_name]
             self._flushing_device = device_name
             try:
-                self.append_output(device_name, text[:self.OUTPUT_SLICE])
+                self.append_output(device_name, text)
             finally:
                 self._flushing_device = None
         if self._pending_output:
@@ -1273,11 +1312,11 @@ class TerminalWidget(QWidget):
 
     def _draw_pending_now(self, device_name: str) -> None:
         """その機器の溜まり分を、いまここで全部描く（画面を付け直す前など）"""
-        chunks = self._pending_output.pop(device_name, None)
-        if chunks and device_name in self._terminals:
+        pending = self._pending_output.pop(device_name, None)
+        if pending and device_name in self._terminals:
             self._flushing_device = device_name
             try:
-                self.append_output(device_name, "".join(chunks))
+                self.append_output(device_name, pending.take())
             finally:
                 self._flushing_device = None
 
