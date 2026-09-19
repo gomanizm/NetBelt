@@ -1,7 +1,6 @@
 from PyQt6.QtWidgets import QDialog, QVBoxLayout, QLabel, QPushButton, QHBoxLayout
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer
 from datetime import datetime
-import os
 from ui import theme
 
 
@@ -13,10 +12,20 @@ class LogRecordingDialog(QDialog):
     # 2台を同時に記録しているときに別の機器の記録を打ち切ってしまう。
     stop_requested = pyqtSignal(str)
     
-    def __init__(self, device_name: str, file_path: str, parent=None):
+    def __init__(self, device_name: str, file_path: str, parent=None,
+                 size_provider=None):
+        """
+        Args:
+            device_name: 記録している機器
+            file_path: 保存先（表示に使うだけで、読みには行かない）
+            parent: 親ウィジェット
+            size_provider: 記録できたバイト数を返す関数（引数なし）。
+                記録している側が数えた値を渡す。省略時は 0 を表示する
+        """
         super().__init__(parent)
         self.device_name = device_name
         self.file_path = file_path
+        self.size_provider = size_provider
         self.start_time = datetime.now()
         
         self.setWindowTitle("ログ記録中")
@@ -94,17 +103,18 @@ class LogRecordingDialog(QDialog):
         self.elapsed_label.setText(f"経過時間: {hours:02d}:{minutes:02d}:{seconds:02d}")
     
     def _update_byte_count(self):
-        """保存先ファイルの実際の大きさを表示する
+        """記録できたバイト数を表示する（保存先は見に行かない）
 
-        受信した文字数ではなくファイルの大きさを出す。テキストモードで
+        受信した文字数ではなくファイル上のバイト数を出す。テキストモードで
         開いているので改行は CRLF になり、日本語は UTF-8 で 3 バイトになる。
-        書き込みのたびに flush しているので、ここで読む値が記録できた量。
+        数えるのは記録している側（size_provider）で、ここではファイル
+        システムを触らない。以前は 1 秒ごとに os.path.getsize を呼んで
+        いたが、共有フォルダ（SMB）へ記録していると、この 1 回が接続の
+        都合で秒単位に延びて画面全体が止まる（実測: getsize が 3 秒
+        かかると、受信が無くても 50ms の描画タイマーの最大間隔が
+        3.06 秒。基準 0.067 秒）。
         """
-        try:
-            size = os.path.getsize(self.file_path)
-        except OSError:
-            self.bytes_label.setText("記録したバイト数: 取得できません")
-            return
+        size = self.size_provider() if self.size_provider is not None else 0
         self.bytes_label.setText(f"記録したバイト数: {size:,} バイト")
 
     def _on_stop(self):

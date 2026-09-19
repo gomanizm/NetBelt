@@ -2,10 +2,14 @@
 OK 待ちのメッセージを出さないことを検証する。
 
 記録中ダイアログには保存先と経過時間しか無く、本当に書けているのかが
-見えなかった。Tera Term のように、経過時間の下へバイト数を出す。数えるのは
-保存先ファイルの実際の大きさ。ログは Windows のテキストモードで開いて
+見えなかった。Tera Term のように、経過時間の下へバイト数を出す。出すのは
+ファイル上のバイト数。ログは Windows のテキストモードで開いて
 いるので LF が CRLF になり、受信した文字数とは一致しない（実測:
 "line 000\\n" ×50 が 500 バイト）。
+
+値はダイアログが保存先を見に行くのではなく、記録している側が数えて渡す
+（size_provider）。GUI スレッドから共有フォルダの os.path.getsize を呼ぶと
+画面全体が止まるため。詳しくは test_log_recording_size_without_stat.py。
 
 また、開始時に「ログ記録開始」、停止時に「ログ記録停止」の情報ダイアログが
 1 回ずつ出ていた（実測）。複数の機器を記録していると、そのたびに OK を押す
@@ -47,9 +51,8 @@ class RecordingDialogShowsSizeTest(unittest.TestCase):
         """バイト数は経過時間のすぐ下に並ぶこと。"""
         from ui.dialogs.log_recording_dialog import LogRecordingDialog
         path = os.path.join(tempfile.mkdtemp(prefix="netbelt-logsize-"), "a.log")
-        with open(path, "wb") as f:
-            f.write(b"x" * 1234567)
-        dialog = LogRecordingDialog("lab-rtr01", path)
+        dialog = LogRecordingDialog("lab-rtr01", path,
+                                    size_provider=lambda: 1234567)
         self.addCleanup(dialog.deleteLater)
         dialog.timer.stop()
 
@@ -62,17 +65,21 @@ class RecordingDialogShowsSizeTest(unittest.TestCase):
         self.assertEqual(labels[size[0]], "記録したバイト数: 1,234,567 バイト")
 
     def test_a_missing_file_does_not_break_the_dialog(self):
-        """保存先を読めなくても落ちず、読めないことが分かる表示になること。"""
+        """保存先が読めない場所でも落ちず、数えた分をそのまま出すこと。
+
+        ダイアログは保存先を見に行かないので、読めるかどうかは表示に効かない。
+        """
         from ui.dialogs.log_recording_dialog import LogRecordingDialog
         path = os.path.join(tempfile.mkdtemp(prefix="netbelt-logsize-"),
                             "gone", "a.log")
-        dialog = LogRecordingDialog("lab-rtr01", path)
+        dialog = LogRecordingDialog("lab-rtr01", path,
+                                    size_provider=lambda: 42)
         self.addCleanup(dialog.deleteLater)
         dialog.timer.stop()
 
         dialog.timer.timeout.emit()
 
-        self.assertIn("取得できません", self._size_label(dialog))
+        self.assertEqual(self._size_label(dialog), "記録したバイト数: 42 バイト")
 
     def test_the_size_follows_what_was_written_to_the_file(self):
         """記録中に届いた出力の分だけ、表示が実ファイルの大きさへ追従すること。"""

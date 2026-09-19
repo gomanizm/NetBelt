@@ -590,6 +590,9 @@ class TerminalWidget(QWidget):
         # 記録（機器名 -> [[ハンドル, パス, 残りの文字数], ...]、停止した順）。
         # 各項目の文字数は、描き待ちの先頭から前の項目のぶんに続く区間
         self._closing_logs: Dict[str, list] = {}
+        # 記録中のファイルへ、始めてから書いたファイル上のバイト数
+        # （機器名 -> バイト数）。記録中ダイアログの表示に使う
+        self._log_bytes: Dict[str, int] = {}
         self._log_dialogs: Dict[str, object] = {}  # 機器名 -> ログ記録ダイアログ
         # ターミナルの外観設定。_create_terminal が参照するので _create_ui より先に持つ
         self._terminal_settings = dict(self.DEFAULT_TERMINAL_SETTINGS)
@@ -1340,6 +1343,10 @@ class TerminalWidget(QWidget):
             try:
                 handle.write(logged)
                 handle.flush()
+                if target is None:
+                    self._log_bytes[device_name] = (
+                        self._log_bytes.get(device_name, 0)
+                        + self._file_byte_count(logged))
             except Exception as e:
                 if target is None:
                     self._abort_log_recording(device_name, e)
@@ -1359,6 +1366,23 @@ class TerminalWidget(QWidget):
             self._closing_logs.pop(device_name, None)
         for handle, path, error in failed:
             self._close_stopped_log(device_name, handle, path, error)
+
+    @staticmethod
+    def _file_byte_count(text: str) -> int:
+        """text を記録へ書いたときに、ファイルの上で増えるバイト数
+
+        記録は open(path, 'w', encoding='utf-8') のテキストモードなので、
+        LF は os.linesep（Windows では CRLF）へ直されてから UTF-8 で
+        符号化される。記録中ダイアログは os.path.getsize を GUI スレッドで
+        呼ばない（共有フォルダだと 1 回で数秒止まる）ので、書いた側で
+        数えたこの値を見せる。
+        """
+        import os
+        return len(text.replace("\n", os.linesep).encode("utf-8"))
+
+    def recorded_bytes(self, device_name: str) -> int:
+        """その機器の記録中のファイルへ、始めてから書いたバイト数"""
+        return self._log_bytes.get(device_name, 0)
 
     def _close_stopped_log(self, device_name: str, handle, path,
                            error=None) -> None:
@@ -1467,6 +1491,7 @@ class TerminalWidget(QWidget):
 
         from core import log_recording
         handle = self._log_files.pop(device_name, None)
+        self._log_bytes.pop(device_name, None)
         # 停止して書き終えていない前の記録の登録は残す
         log_recording.stop(device_name, getattr(handle, "name", None))
         if handle is not None:
@@ -1803,6 +1828,7 @@ class TerminalWidget(QWidget):
                 # ファイルを開く
                 log_file = open(file_path, 'w', encoding='utf-8', buffering=1)  # 行バッファリング
                 self._log_files[tab_name] = log_file
+                self._log_bytes[tab_name] = 0   # 'w' で切り詰めたので 0 から
                 from core import log_recording
                 log_recording.start(tab_name, file_path)
                 
@@ -1812,7 +1838,9 @@ class TerminalWidget(QWidget):
                 
                 # ログ記録ダイアログを表示
                 from .dialogs.log_recording_dialog import LogRecordingDialog
-                dialog = LogRecordingDialog(tab_name, file_path, self)
+                dialog = LogRecordingDialog(
+                    tab_name, file_path, self,
+                    size_provider=lambda name=tab_name: self.recorded_bytes(name))
                 dialog.stop_requested.connect(self.stop_log_recording)
                 dialog.show()
                 self._log_dialogs[tab_name] = dialog
@@ -1865,6 +1893,7 @@ class TerminalWidget(QWidget):
             # ハンドルと「記録中」ダイアログが残り、記録を始め直そうとしても
             # 「既にログ記録中です。」で断られる（止める手段が無くなる）。
             handle = self._log_files.pop(tab_name)
+            self._log_bytes.pop(tab_name, None)
             from core import log_recording
             # 停止より前に受信して、まだ描いていない分がある（受信が描画を
             # 上回って溜まっている最中の停止）。受信した分は記録に入れるので、
