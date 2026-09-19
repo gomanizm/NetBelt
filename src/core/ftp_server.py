@@ -202,6 +202,10 @@ class FTPServerManager(QObject):
                 super().handle_read()
                 try: self.cmd_channel._emit_tx_progress(self.get_transmitted_bytes())
                 except Exception: pass
+            # ioloop が呼ぶのは handle_read_event。DTPHandler はクラス定義時に
+            # handle_read_event = handle_read と別名を束縛しているので、上書き
+            # した handle_read にも付け直さないと呼ばれず、STOR の進捗が出ない
+            handle_read_event = handle_read
 
         class _Handler(FTPHandler):
             dtp_handler = _ProgressDTP
