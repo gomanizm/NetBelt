@@ -632,8 +632,12 @@ class SFTPManager(QObject):
                         except TimeoutError as e:
                             raise unknown_outcome(e)
                         except IOError:
+                            # remove が断られたら最終名は残っている。消えたと
+                            # 伝えてよいのは remove が成功したときだけ
+                            final_removed = False
                             try:
                                 self.sftp_client.remove(remote_path)
+                                final_removed = True
                             except TimeoutError:   # socket.timeout の別名
                                 # IOError の仲間なので先に受ける。消せたかは
                                 # 分からず、チャンネルも以後使えない。2 本目の
@@ -653,7 +657,7 @@ class SFTPManager(QObject):
                                 # 1本目・2本目と同じ。機器側では置き換わって
                                 # いて応答だけが返らないことがあるので、
                                 # 確定した失敗として報告しない
-                                raise unknown_outcome(e, final_removed=True)
+                                raise unknown_outcome(e, final_removed=final_removed)
                             except IOError as e:
                                 keep_tmp[0] = True
                                 raise IOError(
