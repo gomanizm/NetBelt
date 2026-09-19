@@ -328,6 +328,12 @@ class SNMPPanel(QWidget):
         self.walk_button = QPushButton("WALK")
         self.walk_button.clicked.connect(self._on_walk_clicked)
         btn_layout.addWidget(self.walk_button)
+        # GET/WALK の実行中だけ出す（Trap 受信の停止ボタンと同じ出し方）。
+        # GET・WALK は押せるままにして、実行中の要求はマネージャが断る
+        self.stop_button = QPushButton("停止")
+        self.stop_button.clicked.connect(self._on_stop_clicked)
+        self.stop_button.setVisible(False)
+        btn_layout.addWidget(self.stop_button)
         btn_layout.addStretch()
         self.export_button = QPushButton("エクスポート")
         self.export_button.clicked.connect(self._on_export_clicked)
@@ -651,6 +657,7 @@ class SNMPPanel(QWidget):
             return
         self._request_host = host
         self.status_label.setText("GET実行中...")
+        self._show_stop_button(True)
     
     def _on_walk_clicked(self):
         if not self.snmp_manager:
@@ -673,7 +680,26 @@ class SNMPPanel(QWidget):
             return
         self._request_host = host
         self.status_label.setText("WALK実行中...")
-    
+        self._show_stop_button(True)
+
+    def _show_stop_button(self, running: bool):
+        """停止ボタンを、GET/WALK の実行中だけ押せる状態で出す"""
+        self.stop_button.setVisible(running)
+        self.stop_button.setEnabled(True)
+
+    def _on_stop_clicked(self):
+        """実行中の GET/WALK を止める
+
+        待っている応答は切れないので、取り消しは次の応答を受けたところで
+        効く（応答しない機器では最大約 6 秒）。それまでは「停止中…」と出し、
+        新しい要求は実行中と同じくマネージャが断る。止まると、そこまでに
+        取れた行が operation_cancelled で届く。
+        """
+        if not self.snmp_manager or not self.snmp_manager.request_cancel():
+            return   # 結果が既に届く途中。そのまま完了として表示される
+        self.stop_button.setEnabled(False)
+        self.status_label.setText("停止中…（次の応答を待ってから止まります）")
+
     def _refuse_if_recording(self, title: str, file_path: str) -> bool:
         """保存先が端末のログ記録に使われていたら断る（断ったら True）
 
@@ -1210,6 +1236,7 @@ class SNMPPanel(QWidget):
         if self.snmp_manager:
             self.snmp_manager.operation_completed.connect(self._on_operation_completed)
             self.snmp_manager.operation_partial.connect(self._on_operation_partial)
+            self.snmp_manager.operation_cancelled.connect(self._on_operation_cancelled)
             self.snmp_manager.trap_received.connect(self._on_trap_received)
             self.snmp_manager.trap_receiver_started.connect(self._on_trap_receiver_started)
             self.snmp_manager.trap_receiver_stopped.connect(self._on_trap_receiver_stopped)
@@ -1238,7 +1265,29 @@ class SNMPPanel(QWidget):
         """
         self._partial_reason = reason
 
+    # 利用者が止めた結果の、途中までの理由。書き出しの partial_reason にも入る
+    USER_CANCEL_REASON = "利用者が中断"
+
+    def _on_operation_cancelled(self, rows):
+        """利用者が止めた GET/WALK の、そこまでに取れた行を受け取る
+
+        途中で切れた WALK と同じく、全部ではないことを表示と書き出しに
+        残す。0 行でも表を置き換える。前の結果を残すと、それにこの
+        操作の「途中まで」とホストが付いて保存される。
+        """
+        self._show_stop_button(False)
+        rows = list(rows)
+        self.result_model.set_results(rows)
+        self._result_host = self._request_host
+        self._partial_reason = None
+        self._last_partial_reason = self.USER_CANCEL_REASON
+        self.status_label.setText(
+            "途中まで（%s）: %d件（全部ではありません）"
+            % (self.USER_CANCEL_REASON, len(rows)))
+
     def _on_operation_completed(self, success: bool, result):
+        # 失敗の通知（モーダル）を開く前に隠す
+        self._show_stop_button(False)
         if success:
             self.result_model.set_results(result)
             # 表の結果がどのホストのものかを、要求時の値で固定する
