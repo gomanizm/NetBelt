@@ -18,6 +18,7 @@ import gc
 import os
 import sys
 import time
+import tracemalloc
 import unittest
 
 sys.path.insert(0, "src")
@@ -68,16 +69,55 @@ class OutputQueueLinearTest(unittest.TestCase):
         return elapsed
 
     def test_draining_time_per_kib_does_not_grow_with_the_backlog(self):
-        """32MiB を描き切る手間（KiB あたり）が、8MiB のときの 2 倍に届かないこと。
+        """32MiB を描き切る手間（KiB あたり）が、4MiB のときの 4 倍に届かないこと。
 
-        直す前は 8MiB と 32MiB で 4 倍前後（手間が溜まり量に比例して増える）。
+        直す前は 4MiB と 32MiB で 8 倍前後（手間が溜まり量に比例して増える）。
+        直した後もメモリのキャッシュに収まらない分だけ大きい方が遅く、1.5〜2 倍
+        になる（8MiB と 32MiB を 2 倍で比べていたら、他のテストと同時に流した
+        混雑で 2.02 倍になって落ちた）。そのため大きさの差を 8 倍に広げ、
+        判定を 4 倍にした。溜まり量に比例するかどうかは、時間に左右されない
+        下の test_draining_never_copies_the_whole_backlog でも確かめる。
         """
         w = self._widget()
-        small = min(self._drain_seconds(w, 8) for _ in range(3)) / (8 * 1024)
+        small = min(self._drain_seconds(w, 4) for _ in range(3)) / (4 * 1024)
         large = min(self._drain_seconds(w, 32) for _ in range(2)) / (32 * 1024)
-        self.assertLess(large / small, 2.0,
-                        "溜まり量で KiB あたりの手間が増えた: 8MiB %.2fus/KiB、"
+        self.assertLess(large / small, 4.0,
+                        "溜まり量で KiB あたりの手間が増えた: 4MiB %.2fus/KiB、"
                         "32MiB %.2fus/KiB" % (small * 1e6, large * 1e6))
+
+    def test_draining_never_copies_the_whole_backlog(self):
+        """8MiB を描き切る間に確保するメモリの最大が、1 片の数倍に収まること。
+
+        直す前は毎回、溜まり全体をつないで残りを切り出していたので、最大は
+        溜まり量の 2 倍（8MiB で 16MiB）になった。確保の量は CPU の混み具合に
+        左右されない。
+        """
+        w = self._widget()
+        drawn = [0]
+
+        def count_only(device_name, text):
+            # 描いた片を控えると、その分が確保の最大に積み上がってしまう
+            w._flushing_device = None
+            drawn[0] += len(text)
+
+        w.append_output = count_only
+        for _ in range(8 * 1024 * 1024 // len(PIECE)):
+            w.queue_output("dev", PIECE)
+        w._output_timer.stop()
+        tracemalloc.start()
+        try:
+            while w._pending_output:
+                w._flush_pending_output()
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        w._output_timer.stop()
+
+        self.assertEqual(drawn[0], 8 * 1024 * 1024 // len(PIECE) * len(PIECE),
+                         "前提: 溜まりを全部描いていない")
+        self.assertLess(peak, 1024 * 1024,
+                        "描き切るまでに溜まり全体ほどのメモリを確保した: %.1fMiB"
+                        % (peak / 1048576.0))
 
     def test_slices_come_out_whole_and_in_order(self):
         """取り出す片は OUTPUT_SLICE 文字ずつで、順序も中身も変わらないこと。"""
