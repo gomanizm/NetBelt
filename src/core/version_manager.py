@@ -606,23 +606,45 @@ class VersionManager:
                 return None
 
             # 3つそろって初めて最終名にする。
-            # os.replace は宛先があっても置き換えるので、先に消さない。
             # 消してから改名していたときは、その隙に別の受信が失敗すると
             # 検証済みだった ZIP まで失われた。
+            # 同じ版を取り直すときは、既にある組をいったん退避名へ移してから
+            # 置き換え、途中で失敗したら戻す。以前は失敗すると既存の組まで
+            # 無条件に消しており、既存のファイルに触れる前の失敗（最終名の
+            # ZIP を別の NetBelt がハッシュしている等）でも、使えていた
+            # 検証済みの更新が失われていた。退避名は .part で終え、
+            # 取り残されても cleanup_old_updates が拾えるようにする。
+            moves = [(part_path, zip_path), (sha_part, zip_path + '.sha256')]
+            if version:
+                moves.append((ver_part, zip_path + '.version'))
+            stash = part_path[:-len('.part')] + '.prev.part'
+            saved = []   # (退避名, 元の名前)
+            placed = []  # 今回置いた最終名
             try:
-                os.replace(part_path, zip_path)
-                os.replace(sha_part, zip_path + '.sha256')
-                if version:
-                    os.replace(ver_part, zip_path + '.version')
+                for _, dst in moves:
+                    if os.path.exists(dst):
+                        kept = stash + dst[len(zip_path):]
+                        os.replace(dst, kept)
+                        saved.append((kept, dst))
+                for src, dst in moves:
+                    os.replace(src, dst)
+                    placed.append(dst)
             except Exception as e:
-                # 途中で失敗すると ZIP と控えが食い違う。中途半端な組は
-                # 「未適用の更新」として毎回弾かれ続けるだけなので残さない。
+                # 中途半端な組は「未適用の更新」として毎回弾かれ続けるだけ
+                # なので、今回の分は残さず、以前の組を元へ戻す。
                 print(f"[VersionManager] 更新ファイルを確定できませんでした: {e}")
-                for leftover in (part_path, sha_part, ver_part, zip_path,
-                                 zip_path + '.sha256', zip_path + '.version'):
+                for leftover in placed + [part_path, sha_part, ver_part]:
                     self._discard(leftover)
+                for kept, dst in saved:
+                    try:
+                        os.replace(kept, dst)
+                    except Exception as e2:
+                        print(f"[VersionManager] 以前の更新ファイルを戻せませんでした: {e2}")
+                        self._discard(kept)
                 return None
 
+            for kept, _ in saved:
+                self._discard(kept)
             return zip_path
         
         except Exception as e:
