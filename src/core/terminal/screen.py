@@ -558,7 +558,10 @@ class Screen(object):
         elif f == "X":
             self._erase_chars(cols_n)
         elif f == "S":
-            self._scroll_up(rows_n)
+            # 範囲の高さを超えて回すと、下端へ足した空行まで押し出して
+            # 履歴へ入れる (xterm も範囲の高さで頭打ちにする)
+            self._scroll_up(min(rows_n,
+                                self.scroll_bottom - self.scroll_top + 1))
         elif f == "T":
             self._scroll_down(rows_n)
         elif f == "r":
@@ -828,6 +831,9 @@ class Screen(object):
         """IL / DL。スクロール範囲の中でだけ効く。"""
         if not self.scroll_top <= self.cursor_row <= self.scroll_bottom:
             return
+        # 回数はカーソルから範囲の下端までの行数で頭打ち (xterm と同じ)。
+        # 超えて回すと、DL は下端へ足した空行まで押し出して履歴へ入れる
+        n = min(n, self.scroll_bottom - self.cursor_row + 1)
         for _ in range(n):
             if insert:
                 self.lines.pop(self.scroll_bottom)
