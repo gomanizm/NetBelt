@@ -2,6 +2,7 @@
 import json
 import os
 import tempfile
+import threading
 from pathlib import Path
 from typing import Dict, List, Optional
 from .crypto import PasswordCrypto
@@ -23,6 +24,13 @@ _known_hosts_import_warning = None
 
 # 引き継ぎ済みの目印。これができるまで毎回やり直す
 _IMPORT_MARKER_NAME = "known_hosts.imported"
+
+# known_hosts の読み書きを直列化する。旧 known_hosts の引き継ぎ・ホスト鍵の
+# 保存（ssh_connection._save_known_hosts）・接続前の読み込みが共有する。
+# 引き継ぎが読んだあとに別の接続が鍵を保存すると、引き継ぎの os.replace が
+# 古い内容で差し替えてその鍵を消す。Windows では差し替えの最中に読むと
+# Permission denied になり、接続が中止される
+known_hosts_lock = threading.Lock()
 
 
 def take_known_hosts_import_warning():
@@ -113,7 +121,9 @@ def app_data_dir():
         new_dir.mkdir(exist_ok=True)
     except Exception:
         pass
-    _known_hosts_import_warning = _import_legacy_known_hosts(new_dir)
+    # 目印の確認から目印の作成までを、保存・読み込みと同じ錠の中で行う
+    with known_hosts_lock:
+        _known_hosts_import_warning = _import_legacy_known_hosts(new_dir)
     return new_dir
 
 
