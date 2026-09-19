@@ -857,20 +857,37 @@ class SFTPPanel(QWidget):
         if not manager:
             return
 
+        # chmod はリンクをたどって先へ効くが、一覧の mode はリンク自身
+        # （多くは 0777）。それを初期値にすると、何も変えずに OK しただけで
+        # リンク先が 0777 になる。リンクはリンク先の値を初期値にし、適用先を
+        # ダイアログに出す。読めなければ変更しない（理由はマネージャが通知）
+        mode = file_info['mode']
+        applies_to = ""
+        is_link = bool(file_info.get('is_link'))
+        if is_link:
+            found = manager.inspect_link_target(
+                self._remote_path(base_path, file_info['name']))
+            if found is None:
+                return
+            mode, target = found
+            applies_to = ("リンク先 %s に適用されます\n" % target if target
+                          else "'%s' のリンク先に適用されます\n" % file_info['name'])
+
         # 現在のパーミッションを8進数で表示。サーバが permissions を
         # 返さなかった項目は None なので、既定値は空にする。
         # setuid / setgid / sticky を含む 4 桁で出す（& 0o777 で切ると、
         # 何も書き換えずに OK を押しただけで特殊ビットが落ちる）
-        if file_info['mode'] is None:
+        if mode is None:
             current_mode_str = ""
         else:
-            current_mode = file_info['mode'] & 0o7777
+            current_mode = mode & 0o7777
             current_mode_str = format(current_mode, '04o')  # 0o1777 -> '1777'
 
         # 新しいパーミッションを入力
         new_mode_str, ok = QInputDialog.getText(
             self,
             "パーミッション変更",
+            applies_to +
             "新しいパーミッションを8進数で入力してください:\n"
             "（例: 0755, 0644。先頭の桁は setuid/setgid/sticky で、\n"
             "3桁で入力するとこれらは落ちます）",
@@ -881,6 +898,8 @@ class SFTPPanel(QWidget):
             try:
                 # 8進数として解釈
                 new_mode = int(new_mode_str, 8)
+                if is_link and new_mode == current_mode:
+                    return   # リンク先の初期値のまま。何も送らない
                 if not self._still_on(manager):
                     self._abandon("パーミッションの変更")
                     return

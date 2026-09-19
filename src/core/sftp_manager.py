@@ -873,7 +873,51 @@ class SFTPManager(QObject):
         self.transfer_complete.emit(f"パーミッション変更完了: {os.path.basename(path)}")
         # ディレクトリ一覧を更新（ロックを離してから）
         self.list_directory(self.current_path)
-    
+
+    def inspect_link_target(self, path: str):
+        """シンボリックリンクの先の mode と名前を読む（GUI スレッドから呼ぶ）
+
+        一覧の mode はリンク自身（lstat 相当、多くは 0777）だが、chmod は
+        リンクをたどって先へ効く。それを権限変更の初期値にすると、何も
+        変えずに OK しただけでリンク先が 0777 になる。初期値に使うために
+        stat でたどり直し、ダイアログに出す名前を readlink で読む。
+
+        Returns:
+            (mode, リンク先の名前)。名前を読めない機器では名前が None。
+            リンク先を読めない（壊れたリンク・権限が無い）、転送中、
+            未接続のときは None で、理由は error_occurred で通知済み
+        """
+        if not self.is_connected or not self.sftp_client:
+            self.error_occurred.emit("SFTP接続がありません")
+            return None
+        if not self._acquire_for_gui("パーミッション変更"):
+            return None
+        err = mode = target = None
+        try:
+            mode = getattr(self.sftp_client.stat(path), "st_mode", None)
+            try:
+                target = self.sftp_client.readlink(path)
+            except TimeoutError:   # socket.timeout の別名
+                raise
+            except Exception:
+                pass   # 名前が読めなくても、権限は読めている
+        except Exception as e:
+            err = e
+        finally:
+            self._sftp_lock.release()
+        # 通知はロックを離してから（_fail が切断するときロックを取る）
+        if isinstance(err, TimeoutError):
+            self._fail("リンク先の確認エラー", err)
+            return None
+        if err is not None or not isinstance(mode, int):
+            why = (str(err) or err.__class__.__name__) if err is not None \
+                else "権限が返されませんでした"
+            self.error_occurred.emit(
+                f"'{posixpath.basename(path)}' のリンク先を読めないため、"
+                f"パーミッションを変更できません（{why}）")
+            return None
+        return mode, target
+
     def get_current_path(self) -> str:
         """
         現在のディレクトリパスを取得
