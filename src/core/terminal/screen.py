@@ -805,6 +805,11 @@ class Screen(object):
             rng = range(0, end)
         else:
             rng = range(0, len(line))
+        # 範囲の右端が全角の前半なら、後半も消えるので実際の右端は 1 つ先。
+        # _split_wide が継続セルを空白にする前に求めておく
+        stop = rng.stop
+        if stop < len(line) and line[stop][0] == "":
+            stop += 1
         # 範囲の端が全角の途中なら、その全角は丸ごと消える
         _split_wide(line, rng.start)
         _split_wide(line, rng.stop)
@@ -812,8 +817,9 @@ class Screen(object):
             line[c] = BLANK
         # 消した範囲が行の末尾まで届いたら、この行から次の行への続きは
         # 無い。EL 0 と EL 2 は必ず届く。EL 1 は普段は届かないが、
-        # カーソルが行末にあると行が丸ごと空になるので、そこでも外す
-        if rng.stop >= len(line):
+        # カーソルが行末 (行末の全角の前半を含む) にあると行が丸ごと
+        # 空になるので、そこでも外す
+        if stop >= len(line):
             self.wrapped[self.cursor_row] = False
         self.dirty.add(self.cursor_row)
         self._pending_wrap = False
