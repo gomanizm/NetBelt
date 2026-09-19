@@ -631,7 +631,23 @@ class SFTPManager(QObject):
                             self.sftp_client.rename(tmp_remote, remote_path)
                         except TimeoutError as e:
                             raise unknown_outcome(e)
-                        except IOError:
+                        except IOError as first_error:
+                            if not overwrite:
+                                # 非 posix の rename が断る理由の筆頭は
+                                # 「既にある」。上書きの確認を経ていない送信で
+                                # その失敗から最終名を消しにいくと、既存を
+                                # 潰さないための安全網を自分で外すことになる
+                                # （STAT を実装しない機器では送る直前の確認も
+                                # 「無い」と読むので、ここが最後の砦）。
+                                # 最終名には触れず、一時名に残して知らせる
+                                keep_tmp[0] = True
+                                raise IOError(
+                                    "リモートの '%s' へ置き換えられませんでした"
+                                    "（既にある可能性があります）。上書きの確認を経て"
+                                    "いないので最終名には触れていません。転送した内容は"
+                                    "機器の一時名 %s に残っています。上書きしてよければ"
+                                    "一覧を更新してからやり直してください: %s"
+                                    % (remote_name, tmp_remote, first_error))
                             # remove が断られたら最終名は残っている。消えたと
                             # 伝えてよいのは remove が成功したときだけ
                             final_removed = False

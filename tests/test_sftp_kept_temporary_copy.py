@@ -81,11 +81,17 @@ class SftpKeptTemporaryCopyTest(unittest.TestCase):
         return tmp, removed
 
     def test_the_actual_temporary_name_is_not_removed(self):
-        """put に渡した実際の一時名を後始末が消さず、その名前を知らせること。"""
+        """put に渡した実際の一時名を後始末が消さず、その名前を知らせること。
+
+        上書きの確認を経ていない送信は、rename が断られても最終名を消す
+        復旧手順へ進まなくなった（確認なしの置き換えになるため。
+        test_sftp_unconfirmed_replace_keeps_final.py）。この経路では
+        remove そのものを呼ばない。
+        """
         tmp, removed = self._fail_the_rename_after_removing_the_target(overwrite=False)
 
         self.assertNotIn(tmp, removed, "唯一の完全な写し（一時名）を消している")
-        self.assertEqual(removed, [FINAL], "最終名の remove が変わった: %s" % removed)
+        self.assertEqual(removed, [], "確認を経ていない送信が消しにいっている: %s" % removed)
         self.assertIn(tmp, self.errors[0],
                       "機器に残った一時名を知らせていない: %s" % self.errors)
 
