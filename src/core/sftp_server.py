@@ -409,9 +409,13 @@ class SFTPServerManager(QObject):
             return False
         self.server_socket = sock
 
-        # サーバースレッドを起動
-        self._stop_event.clear()
-        self.server_thread = threading.Thread(target=self._run_server, daemon=True)
+        # サーバースレッドを起動。停止フラグは起動ごとに作り直して渡す。
+        # 使い回して clear() すると、前回の stop() で抜けきらなかった
+        # 待受スレッドまで「停止していない」ことになり、新しいルート・
+        # 資格情報で接続を処理してしまう（FTP の _serve と同じ形）
+        self._stop_event = threading.Event()
+        self.server_thread = threading.Thread(
+            target=self._run_server, args=(sock, self._stop_event), daemon=True)
         self.server_thread.start()
         
         return True
@@ -497,14 +501,19 @@ class SFTPServerManager(QObject):
         self.stopped.emit()
         print("[SFTP Server] Server stopped")
     
-    def _run_server(self):
-        """サーバーのメインループ"""
+    def _run_server(self, sock, stop_event):
+        """サーバーのメインループ
+
+        sock と stop_event はこの起動のもの。停止待ちが期限切れになった後で
+        起動し直されても、self の側（新しい起動）の停止フラグやソケットは
+        見ない。
+        """
         try:
             # ソケットは start() でバインド済み
 
             # start() の直後に stop() されていたら、ここで引き返す。
             # 進むと started が stopped の後に飛び、UI が「起動中」へ戻る
-            if self._stop_event.is_set():
+            if stop_event.is_set():
                 return
 
             self.is_running = True
@@ -513,10 +522,19 @@ class SFTPServerManager(QObject):
             print(f"[SFTP Server] Root directory: {self.root_dir}")
             print(f"[SFTP Server] Username: {self.username}")
             
-            while not self._stop_event.is_set():
+            while not stop_event.is_set():
                 try:
+                    # accept は従来どおり self.server_socket に対して行う
+                    # （テストが差し替えて accept の直後を止める）。ただし
+                    # 停止フラグと同じロックの下で読む。stop() はこのロックの
+                    # 下でフラグを立てるので、読めたのは必ずこの起動のソケットで、
+                    # 起動し直した後の新しいソケットではない
+                    with self._client_lock:
+                        if stop_event.is_set():
+                            break
+                        listener = self.server_socket
                     # クライアント接続を待つ
-                    client_socket, client_addr = self.server_socket.accept()
+                    client_socket, client_addr = listener.accept()
                     # 停止判定・ソケット登録・ハンドラの起動とスレッド一覧への
                     # 追加を、すべて同じロックの下で済ませる。どこかで一度でも
                     # ロックを離すと、その隙間に stop() が入った接続は誰にも
@@ -525,7 +543,7 @@ class SFTPServerManager(QObject):
                     accepted = False
                     reject_reason = ""
                     with self._client_lock:
-                        if self._stop_event.is_set():
+                        if stop_event.is_set():
                             try:
                                 client_socket.close()
                             except OSError:
@@ -576,7 +594,7 @@ class SFTPServerManager(QObject):
                     # タイムアウトは正常（停止チェックのため）
                     continue
                 except Exception as e:
-                    if self._stop_event.is_set():
+                    if stop_event.is_set():
                         break
                     print(f"[SFTP Server] Accept error: {e}")
                     
@@ -584,9 +602,14 @@ class SFTPServerManager(QObject):
             self.error_occurred.emit(f"サーバー起動エラー: {str(e)}")
             print(f"[SFTP Server] Server error: {e}")
         finally:
-            self.is_running = False
-            if self.server_socket:
-                self.server_socket.close()
+            # 後始末はこの起動の分だけ。起動し直されていたら is_running も
+            # self.server_socket も新しい起動のものなので触らない
+            if self._stop_event is stop_event:
+                self.is_running = False
+            try:
+                sock.close()
+            except OSError:
+                pass
     
     def _handle_client(self, client_socket, client_addr):
         """クライアント接続を処理"""
