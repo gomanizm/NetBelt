@@ -701,8 +701,12 @@ class Screen(object):
                 for r in range(self.rows):
                     self._other[r] = self._blank_line()
                     self._other_wrapped[r] = False
-            if with_cursor and self._saved_main:
-                row, col, attr, g, charset, pending = self._saved_main
+            if with_cursor:
+                # 47 で入った代替画面では 1049 用の保存が無い。xterm の
+                # 1049l は CursorRestore なので、そのときはメイン画面の
+                # 保存領域 (入れ替えたあとの _saved、DECSC) から戻す
+                row, col, attr, g, charset, pending = (
+                    self._saved_main or self._saved)
                 self.attr = attr
                 self._g = dict(g)
                 self._charset = charset
