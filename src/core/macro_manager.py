@@ -51,8 +51,10 @@ class MacroManager(QObject):
                 送信先が列に溜める作りなら、cancel_callback で取り消せるように
                 印を付けて積む版を渡す。引数は (command文字列, on_sent) で、
                 その行を実際に送り出したときに on_sent() を呼ぶこと（次の行
-                までの遅延はそこから数える）
-            cancel_callback: 送信待ちのコマンドを取り消す関数（引数なし）。
+                までの遅延はそこから数える）。キープアライブの CR もこれで
+                (CR, None, "keepalive") として積む
+            cancel_callback: 送信待ちのコマンドを取り消す関数。引数なしで
+                コマンドリストの、"keepalive" でキープアライブのぶんを取り消す。
                 停止したのに、列に残ったコマンドが後から機器へ届くのを防ぐ
         """
         self._send_callbacks[device_name] = callback
@@ -99,12 +101,18 @@ class MacroManager(QObject):
         """
         キープアライブを停止
         
+        発火した CR が、長い貼り付けの排出待ちなどでまだ送られずに列に
+        残っていることがある。停止したのに後から届き、改行なしで貼った行を
+        実行してしまうので、ここで取り消す。
+
         Args:
             device_name: 機器名
         """
         if device_name in self._keepalive_timers:
             self._keepalive_timers[device_name].stop()
             del self._keepalive_timers[device_name]
+            if device_name in self._cancel_callbacks:
+                self._cancel_callbacks[device_name]("keepalive")
     
     def is_keepalive_active(self, device_name: str) -> bool:
         """
@@ -125,7 +133,10 @@ class MacroManager(QObject):
         Args:
             device_name: 機器名
         """
-        if device_name in self._send_callbacks:
+        if device_name in self._command_send_callbacks:
+            # 空のエンターを、停止で取り消せるように印を付けて積む
+            self._command_send_callbacks[device_name]("\r", None, "keepalive")
+        elif device_name in self._send_callbacks:
             # 空のエンターを送信
             self._send_callbacks[device_name]("\r")
     

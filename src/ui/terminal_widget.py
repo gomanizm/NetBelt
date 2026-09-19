@@ -227,20 +227,20 @@ class InteractiveTerminal(QTextEdit):
     # その規模なら数回で終わる。
     SEND_CHUNK = 512
 
-    def queue_macro_send(self, payload: str, on_sent=None):
-        """マクロ（コマンドリスト）の1行を送信列へ積む
+    def queue_macro_send(self, payload: str, on_sent=None, origin: str = "macro"):
+        """マクロ（コマンドリスト）の1行やキープアライブの CR を送信列へ積む
 
-        マクロ由来という印を付けておく。停止したときに、まだ送っていない
-        ぶんだけを cancel_macro_sends で取り消せるようにするため。
+        由来（origin: "macro" / "keepalive"）の印を付けておく。停止したときに、
+        まだ送っていないぶんだけを cancel_macro_sends で取り消せるようにするため。
 
         on_sent は、その行を機器へ送り出したとき（シリアルは送信スレッドが
         書き終えたとき）に呼ぶ。積んだ時点ではなくここから次の行までの
         遅延を数えないと、長い貼り付けの後ろで待つ間に遅延が過ぎてしまう。
         """
-        self._queue_send(payload, from_macro=True, on_sent=on_sent)
+        self._queue_send(payload, origin=origin, on_sent=on_sent)
 
-    def cancel_macro_sends(self):
-        """まだ送っていないマクロ由来の断片を送信列から取り除く
+    def cancel_macro_sends(self, origin: str = "macro"):
+        """まだ送っていない、その由来（queue_macro_send の origin）の断片を送信列から取り除く
 
         停止したのに、貼り付けの排出待ちで列に残っていたコマンドが
         後から機器へ届くのを防ぐ。打鍵や貼り付けは巻き添えにしない。
@@ -252,10 +252,11 @@ class InteractiveTerminal(QTextEdit):
         """
         self._send_queue = [
             entry for entry in self._send_queue
-            if not entry[1] or entry[2]
+            if entry[1] != origin or entry[2]
         ]
 
-    def _queue_send(self, payload: str, from_macro: bool = False, on_sent=None):
+    def _queue_send(self, payload: str, origin: Optional[str] = None,
+                    on_sent=None):
         """機器へ送るものを列の末尾へ積む
 
         機器へ向かうものは、貼り付けも打鍵も IME の確定も問い合わせへの
@@ -270,9 +271,10 @@ class InteractiveTerminal(QTextEdit):
         """
         if not payload:
             return
-        # [送る文字列, マクロ由来か, 送り始めたか, 送り出したら呼ぶもの] の
-        # 形で積む。停止のときに由来で選り分け、送りかけの行だけは残す
-        self._send_queue.append([payload, from_macro, False, on_sent])
+        # [送る文字列, 由来（打鍵・貼り付けは None）, 送り始めたか,
+        # 送り出したら呼ぶもの] の形で積む。停止のときに由来で選り分け、
+        # 送りかけの行だけは残す
+        self._send_queue.append([payload, origin, False, on_sent])
         if not self._sending:
             self._drain_send_queue()
 
