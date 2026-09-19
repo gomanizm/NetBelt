@@ -14,6 +14,7 @@ LAN 越しの SSH で巨大なファイルを cat したときなど、数十 MB
 溜まりを「かたまりの列 + 先頭のかたまりの読み始め位置」で持ち、先頭から
 描く分だけを取り出すようにした（全体をつないだり残りを切り出したりしない）。
 """
+import gc
 import os
 import sys
 import time
@@ -52,21 +53,31 @@ class OutputQueueLinearTest(unittest.TestCase):
             w.queue_output("dev", PIECE)
         w._output_timer.stop()
         del self.drawn[:]
-        started = time.perf_counter()
-        while w._pending_output:
-            w._flush_pending_output()
-        elapsed = time.perf_counter() - started
+        # 測っている間は GC を止める。全テストを続けて流すと生きている
+        # オブジェクトが多く、途中で走った GC の時間が測定を乱した
+        # （4MiB の排出は 1ms 足らずなので、1 回で比が 2 倍を超えた）
+        gc.disable()
+        try:
+            started = time.perf_counter()
+            while w._pending_output:
+                w._flush_pending_output()
+            elapsed = time.perf_counter() - started
+        finally:
+            gc.enable()
         w._output_timer.stop()
         return elapsed
 
     def test_draining_time_per_kib_does_not_grow_with_the_backlog(self):
-        """32MiB を描き切る手間（KiB あたり）が、4MiB のときの 2 倍に届かないこと。"""
+        """32MiB を描き切る手間（KiB あたり）が、8MiB のときの 2 倍に届かないこと。
+
+        直す前は 8MiB と 32MiB で 4 倍前後（手間が溜まり量に比例して増える）。
+        """
         w = self._widget()
-        small = min(self._drain_seconds(w, 4) for _ in range(3)) / (4 * 1024)
+        small = min(self._drain_seconds(w, 8) for _ in range(3)) / (8 * 1024)
         large = min(self._drain_seconds(w, 32) for _ in range(2)) / (32 * 1024)
         self.assertLess(large / small, 2.0,
-                        "溜まり量で KiB あたりの手間が増えた: 4MiB %.1fus/KiB、"
-                        "32MiB %.1fus/KiB" % (small * 1e6, large * 1e6))
+                        "溜まり量で KiB あたりの手間が増えた: 8MiB %.2fus/KiB、"
+                        "32MiB %.2fus/KiB" % (small * 1e6, large * 1e6))
 
     def test_slices_come_out_whole_and_in_order(self):
         """取り出す片は OUTPUT_SLICE 文字ずつで、順序も中身も変わらないこと。"""
