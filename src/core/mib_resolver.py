@@ -298,6 +298,7 @@ class MIBResolver:
             # 1 ファイルずつ閉じて解決すると、そこにぶら下がる定義が全滅する。
             all_definitions = []
             per_file = {}
+            unread = set()
             for filename in current_files.keys():
                 filepath = os.path.join(mibs_dir, filename)
                 try:
@@ -305,6 +306,9 @@ class MIBResolver:
                     per_file[filename] = definitions
                     all_definitions.extend(definitions)
                 except Exception as e:
+                    # 読めなかったファイルは files に記録しない。記録すると
+                    # 次の起動で mtime が一致して欠けたキャッシュが使われる
+                    unread.add(filename)
                     print(f"[MIBResolver] {filename} エラー: {str(e)}")
 
             cached_mibs = self._resolve_definitions(all_definitions)
@@ -318,7 +322,9 @@ class MIBResolver:
                 cache_data = {
                     'parser': MIB_PARSER_VERSION,
                     'custom': custom_fingerprint,
-                    'files': current_files,
+                    'files': {name: stamp
+                              for name, stamp in current_files.items()
+                              if name not in unread},
                     'mibs': cached_mibs
                 }
                 with open(cache_file, 'w', encoding='utf-8') as f:
@@ -439,6 +445,9 @@ class MIBResolver:
 
         Returns:
             (名前, 親の名前, 添字, モジュール名) のリスト
+
+        Raises:
+            OSError: ファイルを読めなかったとき
         """
         import re
 
@@ -470,6 +479,11 @@ class MIBResolver:
                         definitions.append(
                             (match.group(1), match.group(2), match.group(3),
                              module))
+        except OSError:
+            # 読めなかった（排他ロック・ACL など）ことは空の結果にせず、
+            # 呼び出し側へ返す。空で返すと解析済みとして mtime ごと
+            # キャッシュに記録され、読めるようになっても再解析されない。
+            raise
         except Exception as e:
             print(f"[MIBResolver] MIBファイル解析エラー: {str(e)}")
 
