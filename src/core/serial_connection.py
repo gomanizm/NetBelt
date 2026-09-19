@@ -107,17 +107,27 @@ class SerialConnection(QObject):
                 port.close()
                 return False
 
+            refused = None
             with self._baud_lock:
                 self.serial_conn = port
                 # 開いている最中に set_baudrate されていたら、開くときに
                 # 使った値は古い。開き終えたポートへ合わせ直す
-                if self.baudrate != opened_at:
-                    self._apply_baudrate(port, self.baudrate)
+                if (self.baudrate != opened_at
+                        and not self._apply_baudrate(port, self.baudrate)):
+                    # ポートは開いたときの速度のまま。新しい値を名乗ると、
+                    # 文字化けしているのに接続メッセージが違う速度を示す
+                    refused = self.baudrate
+                    self.baudrate = opened_at
             self._is_connected = True
             
             # 接続成功メッセージ
             self.output_received.emit(
                 f"\r\n接続しました: {self.port} ({self.baudrate} baud)\r\n")
+            if refused is not None:
+                # 接続済みで拒まれたときと同じく、接続は保ってそう知らせる
+                self.output_received.emit(
+                    f"ボーレートを {refused} baud に変更できなかったため、"
+                    f"{self.baudrate} baud のままです\r\n")
             self.connected.emit()
             
             # 読み取りスレッドを開始
