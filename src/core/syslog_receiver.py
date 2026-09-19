@@ -540,13 +540,26 @@ class SyslogReceiver(QObject):
     # PRI（"<"）で始まるので、改行区切りの行が数字で始まる場合と区別できる
     _OCTET_COUNT_RE = re.compile(rb"^(\d{1,9}) <")
 
+    @staticmethod
+    def _find_line_end(buffer):
+        """改行区切りの終端（LF と NUL の早い方）の位置を返す。無ければ -1。
+
+        NUL は RFC 6587 3.4.2 が触れている非透過フレーミングの終端で、
+        Python 標準の SysLogHandler(socktype=SOCK_STREAM) は LF の代わりに
+        これを付ける。NUL は次の LF の手前までだけ探す（行ごとに受信
+        バッファの末尾まで走査しない）。
+        """
+        lf = buffer.find(b"\n")
+        nul = buffer.find(b"\x00", 0, len(buffer) if lf == -1 else lf)
+        return lf if nul == -1 else nul
+
     def _emit_tcp_line(self, line, client_ip, listen_port, octet_counted=False):
         """TCP で切り出した 1 メッセージを配信する（空行は捨てる）
 
         octet_counted=True（RFC 6587 §3.4.1）は宣言された長さぶんがそのまま
         本文なので、末尾の空白・タブ・NEL(U+0085)・NBSP(U+00A0) も原文のまま
         残す。両端を落とすと raw_message が受信原文と一致しなくなる。
-        改行区切り（§3.4.2）の LF は切り出しの時点で落ちているので、落とすのは
+        改行区切り（§3.4.2）の終端（LF / NUL）は切り出しの時点で落ちているので、落とすのは
         CRLF の CR 1 個だけにし、本文末尾の空白は残す。先頭の空白は、PRI の
         解釈を変えないよう従来どおり落とす。
         """
@@ -613,7 +626,8 @@ class SyslogReceiver(QObject):
                         # 「改行がまだ来ていないとき」に限ると、上限を超えた行が
                         # 終端の改行ごと 1 回の recv で届いた場合に素通りする。
                         # 見るのは受信バッファ全体ではなく、次の改行までの長さ。
-                        newline_at = buffer.find(b"\n")
+                        # 終端は LF と NUL の早い方（_find_line_end）
+                        newline_at = self._find_line_end(buffer)
                         if newline_at == -1:
                             current_line = len(buffer)
                             # LF がまだ届いていないだけの CRLF も同じ扱いにする。
@@ -633,7 +647,7 @@ class SyslogReceiver(QObject):
                             break
                         if newline_at == -1:
                             break
-                        line, buffer = buffer.split(b"\n", 1)
+                        line, buffer = buffer[:newline_at], buffer[newline_at + 1:]
                         self._emit_tcp_line(line, client_ip, listen_port)
                     if too_long:
                         # 一覧に並ぶので、機器からの行と同じ RFC 3164 の形で
