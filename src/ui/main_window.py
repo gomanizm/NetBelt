@@ -2340,7 +2340,8 @@ for details.
         # 確認のあとも updater.bat が開き直すまでには間があるので、確かめた
         # 写しを作り、updater.bat にはそのパスを渡す（stage_for_apply の
         # 説明を参照）
-        staged_path, problem = VersionManager().stage_for_apply(
+        version_mgr = VersionManager()
+        staged_path, problem = version_mgr.stage_for_apply(
             zip_path, expected_version)
         if problem:
             QMessageBox.warning(self, "エラー", problem)
@@ -2363,16 +2364,10 @@ for details.
         print(f"[MainWindow] updater.bat exists: {os.path.exists(updater_path)}")
         
         try:
-            import subprocess
-            from core.version_manager import updater_command, updater_env
-            # リストで渡すと、パスの , や = で引数が途中で切れる
-            # （updater_command の説明を参照）
-            subprocess.Popen(
-                updater_command(updater_path, staged_path, app_path),
-                creationflags=subprocess.CREATE_NEW_CONSOLE,
-                env=updater_env()
-            )
-            
+            # 起動できなければ、写しを片付けてから例外が戻ってくる
+            # （更新ダイアログと同じ VersionManager.launch_updater を通す）
+            version_mgr.launch_updater(updater_path, staged_path, app_path)
+
             # アプリケーションを終了する。ここは MainWindow.__init__
             # （起動時の未適用更新）から呼ばれることがあり、その時点では
             # app.exec() がまだ始まっていない。イベントループが回って

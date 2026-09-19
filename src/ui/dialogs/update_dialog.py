@@ -4,7 +4,6 @@
 
 import os
 import sys
-import subprocess
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QProgressBar, QTextEdit, QWidget, QMessageBox
@@ -12,8 +11,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QFont
 from core.version_manager import (
-    VersionManager, updater_command, updater_env, running_from_source,
-    SOURCE_RUN_MESSAGE)
+    VersionManager, running_from_source, SOURCE_RUN_MESSAGE)
 
 
 # 中止したダウンロードは、終わるまでここで生かしておく。実行中の QThread が
@@ -358,20 +356,6 @@ class UpdateDialog(QDialog):
             QMessageBox.information(self, "更新", SOURCE_RUN_MESSAGE)
             return
 
-        # 表示した版と同じものを渡す。ダウンロード先が版ごとに分かれる前は、
-        # 後から来た受信が、先に表示したダイアログの ZIP を置き換えられた。
-        # 適用時は存在確認しかしていなかったので、そのまま別の版が当たる。
-        # 同じ確認は起動時の適用経路（MainWindow._apply_pending_update）も
-        # 通る。片方だけ直る形にしないため VersionManager へまとめてある。
-        # 確認を通ってから updater.bat が ZIP を開き直すまでにも間があるので、
-        # 確かめた写しを作り、updater.bat にはそのパスを渡す
-        # （VersionManager.stage_for_apply の説明を参照）
-        staged_path, problem = VersionManager().stage_for_apply(
-            self.downloaded_zip_path, self.update_info.get('version'))
-        if problem:
-            QMessageBox.warning(self, "エラー", problem)
-            return
-
         # updater.batのパスを取得
         if getattr(sys, 'frozen', False):
             # PyInstallerでビルドされている場合
@@ -401,18 +385,30 @@ class UpdateDialog(QDialog):
                 f"updater.batが見つかりません。\n\nパス: {updater_path}"
             )
             return
-        
+
+        # 表示した版と同じものを渡す。ダウンロード先が版ごとに分かれる前は、
+        # 後から来た受信が、先に表示したダイアログの ZIP を置き換えられた。
+        # 適用時は存在確認しかしていなかったので、そのまま別の版が当たる。
+        # 同じ確認は起動時の適用経路（MainWindow._apply_pending_update）も
+        # 通る。片方だけ直る形にしないため VersionManager へまとめてある。
+        # 確認を通ってから updater.bat が ZIP を開き直すまでにも間があるので、
+        # 確かめた写しを作り、updater.bat にはそのパスを渡す
+        # （VersionManager.stage_for_apply の説明を参照）。
+        # 写しを作るのは updater.bat の存在を確かめた後。先に作っていたときは、
+        # 見つからずに戻るたびに写しが更新フォルダへ溜まっていた。
+        version_mgr = VersionManager()
+        staged_path, problem = version_mgr.stage_for_apply(
+            self.downloaded_zip_path, self.update_info.get('version'))
+        if problem:
+            QMessageBox.warning(self, "エラー", problem)
+            return
+
         # updater.batを起動
         try:
             # updater.bat <ZIPパス> <実行ファイルパス>
-            # リストで渡すと、パスの , や = で引数が途中で切れる
-            # （updater_command の説明を参照）
-            subprocess.Popen(
-                updater_command(updater_path, staged_path, app_path),
-                creationflags=subprocess.CREATE_NEW_CONSOLE,
-                env=updater_env()
-            )
-            
+            # 起動できなければ、写しを片付けてから例外が戻ってくる
+            version_mgr.launch_updater(updater_path, staged_path, app_path)
+
             # ダイアログを閉じる
             self.done(self.UPDATE_NOW)
             

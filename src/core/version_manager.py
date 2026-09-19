@@ -6,6 +6,7 @@ import os
 import sys
 import json
 import shutil
+import subprocess
 import tempfile
 import threading
 import requests
@@ -784,6 +785,28 @@ class VersionManager:
         """用意しかけた写しを、控えごと片付ける。"""
         for suffix in ('', '.sha256', '.version'):
             self._discard(staged + suffix)
+
+    def launch_updater(self, updater_path: str, staged_path: str,
+                       app_path: str) -> None:
+        """stage_for_apply が作った写しを渡して updater.bat を起動する。
+
+        起動できなかったとき（updater_command がパスを拒んだ・Popen の失敗）は、
+        写しを控えごと片付けてから例外を投げ直す。以前は呼び出し側が理由を
+        表示して戻るだけで、失敗のたびに配布 ZIP 1 個分の写しが更新フォルダに
+        溜まり、検証記録つきの .zip として未適用の更新の候補にも並んでいた。
+        起動元の 2 箇所（更新ダイアログと起動時の未適用更新）が同じここを
+        通るので、片方だけ直る形にならない。
+        """
+        try:
+            # リストで渡すと、パスの , や = で引数が途中で切れる
+            # （updater_command の説明を参照）
+            subprocess.Popen(
+                updater_command(updater_path, staged_path, app_path),
+                creationflags=subprocess.CREATE_NEW_CONSOLE,
+                env=updater_env())
+        except Exception:
+            self._discard_staged(staged_path)
+            raise
 
     def get_pending_update_files(self) -> list:
         """
