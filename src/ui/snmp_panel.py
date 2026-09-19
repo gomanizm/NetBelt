@@ -644,9 +644,12 @@ class SNMPPanel(QWidget):
 
         params = self._collect_request_params()
         # 受理された要求のホストだけを記録する。実行中で断られた要求の
-        # ホストまで記録すると、いま走っている要求の結果に別のホストが付く
-        if self.snmp_manager.snmp_get(host, oids, **params):
-            self._request_host = host
+        # ホストまで記録すると、いま走っている要求の結果に別のホストが付く。
+        # 断られたら表示にも触れない。断りの警告を開いている間に前の操作の
+        # 完了が届くので、閉じた後に「実行中」で上書きすることになる
+        if not self.snmp_manager.snmp_get(host, oids, **params):
+            return
+        self._request_host = host
         self.status_label.setText("GET実行中...")
     
     def _on_walk_clicked(self):
@@ -664,9 +667,11 @@ class SNMPPanel(QWidget):
             return
 
         params = self._collect_request_params()
-        # 受理された要求のホストだけを記録する（GET と同じ理由）
-        if self.snmp_manager.snmp_walk(host, oid, **params):
-            self._request_host = host
+        # 受理された要求のホストだけを記録し、断られたら表示にも触れない
+        # （GET と同じ理由）
+        if not self.snmp_manager.snmp_walk(host, oid, **params):
+            return
+        self._request_host = host
         self.status_label.setText("WALK実行中...")
     
     def _refuse_if_recording(self, title: str, file_path: str) -> bool:
