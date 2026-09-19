@@ -249,24 +249,38 @@ class FTPServerManager(QObject):
                                    int(getattr(self, "_tx_total", 0)), getattr(self, "_tx_dir", "download"),
                                    path, self._display_for(path))
 
+            def _forget_tx(self):
+                """終わった転送を制御接続から降ろす。
+
+                進捗はデータチャネルの送受信ごとに出るが、ftp_STOR を
+                通らないデータ転送（名前をサーバが決める STOU、一覧の
+                LIST / NLST）もある。消さずに残すと、それらの進捗が
+                直前に終わった転送の名前・方向で出てしまう
+                """
+                self._tx_name = None; self._tx_path = None
+
             def on_file_sent(self, file):
                 try: total = os.path.getsize(file)
                 except OSError: total = 0
                 mgr._emit_complete(self.remote_ip, os.path.basename(file), total, total, "download",
                                    file, self._display_for(file))
+                self._forget_tx()
             def on_file_received(self, file):
                 try: total = os.path.getsize(file)
                 except OSError: total = 0
                 mgr._emit_complete(self.remote_ip, os.path.basename(file), total, total, "upload",
                                    file, self._display_for(file))
+                self._forget_tx()
             # 未完了で終わったとき（ABOR・データ接続の切断・サーバ停止）。
             # pyftpdlib が DTP を閉じる際に必ずどちらかを呼ぶ
             def on_incomplete_file_sent(self, file):
                 mgr._emit_interrupted(self.remote_ip, os.path.basename(file), "download",
                                       file, self._display_for(file))
+                self._forget_tx()
             def on_incomplete_file_received(self, file):
                 mgr._emit_interrupted(self.remote_ip, os.path.basename(file), "upload",
                                       file, self._display_for(file))
+                self._forget_tx()
             def on_connect(self):
                 mgr._emit_activity(self.remote_ip, "接続")
             def on_disconnect(self):
