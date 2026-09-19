@@ -45,32 +45,42 @@ class FTPServerManager(QObject):
         self._stop_event = threading.Event()
         self.is_running = False
         self.port = 0
-        # (ip, filename, direction) 単位の表示コアレス。機器が1回の copy で複数FTP接続を張っても
+        # (ip, path, direction) 単位の表示コアレス。機器が1回の copy で複数FTP接続を張っても
         # 論理転送1本=履歴1行にする（Cisco IOS は本転送前に接続→RETR→即切断のプローブを複数回行う）。
+        # path は実ファイルのパス（省略時は filename）、値はその転送の表示名。basename で
+        # 束ねると、別ディレクトリの同名ファイルの並行転送が1本にまとめられる
         self._tx = {}
 
-    def _emit_started(self, ip, filename, total, direction):
-        key = (ip, filename, direction)
+    def _emit_started(self, ip, filename, total, direction, path=None, ftp_path=None):
+        key = (ip, path or filename, direction)
         if key in self._tx:
             return  # 既に行がある（機器の複数接続を1行に束ねる）
-        self._tx[key] = True
-        self.transfer_started.emit(ip, filename, int(total), direction)
+        # パネルは表示名で行を追跡する。同じ相手・同じ方向で別の場所の同名
+        # ファイルが転送中なら、取り違えないようルートからのパスで見せる
+        name = filename
+        if ftp_path and name in [v for (i, _, d), v in list(self._tx.items())
+                                 if i == ip and d == direction]:
+            name = ftp_path
+        self._tx[key] = name
+        self.transfer_started.emit(ip, name, int(total), direction)
 
-    def _emit_progress(self, ip, filename, done, total, direction):
-        self.transfer_progress.emit(ip, filename, int(done), int(total), direction)
+    def _emit_progress(self, ip, filename, done, total, direction, path=None):
+        name = self._tx.get((ip, path or filename, direction), filename)
+        self.transfer_progress.emit(ip, name, int(done), int(total), direction)
 
-    def _emit_complete(self, ip, filename, done, total, direction):
-        self._tx.pop((ip, filename, direction), None)  # 完了で解放し次の転送は新規行に
-        self.transfer_complete.emit(ip, filename, int(done), int(total), direction)
+    def _emit_complete(self, ip, filename, done, total, direction, path=None):
+        # 完了で解放し次の転送は新規行に
+        name = self._tx.pop((ip, path or filename, direction), filename)
+        self.transfer_complete.emit(ip, name, int(done), int(total), direction)
 
-    def _emit_interrupted(self, ip, filename, direction):
+    def _emit_interrupted(self, ip, filename, direction, path=None):
         """未完了で終わった転送（ABOR・接続断・停止）を通知する。
 
         完了と同じく鍵を解放する。残したままにすると、進行中の表示が
         そのまま残り、同じファイルの再試行が開始として通知されない。
         """
-        self._tx.pop((ip, filename, direction), None)
-        self.transfer_interrupted.emit(ip, filename, direction)
+        name = self._tx.pop((ip, path or filename, direction), filename)
+        self.transfer_interrupted.emit(ip, name, direction)
 
     # 匿名に与える権限。認証ユーザー用の "elradfmwMT" を使い回すと、
     # 資格情報なしでルート配下を上書き・削除・改名・フォルダ作成できる。
@@ -157,16 +167,18 @@ class FTPServerManager(QObject):
                     try: total = self.fs.getsize(file)
                     except Exception: total = 0
                     self._tx_name = os.path.basename(file); self._tx_total = int(total)
-                    self._tx_dir = "download"; self._tx_last = 0.0
-                    mgr._emit_started(self.remote_ip, self._tx_name, self._tx_total, "download")
+                    self._tx_dir = "download"; self._tx_last = 0.0; self._tx_path = file
+                    mgr._emit_started(self.remote_ip, self._tx_name, self._tx_total, "download",
+                                      file, self.fs.fs2ftp(file))
                 return result
 
             def ftp_STOR(self, file, mode="w"):
                 result = super().ftp_STOR(file, mode)
                 if result is not None:
                     self._tx_name = os.path.basename(file); self._tx_total = 0  # アップロードは総サイズ不明
-                    self._tx_dir = "upload"; self._tx_last = 0.0
-                    mgr._emit_started(self.remote_ip, self._tx_name, 0, "upload")
+                    self._tx_dir = "upload"; self._tx_last = 0.0; self._tx_path = file
+                    mgr._emit_started(self.remote_ip, self._tx_name, 0, "upload",
+                                      file, self.fs.fs2ftp(file))
                 return result
 
             def _emit_tx_progress(self, done):
@@ -176,22 +188,23 @@ class FTPServerManager(QObject):
                 if now - getattr(self, "_tx_last", 0.0) < 0.2: return  # 約200msに間引き
                 self._tx_last = now
                 mgr._emit_progress(self.remote_ip, name, int(done),
-                                   int(getattr(self, "_tx_total", 0)), getattr(self, "_tx_dir", "download"))
+                                   int(getattr(self, "_tx_total", 0)), getattr(self, "_tx_dir", "download"),
+                                   getattr(self, "_tx_path", None))
 
             def on_file_sent(self, file):
                 try: total = os.path.getsize(file)
                 except OSError: total = 0
-                mgr._emit_complete(self.remote_ip, os.path.basename(file), total, total, "download")
+                mgr._emit_complete(self.remote_ip, os.path.basename(file), total, total, "download", file)
             def on_file_received(self, file):
                 try: total = os.path.getsize(file)
                 except OSError: total = 0
-                mgr._emit_complete(self.remote_ip, os.path.basename(file), total, total, "upload")
+                mgr._emit_complete(self.remote_ip, os.path.basename(file), total, total, "upload", file)
             # 未完了で終わったとき（ABOR・データ接続の切断・サーバ停止）。
             # pyftpdlib が DTP を閉じる際に必ずどちらかを呼ぶ
             def on_incomplete_file_sent(self, file):
-                mgr._emit_interrupted(self.remote_ip, os.path.basename(file), "download")
+                mgr._emit_interrupted(self.remote_ip, os.path.basename(file), "download", file)
             def on_incomplete_file_received(self, file):
-                mgr._emit_interrupted(self.remote_ip, os.path.basename(file), "upload")
+                mgr._emit_interrupted(self.remote_ip, os.path.basename(file), "upload", file)
             def on_connect(self):
                 mgr.client_activity.emit(self.remote_ip, "接続")
             def on_disconnect(self):
