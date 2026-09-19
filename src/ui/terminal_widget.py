@@ -109,6 +109,8 @@ class InteractiveTerminal(QTextEdit):
         self._sending = False
         # 渡した送信を接続がまだ書き終えていないかを返す関数（set_send_backlog）
         self._send_backlog = None
+        # 最後に渡した行を送り出し終えたら呼ぶもの（queue_macro_send の on_sent）
+        self._sent_callback = None
         # テキストのドロップは受け付けない。選択範囲をうっかりドラッグした
         # だけで、改行ごと機器へ送られて各行が実行されていた（利用者報告）
         self.setAcceptDrops(False)
@@ -225,13 +227,17 @@ class InteractiveTerminal(QTextEdit):
     # その規模なら数回で終わる。
     SEND_CHUNK = 512
 
-    def queue_macro_send(self, payload: str):
+    def queue_macro_send(self, payload: str, on_sent=None):
         """マクロ（コマンドリスト）の1行を送信列へ積む
 
         マクロ由来という印を付けておく。停止したときに、まだ送っていない
         ぶんだけを cancel_macro_sends で取り消せるようにするため。
+
+        on_sent は、その行を機器へ送り出したとき（シリアルは送信スレッドが
+        書き終えたとき）に呼ぶ。積んだ時点ではなくここから次の行までの
+        遅延を数えないと、長い貼り付けの後ろで待つ間に遅延が過ぎてしまう。
         """
-        self._queue_send(payload, from_macro=True)
+        self._queue_send(payload, from_macro=True, on_sent=on_sent)
 
     def cancel_macro_sends(self):
         """まだ送っていないマクロ由来の断片を送信列から取り除く
@@ -249,7 +255,7 @@ class InteractiveTerminal(QTextEdit):
             if not entry[1] or entry[2]
         ]
 
-    def _queue_send(self, payload: str, from_macro: bool = False):
+    def _queue_send(self, payload: str, from_macro: bool = False, on_sent=None):
         """機器へ送るものを列の末尾へ積む
 
         機器へ向かうものは、貼り付けも打鍵も IME の確定も問い合わせへの
@@ -264,9 +270,9 @@ class InteractiveTerminal(QTextEdit):
         """
         if not payload:
             return
-        # [送る文字列, マクロ由来か, 送り始めたか] の形で積む。
-        # 停止のときに由来で選り分け、送りかけの行だけは残す
-        self._send_queue.append([payload, from_macro, False])
+        # [送る文字列, マクロ由来か, 送り始めたか, 送り出したら呼ぶもの] の
+        # 形で積む。停止のときに由来で選り分け、送りかけの行だけは残す
+        self._send_queue.append([payload, from_macro, False, on_sent])
         if not self._sending:
             self._drain_send_queue()
 
@@ -306,17 +312,22 @@ class InteractiveTerminal(QTextEdit):
         if self._reconnect_mode:
             self._send_queue.clear()
             self._sending = False
+            self._sent_callback = None
             return
+
+        # 接続がまだ前の区切りを書き終えていない（シリアルの送信スレッド）。
+        # 書き終えた知らせ（resume_send_queue）が来たら続きを渡す
+        if self._connection_busy():
+            self._sending = True
+            return
+        # 前に渡したマクロの行は、ここで送り出し済みになった
+        self._notify_sent()
 
         if not self._send_queue:
             self._sending = False
             return
 
         self._sending = True
-        # 接続がまだ前の区切りを書き終えていない（シリアルの送信スレッド）。
-        # 書き終えた知らせ（resume_send_queue）が来たら続きを渡す
-        if self._send_backlog is not None and self._send_backlog():
-            return
         entry = self._send_queue[0]
         payload = entry[0]
         chunk, rest = payload[:self.SEND_CHUNK], payload[self.SEND_CHUNK:]
@@ -326,13 +337,27 @@ class InteractiveTerminal(QTextEdit):
             entry[2] = True
         else:
             self._send_queue.pop(0)
+            self._sent_callback = entry[3]
 
         self.key_pressed.emit(chunk)
 
-        if self._send_queue:
+        # 受け取ったその場で送る接続（SSH・Telnet）なら、もう送り出している
+        if not self._connection_busy():
+            self._notify_sent()
+        if self._send_queue or self._sent_callback is not None:
             QTimer.singleShot(0, self._drain_send_queue)
         else:
             self._sending = False
+
+    def _connection_busy(self) -> bool:
+        """接続が、渡した送信をまだ書き終えていないか（set_send_backlog）"""
+        return self._send_backlog is not None and self._send_backlog()
+
+    def _notify_sent(self) -> None:
+        """送り出し終えた行を積んだ側へ知らせる（queue_macro_send の on_sent）"""
+        callback, self._sent_callback = self._sent_callback, None
+        if callback is not None:
+            callback()
 
     def custom_paste(self):
         """クリップボードの内容を機器へ送る
