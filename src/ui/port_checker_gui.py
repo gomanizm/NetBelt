@@ -5,6 +5,8 @@
 TCP/UDPポートの状態を確認するGUIツール
 """
 
+import csv
+import io
 import sys
 import socket
 import subprocess
@@ -190,9 +192,10 @@ class PortCheckThread(QThread):
                         try:
                             cmd = f"tasklist /FI \"PID eq {pid}\" /FO CSV /NH"
                             proc_info = self._run_command(cmd)
-                            # CSVフォーマットをパース
-                            proc_info = proc_info.strip().replace('"', '')
-                            parts = proc_info.split(',')
+                            # CSV として引用符を解釈して読む。引用符を消して
+                            # カンマで分けると、カンマを含む名前
+                            # （"net,agent.exe"）が途中で切れる
+                            parts = next(csv.reader(io.StringIO(proc_info.strip())), [])
                             if len(parts) >= 2:
                                 proc_name = parts[0]
                                 result += f"  PID {pid}: {proc_name}\n"
