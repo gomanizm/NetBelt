@@ -68,18 +68,25 @@ jobs:
       run: |
         python -m PyInstaller --clean NetBelt.spec
         
+    # cmd はステップの終了コードとして最後のコマンドの値しか返さない。
+    # 途中の copy が失敗しても最後の xcopy が通れば成功になり、exe の無い
+    # ZIP とその正しい SHA-256 を公開してしまう。1 つずつ止める。
     - name: Create portable package
       run: |
-        mkdir portable
-        copy dist\NetBelt.exe portable\
-        copy README.md portable\README.txt
-        copy LICENSE portable\LICENSE.txt
-        copy THIRD-PARTY-NOTICES.txt portable\
-        copy updater.bat portable\
-        copy CHANGELOG.md portable\CHANGELOG.txt
-        
+        mkdir portable || exit /b 1
+        copy dist\NetBelt.exe portable\ || exit /b 1
+        copy README.md portable\README.txt || exit /b 1
+        copy LICENSE portable\LICENSE.txt || exit /b 1
+        copy THIRD-PARTY-NOTICES.txt portable\ || exit /b 1
+        copy updater.bat portable\ || exit /b 1
+        copy CHANGELOG.md portable\CHANGELOG.txt || exit /b 1
+
         REM MIBファイルもコピー
-        xcopy /E /I mibs portable\mibs
+        xcopy /E /I mibs portable\mibs || exit /b 1
+
+        REM 更新に欠かせない 2 つが入ったことを、ZIP を作る前に確かめる
+        if not exist portable\NetBelt.exe (echo ::error::portable\NetBelt.exe is missing & exit /b 1)
+        if not exist portable\updater.bat (echo ::error::portable\updater.bat is missing & exit /b 1)
       shell: cmd
         
     - name: Create ZIP archive
