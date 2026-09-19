@@ -659,9 +659,15 @@ class SFTPManager(QObject):
                                 # 確定した失敗として報告しない
                                 raise unknown_outcome(e, final_removed=final_removed)
                             except IOError as e:
+                                # 期限切れの枝（unknown_outcome）と同じ考え。
+                                # 復旧手順で最終名を消したあとなら、利用者が
+                                # 元の設定の無事を誤解しないよう書き添える
                                 keep_tmp[0] = True
+                                gone = ("最終名は置き換えの手順で既に消してあります。"
+                                        if final_removed else "")
                                 raise IOError(
-                                    "最終名への置き換えに失敗しました。転送済みの内容は"
+                                    "最終名への置き換えに失敗しました。" + gone +
+                                    "転送済みの内容は"
                                     "機器の一時名 %s に残っています: %s" % (tmp_remote, e))
                 
                 # 完了通知
