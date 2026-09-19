@@ -339,9 +339,11 @@ class Screen(object):
             # 折り返しの印は折り返しでだけ付く。書き直しでは、右端まで
             # 届いたときに限って元の印を残す (まだ次の行へ続いている)。
             # 届かなければ外す。残すと、EL 無しで書き直された行が履歴で
-            # 次の行と連結される
+            # 次の行と連結される。空白で塗り潰して消した行も中身が無い
+            # ので外す (EL / DCH と同じ基準。印が残るときしか調べない)
             self.wrapped[self.cursor_row] = (
-                entry_mark and end >= self.cols and self.autowrap)
+                entry_mark and end >= self.cols and self.autowrap
+                and not all(c == BLANK for c in line))
             self.dirty.add(self.cursor_row)
             if end < self.cols:
                 self.cursor_col = end
@@ -389,7 +391,10 @@ class Screen(object):
             _split_wide(line, end)
             line[col:end] = zip(text[start:start + count], cell_attr)
             start += count
-            self.wrapped[row] = entry_mark and end >= cols and self.autowrap
+            # 空白で塗り潰して消した行からは印を外す (_print_chars と同じ)
+            self.wrapped[row] = (
+                entry_mark and end >= cols and self.autowrap
+                and not all(c == BLANK for c in line))
             self.dirty.add(row)
             if end < cols:
                 self.cursor_col = end
