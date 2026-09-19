@@ -50,6 +50,40 @@ class FTPServerManager(QObject):
         # path は実ファイルのパス（省略時は filename）、値はその転送の表示名。basename で
         # 束ねると、別ディレクトリの同名ファイルの並行転送が1本にまとめられる
         self._tx = {}
+        # GUI へ渡したまま、まだ処理されていない client_activity の件数の上限。
+        # 接続と切断のたびに 1 件出るので、認証の要らない相手が接続して即切断を
+        # 繰り返すと、GUI が他の処理で塞がっている間に Qt の配送キューへ際限なく
+        # 積み上がる（パネルのログの行数上限が効くのは配送の後）。TFTP の
+        # protocol_event と同じく、超過中は数えるだけにして、はけた時点で
+        # 省略した件数を 1 行だけ出す。数え違えないよう、この信号はすべて
+        # _emit_activity から出す
+        self.max_pending_notices = 1000
+        self._notice_lock = threading.Lock()
+        self._pending_notices = 0
+        self._dropped_notices = 0
+        # 自分の信号を自分でも受ける。待受スレッドから emit した分はキュー経由で
+        # GUI スレッドへ届くので、呼ばれたことが「GUI が 1 件処理した」の合図
+        self.client_activity.connect(self._on_notice_delivered)
+
+    def _emit_activity(self, ip, message):
+        """client_activity を 1 件渡す。配送待ちが上限に達している間は数えるだけ。"""
+        with self._notice_lock:
+            if self._pending_notices >= self.max_pending_notices:
+                self._dropped_notices += 1
+                return
+            self._pending_notices += 1
+        self.client_activity.emit(ip, message)
+
+    def _on_notice_delivered(self, *_args):
+        """GUI が client_activity を 1 件処理したので配送待ちを戻す（GUI スレッドで動く）"""
+        with self._notice_lock:
+            if self._pending_notices > 0:
+                self._pending_notices -= 1
+            dropped = 0
+            if self._pending_notices == 0:
+                dropped, self._dropped_notices = self._dropped_notices, 0
+        if dropped:
+            self._emit_activity("", "表示が追いつかず %d 件の通知を省略しました" % dropped)
 
     def _emit_started(self, ip, filename, total, direction, path=None, ftp_path=None):
         key = (ip, path or filename, direction)
@@ -115,7 +149,7 @@ class FTPServerManager(QObject):
         os.makedirs(root_dir, exist_ok=True)
         # ファイアウォールは自動設定しない（3CDaemon 方式）。管理者昇格(UAC)を避けるため、
         # 制御21/passive の受信許可は Windows 標準の初回プロンプト／既存ルールに委ねる。
-        self.client_activity.emit("", "ファイアウォール: 自動設定なし（Windowsの許可に委ねます）")
+        self._emit_activity("", "ファイアウォール: 自動設定なし（Windowsの許可に委ねます）")
 
         try:
             authorizer = DummyAuthorizer()
@@ -206,9 +240,9 @@ class FTPServerManager(QObject):
             def on_incomplete_file_received(self, file):
                 mgr._emit_interrupted(self.remote_ip, os.path.basename(file), "upload", file)
             def on_connect(self):
-                mgr.client_activity.emit(self.remote_ip, "接続")
+                mgr._emit_activity(self.remote_ip, "接続")
             def on_disconnect(self):
-                mgr.client_activity.emit(self.remote_ip, "切断")
+                mgr._emit_activity(self.remote_ip, "切断")
 
         _Handler.authorizer = authorizer
         _Handler.passive_ports = range(passive_ports[0], passive_ports[1] + 1)
@@ -328,12 +362,12 @@ class FTPServerManager(QObject):
         try:
             from .firewall import ensure_inbound_allow, ensure_self_program_allow
             ok, msg = ensure_inbound_allow("FTP Server", "TCP", port)
-            self.client_activity.emit("", "ファイアウォール(制御): %s" % msg)
+            self._emit_activity("", "ファイアウォール(制御): %s" % msg)
             lo, hi = passive_ports
             ok2, msg2 = ensure_inbound_allow("FTP Passive", "TCP", "%d-%d" % (lo, hi))
-            self.client_activity.emit("", "ファイアウォール(passive): %s" % msg2)
+            self._emit_activity("", "ファイアウォール(passive): %s" % msg2)
             ok3, msg3 = ensure_self_program_allow()
-            self.client_activity.emit("", "ファイアウォール(自exe): %s" % msg3)
+            self._emit_activity("", "ファイアウォール(自exe): %s" % msg3)
             return (ok and ok2 and ok3), msg
         except Exception as e:
             self.error_occurred.emit("ファイアウォール設定エラー: %s" % e)

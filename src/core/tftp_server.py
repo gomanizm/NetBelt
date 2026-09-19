@@ -625,6 +625,40 @@ class TFTPServerManager(QObject):
         # 重複 started と偽 timeout をここで束ね, UI には論理転送1本だけを見せる。
         self._tx = {}
         self._tx_lock = threading.Lock()
+        # GUI へ渡したまま、まだ処理されていない protocol_event の件数の上限。
+        # 失敗した要求（存在しないファイルへの RRQ など）ごとに 1 件出るので、
+        # 認証の要らない相手が GUI の処理を上回る勢いで送ると、パネルのログの
+        # 行数上限より手前の Qt の配送キューに際限なく積み上がる。Syslog の
+        # max_pending_messages と同じく、超過中は数えるだけにして、はけた時点で
+        # 省略した件数を 1 行だけ出す
+        self.max_pending_notices = 1000
+        self._notice_lock = threading.Lock()
+        self._pending_notices = 0
+        self._dropped_notices = 0
+        # 自分の信号を自分でも受ける。ワーカーから emit した分はキュー経由で
+        # GUI スレッドへ届くので、呼ばれたことが「GUI が 1 件処理した」の合図
+        self.protocol_event.connect(self._on_notice_delivered)
+
+    def _emit_protocol_event(self, ip, filename, reason, direction):
+        """protocol_event を 1 件渡す。配送待ちが上限に達している間は数えるだけ。"""
+        with self._notice_lock:
+            if self._pending_notices >= self.max_pending_notices:
+                self._dropped_notices += 1
+                return
+            self._pending_notices += 1
+        self.protocol_event.emit(ip, filename, reason, direction)
+
+    def _on_notice_delivered(self, *_args):
+        """GUI が protocol_event を 1 件処理したので配送待ちを戻す（GUI スレッドで動く）"""
+        with self._notice_lock:
+            if self._pending_notices > 0:
+                self._pending_notices -= 1
+            dropped = 0
+            if self._pending_notices == 0:
+                dropped, self._dropped_notices = self._dropped_notices, 0
+        if dropped:
+            self.client_activity.emit(
+                "", "表示が追いつかず %d 件の通知を省略しました" % dropped)
 
     def start(self, port=69, root_dir="./tftp_root", allow_upload=True, allow_download=True):
         if self.is_running:
@@ -734,6 +768,6 @@ class TFTPServerManager(QObject):
                         if st["count"] <= 0:
                             self._tx.pop((ip, filename, direction), None)
             if not suppress:
-                self.protocol_event.emit(ip, filename, reason, direction)
+                self._emit_protocol_event(ip, filename, reason, direction)
         else:
             self.client_activity.emit(ip, payload)
