@@ -645,6 +645,11 @@ class MainWindow(QMainWindow):
         )
         
         if reply == QMessageBox.StandardButton.Yes:
+            # 削除に失敗したとき、設定に元から無かったのか（ツリーにだけ
+            # 残っていた）、保存だけ失敗したのかを見分けるために控えておく
+            group = self.config_manager.get_group(group_name) or {}
+            existed = any(d.get("name") == device_name
+                          for d in group.get("devices", []))
             if self.config_manager.remove_device(group_name, device_name):
                 # 消した機器の接続情報を残さない（残すと、開いたままの
                 # タブで Enter を押したときに消したはずの機器へ繋がる）
@@ -653,6 +658,12 @@ class MainWindow(QMainWindow):
                 self._load_devices()
                 self.status_bar.showMessage(f"機器 '{device_name}' を削除しました")
             else:
+                if not existed:
+                    # 設定に無い機器がツリーにだけ残っていた。案内だけで
+                    # 済ませると、何度試しても消せない（グループの削除と同じ）。
+                    # 保存に失敗しただけなら remove_device がメモリを戻して
+                    # いるので、ツリーは設定と一致したまま＝作り直さない
+                    self._load_devices()
                 QMessageBox.warning(self, "エラー", "機器の削除に失敗しました。")
     
     def _on_device_duplicate(self, group_name: str, device_data: dict):
