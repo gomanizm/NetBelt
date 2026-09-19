@@ -296,6 +296,12 @@ class MIBResolver:
             # ファイルを開く経路は変えない。
             if filename.lower().endswith(('.mib', '.txt', '.my')):
                 filepath = os.path.join(mibs_dir, filename)
+                # 名前が合っても通常のファイルでないもの（vendor.mib という
+                # フォルダなど）は外す。開けないので「読めなかったファイル」に
+                # なり、キャッシュに記録されないまま起動のたびに全ファイルを
+                # 解析し直していた（実測）
+                if not os.path.isfile(filepath):
+                    continue
                 stamp = _mib_file_stamp(filepath)
                 cached = cached_files.get(filename)
                 if (stamp['sha1'] is None and isinstance(cached, dict)
@@ -336,7 +342,14 @@ class MIBResolver:
                     # 読めなかったファイルは files に記録しない。記録すると
                     # 次の起動で mtime が一致して欠けたキャッシュが使われる
                     unread.add(filename)
-                    print(f"[MIBResolver] {filename} エラー: {str(e)}")
+                    # 読めるようになったら取り戻すために毎回解析し直すので、
+                    # そのことと止め方を伝える
+                    print(f"[MIBResolver] {filename} を読めません（{e}）。"
+                          f"このファイルの定義は使われず、読めるようになるまで"
+                          f"起動のたびに MIB をすべて解析し直します。止めるには、"
+                          f"このファイルを読めるようにする（アクセス権や、"
+                          f"他のアプリがロックしていないかを確かめる）か、"
+                          f"mibs フォルダから取り除いてください")
 
             cached_mibs = self._resolve_definitions(all_definitions)
             resolved_names = set(cached_mibs.values())
