@@ -351,8 +351,7 @@ class MainWindow(QMainWindow):
             self.terminal_widget.set_command_list_status)
         self.terminal_widget.terminal_resized.connect(self._on_terminal_resized)
         # 接続先リストの機器メニュー「ツール」（キープアライブ・マクロ）
-        self.device_tree.set_tools_state_provider(
-            self.terminal_widget.tools_state_for)
+        self.device_tree.set_tools_state_provider(self._tools_state_for)
         self.device_tree.macro_execute_requested.connect(
             self._on_macro_execute_requested)
         self.device_tree.macro_stop_requested.connect(
@@ -1710,6 +1709,19 @@ class MainWindow(QMainWindow):
         self.terminal_widget.set_keepalive_status(device_name, False)
         self.status_bar.showMessage(f"{device_name}: キープアライブ停止")
     
+    def _tools_state_for(self, device_name: str) -> dict:
+        """接続先リストの「ツール」に出す状態（マクロの一覧は開くたびに設定から取る）
+
+        端末は接続したときに渡されたマクロのリストを持ち続ける。プリセットを
+        削除すると ConfigManager はリストごと差し替えるので、端末の一覧は古い
+        ままになり、削除済みの項目が残って新しい項目が出ず、同じ名前で作り
+        直すと古い説明のまま新しい定義が実行されていた。
+        """
+        state = self.terminal_widget.tools_state_for(device_name)
+        if "macros" in state:
+            state["macros"] = list(self.config_manager.get_global_macros())
+        return state
+
     def _on_macro_execute_requested(self, device_name: str, macro_name: str):
         """
         右クリックメニューからマクロ実行が要求されたときの処理
