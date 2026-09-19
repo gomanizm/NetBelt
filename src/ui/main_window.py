@@ -1512,6 +1512,16 @@ class MainWindow(QMainWindow):
             applied = (auto_commands != new_auto_commands
                        and group_now is not None
                        and group_now.get("auto_commands") == new_auto_commands)
+            if new_group_name != group_name and not applied:
+                # 改名は上の rename_group で保存できている。ツリーを旧名の
+                # まま残すと、そこからの機器の編集・削除・移動が旧名で
+                # グループを探して失敗するので、作り直してから知らせる
+                self._load_devices()
+                QMessageBox.warning(
+                    self, "エラー",
+                    "グループ名の変更は保存しました。\n"
+                    "自動実行コマンドの保存に失敗しました。")
+                return
             self._warn_change_failed("自動実行コマンドの保存", applied)
             return
 
