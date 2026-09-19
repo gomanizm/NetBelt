@@ -573,13 +573,25 @@ class MainWindow(QMainWindow):
             # マクロの実行状態は古い名前のまま残り、接続先リストの「ツール」は
             # 新しい名前で引くので、そのセッションのマクロやキープアライブを
             # 止められなくなる。名前以外の変更はそのまま通す
-            if new_name != old_device_name and (
-                    self.terminal_widget.has_terminal(old_device_name)
-                    or old_device_name in self.connections):
+            session_open = (self.terminal_widget.has_terminal(old_device_name)
+                            or old_device_name in self.connections)
+            if new_name != old_device_name and session_open:
                 QMessageBox.warning(
                     self, "機器の編集",
                     f"'{old_device_name}' のタブを開いている間は、名前を変えられません。\n"
                     "タブを閉じてから、もう一度名前を変更してください。\n"
+                    "（今回の変更は保存していません）")
+                return
+
+            # 接続先（ホスト・ポート・プロトコル、シリアルならポート）の変更も
+            # 同じく断る。タブと接続は古い接続先のまま残り、「ツール」から
+            # 選んだマクロは古い接続先へ送られる。接続先以外の変更は通す
+            if session_open and (self._endpoint_of(new_device_data)
+                                 != self._endpoint_of(device_data)):
+                QMessageBox.warning(
+                    self, "機器の編集",
+                    f"'{old_device_name}' のタブを開いている間は、接続先を変えられません。\n"
+                    "タブを閉じてから変更してください。\n"
                     "（今回の変更は保存していません）")
                 return
 
@@ -591,7 +603,11 @@ class MainWindow(QMainWindow):
                 # ここを更新しないと編集内容が届かず、古い接続情報のまま
                 # 繋がり続ける（存在しない鍵を指定しても、以前の鍵で
                 # 繋がってしまう）。名前を変えたときは古い写しを残さない。
-                if old_device_name in self.device_info:
+                # 写しが名前だけ同じ別の接続先（自動検出の COM3 と登録機器
+                # 「COM3」など）のものなら、そのセッションの写しなので触らない
+                session = self.device_info.get(old_device_name)
+                if (session is not None and self._endpoint_of(session)
+                        == self._endpoint_of(device_data)):
                     del self.device_info[old_device_name]
                     self.device_info[new_device_data["name"]] = new_device_data
                 # ツリーを再読み込み

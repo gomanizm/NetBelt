@@ -96,13 +96,18 @@ class RenameWithOpenTabRefusedTest(unittest.TestCase):
         warn.assert_called_once()
 
     def test_other_changes_to_a_device_with_an_open_tab_are_saved(self):
-        """名前を変えない編集は、タブを開いていても保存すること（回帰防止）。"""
+        """名前も接続先も変えない編集は、タブを開いていても保存すること（回帰防止）。
+
+        接続先（ホストなど）の変更は、タブを開いている間は断る（利用者判断
+        2026-09-20、test_endpoint_change_with_open_tab_refused.py）。ここでは
+        接続先以外のユーザー名を変える。
+        """
         window = self._window()
         old = _device("rtrA")
         window.terminal_widget.create_terminal_tab("rtrA")
 
         warn, update_device = self._edit(window, old,
-                                         _device("rtrA", host="192.0.2.20"))
+                                         _device("rtrA", username="admin"))
 
         self.assertTrue(update_device.called, "名前以外の変更まで断っている")
         warn.assert_not_called()
