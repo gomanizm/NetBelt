@@ -285,6 +285,10 @@ class Screen(object):
             if width == 2 and self.cols < 2:
                 continue                # 1 桁の画面に全角は置けない
             from_wrap = False           # この文字で折り返して行が変わった
+            if self._pending_wrap and not self.autowrap:
+                # DECRC・1049 で戻した折り返し待ち。xterm と同じく、実行する
+                # 時点で折り返しが無効なら捨てて右端へ重ねる
+                self._pending_wrap = False
             if self._pending_wrap:      # 右端の 1 文字あとの折り返し
                 self.cursor_col = 0
                 self._linefeed(from_wrap=True)
@@ -356,6 +360,8 @@ class Screen(object):
         cell_attr = itertools.repeat(self.attr)
         start, stop = 0, len(text)
         while start < stop:
+            if self._pending_wrap and not self.autowrap:
+                self._pending_wrap = False  # 戻した折り返し待ち (_print_chars)
             if self._pending_wrap:      # 右端の 1 文字あとの折り返し
                 self.cursor_col = 0
                 self._linefeed(from_wrap=True)
