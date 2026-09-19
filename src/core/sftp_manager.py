@@ -331,15 +331,21 @@ class SFTPManager(QObject):
 
         読めない相手（stat が失敗する）や、当てられない相手（機器の flash の
         ように mode が意味を持たない）では、これまでどおり何もしない。
+        ただし期限切れは握りつぶさずに上へ送る。チャンネルはもう使えないので、
+        そのまま改名へ進むと、もう一度期限まで待ったうえ接続中のまま残る。
         """
         try:
             mode = getattr(self.sftp_client.stat(remote_path), "st_mode", None)
+        except TimeoutError:   # socket.timeout の別名
+            raise
         except Exception:
             return
         if not isinstance(mode, int):
             return
         try:
             self.sftp_client.chmod(tmp_remote, mode & 0o7777)
+        except TimeoutError:
+            raise
         except Exception:
             # 権限を引き継げないことは、転送そのものの失敗にはしない
             pass
@@ -569,7 +575,18 @@ class SFTPManager(QObject):
                         # 置き換えなら、既存の権限を一時名へ写しておく
                         # （overwrite=False のときは上で「無い」と確かめた
                         # あとなので、引き継ぐ mode は無い）
-                        self._carry_over_mode(remote_path, tmp_remote)
+                        try:
+                            self._carry_over_mode(remote_path, tmp_remote)
+                        except TimeoutError:   # socket.timeout の別名
+                            # 使えないチャンネルで改名へ進まない。転送した
+                            # 内容は一時名に残し、抜けてから接続を畳む
+                            # （ロックの中では畳めない。畳むのは finally）
+                            keep_tmp[0] = True
+                            probe_timed_out[0] = True
+                            timed_out_note[0] = (
+                                "（置き換えていません。転送した内容は一時名 %s に"
+                                "残っています）" % tmp_remote)
+                            return
                     # 全部送れてから最終名へ。posix_rename（OpenSSH 拡張）は
                     # 既存を上書きできる。無いサーバでは、まず rename を試し、
                     # 既存があって失敗したときだけ消してからもう一度 rename
