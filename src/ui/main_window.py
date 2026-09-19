@@ -624,6 +624,17 @@ class MainWindow(QMainWindow):
             group_name: グループ名
             device_name: 機器名
         """
+        # タブを開いている（接続が残っている）機器の削除は、改名と同じく断る。
+        # 消すと接続先リストから項目が無くなり、実行中のマクロを「ツール」
+        # から止められなくなる（接続もマクロも残る）
+        if (self.terminal_widget.has_terminal(device_name)
+                or device_name in self.connections):
+            QMessageBox.warning(
+                self, "機器の削除",
+                f"'{device_name}' のタブを開いている間は、削除できません。\n"
+                "タブを閉じてから削除してください。")
+            return
+
         # 確認ダイアログ
         reply = QMessageBox.question(
             self,
