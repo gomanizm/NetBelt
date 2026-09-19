@@ -218,7 +218,23 @@ class SSHConnection(QObject):
             raise outcome['error']
         return outcome.get('channel')
 
-    def _fail(self, message: str, client=None) -> bool:
+    @staticmethod
+    def _close_transports(transports):
+        """client.connect() の中で作られた Transport を直接閉じる。
+
+        dispose() が Transport の作成から start_client までの間に着地すると、
+        client.close() は「まだ動いていない」Transport を閉じずに（paramiko の
+        Transport.close() は active でなければ何もしない）参照だけ捨てる。
+        そのあと動き出した Transport には client からたどれないので、作った
+        ときに覚えておいたものを閉じる。閉じ済みのものには何もしない。
+        """
+        for transport in transports:
+            try:
+                transport.close()
+            except Exception:
+                pass
+
+    def _fail(self, message: str, client=None, transports=()) -> bool:
         """接続に失敗したときの後始末と通知
 
         paramiko の SSHClient.connect() は失敗しても自分ではトランスポートを
@@ -234,6 +250,7 @@ class SSHConnection(QObject):
         client は connect() が握っているローカル参照。接続を待っている間に
         dispose() が先に走ると self.client は None になっており、dispose()
         ではそのあと作られた Transport を閉じられない。その場合はここで閉じる。
+        transports は connect() が覚えている Transport（_close_transports 参照）。
         """
         orphan = client if client is not None and client is not self.client else None
         self.dispose()
@@ -242,10 +259,11 @@ class SSHConnection(QObject):
                 orphan.close()
             except Exception:
                 pass
+        self._close_transports(transports)
         self.error_occurred.emit(message)
         return False
 
-    def _abandon(self, client, channel) -> bool:
+    def _abandon(self, client, channel, transports=()) -> bool:
         """破棄済みの接続で成立してしまった分を閉じ、失敗として戻る。
 
         利用者がタブを閉じただけなので error_occurred は出さない。ここで
@@ -260,6 +278,7 @@ class SSHConnection(QObject):
             client.close()
         except Exception:
             pass
+        self._close_transports(transports)
         return False
 
     def connect(self) -> bool:
@@ -270,6 +289,14 @@ class SSHConnection(QObject):
             bool: 接続成功時True
         """
         client = None       # 例外の後始末で閉じるため、try の外で用意する
+        # client.connect() の中で作られた Transport。後始末で直接閉じる
+        transports = []
+
+        def transport_factory(*args, **kwargs):
+            transport = paramiko.Transport(*args, **kwargs)
+            transports.append(transport)
+            return transport
+
         try:
             if self._disposed:
                 # 接続スレッドが動き出す前にタブが閉じられ、dispose() が先に
@@ -298,6 +325,8 @@ class SSHConnection(QObject):
                 'allow_agent': False,     # SSHエージェントを使わない
                 'banner_timeout': 30,     # バナー待機時間を増やす
                 'auth_timeout': 30,       # 認証タイムアウトを増やす
+                # 作った Transport を覚える（_close_transports を参照）
+                'transport_factory': transport_factory,
             }
             
             # パスワードまたは秘密鍵で認証
@@ -350,10 +379,10 @@ class SSHConnection(QObject):
 
             if self._stop_reading:
                 # 名前解決や TCP 接続を待っている間にタブが閉じられた。
-                # dispose() が呼んだ close() は Transport 登録前で何もして
-                # いないので、ここで閉じないと成立したセッションとスレッドが
+                # dispose() が呼んだ close() は Transport の登録前や動き出す前で
+                # 何もしていないので、ここで閉じないと成立したセッションとスレッドが
                 # 残り、機器の vty 枠を掴んだままになる
-                return self._abandon(client, None)
+                return self._abandon(client, None, transports)
             
             # インタラクティブシェルを開始 (RFC 4254 6.2 pty-req)
             channel = self._open_shell(client)
@@ -367,7 +396,7 @@ class SSHConnection(QObject):
             
             if self._stop_reading:
                 # シェルを開いている間に閉じられた場合も同じ
-                return self._abandon(client, channel)
+                return self._abandon(client, channel, transports)
 
             self.channel = channel
             self.is_connected = True
@@ -380,16 +409,16 @@ class SSHConnection(QObject):
             return True
             
         except paramiko.AuthenticationException:
-            return self._fail(self._auth_failure_message(), client)
+            return self._fail(self._auth_failure_message(), client, transports)
         except paramiko.BadHostKeyException:
             return self._fail(
                 "ホストキーが変更されています(中間者攻撃の可能性)。"
                 "意図的な変更の場合は ~/.netbelt/known_hosts の該当ホスト行を削除してください。",
-                client)
+                client, transports)
         except paramiko.SSHException as e:
-            return self._fail(f"SSH接続エラー: {str(e)}", client)
+            return self._fail(f"SSH接続エラー: {str(e)}", client, transports)
         except Exception as e:
-            return self._fail(f"接続エラー: {str(e)}", client)
+            return self._fail(f"接続エラー: {str(e)}", client, transports)
     
     def dispose(self):
         """チャネルと SSHClient を閉じて資源を手放す（通知は出さない）
