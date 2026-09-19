@@ -218,7 +218,7 @@ class SSHConnection(QObject):
             raise outcome['error']
         return outcome.get('channel')
 
-    def _fail(self, message: str) -> bool:
+    def _fail(self, message: str, client=None) -> bool:
         """接続に失敗したときの後始末と通知
 
         paramiko の SSHClient.connect() は失敗しても自分ではトランスポートを
@@ -230,8 +230,18 @@ class SSHConnection(QObject):
         機器側は認証前のログイン猶予（Cisco IOS の ip ssh time-out、
         OpenSSH の LoginGraceTime、いずれも既定 120 秒）でいずれ切るが、
         invoke_shell の失敗は認証が通ったあとなので猶予が効かない。
+
+        client は connect() が握っているローカル参照。接続を待っている間に
+        dispose() が先に走ると self.client は None になっており、dispose()
+        ではそのあと作られた Transport を閉じられない。その場合はここで閉じる。
         """
+        orphan = client if client is not None and client is not self.client else None
         self.dispose()
+        if orphan is not None:
+            try:
+                orphan.close()
+            except Exception:
+                pass
         self.error_occurred.emit(message)
         return False
 
@@ -259,6 +269,7 @@ class SSHConnection(QObject):
         Returns:
             bool: 接続成功時True
         """
+        client = None       # 例外の後始末で閉じるため、try の外で用意する
         try:
             if self._disposed:
                 # 接続スレッドが動き出す前にタブが閉じられ、dispose() が先に
@@ -369,16 +380,16 @@ class SSHConnection(QObject):
             return True
             
         except paramiko.AuthenticationException:
-            return self._fail(self._auth_failure_message())
+            return self._fail(self._auth_failure_message(), client)
         except paramiko.BadHostKeyException:
             return self._fail(
                 "ホストキーが変更されています(中間者攻撃の可能性)。"
-                "意図的な変更の場合は ~/.netbelt/known_hosts の該当ホスト行を削除してください。"
-            )
+                "意図的な変更の場合は ~/.netbelt/known_hosts の該当ホスト行を削除してください。",
+                client)
         except paramiko.SSHException as e:
-            return self._fail(f"SSH接続エラー: {str(e)}")
+            return self._fail(f"SSH接続エラー: {str(e)}", client)
         except Exception as e:
-            return self._fail(f"接続エラー: {str(e)}")
+            return self._fail(f"接続エラー: {str(e)}", client)
     
     def dispose(self):
         """チャネルと SSHClient を閉じて資源を手放す（通知は出さない）
