@@ -655,6 +655,16 @@ class Screen(object):
     def _switch_screen(self, to_alt, with_cursor, clear=True):
         """代替画面と行き来する。clear は代替画面を白紙にするか。"""
         if to_alt == self.alt_active:
+            if to_alt and clear:
+                # 代替画面にいるまま 1049h を受けた。xterm は切り替えが
+                # 要らなくても ClearScreen は行う (カーソルは動かさない)。
+                # 1049 用の保存 (_saved_main) は上書きしない。2 回目の保存で
+                # メイン画面へ戻る位置を潰さないため
+                for r in range(self.rows):
+                    self.lines[r] = self._blank_line()
+                    self.wrapped[r] = False
+                self.dirty.update(range(self.rows))
+                self._pending_wrap = False
             return
         pending = False                 # 1049 の復元でだけ書き換わる
         if to_alt and with_cursor:
