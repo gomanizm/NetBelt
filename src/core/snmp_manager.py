@@ -813,12 +813,15 @@ class SNMPManager(QObject):
         押したときだけ昇格する。
         """
         try:
-            from .firewall import ensure_inbound_allow, ensure_self_program_allow
+            from .firewall import (combine_results, ensure_inbound_allow,
+                                   ensure_self_program_allow)
             ok, msg = ensure_inbound_allow("SNMP Trap", "UDP", port)
             print(f"[SNMP] ファイアウォール: {msg}")
             ok2, msg2 = ensure_self_program_allow()
             print(f"[SNMP] ファイアウォール(自exe): {msg2}")
-            return (ok and ok2), msg
+            # 失敗した操作の理由を返す。最初の msg を決め打ちで返すと、
+            # 自exe の許可だけ失敗したとき成功の文言が出る
+            return combine_results([(ok, msg), (ok2, msg2)])
         except Exception as e:
             print(f"[SNMP] ファイアウォール設定エラー: {e}")
             return False, str(e)
