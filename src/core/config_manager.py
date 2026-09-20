@@ -1333,6 +1333,13 @@ class ConfigManager:
         index = self._device_index(source["devices"], old_name, old_endpoint)
         if index is None:
             return False
+        # グループを移すなら、移動先に同名が居ないかを見る。名前を変えない
+        # 編集は上の重複検査を通らないので、ここを見ないとドラッグ＆ドロップ
+        # （move_device）が断る移動を、編集のグループ欄からは黙って通せる
+        if source is not target and any(
+                d.get("name") == new_name for d in target["devices"]):
+            print(f"エラー: デバイス '{new_name}' は移動先グループに既に存在します")
+            return False
 
         source_before = list(source["devices"])
         target_before = list(target["devices"])
