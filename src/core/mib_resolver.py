@@ -11,7 +11,7 @@ from typing import Dict, Optional
 # MIB 解析器の版。抽出・解決の規則を変えたら上げる。mib_cache.json は
 # この値も鍵にするので、古い解析器が作ったキャッシュがアプリの更新後に
 # そのまま使われることがなくなる。
-MIB_PARSER_VERSION = '2026-09-20.3'
+MIB_PARSER_VERSION = '2026-09-20.4'
 
 
 def app_dir() -> str:
@@ -470,8 +470,17 @@ class MIBResolver:
         r'|MODULE-IDENTITY|OBJECT-IDENTITY|OBJECT-GROUP|NOTIFICATION-GROUP'
         r'|MODULE-COMPLIANCE|AGENT-CAPABILITIES|TRAP-TYPE|TEXTUAL-CONVENTION)'
     )
+    # 名前と型キーワードの間の空白。実 MIB は名前だけを行に置くことが
+    # あるので、抽出の開始（`([\w-]+)\s+<キーワード>`）と同じく改行を
+    # 1 つ許す。ここだけ `[ \t]+` に狭めていたため、IMPORTS 節の直後の
+    # 根が改行で割れていると境界が見えず、IMPORTS から始まった一致が
+    # その根の `::=` まで伸びて偽の名前を登録していた（実測）。
+    # `\s+` にせず改行 1 つに限るのは、空行をまたいで別の定義まで
+    # 届かないようにするため。
+    _MIB_NAME_GAP = r'(?:[ \t]+|[ \t]*\r?\n[ \t]*)'
     _MIB_DEFINITION_BODY = (
-        r'(?:(?!::=)(?!\n[ \t]*(?![A-Z][A-Z0-9-]*[ \t])[\w-]+[ \t]+'
+        r'(?:(?!::=)(?!\n[ \t]*(?![A-Z][A-Z0-9-]*' + _MIB_NAME_GAP
+        + r')[\w-]+' + _MIB_NAME_GAP
         + _MIB_DEFINITION_KEYWORDS + r'\b).)*?'
     )
     _MIB_ASSIGNMENT = r'::=\s*\{\s*([\w-]+)\s+(\d+)\s*\}'
