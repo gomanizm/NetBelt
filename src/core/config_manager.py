@@ -1231,8 +1231,14 @@ class ConfigManager:
         new_name = device_info.get("name", "")
         if is_reserved_device_name(new_name):
             return False
-        owner = self.find_device_group(new_name)
-        if owner is not None and not (owner == group_name and new_name == old_name):
+        # 名前を変えないなら、その名前は編集している当の機器のものなので衝突
+        # ではない。find_device_group() は全グループを通して先頭の 1 件しか
+        # 返さないため、同じ名前の機器が 2 グループにあると、2 台目は
+        # owner が別グループになって「別の機器の名前」と判定され、パスワード
+        # を入れ直すだけの保存まで断られていた（復号できなかったときの
+        # 「機器の編集で入れ直してください」が、その機器だけ実行できない）。
+        # 改名するときだけ、その名前が既に使われていないかを見る。
+        if new_name != old_name and self.find_device_group(new_name) is not None:
             return False   # 別の機器の名前
         index = next((i for i, d in enumerate(source["devices"])
                       if d.get("name") == old_name), None)
