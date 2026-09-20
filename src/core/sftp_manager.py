@@ -665,7 +665,11 @@ class SFTPManager(QObject):
                                     "転送した内容は一時名 %s に残っています）"
                                     % tmp_remote)
                                 return
-                            except IOError:
+                            except Exception:
+                                # paramiko は OSError の仲間でない例外も上げる
+                                # （EOFError / SFTPError / SSHException）。
+                                # IOError だけ見ていると、外側の except へ
+                                # 落ちて 2 本目の rename にも進めない
                                 pass
                             try:
                                 self.sftp_client.rename(tmp_remote, remote_path)
@@ -674,10 +678,15 @@ class SFTPManager(QObject):
                                 # いて応答だけが返らないことがあるので、
                                 # 確定した失敗として報告しない
                                 raise unknown_outcome(e, final_removed=final_removed)
-                            except IOError as e:
+                            except Exception as e:
                                 # 期限切れの枝（unknown_outcome）と同じ考え。
                                 # 復旧手順で最終名を消したあとなら、利用者が
-                                # 元の設定の無事を誤解しないよう書き添える
+                                # 元の設定の無事を誤解しないよう書き添える。
+                                # IOError に限らないのは、paramiko が
+                                # EOFError / SFTPError / SSHException も
+                                # 上げるため。外側の except Exception へ
+                                # 落ちると keep_tmp が立たず、最終名を消した
+                                # あとの唯一の完全な写しまで後始末が消す
                                 keep_tmp[0] = True
                                 gone = ("最終名は置き換えの手順で既に消してあります。"
                                         if final_removed else "")
