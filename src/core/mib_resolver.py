@@ -534,6 +534,54 @@ class MIBResolver:
                 i += 1
         return ''.join(out)
 
+    @classmethod
+    def _normalize_module_boms(cls, raw: str) -> str:
+        """本文に残る BOM（U+FEFF）を、1 文字ずつ改行か空白へ置き換えて返す。
+
+        BOM 付きの MIB を `copy /b A.my+B.my` のように生のまま連結すると、
+        A.my に末尾の改行が無ければ `END` の直後に次の BOM が来る。見出しを
+        探す正規表現は行頭の BOM しか読み飛ばせないので、そのままでは
+        モジュールを区切れず、同じ名前が後勝ちで混ざる（実測: A の Trap が
+        B の enterprise の下に付いた）。そこで、直後にモジュールの見出しが
+        続く BOM を改行へ置き換える。
+
+        ただし置き換えを本文の見た目だけで決めると、`--` コメントの中の
+        `<BOM>NAME DEFINITIONS` でコメントが切れ、その残りが生きたコードに
+        なる（実測: 由来を書いたコメントの中の見出しで、直後の定義が区間
+        ごと打ち切られて解決できなくなった）。コメント・文字列の中の BOM は、
+        その行の残りがモジュールの見出しちょうど（連結したファイルの先頭が
+        そのまま続く形）のときだけ区切りとして扱う。
+
+        見出しにならない BOM は空白にする。どちらも 1 文字→1 文字なので、
+        あとで位置を使う処理がずれない。
+        """
+        import re
+
+        bom = chr(0xFEFF)
+        positions = [m.start() for m in re.finditer(bom, raw)]
+        if not positions:
+            return raw
+        # コメント・文字列の中身は空白になるので、ここに BOM が残っていれば
+        # 「コメントの外の BOM」。先頭の 1 つだけなら調べるまでもない
+        masked = (raw if positions == [0]
+                  else cls._blank_comments_and_strings(raw))
+        # コメントの外: 見出しを探す _MIB_MODULE_HEADER と同じ広さで見る
+        outside = re.compile(r'[ \t' + bom + r']*[\w-]+[\s' + bom
+                             + r']+DEFINITIONS\b')
+        # コメント・文字列の中: 行の残りが見出しちょうどのときだけ
+        inside = re.compile(
+            r'[ \t]*[\w-]+[ \t]+DEFINITIONS[ \t]*::=[ \t]*BEGIN'
+            r'[ \t]*(?:--[^\r\n]*)?\r?$', re.MULTILINE)
+        out = []
+        prev = 0
+        for i in positions:
+            ahead = outside if masked[i] == bom else inside
+            out.append(raw[prev:i])
+            out.append('\n' if ahead.match(raw, i + 1) else ' ')
+            prev = i + 1
+        out.append(raw[prev:])
+        return ''.join(out)
+
     # モジュール名。`FOO-MIB DEFINITIONS ::= BEGIN` の FOO-MIB。
     # 行頭の BOM（U+FEFF）も空白と同じく読み飛ばす。BOM 付きの MIB を
     # 連結すると各モジュールの先頭に BOM が残り、見出しを見落として
@@ -569,26 +617,9 @@ class MIBResolver:
         try:
             with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
                 raw = f.read()
-            # 本文に残る BOM（U+FEFF）を始末する。BOM 付きの MIB を
-            # `copy /b A.my+B.my` のように生のまま連結すると、A.my に末尾の
-            # 改行が無ければ `END` の直後に次の BOM が来る。見出しの
-            # 正規表現は行頭の BOM を読み飛ばすが、これは行頭ではないので
-            # 当たらず、モジュールを区切れないまま同じ名前が後勝ちで
-            # 混ざる（実測: A の Trap が B の enterprise の下に付いた）。
-            # そこで、直後にモジュールの見出しが続く BOM だけを改行へ
-            # 置き換える。すべてを改行にすると、`--` コメントの中に
-            # 混ざった 1 つでコメントが終わり、その中の `::= { x n }` が
-            # 偽の親として生き返る（実測）。見出しが続かない BOM は
-            # 空白にする。どちらも 1 文字→1 文字なので、あとで位置を
-            # 使う処理がずれない。
-            # 「見出しが続くか」の判定は _MIB_MODULE_HEADER と同じ広さに
-            # そろえる。狭めると、見出しとしては正しい形（名前と
-            # DEFINITIONS の間で行が折れている、BOM が続けて並んでいる）が
-            # 区切りとして拾われず、前のモジュールに末尾の改行が無い連結が
-            # 混ざったままになる（実測: alarmA が B の enterprise の下へ）。
-            bom = chr(0xFEFF)
-            raw = re.sub(bom + r'(?=[ \t' + bom + r']*[\w-]+[\s' + bom
-                         + r']+DEFINITIONS\b)', '\n', raw).replace(bom, ' ')
+            # 本文に残る BOM（U+FEFF）を、連結の区切り（改行）か無害な
+            # 空白へ振り分ける。詳しくは _normalize_module_boms を見ること
+            raw = self._normalize_module_boms(raw)
             content = self._blank_comments_and_strings(raw)
             # 1 ファイルに複数のモジュールを連結して配る MIB があるので、
             # 見出しの位置ごとに本文を区切り、区間ごとにそのモジュール名を
