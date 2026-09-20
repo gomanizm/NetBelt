@@ -1903,6 +1903,18 @@ class TerminalWidget(QWidget):
             try:
                 # ファイルを開く
                 log_file = open(file_path, 'w', encoding='utf-8', buffering=1)  # 行バッファリング
+                # 記録していなかった間に受信して、まだ描いていない分を
+                # 取り置く。停止側と同じ式で「どの停止した記録の区間にも
+                # 割り当てられていない文字数」を出し、ハンドルを持たない
+                # 「捨てる区間」として預ける（_split_for_logs / _write_logs は
+                # ハンドルが None の区間を読み飛ばす）。取り置かないと、
+                # 停止した記録の区間を配ったあとの残り全部がこの記録へ回り、
+                # 記録から外したかった停止中の受信が先頭に入る
+                skipped = len(self._pending_output.get(tab_name, ())) - sum(
+                    entry[2] for entry in self._closing_logs.get(tab_name, ()))
+                if skipped > 0:
+                    self._closing_logs.setdefault(tab_name, []).append(
+                        [None, None, skipped])
                 self._log_files[tab_name] = log_file
                 self._log_bytes[tab_name] = 0   # 'w' で切り詰めたので 0 から
                 from core import log_recording
