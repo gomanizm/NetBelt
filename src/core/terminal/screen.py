@@ -13,8 +13,9 @@ XTerm Control Sequences。
 折り返しの印 (wrapped[r]) は行単位の近似で、論理行そのものは追って
 いない。そのため、折り返した行の一部だけを (右端まで届かない形で)
 書き直すと印が外れ、履歴・コピー・ログでは次の行との間に改行が入る。
-ECH も同じく行全体の印を外す。印字が複数回に分かれて届いた場合も、
-右端までの書き直しが途中で切れると印は外れる。
+右端まで届く書き直しでも、結果が空白だけになった行は中身が無いものと
+して印を外す。印字が複数回に分かれて届いた場合も、右端までの書き直しが
+途中で切れると印は外れる。
 
 DECOM (ESC[?6h) は保持しない。有効なら CUP・VPA の行番号は
 スクロール範囲の上端から数えるべきだが、ここでは常に画面の
@@ -673,8 +674,10 @@ class Screen(object):
                                     clear=clear)
             elif mode == 1048:
                 # 画面は切り替えず、DECSC / DECRC と同じ保存・復元だけ
-                # を行う (XTerm ctlseqs)。1049 = 1048 + 1047 なので、
-                # 保存領域も DECSC と共通の _saved を使う
+                # を行う (XTerm ctlseqs)。保存領域も DECSC と共通の
+                # _saved。xterm は 1049 = 1048 + 1047 でここも共通だが、
+                # この実装の 1049 は _switch_screen の _saved_main へ
+                # 保存するので、register は 2 つに分かれている
                 if on:
                     self._save_cursor()
                 else:
@@ -967,6 +970,11 @@ class Screen(object):
         _split_wide(line, rng.stop)
         for c in rng:
             line[c] = BLANK
-        self.wrapped[self.cursor_row] = False   # 印字と同じ扱い
+        # 消したあとに中身が残る行は、次の行への続きを持ったまま。
+        # 丸ごと空白になったときだけ外す (EL / DCH / ICH と同じ基準)。
+        # 無条件に外すと、ECH だけが 1 本の論理行を履歴・コピー・文書で
+        # 2 行に割る
+        if all(c == BLANK for c in line):
+            self.wrapped[self.cursor_row] = False
         self.dirty.add(self.cursor_row)
         self._pending_wrap = False
