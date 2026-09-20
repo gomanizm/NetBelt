@@ -375,10 +375,21 @@ REM 目印は :release_lock で必ず外す（成功・失敗・中止のどれ�
 REM 目印の中へ holder.txt を書くので、フォルダの更新日時＝確保した時刻に
 REM なる。異常終了（コンソールを閉じられた等）で残った目印は、10分より
 REM 古ければ取り除いて続ける。
+REM その回収は「古いか見てから消す」ではなく「ren でつかんでから消す」。
+REM 実測（検査役 cx5j-check-release の p2_stale_lock_race.py）: 古い目印を
+REM 二つの更新がともに「古い」と判定すると、先に消したほうが取り直した
+REM 新しい目印を、後から来たほうの削除が消してしまい、両方が排他を持って
+REM 両方が「更新が完了しました！」を出した。ren は同時に 1 つしか成功
+REM しないので、負けた側は何も消せずに中止できる。
+REM つかんだ後にもう一度古さを見るのは、見てから掴むまでの間に別の更新が
+REM 取り直しているかもしれないため。そのときは元の名前へ戻して譲る。
 REM 目印を作れない理由が重なり以外（インストール先へ書けない等）でも、
 REM その場合はどのみち更新を当てられないので、同じ中止でよい。
 set "LOCK_DIR=!APP_DIR!NetBelt-update-lock"
+set "LOCK_OLD_NAME=NetBelt-update-lock.!STAMP!.old"
+set "LOCK_OLD=!APP_DIR!!LOCK_OLD_NAME!"
 set "LOCK_HELD="
+set "LOCK_STAMPED="
 set "LOCK_TRY=0"
 :claim_lock
 set /a LOCK_TRY+=1
@@ -386,10 +397,26 @@ md "!LOCK_DIR!" 2>nul
 if not errorlevel 1 goto :lock_claimed
 if !LOCK_TRY! geq 2 goto :lock_busy
 set "PS_LOCK=!LOCK_DIR!"
-powershell -NoProfile -ExecutionPolicy Bypass -Command "try { $d = Get-Item -LiteralPath $env:PS_LOCK -Force -ErrorAction Stop; if ($d.LastWriteTime -lt (Get-Date).AddMinutes(-10)) { Remove-Item -LiteralPath $env:PS_LOCK -Recurse -Force -ErrorAction Stop; exit 0 } } catch { }; exit 1"
+call :lock_is_stale
 if errorlevel 1 goto :lock_busy
+ren "!LOCK_DIR!" "!LOCK_OLD_NAME!" 2>nul
+if not exist "!LOCK_OLD!" goto :lock_busy
+set "PS_LOCK=!LOCK_OLD!"
+call :lock_is_stale
+if errorlevel 1 goto :lock_put_back
+rd /s /q "!LOCK_OLD!" 2>nul
+if exist "!LOCK_OLD!" goto :lock_put_back
 echo   前の更新が残した目印を取り除きました
 goto :claim_lock
+
+REM つかんだのは生きている目印だった（見てから掴むまでの間に別の更新が
+REM 取り直した）か、片付けられなかった。元の名前へ戻して譲る。戻せない
+REM のは、その間に別の更新が新しい目印を作ったときで、名前から外れた以上
+REM もう誰の排他にもならないので、置き去りにせず消す。
+:lock_put_back
+ren "!LOCK_OLD!" "NetBelt-update-lock" 2>nul
+if exist "!LOCK_OLD!" rd /s /q "!LOCK_OLD!" 2>nul
+goto :lock_busy
 
 :lock_busy
 echo エラー: 別の更新が進行中です
@@ -403,7 +430,12 @@ exit /b 1
 
 :lock_claimed
 set "LOCK_HELD=1"
-echo held>"!LOCK_DIR!\holder.txt" 2>nul
+REM 誰の目印かを中へ書く。:release_lock は中身が自分の識別子のときだけ
+REM 外す。識別子は親が md で確保した作業フォルダの名前（STAMP）。
+REM 括弧で囲むのは、STAMP が数字で終わると echo の直前の 1 桁が
+REM リダイレクト先のハンドル番号として読まれてしまうため。
+(echo !STAMP!)>"!LOCK_DIR!\holder.txt" 2>nul
+if exist "!LOCK_DIR!\holder.txt" set "LOCK_STAMPED=1"
 
 REM 前の実行が置き去りにした一時名の exe を片付ける。差し替えが 5 回とも
 REM 失敗すると、後始末の del も同じ理由（削除共有なしで掴まれている）で
@@ -553,8 +585,28 @@ REM インストール先の目印を外す（call で呼ぶ）
 REM ================================================================
 REM 自分が確保したときだけ外す。目印を取れずに中止した側がここを通っても、
 REM 動いているほうの目印を消してしまわないようにするため。
+REM 確保したはずの目印が、走っている間に別の更新のものへ入れ替わることも
+REM ある（上の :claim_lock の注を参照）。LOCK_HELD だけを見て消していた
+REM ときは、そこで他人の排他まで外していた。中身の識別子で確かめる。
+REM 識別子を書けなかったときだけ、以前と同じ無条件の削除にする。自分の
+REM 目印を外せないほうが、次の更新を 10 分待たせる分だけ悪いため。
 :release_lock
 if not defined LOCK_HELD exit /b 0
 set "LOCK_HELD="
+if not defined LOCK_STAMPED goto :release_lock_rd
+set "LOCK_OWNER="
+set /p LOCK_OWNER=<"!LOCK_DIR!\holder.txt" 2>nul
+if not "!LOCK_OWNER!"=="!STAMP!" exit /b 0
+:release_lock_rd
 rd /s /q "!LOCK_DIR!" 2>nul
 exit /b 0
+
+REM ================================================================
+REM 目印が古い（＝異常終了の置き土産）かを見る（call で呼ぶ）
+REM ================================================================
+REM PS_LOCK に見るフォルダを入れて呼ぶ。古ければ errorlevel 0、そうで
+REM なければ 1。フォルダの更新日時は holder.txt を書いた時刻＝確保した
+REM 時刻になる。回収では 2 回呼ぶ（つかむ前と、つかんだ後）。
+:lock_is_stale
+powershell -NoProfile -ExecutionPolicy Bypass -Command "try { $d = Get-Item -LiteralPath $env:PS_LOCK -Force -ErrorAction Stop; if ($d.LastWriteTime -lt (Get-Date).AddMinutes(-10)) { exit 0 } } catch { }; exit 1"
+exit /b !errorlevel!
