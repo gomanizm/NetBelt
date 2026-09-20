@@ -537,9 +537,13 @@ class Screen(object):
     def _scroll_up(self, n, from_wrap=False):
         # 範囲の下端にあった行は n 行ぶん上がるが、その続き (下端の 1 つ
         # 下の行) は範囲の外なので動かない。印を残すと、描画側が範囲の
-        # 中の行と範囲外の行を 1 行に繋ぐ。最下行での折り返し
-        # (_linefeed(from_wrap=True)) の印だけはそこに載っているので残す
-        stale_bottom = self.wrapped[self.scroll_bottom] and not from_wrap
+        # 中の行と範囲外の行を 1 行に繋ぐ。動かす前に外すので、範囲の
+        # 高さぶん回して下端の行が履歴へ押し出される場合も同じに直る
+        # (印ごと履歴へ入れると、そのあと空いた先頭へ来た無関係な出力と
+        # 1 行に繋がる)。最下行での折り返し (_linefeed(from_wrap=True))
+        # の印だけはそこに載っているので残す
+        if not from_wrap:
+            self.wrapped[self.scroll_bottom] = False
         for _ in range(n):
             removed = self.lines.pop(self.scroll_top)
             removed_wrap = self.wrapped.pop(self.scroll_top)
@@ -559,11 +563,6 @@ class Screen(object):
         # もう下に無い。上端が画面の先頭のときは上の行が無いので、押し
         # 出された行を履歴へ送る既存の扱いは変わらない
         self._drop_mark_above(self.scroll_top)
-        # 下端から上がってきた行の古い印を外す。範囲の外まで押し出された
-        # ときは触らない (その行は印ごと履歴へ入り、続きは画面に残る)
-        moved = self.scroll_bottom - n
-        if stale_bottom and moved >= self.scroll_top:
-            self.wrapped[moved] = False
         self.dirty.update(range(self.scroll_top, self.scroll_bottom + 1))
 
     def _scroll_down(self, n):
@@ -969,9 +968,10 @@ class Screen(object):
         # 超えて回すと、DL は下端へ足した空行まで押し出して履歴へ入れる
         n = min(n, self.scroll_bottom - self.cursor_row + 1)
         # DL は範囲の下端にあった行を上げるが、その続き (下端の 1 つ下の
-        # 行) は範囲の外なので動かない。上がった先で印を外す (_scroll_up
-        # と同じ)。IL は下端の行を捨てる側なので、下で別に始末する
-        stale_bottom = self.wrapped[self.scroll_bottom] and not insert
+        # 行) は範囲の外なので動かない。動かす前に印を外す (_scroll_up と
+        # 同じ)。IL は下端の行を捨てる側なので、下で別に始末する
+        if not insert:
+            self.wrapped[self.scroll_bottom] = False
         for _ in range(n):
             if insert:
                 self.lines.pop(self.scroll_bottom)
@@ -1000,12 +1000,6 @@ class Screen(object):
             # 1 つ上の行を下端へ上げる。上がってきた行の続きは今捨てた行
             # なので、印を残すと範囲の外の行と 1 行に繋がる
             self.wrapped[self.scroll_bottom] = False
-        else:
-            # DL で上がってきた行の古い印を外す。カーソル行まで削られて
-            # 範囲から出たときは、その行は動いていないので触らない
-            moved = self.scroll_bottom - n
-            if stale_bottom and moved >= self.cursor_row:
-                self.wrapped[moved] = False
         self.dirty.update(range(self.cursor_row, self.scroll_bottom + 1))
         # DEC の IL/DL はカーソルを左マージンへ戻す (xterm も同じ)。
         # 戻さないと、直後に位置指定なしで印字したとき桁がずれる
