@@ -470,6 +470,16 @@ class Screen(object):
         elif self.cursor_row + 1 < self.rows:
             self.cursor_row += 1
 
+    def _drop_mark_above(self, row):
+        """row へ別の行が来たので、1 つ上の行の折り返しの印を外す。
+
+        印は「この行は次の行へ続く」という意味しか持たないので、続きの
+        行が動いて別の論理行や空行が下へ来たら外さないと、描画側が
+        無関係な 2 行を 1 行に繋ぐ。画面の先頭には上の行が無い。
+        """
+        if row:
+            self.wrapped[row - 1] = False
+
     def _scroll_up(self, n):
         for _ in range(n):
             removed = self.lines.pop(self.scroll_top)
@@ -486,6 +496,12 @@ class Screen(object):
             if not self.alt_active and self.scroll_top == 0:
                 self.history.append(removed)
                 self._new_history.append((removed, removed_wrap))
+        # 範囲の上端から出ていった行が 1 つ上の行の続きだったなら、続きは
+        # もう下に無い。上端が画面の先頭のときは上の行が無いので、押し
+        # 出された行を履歴へ送る既存の扱いは変わらない。下端へ入る空行の
+        # 手前は外さない。最下行で折り返したとき (_linefeed(from_wrap=
+        # True)) の印がそこに載っており、外すと素の折り返しが切れる
+        self._drop_mark_above(self.scroll_top)
         self.dirty.update(range(self.scroll_top, self.scroll_bottom + 1))
 
     def _scroll_down(self, n):
@@ -494,6 +510,8 @@ class Screen(object):
             self.wrapped.pop(self.scroll_bottom)
             self.lines.insert(self.scroll_top, self._blank_line())
             self.wrapped.insert(self.scroll_top, False)
+        # 範囲の上端へ空行が割り込んだ。1 つ上の行の続きはそこには無い
+        self._drop_mark_above(self.scroll_top)
         self.dirty.update(range(self.scroll_top, self.scroll_bottom + 1))
 
     # ---- CSI -------------------------------------------------------
@@ -901,6 +919,10 @@ class Screen(object):
                         and self.cursor_row == 0):
                     self.history.append(removed)
                     self._new_history.append((removed, removed_wrap))
+        # カーソル行へは別の行 (DL) か空行 (IL) が来た。1 つ上の行の続きは
+        # もう下に無いので印を外す。残すと、無関係な 2 つの論理行が履歴・
+        # コピー・文書で 1 行に繋がる
+        self._drop_mark_above(self.cursor_row)
         self.dirty.update(range(self.cursor_row, self.scroll_bottom + 1))
         # DEC の IL/DL はカーソルを左マージンへ戻す (xterm も同じ)。
         # 戻さないと、直後に位置指定なしで印字したとき桁がずれる
