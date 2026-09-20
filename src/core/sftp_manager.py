@@ -873,11 +873,22 @@ class SFTPManager(QObject):
         見ないので、まだ無い同じ保存先へ 2 件落とすと、後から終わった方の
         置き換えで先の方が確認なしに消える。予約は転送が終わったとき
         （成功・失敗・中断）に外す。
+
+        予約が見るのは同一プロセスの SFTP ダウンロード同士だけなので、
+        別アプリ・別プロセスの書き込みは素通りする。そこで、呼ばれた時点
+        （GUI スレッド、保存ダイアログの直後）で保存先の有無も控える。
+        無ければ上書きは承認されていないので、最後の確定を os.replace では
+        なく os.rename で行う。Windows の os.rename は宛先があると
+        FileExistsError（WinError 183）で断り、宛先の中身には触れない。
         """
         if not self.is_connected or not self.sftp_client:
             self.error_occurred.emit("SFTP接続がありません")
             return
         
+        # 保存ダイアログが上書きを確認したかどうかの手掛かり。ここは
+        # ダイアログの直後（GUI スレッド）なので、まだ誰も割り込んでいない
+        overwrite_granted = os.path.exists(local_path)
+
         target_key = self._download_target_key(local_path)
         with self._download_targets_lock:
             busy = target_key in self._download_targets
@@ -909,6 +920,9 @@ class SFTPManager(QObject):
             self.error_occurred.emit(f"ダウンロードエラー: {str(e)}")
             return
 
+        # 置き換えを断ったときは、落とした内容が一時名にしか無いので消さない
+        keep_tmp = [False]
+
         def download_thread():
             try:
                 # ダウンロード実行
@@ -928,18 +942,33 @@ class SFTPManager(QObject):
                                          callback=progress_callback)
                 
                 # 全部落とせてから最終名へ（同じディレクトリなので原子的）
-                os.replace(tmp_local, local_path)
+                if overwrite_granted:
+                    os.replace(tmp_local, local_path)
+                else:
+                    # 呼ばれた時点では無かった＝上書きは承認されていない。
+                    # 転送しているあいだに外から作られていたら置き換えない
+                    try:
+                        os.rename(tmp_local, local_path)
+                    except FileExistsError:
+                        keep_tmp[0] = True
+                        raise OSError(
+                            "転送しているあいだに保存先 '%s' が作られました。"
+                            "上書きの確認を経ていないので置き換えていません。"
+                            "落とした内容は %s に残っています"
+                            % (os.path.basename(local_path), tmp_local))
                 # 予約は通知より先に外す（完了を見てすぐ落とし直しても断られない）
                 self._release_download_target(target_key)
                 # 完了通知
                 self.transfer_complete.emit(f"ダウンロード完了: {os.path.basename(remote_path)}")
                 
             except Exception as e:
-                # 失敗した転送の残骸を消す。既存の保存先には触っていない
-                try:
-                    os.remove(tmp_local)
-                except OSError:
-                    pass
+                # 失敗した転送の残骸を消す。既存の保存先には触っていない。
+                # 置き換えを断った場合は、落とした内容がここにしか無い
+                if not keep_tmp[0]:
+                    try:
+                        os.remove(tmp_local)
+                    except OSError:
+                        pass
                 self._release_download_target(target_key)
                 self._fail("ダウンロードエラー", e)
         
