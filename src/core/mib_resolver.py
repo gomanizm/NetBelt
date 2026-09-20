@@ -301,7 +301,25 @@ class MIBResolver:
         
         # MIBファイルの変更をチェック（mtime・大きさ・中身の sha1）
         current_files = {}
-        for filename in os.listdir(mibs_dir):
+        try:
+            filenames = os.listdir(mibs_dir)
+        except OSError as e:
+            # os.path.exists / os.path.isdir を通った直後でも、一覧その
+            # ものが失敗することがある（起動中の mibs/ の入れ替え、同期
+            # クライアント、一覧だけを拒否する ACL）。ここで素通りさせると
+            # OSError が MIBResolver.__init__ まで上がり、内蔵の標準 MIB
+            # まで 1 件も読めなくなる（実測: 画面には何も出ず、標準出力に
+            # 「バックグラウンドMIB読み込みエラー」が 1 行出るだけ）。
+            # 読めない MIB ファイルと同じように理由を 1 行残し、前回の
+            # 解析結果（読めていれば）で続ける。解析し直していないので
+            # キャッシュはそのまま、上書きもしない。
+            print(f"[MIBResolver] mibs フォルダの一覧を取得できません"
+                  f"（{e}）。今回は MIB ファイルを読み込まず、"
+                  f"キャッシュがあればその内容を使います（フォルダを"
+                  f"入れ替え中か、アクセス権が無い可能性があります）")
+            self._mib_cache_used = True
+            return cached_mibs
+        for filename in filenames:
             # 拡張子は大小を無視して判定する。Windows はファイル名の大小を
             # 保持するので、CASE.MIB のように大文字で配布された MIB が
             # 無言で解析からも監視対象からも外れていた（実測）。
