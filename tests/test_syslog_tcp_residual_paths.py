@@ -12,9 +12,20 @@ TCP の改行区切りは終端（LF / NUL）が来るまで行を配信しな�
 切る枝と、停止要求で待受ループを抜けた経路からも通す。1 行が上限を
 超えて切断した枝だけは対象外にする（切り捨てたことを通知した直後に、
 その切れ端を 1 件として出してしまうため）。
+
+追記: 相手が RST で打ち切った場合（SO_LINGER 0 での close。Windows では
+WSAECONNRESET）だけは、まだ消えたままだった。recv が例外を投げるので
+受信ループの except に入り、残りを配信せずに return していた。実測（同じ
+2 行を送り、片方は普通に close、片方は SO_LINGER 0 で close）: 普通の
+close なら 2 件、RST なら 1 件で、ログに [WinError 10054] が出ていた。
+機器の reload や経路のセッション切断で RST は普通に起きる。
+直し方: 捕捉を except OSError に絞って、その枝でも残りを配信してから
+畳む。行の配信そのものが投げた例外まで拾って配信をもう一度踏まないよう、
+配信は try/except で包む。
 """
 import os
 import socket
+import struct
 import sys
 import time
 import unittest
@@ -85,6 +96,21 @@ class SyslogTcpResidualPathsTest(unittest.TestCase):
         raws = self._wait(2, 3)
         self.assertEqual(raws, ["<134>terminated", "<134>no-terminator"],
                          "停止のときに捨てられた: %r" % (raws,))
+
+    def test_an_abortive_close_still_delivers_the_unterminated_line(self):
+        c = self._connect()
+        # SO_LINGER 0 = close() で FIN ではなく RST を送る（機器の reload や
+        # 経路のセッション切断で起きるのと同じ終わり方）
+        c.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                     struct.pack("hh", 1, 0))
+        c.sendall(TERMINATED)
+        c.sendall(RESIDUAL)
+        self._wait(1, 5)             # 受信側が読み取るまで待ってから打ち切る
+
+        c.close()
+        raws = self._wait(2, 5)
+        self.assertEqual(raws, ["<134>terminated", "<134>no-terminator"],
+                         "RST で打ち切られたときに捨てられた: %r" % (raws,))
 
     def test_a_line_cut_for_being_too_long_is_not_delivered_afterwards(self):
         self.recv.max_line_bytes = 32

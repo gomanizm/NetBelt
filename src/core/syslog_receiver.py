@@ -597,10 +597,10 @@ class SyslogReceiver(QObject):
 
         最後に受信してから tcp_idle_timeout_seconds を過ぎた接続は切断する。
 
-        相手が閉じた・無通信で切った・停止要求で抜けた、のいずれで終わる
-        場合も、残った終端なしの 1 行を配信してから畳む。1 行が上限を
-        超えて切断した場合だけは配信しない（切り捨てたことを通知した
-        直後に、その切れ端を 1 件として出すことになるため）。
+        相手が閉じた・相手が RST で打ち切った・無通信で切った・停止要求で
+        抜けた、のいずれで終わる場合も、残った終端なしの 1 行を配信してから
+        畳む。1 行が上限を超えて切断した場合だけは配信しない（切り捨てた
+        ことを通知した直後に、その切れ端を 1 件として出すことになるため）。
         """
         try:
             client_socket.settimeout(1.0)
@@ -687,7 +687,23 @@ class SyslogReceiver(QObject):
                         self._flush_tcp_residual(buffer, client_ip, listen_port)
                         return
                     continue
+                except OSError as e:
+                    # 相手が RST で打ち切った（SO_LINGER 0 での close。
+                    # Windows では WSAECONNRESET）。FIN と違って recv は空を
+                    # 返さず例外になるので、ここでも残りを配信しないと、
+                    # 機器の reload や経路のセッション切断のたびに終端なしの
+                    # 最後の 1 行が消える。
+                    # 配信そのものが投げた例外もこの枝に来うるので、配信は
+                    # 包んでおく（同じ例外をもう一度踏まないため）
+                    print("[Syslog] TCP receive error: %s" % e)
+                    try:
+                        self._flush_tcp_residual(buffer, client_ip, listen_port)
+                    except Exception as flush_error:
+                        print("[Syslog] TCP flush error: %s" % flush_error)
+                    return
                 except Exception as e:
+                    # 通信以外の異常。何が壊れたか分からないので、従来どおり
+                    # 残りは配信せずに畳む
                     print("[Syslog] TCP receive error: %s" % e)
                     return
             # 停止要求で待受ループを抜けた。相手は閉じていないので、
