@@ -671,7 +671,11 @@ class SFTPManager(QObject):
                                 "いないので最終名には触れていません。転送した内容は"
                                 "機器の一時名 %s に残っています。上書きしてよければ"
                                 "一覧を更新してからやり直してください: %s"
-                                % (remote_name, tmp_remote, first_error))
+                                # paramiko は message の無い応答でも読み進むので、
+                                # str が空の IOError が届く。そのまま連結すると
+                                # 理由の無い「: 」で終わる
+                                % (remote_name, tmp_remote,
+                                   str(first_error) or first_error.__class__.__name__))
                         # posix_rename の無いサーバ。ふつうの rename を試す
                         try:
                             self.sftp_client.rename(tmp_remote, remote_path)
