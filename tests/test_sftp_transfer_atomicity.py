@@ -228,7 +228,14 @@ class SftpTransferAtomicityTest(unittest.TestCase):
                       "機器側で確かめる一時名を知らせていない: %s" % self.errors)
 
     def test_a_fallback_rename_that_times_out_removes_neither_name(self):
-        """posix_rename の無いサーバで、代わりの rename が期限切れになった場合も同じ。"""
+        """posix_rename の無いサーバで、代わりの rename が期限切れになった場合も同じ。
+
+        overwrite=True で送るのは、posix_rename を使うのが上書きの確認を得た
+        送信だけになったため（利用者の決定 2026-09-20）。確認を経ていない送信
+        だと posix_rename が呼ばれず、「posix_rename の無い機器」という前提が
+        空振りになり、ここで期限切れになるのは 1 本目の rename になってしまう。
+        見たいのは代わりの rename の経路なので、承認済みの送信にしてある。
+        """
         m = self._manager()
         local = os.path.join(self.dir, "running.cfg")
         with io.open(local, "w", encoding="utf-8") as f:
@@ -236,9 +243,10 @@ class SftpTransferAtomicityTest(unittest.TestCase):
         m.sftp_client.posix_rename.side_effect = IOError("Operation unsupported")
         m.sftp_client.rename.side_effect = TimeoutError()
 
-        m.upload_file(local, "/flash/running.cfg")
+        m.upload_file(local, "/flash/running.cfg", overwrite=True)
 
         self.assertTrue(self._wait(lambda: self.errors), "失敗が通知されない")
+        self.client.posix_rename.assert_called_once()   # 前提が生きていること
         removed = [c[0][0] for c in self.client.remove.call_args_list]
         self.assertEqual(removed, [], "期限切れなのに消しにいっている: %s" % removed)
         self.assertEqual(self.client.rename.call_count, 1,

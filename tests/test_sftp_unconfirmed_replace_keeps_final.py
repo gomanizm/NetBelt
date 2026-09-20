@@ -16,6 +16,14 @@ rename が [IOError("Failure"), 成功]、overwrite=False）: remove の呼び�
 直し方: 上書きの確認を得ている（overwrite が真）ときだけ、最終名を消す
 復旧手順へ進む。確認を得ていなければ最終名には触れず、転送した内容が一時名に
 残っていることと、上書きなら置き換えられることが分かる文面で断る。
+
+前提の更新（2026-09-20、利用者の承認済み）: 6 周目に「確認を経ていない送信は
+posix_rename を使わない」へ変えたので、overwrite=False の場合は posix_rename が
+呼ばれない。それでも IOError を仕込んだままだと「posix_rename の無い機器」という
+前提が空振りし、見張りとして効かない。確認なしの送信では posix_rename を成功する
+ままにして（退行したら既存が黙って置き換わり、完了が通知されて検査が落ちる）、
+呼ばれていないことも確かめる。posix_rename の無い機器という前提が要るのは、
+最終名を消す復旧手順を見る overwrite=True の検査だけなので、そちらにだけ残す。
 """
 import io
 import os
@@ -64,8 +72,13 @@ class SftpUnconfirmedReplaceKeepsFinalTest(unittest.TestCase):
         # STAT を実装しない機器。在るファイルにも汎用の失敗を返すので、
         # 送る直前の確認は「無い」と読む
         self.client.stat.side_effect = IOError("Failure")
-        self.client.posix_rename.side_effect = IOError("Operation unsupported")
-        # 最終名は実在するので 1 本目は断られる。消したあとなら通る
+        if overwrite:
+            # 最終名を消す復旧手順を見るので、posix_rename の無い機器にする
+            self.client.posix_rename.side_effect = IOError("Operation unsupported")
+        # 確認を経ていない送信では posix_rename を成功するままにしておく。
+        # 使ってしまう退行が起きたら、既存が黙って置き換わって完了が通知され、
+        # 下の検査が落ちる（IOError を仕込むと、呼ばれない前提が空振りする）
+        # 最終名は実在するので 1 本目の rename は断られる。消したあとなら通る
         self.client.rename.side_effect = [IOError("Failure"), None]
         m.list_directory = mock.Mock()      # 転送後の一覧更新は動かさない
         self.errors, self.done = [], []
@@ -85,6 +98,7 @@ class SftpUnconfirmedReplaceKeepsFinalTest(unittest.TestCase):
         removed = [c[0][0] for c in self.client.remove.call_args_list]
         self.assertNotIn(FINAL, removed,
                          "確認を経ていないのに最終名を消している: %s" % removed)
+        self.client.posix_rename.assert_not_called()
         self.assertEqual(self.client.rename.call_count, 1,
                          "最終名を消す復旧手順へ進んでいる")
         self.assertEqual(self.done, [],
