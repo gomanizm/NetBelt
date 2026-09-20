@@ -721,15 +721,11 @@ class SFTPManager(QObject):
                                 timed_out_note[0] = "（%s）" % unknown_outcome_note(
                                     final_removed=final_removed)
                                 return
-                            except Exception as e:
-                                # 期限切れの枝と同じ考え。
+                            except IOError as e:
+                                # 機器が答えた失敗。改名は行われていないと
+                                # 分かるので、これまでどおり断定してよい。
                                 # 復旧手順で最終名を消したあとなら、利用者が
-                                # 元の設定の無事を誤解しないよう書き添える。
-                                # IOError に限らないのは、paramiko が
-                                # EOFError / SFTPError / SSHException も
-                                # 上げるため。外側の except Exception へ
-                                # 落ちると keep_tmp が立たず、最終名を消した
-                                # あとの唯一の完全な写しまで後始末が消す
+                                # 元の設定の無事を誤解しないよう書き添える
                                 keep_tmp[0] = True
                                 gone = ("最終名は置き換えの手順で既に消してあります。"
                                         if final_removed else "")
@@ -741,6 +737,16 @@ class SFTPManager(QObject):
                                     # EOFError() を上げる（str が空）。
                                     # そのまま連結すると「: 」で終わる
                                     % (tmp_remote, str(e) or e.__class__.__name__))
+                            except Exception as e:
+                                # 切断・壊れた応答（EOFError / SFTPError /
+                                # SSHException）。改名の要求は届いていて応答
+                                # だけが返らなかったのなら、最終名には新しい
+                                # 内容があり一時名は無い。それを「失敗した」
+                                # 「写しは一時名にある」と断定すると、利用者は
+                                # 両方失ったと読んで無用な復旧へ向かう。
+                                # 期限切れの枝と同じく、確かめ方だけを伝える
+                                raise unknown_outcome_error(
+                                    e, final_removed=final_removed)
                         except Exception as e:
                             # 2 本目の rename が、機器の答えた失敗ではなく
                             # 接続の切断や壊れた応答で落ちた。置き換わったかは
