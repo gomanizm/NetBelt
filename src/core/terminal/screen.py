@@ -11,11 +11,14 @@ XTerm Control Sequences。
 文字が行頭に来たときは前の行へ繋げず捨てる。
 
 折り返しの印 (wrapped[r]) は行単位の近似で、論理行そのものは追って
-いない。そのため、折り返した行の一部だけを (右端まで届かない形で)
-書き直すと印が外れ、履歴・コピー・ログでは次の行との間に改行が入る。
-右端まで届く書き直しでも、結果が空白だけになった行は中身が無いものと
-して印を外す。印字が複数回に分かれて届いた場合も、右端までの書き直しが
-途中で切れると印は外れる。
+いない。消去・削除 (EL・ECH・DCH・ICH) は、残った行が丸ごと空白に
+なったときだけ印を外す。中身が残るかぎり次の行はまだ続きなので、
+行末まで届く消去でも印は保つ。印字での書き直しは、右端まで届いた
+ときだけ印を保ち、届かなければ外す。そのため、折り返した行の一部だけを
+(右端まで届かない形で) 書き直すと印が外れ、履歴・コピー・ログでは次の
+行との間に改行が入る。印字が複数回に分かれて届いた場合も、右端までの
+書き直しが途中で切れると印は外れる。続きの行そのものが無くなる命令
+(ED 0・IL・DL・スクロール) では、その場で印を外す。
 
 DECOM (ESC[?6h) は保持しない。有効なら CUP・VPA の行番号は
 スクロール範囲の上端から数えるべきだが、ここでは常に画面の
@@ -839,6 +842,11 @@ class Screen(object):
             rng = range(0, self.rows)
         elif mode == 0:
             self._erase_line(0)
+            # ED 0 はカーソル行の下も丸ごと消すので、この行の続きは
+            # 中身が残っていても無くなる。EL 0 は続きの行を触らないため
+            # 印を保つ (_erase_line) が、ここは外さないと、あとから
+            # 下の行へ出た無関係な出力と 1 行に繋がる
+            self.wrapped[self.cursor_row] = False
             rng = range(self.cursor_row + 1, self.rows)
         else:
             self._erase_line(1)
@@ -880,22 +888,17 @@ class Screen(object):
             rng = range(0, end)
         else:
             rng = range(0, len(line))
-        # 範囲の右端が全角の前半なら、後半も消えるので実際の右端は 1 つ先。
-        # _split_wide が継続セルを空白にする前に求めておく
-        stop = rng.stop
-        if stop < len(line) and line[stop][0] == "":
-            stop += 1
         # 範囲の端が全角の途中なら、その全角は丸ごと消える
         _split_wide(line, rng.start)
         _split_wide(line, rng.stop)
         for c in rng:
             line[c] = BLANK
-        # 消した範囲が行の末尾まで届いたら、この行から次の行への続きは
-        # 無い。EL 0 と EL 2 は必ず届く。EL 1 は普段は届かないが、
-        # カーソルが行末 (行末の全角の前半を含む) にあると行が丸ごと
-        # 空になるので、そこでも外す。消した範囲の右に印字された空白
-        # しか残らないときも行は空なので外す (_shift_chars と同じ基準)
-        if stop >= len(line) or all(c == BLANK for c in line):
+        # 消したあとに中身が残る行は、次の行への続きを持ったまま。丸ごと
+        # 空白になったときだけ外す (ECH / DCH / ICH と同じ基準)。行末まで
+        # 届いたかどうかでは決めない。EL 0 は必ず届くので、そうすると
+        # ECH・DCH・右端まで空白を印字した書き直しと同じ画面から、EL 0 の
+        # ときだけ 1 本の論理行が履歴・コピー・文書で 2 行に割れる
+        if all(c == BLANK for c in line):
             self.wrapped[self.cursor_row] = False
         self.dirty.add(self.cursor_row)
         self._pending_wrap = False
