@@ -16,7 +16,7 @@ from .dialogs.device_dialog import DeviceDialog
 from .dialogs.group_dialog import GroupDialog
 from .dialogs.macro_dialog import MacroDialog
 from .dialogs.settings_dialog import SettingsDialog
-from core.config_manager import ConfigManager
+from core.config_manager import ConfigManager, device_endpoint
 from core.ssh_connection import SSHConnection
 from core.serial_connection import SerialConnection
 from core.telnet_connection import TelnetConnection
@@ -596,9 +596,12 @@ class MainWindow(QMainWindow):
                 return
 
             # 差し替えは 1 回の保存で行う。削除→追加の 2 段階だと、片方の
-            # 保存だけ失敗したときに機器が消えたり新旧 2 件になったりする
+            # 保存だけ失敗したときに機器が消えたり新旧 2 件になったりする。
+            # 編集前の接続先も渡す。同じグループに同名が並んでいると、名前
+            # だけでは開いた項目を指せず、別の 1 台が書き換わってしまう
             if self.config_manager.update_device(group_name, old_device_name,
-                                                 new_group_name, new_device_data):
+                                                 new_group_name, new_device_data,
+                                                 old_endpoint=self._endpoint_of(device_data)):
                 # 開いているタブの再接続は device_info の写しを見る。
                 # ここを更新しないと編集内容が届かず、古い接続情報のまま
                 # 繋がり続ける（存在しない鍵を指定しても、以前の鍵で
@@ -1219,19 +1222,11 @@ class MainWindow(QMainWindow):
         自動検出か登録か・プロトコル・ホストとポート（シリアルはポート名）。
         _on_connect_requested と _connect_ssh / _connect_telnet /
         _connect_serial が実際に使う値と同じ読み方をする。
+
+        ConfigManager も同名の機器を見分けるのに同じ組を使うので、読み方が
+        ずれないよう core 側の device_endpoint() をそのまま呼ぶ。
         """
-        if not isinstance(device_data, dict):
-            return None
-        autodetect = device_data.get('source') == 'autodetect'
-        protocol = device_data.get('protocol', 'ssh')
-        if protocol in ('serial', 'console'):
-            if protocol == 'console':
-                return (autodetect, 'serial', device_data.get('host', ''))
-            return (autodetect, 'serial', str(device_data.get('port', '')))
-        default_port = 23 if protocol == 'telnet' else 22
-        return (autodetect, 'telnet' if protocol == 'telnet' else 'ssh',
-                device_data.get('host', 'unknown'),
-                str(device_data.get('port', default_port)))
+        return device_endpoint(device_data)
 
     def _tools_target_matches(self, device_name: str, device_data: dict) -> bool:
         """「ツール」を開いた項目が、その名前のセッションと同じ接続先かを返す

@@ -30,6 +30,28 @@ def is_reserved_device_name(name) -> bool:
     return isinstance(name, str) and name.strip() in RESERVED_DEVICE_NAMES
 
 
+def device_endpoint(device_data):
+    """機器データが指す接続先を、比べられる形で返す（辞書でなければ None）
+
+    自動検出か登録か・プロトコル・ホストとポート（シリアルはポート名）。
+    接続処理が実際に使う値と同じ読み方をする。機器名が同じでも接続先が
+    違えば別の機器なので、名前だけで 1 件に絞れないときの決め手に使う。
+    画面側（MainWindow._endpoint_of）もこの関数を呼ぶ。
+    """
+    if not isinstance(device_data, dict):
+        return None
+    autodetect = device_data.get('source') == 'autodetect'
+    protocol = device_data.get('protocol', 'ssh')
+    if protocol in ('serial', 'console'):
+        if protocol == 'console':
+            return (autodetect, 'serial', device_data.get('host', ''))
+        return (autodetect, 'serial', str(device_data.get('port', '')))
+    default_port = 23 if protocol == 'telnet' else 22
+    return (autodetect, 'telnet' if protocol == 'telnet' else 'ssh',
+            device_data.get('host', 'unknown'),
+            str(device_data.get('port', default_port)))
+
+
 # 旧 ~/.terminal-tool/known_hosts を引き継げなかったときの警告文。
 # app_data_dir() が呼ばれるたびに更新する。
 _known_hosts_import_warning = None
@@ -1248,6 +1270,28 @@ class ConfigManager:
         group["devices"] = before
         return False
 
+    @staticmethod
+    def _device_index(devices: List[Dict], device_name: str,
+                      endpoint=None) -> Optional[int]:
+        """その名前の機器が一覧のどこにいるかを返す（無ければ None）。
+
+        機器名は本来グループをまたいで一意だが、手編集や他ツールの
+        config.json では同じグループに同名が並ぶ。名前だけで探すと必ず
+        先頭に当たるので、2 台目を編集・削除したつもりで 1 台目が
+        書き換わったり消えたりする（実測）。呼び出し側が操作対象の
+        接続先を知っているときは、それで 1 件に絞る。
+        接続先でも絞れない（完全に同じ機器が 2 つある）ときは先頭。
+        """
+        found = [i for i, d in enumerate(devices)
+                 if isinstance(d, dict) and d.get("name") == device_name]
+        if not found:
+            return None
+        if len(found) > 1 and endpoint is not None:
+            matched = [i for i in found if device_endpoint(devices[i]) == endpoint]
+            if len(matched) == 1:
+                return matched[0]
+        return found[0]
+
     def find_device_group(self, device_name: str) -> Optional[str]:
         """その名前の機器が属するグループ名を返す（無ければ None）"""
         for group in self.get_groups():
@@ -1257,13 +1301,18 @@ class ConfigManager:
         return None
 
     def update_device(self, group_name: str, old_name: str,
-                      new_group_name: str, device_info: Dict) -> bool:
+                      new_group_name: str, device_info: Dict,
+                      old_endpoint=None) -> bool:
         """機器を差し替える（改名・グループ移動を含む）。保存は 1 回。
 
         remove_device → add_device の 2 段階にすると、間の状態がディスクに
         残ったり、片方の保存だけ失敗して機器が消えたり新旧 2 件になったり
         する。差し替えをメモリ上で組んでから 1 回だけ保存し、失敗したら
         メモリも元に戻す。
+
+        old_endpoint には編集前の機器の接続先（device_endpoint() の戻り値）を
+        渡す。同じグループに同名が並んでいるときに、どちらを編集したのかは
+        名前だけでは決まらないため。省略すると先頭の 1 件を編集する。
         """
         source = self.get_group(group_name)
         target = self.get_group(new_group_name)
@@ -1281,8 +1330,7 @@ class ConfigManager:
         # 改名するときだけ、その名前が既に使われていないかを見る。
         if new_name != old_name and self.find_device_group(new_name) is not None:
             return False   # 別の機器の名前
-        index = next((i for i, d in enumerate(source["devices"])
-                      if d.get("name") == old_name), None)
+        index = self._device_index(source["devices"], old_name, old_endpoint)
         if index is None:
             return False
 
