@@ -405,6 +405,14 @@ class SFTPManager(QObject):
         permissions を open(2) の mode に渡すので、最初から既存と同じ mode で
         作られる。umask で落ちたビットは続くハンドルへの chmod で当て直す。
         mode 付きの OPEN を断る機器では、これまでどおり属性なしで開く。
+
+        当てる mode には所有者の書込みビットを足す。ここで作ったハンドルは
+        すぐ閉じ、続く put() が同じ名前を 'wb' で開き直すので、既存が 0444 や
+        0400 だと open(2) の権限検査で断られ、書込みビットの無いファイルを
+        一切置き換えられなくなる（実測: 「[Errno 13] Permission denied」だけが
+        出て、原因が一時名の mode だとは分からない）。他のユーザーへの
+        見え方は広がらず（0444→0644、0400→0600）、転送後の _carry_over_mode が
+        最終的に元どおりの mode を当て直す。
         """
         try:
             mode = getattr(self.sftp_client.stat(remote_path), "st_mode", None)
@@ -414,15 +422,16 @@ class SFTPManager(QObject):
             return
         if not isinstance(mode, int):
             return
+        tmp_mode = (mode & 0o7777) | 0o200
         try:
-            handle = self._open_new_with_mode(tmp_remote, mode & 0o7777)
+            handle = self._open_new_with_mode(tmp_remote, tmp_mode)
         except TimeoutError:
             raise
         except Exception:
             # mode 付きの OPEN（や EXCL）を受け付けない機器
             handle = self.sftp_client.open(tmp_remote, "wb")
         try:
-            handle.chmod(mode & 0o7777)
+            handle.chmod(tmp_mode)
         except TimeoutError:
             raise   # 閉じにいっても、さらに期限ぶん待つだけ
         except Exception:
