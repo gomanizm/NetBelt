@@ -203,6 +203,10 @@ class SftpTransferAtomicityTest(unittest.TestCase):
         「posix_rename が使えないサーバ」と同じ後始末へ落ちていた。一時名は
         既に無いので rename が失敗し、その復旧として最終名を remove する。
         置き換わったばかりの内容と、転送した写しの両方が消える。
+
+        overwrite=True で送るのは、posix_rename を使うのが上書きの確認を得た
+        送信だけになったため（利用者の決定 2026-09-20）。ここで見ているのは
+        置き換えの仕組みなので、意図どおり承認済みの送信にしてある。
         """
         m = self._manager()
         local = os.path.join(self.dir, "running.cfg")
@@ -212,7 +216,7 @@ class SftpTransferAtomicityTest(unittest.TestCase):
         # 機器側では置き換わっているので、一時名はもう無い
         m.sftp_client.rename.side_effect = IOError("No such file")
 
-        m.upload_file(local, "/flash/running.cfg")
+        m.upload_file(local, "/flash/running.cfg", overwrite=True)
 
         self.assertTrue(self._wait(lambda: self.errors), "失敗が通知されない")
         removed = [c[0][0] for c in m.sftp_client.remove.call_args_list]
@@ -239,12 +243,17 @@ class SftpTransferAtomicityTest(unittest.TestCase):
                          "期限切れのあとに rename をやり直している")
 
     def test_a_successful_upload_is_moved_into_place(self):
+        """置き換えの仕組み（一時名へ送ってから改名）を見る。
+
+        overwrite=True で送るのは、posix_rename を使うのが上書きの確認を得た
+        送信だけになったため（利用者の決定 2026-09-20）。
+        """
         m = self._manager()
         local = os.path.join(self.dir, "running.cfg")
         with io.open(local, "w", encoding="utf-8") as f:
             f.write("hostname R1")
 
-        m.upload_file(local, "/flash/running.cfg")
+        m.upload_file(local, "/flash/running.cfg", overwrite=True)
 
         self.assertTrue(self._wait(lambda: self.done), "完了が通知されない: %s" % self.errors)
         put_target = m.sftp_client.put.call_args[0][1]

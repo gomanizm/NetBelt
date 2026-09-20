@@ -622,35 +622,42 @@ class SFTPManager(QObject):
                                 "残っています）" % tmp_remote)
                             return
                     # 全部送れてから最終名へ。posix_rename（OpenSSH 拡張）は
-                    # 既存を上書きできる。無いサーバでは、まず rename を試し、
-                    # 既存があって失敗したときだけ消してからもう一度 rename
-                    # する（先に消すと、rename に失敗した瞬間に元が消える）
+                    # 既存を上書きできるので、上書きの確認を得ている送信だけが
+                    # 使う。確認を経ていない送信は、既存があれば失敗する
+                    # ふつうの rename を使う（STAT を実装しない機器では送る
+                    # 直前の確認も転送後の再確認も「無い」と読むので、既存を
+                    # 潰さないための最後の砦がこの失敗になる）。posix_rename
+                    # の無いサーバでは、まず rename を試し、既存があって失敗
+                    # したときだけ消してからもう一度 rename する（先に消すと、
+                    # rename に失敗した瞬間に元が消える）
                     try:
-                        self.sftp_client.posix_rename(tmp_remote, remote_path)
+                        if overwrite:
+                            self.sftp_client.posix_rename(tmp_remote, remote_path)
+                        else:
+                            self.sftp_client.rename(tmp_remote, remote_path)
                     except TimeoutError as e:      # socket.timeout の別名
                         raise unknown_outcome(e)
-                    except (AttributeError, IOError):
+                    except (AttributeError, IOError) as first_error:
+                        if not overwrite:
+                            # 非 posix の rename が断る理由の筆頭は
+                            # 「既にある」。上書きの確認を経ていない送信で
+                            # その失敗から最終名を消しにいくと、既存を
+                            # 潰さないための安全網を自分で外すことになる。
+                            # 最終名には触れず、一時名に残して知らせる
+                            keep_tmp[0] = True
+                            raise IOError(
+                                "リモートの '%s' へ置き換えられませんでした"
+                                "（既にある可能性があります）。上書きの確認を経て"
+                                "いないので最終名には触れていません。転送した内容は"
+                                "機器の一時名 %s に残っています。上書きしてよければ"
+                                "一覧を更新してからやり直してください: %s"
+                                % (remote_name, tmp_remote, first_error))
+                        # posix_rename の無いサーバ。ふつうの rename を試す
                         try:
                             self.sftp_client.rename(tmp_remote, remote_path)
                         except TimeoutError as e:
                             raise unknown_outcome(e)
-                        except IOError as first_error:
-                            if not overwrite:
-                                # 非 posix の rename が断る理由の筆頭は
-                                # 「既にある」。上書きの確認を経ていない送信で
-                                # その失敗から最終名を消しにいくと、既存を
-                                # 潰さないための安全網を自分で外すことになる
-                                # （STAT を実装しない機器では送る直前の確認も
-                                # 「無い」と読むので、ここが最後の砦）。
-                                # 最終名には触れず、一時名に残して知らせる
-                                keep_tmp[0] = True
-                                raise IOError(
-                                    "リモートの '%s' へ置き換えられませんでした"
-                                    "（既にある可能性があります）。上書きの確認を経て"
-                                    "いないので最終名には触れていません。転送した内容は"
-                                    "機器の一時名 %s に残っています。上書きしてよければ"
-                                    "一覧を更新してからやり直してください: %s"
-                                    % (remote_name, tmp_remote, first_error))
+                        except IOError:
                             # remove が断られたら最終名は残っている。消えたと
                             # 伝えてよいのは remove が成功したときだけ
                             final_removed = False
