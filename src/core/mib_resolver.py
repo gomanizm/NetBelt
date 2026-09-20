@@ -91,6 +91,9 @@ class MIBResolver:
     def __init__(self):
         self.oid_to_name: Dict[str, str] = {}
         self.name_to_oid: Dict[str, str] = {}
+        # 直前の読み込みで mib_cache.json をそのまま使えたか。
+        # 読み込み件数の知らせに「（キャッシュ使用）」を付けるかを決める
+        self._mib_cache_used = False
         self._load_default_mibs()
         self._load_custom_mibs()
     
@@ -245,15 +248,25 @@ class MIBResolver:
                 for oid, name in cached_mibs.items():
                     self.name_to_oid[name] = oid
                 
-                print(f"[MIBResolver] MIBファイルから {len(cached_mibs)}件のOIDを読み込みました（キャッシュ使用）")
-    
+                # 「（キャッシュ使用）」は、本当にキャッシュをそのまま
+                # 使えたときだけ付ける。常に付けていたので、直前に
+                # 「キャッシュを保存できません…次の起動でも解析し直します」
+                # と出した後でもこれが続き、打ち消していた（実測）。
+                # 初回起動（全ファイルを解析した回）でも同じで、起動が
+                # 遅い理由を探している利用者に逆のことを伝えていた
+                note = '（キャッシュ使用）' if self._mib_cache_used else ''
+                print(f"[MIBResolver] MIBファイルから {len(cached_mibs)}件のOIDを読み込みました{note}")
+
     def _load_or_update_mib_cache(self, mibs_dir: str) -> dict:
         """
         MIBキャッシュを読み込むか、必要に応じて更新
-        
+
+        解析し直さずにキャッシュをそのまま使えたかを self._mib_cache_used に
+        残す（呼び出し側が知らせの文言に使う）。
+
         Args:
             mibs_dir: MIBファイルのディレクトリ
-        
+
         Returns:
             OID→名前の辞書
         """
@@ -407,7 +420,9 @@ class MIBResolver:
                       f"{cache_file} へ書き込めるようにする（アクセス権や、"
                       f"同じ名前のフォルダ・読み取り専用のファイルが無いかを"
                       f"確かめる）か、書き込める場所へアプリを移してください")
-        
+
+        # 解析し直したときは、保存できたかに関わらずキャッシュは使っていない
+        self._mib_cache_used = not cache_needs_update
         return cached_mibs
     
     # MIB から拾う定義。現代の MIB はモジュールの根を MODULE-IDENTITY で
