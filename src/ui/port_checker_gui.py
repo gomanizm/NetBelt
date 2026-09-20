@@ -141,13 +141,24 @@ class PortCheckThread(QThread):
                 else:
                     result += f"  → サーバーアプリケーションを起動できます\n\n"
             except OSError as e:
-                # 10048: Address already in use。10013 (errno 13): 占有側が
-                # SO_REUSEADDR 無しで、こちらが SO_REUSEADDR 付きのときに
-                # 出る「アクセス許可で禁じられた方法」。どちらも使用中
-                if e.errno in (10048, 13) or getattr(e, "winerror", None) in (10048, 10013):
+                winerror = getattr(e, "winerror", None)
+                # 10048: Address already in use。排他 bind なので、実在の占有は
+                # TCP / UDP・占有側の SO_REUSEADDR の有無によらずこれになる
+                if e.errno == 10048 or winerror == 10048:
                     result += f"✗ ポート {self.port}/{self.protocol} は既に使用されています\n"
                     result += f"  → 別のプログラムがこのポートを使用中です\n"
                     result += f"  → 下記のプロセス情報を確認してください\n\n"
+                # 10013 / errno 13 (WSAEACCES): 占有とは限らない。OS の予約・
+                # 除外範囲（netsh の excludedportrange、Hyper-V / WSL の予約）
+                # でも出る。占有と断定すると、同じ画面の netstat 欄（使用して
+                # いる接続は見つかりませんでした）と矛盾する
+                elif e.errno == 13 or winerror == 10013:
+                    result += (f"✗ ポート {self.port}/{self.protocol} は"
+                               f"バインドできません（アクセスが拒否されました）\n")
+                    result += f"  → 別のプログラムが使用中か、OSが予約・除外しています\n"
+                    result += (f"  → 除外範囲は netsh int ipv4 show excludedportrange "
+                               f"protocol={self.protocol.lower()} で確認できます\n")
+                    result += f"  → 元のエラー: {e}\n\n"
                 else:
                     result += f"✗ エラー: {e}\n\n"
         
