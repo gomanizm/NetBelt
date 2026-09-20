@@ -365,6 +365,12 @@ class ConfigManager:
     # 画面では伏字にしているのにディスクは平文、という状態を避ける。
     _ENCRYPTED_SETTING_SECTIONS = ("ftp_server", "sftp_server")
 
+    # 復号できなかったときに、どのタブを開けばよいか伝えるための表示名
+    _SETTING_SECTION_LABELS = {
+        "ftp_server": "FTPサーバー",
+        "sftp_server": "SFTPサーバー",
+    }
+
     def _encrypt_passwords(self, config: Dict) -> None:
         """
         設定内の全パスワードを暗号化
@@ -408,6 +414,7 @@ class ConfigManager:
     
     def _decrypt_passwords(self, config: Dict) -> None:
         self._undecryptable_count = 0
+        self._undecryptable_settings: List[str] = []
         """
         設定内の全パスワードを復号化
         
@@ -422,18 +429,18 @@ class ConfigManager:
                 decrypted = self.crypto.decrypt(encrypted)
                 # 復号に失敗すると入力がそのまま返る。値は保持したまま件数を数える
                 # （原本の保護は _encrypt_passwords 側で行う）
-                if self.crypto.is_encrypted(decrypted):
+                # 本物の DPAPI 暗号文だけを覚え、数える。"DPAPI:cisco123" の
+                # ような平文の合言葉まで覚えると、接続の入口がそれを暗号文と
+                # みなして、正しいパスワードの機器を断る。数だけ入れても、
+                # 案内の件数と実際に断られる機器の数が食い違う
+                if self.crypto.is_dpapi_ciphertext(decrypted):
                     self._undecryptable_count += 1
-                    # 本物の DPAPI 暗号文だけを覚える。"DPAPI:cisco123" の
-                    # ような平文の合言葉まで覚えると、接続の入口がそれを
-                    # 暗号文とみなして、正しいパスワードの機器を断る
-                    if self.crypto.is_dpapi_ciphertext(decrypted):
-                        # 名前は上書きされうるが、値は同名の機器が何台あっても
-                        # それぞれ残る
-                        self.undecryptable_values.add(decrypted)
-                        name = device.get("name")
-                        if isinstance(name, str) and name:
-                            self.undecryptable_devices[name] = decrypted
+                    # 名前は上書きされうるが、値は同名の機器が何台あっても
+                    # それぞれ残る
+                    self.undecryptable_values.add(decrypted)
+                    name = device.get("name")
+                    if isinstance(name, str) and name:
+                        self.undecryptable_devices[name] = decrypted
                 device["password"] = decrypted
 
         # トークンは件数に数えない。復号できないときの案内は
@@ -455,8 +462,11 @@ class ConfigManager:
             if not isinstance(encrypted, str) or not encrypted:
                 continue
             decrypted = self.crypto.decrypt(encrypted)
+            # 機器と違い、内蔵サーバは is_encrypted に当たる値のままでは
+            # 起動を断られる（平文の合言葉でも同じ）。断られる条件に
+            # そろえて、ここは is_encrypted で数える
             if self.crypto.is_encrypted(decrypted):
-                self._undecryptable_count += 1
+                self._undecryptable_settings.append(name)
             section["password"] = decrypted
     
     def _notify_undecryptable(self) -> None:
@@ -465,15 +475,30 @@ class ConfigManager:
         print だけだと、exe から起動した利用者には何も見えない。接続を
         断られてから理由を探すことになるので、起動時の警告（load_warning）
         にも載せて画面に出す。
+
+        機器と内蔵サーバでは入れ直す場所が違う。ひとまとめに数えて
+        「機器の編集で入れ直してください」と出すと、機器が 1 台も絡まない
+        ときにも機器の話をしてしまい、開いても直すところが無い。由来ごとに
+        分けて数え、書き分ける。
         """
-        n = getattr(self, "_undecryptable_count", 0)
-        if not n:
+        devices = getattr(self, "_undecryptable_count", 0)
+        sections = getattr(self, "_undecryptable_settings", [])
+        parts = []
+        if devices:
+            parts.append(f"{devices}件の機器のパスワードを復号できませんでした。"
+                         "該当機器のパスワードは、機器の編集で入れ直してください。")
+        if sections:
+            labels = "、".join(self._SETTING_SECTION_LABELS.get(name, name)
+                              for name in sections)
+            parts.append(f"{labels}のパスワードを復号できませんでした。"
+                         "その画面で入れ直してください"
+                         "（表示メニューから開けます）。")
+        if not parts:
             return
         self._append_load_warning(
-            f"{n}件のパスワードを復号できませんでした。"
-            "別の Windows アカウント/PC で保存された設定の可能性があります。"
-            "該当機器のパスワードは、機器の編集で入れ直してください。"
-            "（設定ファイル内の元の値は保護されており、上書きされません）")
+            "\n".join(parts)
+            + "\n別の Windows アカウント/PC で保存された設定の可能性があります。"
+              "（設定ファイル内の元の値は保護されており、上書きされません）")
 
     def _append_load_warning(self, message: str) -> None:
         """起動時の警告を書き足す（先に記録された警告を消さない）。"""
