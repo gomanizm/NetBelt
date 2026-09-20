@@ -247,11 +247,18 @@ class Screen(object):
             alt.append([BLANK] * cols)
             alt_marks.append(False)
 
+        # 折り返し待ちは「カーソルは論理的に桁 self.cols にいる」状態。
+        # 桁で丸める前に論理位置へ直しておかないと、右端ちょうどまで
+        # 書いて出力が止まっている瞬間に窓の大きさや文字の大きさを変え
+        # たとき、続きの 1 文字目が右端の文字を上書きして黙って消す
+        logical_col = self.cursor_col + (1 if self._pending_wrap else 0)
         self.rows, self.cols = rows, cols
         self.scroll_top, self.scroll_bottom = 0, rows - 1
         self.cursor_row = min(self.cursor_row, rows - 1)
-        self.cursor_col = min(self.cursor_col, cols - 1)
-        self._pending_wrap = False
+        self.cursor_col = min(logical_col, cols - 1)
+        # 桁が広がったら折り返す必要が無くなるので、待ちを解いて旧桁の
+        # 位置から続ける。桁が同じか狭いときは待ちのまま持ち越す
+        self._pending_wrap = self._pending_wrap and logical_col >= cols
         self.dirty = set(range(rows))
         self._reflowed = True
 
