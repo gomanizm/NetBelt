@@ -183,14 +183,28 @@ class SyslogTableModel(QAbstractTableModel):
             return self.headers[section]
         return None
     
+    def _limit_reached(self):
+        """保持件数が上限に達しているか。上限が数でなければ達していない扱い。
+
+        max_messages は手編集の config.json から来ることがあり、null や
+        文字列だと比較そのものが TypeError になる。ここで受け止めないと、
+        受信スロットを例外が抜けて PyQt6 がプロセスを落とす
+        """
+        try:
+            return len(self.messages) >= int(self.max_messages)
+        except (TypeError, ValueError):
+            return False
+
     def add_message(self, msg: SyslogMessage):
         """メッセージを追加"""
-        # 最大行数を超える場合は古いものを削除
-        if len(self.messages) >= self.max_messages:
+        # 最大行数を超える場合は古いものを削除。保持している行があるときだけ
+        # 削除する。上限が 0 以下だと条件が常に真になり、beginRemoveRows の
+        # 後の pop(0) が空リストで失敗して、行削除通知が開いたまま残っていた
+        if self.messages and self._limit_reached():
             self.beginRemoveRows(QModelIndex(), 0, 0)
             self.messages.pop(0)
             self.endRemoveRows()
-        
+
         # 新しいメッセージを追加
         row = len(self.messages)
         self.beginInsertRows(QModelIndex(), row, row)
@@ -267,7 +281,10 @@ class SyslogFilterProxyModel(QSortFilterProxyModel):
 
 class SyslogPanel(QWidget):
     """Syslogビューアパネル"""
-    
+
+    # 保持するメッセージ件数の既定値
+    DEFAULT_MAX_MESSAGES = 1000
+
     def __init__(self, parent=None, config_manager=None):
         super().__init__(parent)
         self.config_manager = config_manager
@@ -298,14 +315,33 @@ class SyslogPanel(QWidget):
         section = settings.get("syslog", {}) if isinstance(settings, dict) else {}
         return section if isinstance(section, dict) else {}
 
+    @staticmethod
+    def _sanitize_max_messages(value):
+        """保持件数を int へ寄せる。使えない値は既定値へ戻す。
+
+        config.json は手で編集できるうえ、max_messages は GUI からもアプリからも
+        書かれないので、ここへ来る値は手書きのものだけ。null・0・負数・文字列が
+        入ると最初の受信で add_message が例外になり、それが受信スロットを抜けて
+        PyQt6 がプロセスを落としていた（メッセージも出ずに終了）。auto_scroll と
+        同じく、値が不正でも起動と受信は続けたいので既定値へ戻す
+        """
+        if isinstance(value, bool):
+            return SyslogPanel.DEFAULT_MAX_MESSAGES
+        try:
+            limit = int(value)
+        except (TypeError, ValueError):
+            return SyslogPanel.DEFAULT_MAX_MESSAGES
+        return limit if limit >= 1 else SyslogPanel.DEFAULT_MAX_MESSAGES
+
     def _load_config(self):
         """設定の読み込み"""
         if self.config_manager:
             syslog_config = self._syslog_settings()
-            self.max_messages = syslog_config.get("max_messages", 1000)
+            self.max_messages = self._sanitize_max_messages(
+                syslog_config.get("max_messages", self.DEFAULT_MAX_MESSAGES))
             self.auto_scroll = syslog_config.get("auto_scroll", True)
         else:
-            self.max_messages = 1000
+            self.max_messages = self.DEFAULT_MAX_MESSAGES
             self.auto_scroll = True
     
     def _init_ui(self):
