@@ -490,6 +490,31 @@ class MainWindow(QMainWindow):
             self, "機器名の重複",
             "%s\n別の名前を付けてください。" % reason)
 
+    def _exec_dialog(self, dialog) -> int:
+        """ダイアログを開き、閉じたあとの破棄を予約して結果を返す
+
+        ダイアログはどれも parent=self（MainWindow）で作るので、exec() から
+        抜けても非表示のまま子として残り続けていた（実測: 機器の編集を
+        20 回繰り返すと DeviceDialog が 20 個・子ウィジェットが 1000 個、
+        設定は 1 回あたり 47 個、マクロは 27 個増える）。OK でもキャンセル
+        でも積み上がり、アプリを閉じるまで解放されない。
+
+        戻り値を見たあとの早期 return が多いので、ここで try/finally にして
+        予約を取りこぼさないようにする。deleteLater() はイベントループへ
+        戻るまで実際には消さないため、戻り値を見てから dialog.get_*() を
+        読む呼び出し側はそのまま動く。
+
+        Args:
+            dialog: 開くダイアログ
+
+        Returns:
+            int: exec() の戻り値（QDialog.DialogCode）
+        """
+        try:
+            return dialog.exec()
+        finally:
+            dialog.deleteLater()
+
     def _on_add_device(self):  # 追加
         """機器追加ダイアログを表示"""
         # グループ名リストを取得
@@ -505,7 +530,7 @@ class MainWindow(QMainWindow):
         
         # ダイアログ表示
         dialog = DeviceDialog(self, groups=group_names)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
+        if self._exec_dialog(dialog) == QDialog.DialogCode.Accepted:
             # 機器データ取得
             device_data = dialog.get_device_data()
             group_name = dialog.get_selected_group()
@@ -555,7 +580,7 @@ class MainWindow(QMainWindow):
         if index >= 0:
             dialog.group_combo.setCurrentIndex(index)
         
-        if dialog.exec() == QDialog.DialogCode.Accepted:
+        if self._exec_dialog(dialog) == QDialog.DialogCode.Accepted:
             # 新しい機器データを取得
             new_device_data = dialog.get_device_data()
             new_group_name = dialog.get_selected_group()
@@ -698,7 +723,7 @@ class MainWindow(QMainWindow):
         if index >= 0:
             dialog.group_combo.setCurrentIndex(index)
         
-        if dialog.exec() == QDialog.DialogCode.Accepted:
+        if self._exec_dialog(dialog) == QDialog.DialogCode.Accepted:
             # 機器データを取得
             new_device_data = dialog.get_device_data()
             new_group_name = dialog.get_selected_group()
@@ -1536,7 +1561,7 @@ class MainWindow(QMainWindow):
 
         # ダイアログ表示
         dialog = GroupDialog(self, existing_groups=existing_groups)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
+        if self._exec_dialog(dialog) == QDialog.DialogCode.Accepted:
             # グループ名と自動実行コマンドを取得
             group_name = dialog.get_group_name()
             auto_commands = dialog.get_auto_commands()
@@ -1596,7 +1621,7 @@ class MainWindow(QMainWindow):
         dialog = GroupDialog(self, group_name=group_name,
                              existing_groups=existing_groups,
                              auto_commands=auto_commands)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        if self._exec_dialog(dialog) != QDialog.DialogCode.Accepted:
             return
 
         new_group_name = dialog.get_group_name()
@@ -1755,7 +1780,7 @@ class MainWindow(QMainWindow):
         案内している。ここで塞ぐと復旧手段が無くなる。
         """
         dialog = SettingsDialog(self, config_manager=self.config_manager)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
+        if self._exec_dialog(dialog) == QDialog.DialogCode.Accepted:
             self._apply_terminal_settings_from_config()
             self.status_bar.showMessage("設定を保存しました")
 
@@ -1802,7 +1827,7 @@ class MainWindow(QMainWindow):
             lambda: self.macro_manager.stop_command_list(current_tab_name)
         )
         
-        dialog.exec()
+        self._exec_dialog(dialog)
     
     def _start_keepalive(self, device_name: str, interval: int):
         """キープアライブを開始してUI更新"""
@@ -1901,7 +1926,7 @@ class MainWindow(QMainWindow):
             lambda: self.macro_manager.stop_command_list(device_name)
         )
         
-        dialog.exec()
+        self._exec_dialog(dialog)
     
     def _session_is_live(self, device_name: str, what: str) -> bool:
         """「ツール」から来た要求を、いまも繋がっているときだけ通す
@@ -2550,7 +2575,7 @@ for details.
         from .dialogs.update_dialog import UpdateDialog
         
         dialog = UpdateDialog(self, update_info)
-        result = dialog.exec()
+        result = self._exec_dialog(dialog)
         
         # 最終チェック時刻を更新
         self.config_manager.set_last_check_time(datetime.now().isoformat())
