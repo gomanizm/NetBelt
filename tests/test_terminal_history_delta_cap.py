@@ -20,7 +20,10 @@ TerminalWidget を通した 1 回の描画は 24x80 で 0.40 秒、200x500 で 2
 直し方: _new_history を上限付き (Screen.MAX_NEW_HISTORY) にして、
 あふれた分は古い方から捨てる。上限は文書の上限 MAX_DOCUMENT_BLOCKS
 以上にしてあり、文書は末尾から数えて上限行だけを残すので、描き終えた
-文書は上限が無かったときと同じになる。捨てたことは
+文書は上限が無かったときと同じになる。数えるのは「行」ではなく
+「文書の 1 行を終える行」で、折り返しが混ざったときに文書が上限へ
+届かなくなる件は tests/test_terminal_history_delta_wrapped_lines.py
+で別に見ている。捨てたことは
 take_history_dropped() で描画側へ伝え、「全ログ保存」の欠落警告
 (_log_truncated) を立てる。Screen.history は deque(maxlen) のまま触らない。
 """

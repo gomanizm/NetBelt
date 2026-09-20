@@ -87,18 +87,22 @@ def _split_wide(line, i):
 
 
 class Screen(object):
-    # 描画側へ渡す履歴の差分 (_new_history) を持てる行数。
+    # 描画側へ渡す履歴の差分 (_new_history) に残す論理行の数。
     # 描画側は文書を MAX_DOCUMENT_BLOCKS 行で頭から切り詰めるので、
     # それより古い行は書いた先から捨てられるだけ。上限をそれ以上に
     # 取り、捨てるのを古い方に限ってあるので、描き終えた文書は上限が
-    # 無かったときと同じになる (下げると文書から行が消える)
+    # 無かったときと同じになる (下げると文書から行が消える)。
+    # 数えるのは「行」ではなく「文書の 1 行を終える行 = 折り返しで
+    # 続かない行」。折り返しで続く行は次の行と繋いで 1 行として書かれる
+    # ので、行で数えると折り返しが混ざったぶん文書が上限に届かない
     MAX_NEW_HISTORY = 20000
 
     def __init__(self, rows=24, cols=80, max_history=5000):
         self.rows = rows
         self.cols = cols
         self.history = collections.deque(maxlen=max_history)
-        self._new_history = collections.deque(maxlen=self.MAX_NEW_HISTORY)
+        self._new_history = collections.deque()
+        self._new_history_lines = 0     # 差分に入っている論理行の数
         self._history_dropped = False
         self.title = ""
         self.responses = []             # 機器へ送り返す応答 (DSR/DA)
@@ -176,15 +180,25 @@ class Screen(object):
         MAX_DOCUMENT_BLOCKS 行しか残さないので、大半は捨てられるためだけ
         に確保され書き込まれていた。self.history は deque(maxlen) で既に
         抑えられている。
+
+        捨てるのは論理行の頭まで。折り返しの途中から残すと、切れ端が
+        1 行として文書へ入る。新しく折り返しの印が付くには右端まで印字
+        する必要があるので、印付きの行は 1 回の描画単位ぶんの入力で
+        抑えられており、上限に数えなくても青天井にはならない。
         """
-        if len(self._new_history) == self._new_history.maxlen:
-            self._history_dropped = True
         self._new_history.append((line, wrapped))
+        if not wrapped:
+            self._new_history_lines += 1
+        while self._new_history_lines > self.MAX_NEW_HISTORY:
+            self._history_dropped = True
+            if not self._new_history.popleft()[1]:
+                self._new_history_lines -= 1
 
     def take_new_history(self):
         """前回から増えた履歴を (行, 折り返しで続くか) で返して忘れる。"""
         new = list(self._new_history)
         self._new_history.clear()
+        self._new_history_lines = 0
         return new
 
     def take_history_dropped(self):
