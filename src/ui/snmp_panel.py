@@ -12,6 +12,7 @@ from PyQt6.QtGui import QAction, QStandardItemModel, QStandardItem
 from contextlib import contextmanager
 from datetime import datetime
 import json
+import math
 import os
 import re
 import tempfile
@@ -801,12 +802,25 @@ class SNMPPanel(QWidget):
 
         config.json は手で編集できるので、数でない値や 0 以下が来る。
         そのまま使うと上限が消えたり、1件も残らなくなる。
+
+        非有限（±inf）にも気をつける。JSON の 1e309 や Infinity を
+        json.load は float の無限大として読み、int() はそこで
+        OverflowError を送出する。これは ArithmeticError 系なので
+        ValueError の網に掛からず、SNMPPanel のコンストラクタから
+        MainWindow の初期化まで抜けて、画面が出ないまま終了していた
+        （実測）。値は config.json に残るので、直すまで毎回起動に失敗
+        する。NaN は int(nan) が ValueError なので元から既定値へ落ちる。
         """
         try:
             settings = self.config_manager.config.get("settings", {})
-            value = int(settings.get("snmp", {}).get(
-                "max_traps", self.DEFAULT_MAX_TRAPS))
-        except (AttributeError, TypeError, ValueError):
+            raw = settings.get("snmp", {}).get(
+                "max_traps", self.DEFAULT_MAX_TRAPS)
+            # int() へ渡す前に非有限を弾く。捕捉だけでは、下の
+            # `value > 0` が inf でも真になるため素通りしてしまう
+            if isinstance(raw, float) and not math.isfinite(raw):
+                return self.DEFAULT_MAX_TRAPS
+            value = int(raw)
+        except (AttributeError, OverflowError, TypeError, ValueError):
             return self.DEFAULT_MAX_TRAPS
         return value if value > 0 else self.DEFAULT_MAX_TRAPS
 
