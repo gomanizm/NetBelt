@@ -15,6 +15,12 @@
 キープアライブの CR に由来の印（keepalive）を付けて積み、stop_keepalive（と、
 それを呼ぶ cleanup_device）で、端末の送信列からまだ送っていないものを取り除く
 ようにした。シリアルは、書き終えるまで次を渡さない背圧で端末の列に残る。
+
+なお、この見張りは「発火した CR が列に積まれる」ことが前提である。打ちかけの
+入力がある間はキープアライブを送らない（利用者の決定 2026-09-20）ので、
+改行で終わらない貼り付けを使うと CR がそもそも積まれず、取り消しの検証が
+空回りする（実測: cancel_macro_sends の本体を `return` 1 行へ差し替えても、
+このファイルは 1 件しか落ちなかった）。貼り付けはすべて行送りで終わらせる。
 """
 import os
 import sys
@@ -138,25 +144,37 @@ class KeepaliveStopCancelsQueuedCrTest(unittest.TestCase):
         return window, terminal, conn
 
     def test_a_stopped_keepalive_sends_no_queued_cr(self):
-        """発火して列で待っていた CR が、停止の後に届かないこと。"""
+        """発火して列で待っていた CR が、停止の後に届かないこと。
+
+        打ちかけ（最後の行送りより後ろに送った分がある）の間はキープアライブを
+        送らない（利用者の決定 2026-09-20）ので、行送りで終わる貼り付けにする。
+        改行なしで貼ると CR がそもそも列に積まれず、この見張りが空回りする。
+        """
         window, terminal, conn = self._ssh()
         chunk = terminal.SEND_CHUNK
-        terminal.send_text("x" * (chunk * 3))       # 改行なしの長い 1 行
+        # 行送りで終わる長い貼り付け（排出待ちの列を作る）
+        terminal.send_text("x" * (chunk * 3 - 1) + "\n")
         window._start_keepalive("dev", 60)
         window.macro_manager._send_keepalive("dev")  # タイマーの発火と同じ
 
         window._stop_keepalive("dev")
         self._pump()
 
-        self.assertEqual(conn.sent, ["x" * chunk] * 3,
+        self.assertEqual(conn.sent,
+                         ["x" * chunk, "x" * chunk, "x" * (chunk - 1) + "\r"],
                          "停止したキープアライブの CR が届いた: %r"
                          % [(len(s), s[:3]) for s in conn.sent])
 
     def test_stopping_the_keepalive_leaves_macro_commands_alone(self):
-        """キープアライブの停止で、マクロのコマンドまで消えないこと（逆も同じ）。"""
+        """キープアライブの停止で、マクロのコマンドまで消えないこと（逆も同じ）。
+
+        打ちかけの間はキープアライブを送らない（利用者の決定 2026-09-20）ので、
+        行送りで終わる貼り付けにする。改行なしで貼ると、停止で取り消される
+        はずの CR がそもそも列に積まれない。
+        """
         window, terminal, conn = self._ssh()
         chunk = terminal.SEND_CHUNK
-        terminal.send_text("x" * (chunk * 2))
+        terminal.send_text("x" * (chunk * 2 - 1) + "\n")
         window._start_keepalive("dev", 60)
         window.macro_manager._send_keepalive("dev")
         window.macro_manager.start_command_list("dev", ["cmd1"], 50)
@@ -164,7 +182,8 @@ class KeepaliveStopCancelsQueuedCrTest(unittest.TestCase):
         window._stop_keepalive("dev")
         self._pump()
 
-        self.assertEqual(conn.sent, ["x" * chunk, "x" * chunk, "cmd1\r"],
+        self.assertEqual(conn.sent,
+                         ["x" * chunk, "x" * (chunk - 1) + "\r", "cmd1\r"],
                          "キープアライブの停止でマクロのコマンドが消えた: %r"
                          % [(len(s), s[:4]) for s in conn.sent])
 
@@ -191,13 +210,19 @@ class KeepaliveStopCancelsQueuedCrTest(unittest.TestCase):
         window._stop_keepalive("dev")
 
     def test_a_stopped_keepalive_sends_no_cr_on_a_busy_serial_port(self):
-        """シリアルで書き込み待ちの間に止めても、CR が後から書かれないこと。"""
+        """シリアルで書き込み待ちの間に止めても、CR が後から書かれないこと。
+
+        打ちかけの間はキープアライブを送らない（利用者の決定 2026-09-20）ので、
+        行送りで終わる貼り付けにする。改行なしで貼ると CR が列に積まれず、
+        この見張りが空回りする。
+        """
         window, terminal = self._window({"name": "con1", "host": "COM99",
                                          "protocol": "console", "baudrate": 9600})
         port = GatedPort.instances[-1]
         self.addCleanup(port.gate.set)
         chunk = terminal.SEND_CHUNK
-        terminal.send_text("abc " * chunk)    # 改行なしの 2KB
+        # 行送りで終わる 2KB（長さは変えない）
+        terminal.send_text("abc " * (chunk - 1) + "abc" + "\n")
         self._pump(0.1)
         window._start_keepalive("con1", 60)
         window.macro_manager._send_keepalive("con1")
@@ -210,7 +235,8 @@ class KeepaliveStopCancelsQueuedCrTest(unittest.TestCase):
             self._pump(0.02)
         self._pump(0.3)
 
-        self.assertEqual(b"".join(port.writes), b"abc " * chunk,
+        self.assertEqual(b"".join(port.writes),
+                         b"abc " * (chunk - 1) + b"abc" + bytes([13]),
                          "停止したキープアライブの CR が書かれた: %r"
                          % [w[-4:] for w in port.writes])
 
