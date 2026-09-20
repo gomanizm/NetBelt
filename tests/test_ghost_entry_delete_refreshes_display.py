@@ -85,8 +85,16 @@ class GhostEntryDeleteTest(unittest.TestCase):
         warn.assert_called_once()
         self.assertIn("失敗", warn.call_args[0][2])
 
-    def test_a_save_failure_does_not_rebuild_the_tree_twice(self):
-        """対照: 保存だけ失敗した経路の作り直しは、これまでどおり 1 回。"""
+    def test_a_save_failure_does_not_rebuild_the_tree(self):
+        """対照: 保存だけ失敗した経路では、ツリーを作り直さないこと。
+
+        このテストは当初「作り直しは 1 回」を期待していた。同じ周で入れた
+        利用者の決定 6（2026-09-20）により、グループの変更は保存に失敗したら
+        メモリも巻き戻すようになったので、失敗後の設定は操作前と同じであり、
+        ツリーは作り直す必要がない（作り直すと、設定は変わっていないのに
+        畳んでいたグループが開き直り、選択も外れる）。表示から消せない
+        グループを救う作り直しは、元から設定に無かった場合だけに限る。
+        """
         from PyQt6.QtWidgets import QMessageBox
         w = self._window()
         w.config_manager.add_group("消える予定", [])
@@ -96,7 +104,9 @@ class GhostEntryDeleteTest(unittest.TestCase):
                 mock.patch("ui.main_window.QMessageBox.warning"), \
                 mock.patch.object(w, "_load_devices") as reload_tree:
             w._on_delete_group("消える予定")
-        self.assertEqual(reload_tree.call_count, 1)
+        self.assertEqual(reload_tree.call_count, 0)
+        self.assertIsNotNone(w.config_manager.get_group("消える予定"),
+                             "保存に失敗したのに設定から消えている")
 
     def test_an_existing_group_is_still_deleted(self):
         """対照: 設定にあるグループは、これまでどおり消えること。"""
