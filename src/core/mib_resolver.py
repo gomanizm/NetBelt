@@ -563,9 +563,14 @@ class MIBResolver:
             # 偽の親として生き返る（実測）。見出しが続かない BOM は
             # 空白にする。どちらも 1 文字→1 文字なので、あとで位置を
             # 使う処理がずれない。
+            # 「見出しが続くか」の判定は _MIB_MODULE_HEADER と同じ広さに
+            # そろえる。狭めると、見出しとしては正しい形（名前と
+            # DEFINITIONS の間で行が折れている、BOM が続けて並んでいる）が
+            # 区切りとして拾われず、前のモジュールに末尾の改行が無い連結が
+            # 混ざったままになる（実測: alarmA が B の enterprise の下へ）。
             bom = chr(0xFEFF)
-            raw = re.sub(bom + r'(?=[ \t]*[\w-]+[ \t]+DEFINITIONS\b)',
-                         '\n', raw).replace(bom, ' ')
+            raw = re.sub(bom + r'(?=[ \t' + bom + r']*[\w-]+[\s' + bom
+                         + r']+DEFINITIONS\b)', '\n', raw).replace(bom, ' ')
             content = self._blank_comments_and_strings(raw)
             # 1 ファイルに複数のモジュールを連結して配る MIB があるので、
             # 見出しの位置ごとに本文を区切り、区間ごとにそのモジュール名を
