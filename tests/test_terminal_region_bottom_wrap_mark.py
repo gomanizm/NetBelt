@@ -18,10 +18,16 @@ ESC[T (SD 1) を流すと rows=['','','ABCD','STAT'] で wrapped は
 
 直し方: 上端側と対称に、下端の行の印も外す。_shift_lines (insert=True)
 と _scroll_down は、範囲の下端の行の続きを範囲の外へ置いたまま捨てて
-いるので、下端へ上がってきた行に続きはもう無い。DL は下端へ空行を
-入れる側で印が最初から立たないため触らない。_scroll_up も下端へ空行を
-入れる側で、そこの手前の印は最下行での折り返し (_linefeed(from_wrap=
-True)) が使うので、これまでどおり残す。
+いるので、下端へ上がってきた行に続きはもう無い。
+
+鏡の経路 (行が下から上へ動く SU / DL) は 7 周目で別に直した
+(tests/test_terminal_scrolled_up_wrap_mark.py)。5 周目のこの docstring
+には「DL は下端へ空行を入れる側で印が最初から立たないため触らない」と
+書いてあったが、DL でも下端の印は立つ (ESC[3;1H 'ABCDEFGH' ESC[1;3r
+ESC[1;1H ESC[M で再現) ので誤りだった。SU / DL では下端にあった行が
+上がり、その続き (範囲の外の行) が動かずに残るため、上がった先で印を
+外す。最下行での折り返し (_linefeed(from_wrap=True)) の印だけは、
+そこに載っているのでこれまでどおり残す。
 """
 import os
 import sys
