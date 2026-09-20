@@ -1586,7 +1586,11 @@ class MainWindow(QMainWindow):
         # 既存のグループ名リストと、現在の自動実行コマンドを取得
         existing_groups = [g["name"] for g in self.config_manager.get_groups()]
         group = self.config_manager.get_group(group_name)
-        auto_commands = list(group.get("auto_commands", [])) if group else []
+        # 読み込み時にそろえてはいるが（ConfigManager の
+        # _normalize_optional_list）、ここで例外になるとこのグループは
+        # 編集で直せなくなるので、読み手側でもリスト以外は空として扱う
+        stored = group.get("auto_commands") if group else None
+        auto_commands = list(stored) if isinstance(stored, list) else []
 
         # ダイアログ表示
         dialog = GroupDialog(self, group_name=group_name,

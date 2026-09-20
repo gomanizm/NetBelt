@@ -152,9 +152,13 @@ class DeviceDialog(QDialog):
             self.protocol_combo.blockSignals(False)
         self._sync_protocol_ui(self.protocol_combo.currentText())
         
-        # マクロ読み込み
-        for macro in self.device_data.get("macros", []):
-            self.macro_list.addItem(macro.get("name", ""))
+        # マクロ読み込み。読み込み時にそろえてはいるが（ConfigManager の
+        # _normalize_optional_list）、ここで例外になるとこの機器は編集で
+        # 直せなくなるので、読み手側でも読めない値は黙って飛ばす
+        macros = self.device_data.get("macros")
+        for macro in macros if isinstance(macros, list) else []:
+            if isinstance(macro, dict):
+                self.macro_list.addItem(macro.get("name", ""))
     
     def _on_protocol_changed(self, protocol: str):
         """プロトコルを選び直したときの処理（利用者の操作）"""

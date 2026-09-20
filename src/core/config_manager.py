@@ -685,6 +685,38 @@ class ConfigManager:
                 and all(isinstance(c, str) for c in commands))
 
     @staticmethod
+    def _normalize_optional_list(container: Dict, key: str, keep) -> bool:
+        """任意項目のリストをそろえる。読めない分を外したら True を返す。
+
+        機器の macros とグループの auto_commands は無くてもよい項目だが、
+        読み手は list であることを前提にしている（for で回す・list() で
+        写す）。手編集や他ツールの config.json に null や別の型が入ると、
+        一覧には出るのに編集ダイアログが例外で開かなくなり、その機器・
+        グループは編集で直すこともパスワードを入れ直すこともできない。
+
+        null は「無し」と同じ意味なので、黙って空のリストにそろえる
+        （パスワードの null と同じ扱い）。ほかの型と、リストの中の読めない
+        要素は、中身を失う直し方なので name / host の隔離と同じく知らせる。
+
+        Args:
+            container: 機器またはグループの辞書
+            key: そろえる項目名
+            keep: 残してよい要素かを答える関数
+        """
+        value = container.get(key, [])
+        if value is None:
+            container[key] = []
+            return False
+        if not isinstance(value, list):
+            container[key] = []
+            return True
+        kept = [item for item in value if keep(item)]
+        if len(kept) == len(value):
+            return False
+        container[key] = kept
+        return True
+
+    @staticmethod
     def _normalize_password(device) -> Optional[str]:
         """機器のパスワード欄を文字列にそろえる。直したら種別を返す。
 
@@ -757,7 +789,8 @@ class ConfigManager:
         emptied_groups = 0
         numeric_passwords = []   # 文字列に直した機器名
         emptied_passwords = []   # パスワードを空にした機器名
-        broken_auto = []         # 自動実行コマンドを無効にしたグループ名
+        broken_macros = []       # 読めないマクロを外した機器名
+        broken_auto_commands = []  # 自動実行コマンドを無効にしたグループ名
         kept_groups = []
         # 手で付けられた名前とも衝突させない
         used_names = {g["name"] for g in config.get("groups", [])
@@ -773,12 +806,16 @@ class ConfigManager:
                 used_names.add(group["name"])
                 renamed_groups += 1
             # 自動実行コマンドの形。接続しただけで実機へ流れるので、読めない
-            # 形なら送らずに知らせる（利用者が書いていない操作を送るより安全）。
-            # キーごと無いのは「自動実行なし」なので触らない
-            if ("auto_commands" in group
-                    and not self._is_valid_auto_commands(group["auto_commands"])):
-                group["auto_commands"] = []
-                broken_auto.append(group["name"])
+            # 形なら一覧ごと無効にして知らせる（利用者が書いていない操作を
+            # 送るより安全）。キーごと無いのは「自動実行なし」なので触らない。
+            # null も「無し」と同じ意味なので、黙って空のリストにそろえる
+            # （グループの編集ダイアログは list() で写すので、null では開けない）
+            if "auto_commands" in group:
+                if group["auto_commands"] is None:
+                    group["auto_commands"] = []
+                elif not self._is_valid_auto_commands(group["auto_commands"]):
+                    group["auto_commands"] = []
+                    broken_auto_commands.append(group["name"])
             devices = group.get("devices")
             if isinstance(devices, list):
                 kept = []
@@ -793,6 +830,11 @@ class ConfigManager:
                             numeric_passwords.append(d["name"])
                         elif fixed == "emptied":
                             emptied_passwords.append(d["name"])
+                        # 機器別マクロも、機器の編集ダイアログが for で回すので
+                        # list であることが前提（要素は名前を持つ辞書）
+                        if self._normalize_optional_list(
+                                d, "macros", lambda m: isinstance(m, dict)):
+                            broken_macros.append(d["name"])
                         kept.append(d)
                 group["devices"] = kept
             else:
@@ -807,7 +849,7 @@ class ConfigManager:
             config["groups"] = kept_groups
         if not (removed or reserved or renamed_groups or dropped_groups
                 or emptied_groups or numeric_passwords or emptied_passwords
-                or broken_auto):
+                or broken_macros or broken_auto_commands):
             return
         self._backup_corrupted_config()
         parts = []
@@ -839,12 +881,16 @@ class ConfigManager:
                          "機器があり、パスワードを空にしました。"
                          "機器の編集で入れ直してください: "
                          + "、".join(emptied_passwords))
-        if broken_auto:
+        if broken_macros:
+            parts.append("設定ファイル (config.json) でマクロの一覧が読めない機器が"
+                         "あり、そのマクロを外しました。機器の編集で入れ直して"
+                         "ください: " + "、".join(broken_macros))
+        if broken_auto_commands:
             parts.append("設定ファイル (config.json) で自動実行コマンドが"
                          "文字列の配列になっていないグループがあり、"
                          "そのグループの自動実行を無効にしました。"
                          "グループの編集で入れ直してください: "
-                         + "、".join(broken_auto))
+                         + "、".join(broken_auto_commands))
         message = "\n".join(parts)
         if self.backup_path:
             message += f"\n\n元のファイルはバックアップしました:\n  {self.backup_path}"
@@ -855,7 +901,8 @@ class ConfigManager:
               f"グループ{emptied_groups}件の機器一覧を空にしました "
               f"(パスワードを文字列化={len(numeric_passwords)}, "
               f"空にした={len(emptied_passwords)}, "
-              f"自動実行を無効にしたグループ={len(broken_auto)})")
+              f"マクロを外した={len(broken_macros)}, "
+              f"自動実行を無効にしたグループ={len(broken_auto_commands)})")
 
     def _backup_corrupted_config(self) -> None:
         """
