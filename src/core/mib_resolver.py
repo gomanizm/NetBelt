@@ -11,7 +11,7 @@ from typing import Dict, Optional
 # MIB 解析器の版。抽出・解決の規則を変えたら上げる。mib_cache.json は
 # この値も鍵にするので、古い解析器が作ったキャッシュがアプリの更新後に
 # そのまま使われることがなくなる。
-MIB_PARSER_VERSION = '2026-09-20.4'
+MIB_PARSER_VERSION = '2026-09-20.5'
 
 
 def app_dir() -> str:
@@ -559,7 +559,10 @@ class MIBResolver:
         なる（実測: 由来を書いたコメントの中の見出しで、直後の定義が区間
         ごと打ち切られて解決できなくなった）。コメント・文字列の中の BOM は、
         その行の残りがモジュールの見出しちょうど（連結したファイルの先頭が
-        そのまま続く形）のときだけ区切りとして扱う。
+        そのまま続く形）で、かつ直前のモジュールが END で閉じているときだけ
+        区切りとして扱う。連結の境目は必ず直前のファイルの END の後ろに
+        来るのに対し、由来を書いたコメントはモジュールの途中にあるので、
+        この 1 点で分けられる。
 
         見出しにならない BOM は空白にする。どちらも 1 文字→1 文字なので、
         あとで位置を使う処理がずれない。
@@ -577,16 +580,27 @@ class MIBResolver:
         # コメントの外: 見出しを探す _MIB_MODULE_HEADER と同じ広さで見る
         outside = re.compile(r'[ \t' + bom + r']*[\w-]+[\s' + bom
                              + r']+DEFINITIONS\b')
-        # コメント・文字列の中: 行の残りが見出しちょうどのときだけ
+        # コメント・文字列の中: 行の残りが見出しちょうどのときだけ。
+        # 広さはコメントの外と揃える。ここだけ 1 行に収まる見出ししか
+        # 認めていなかったので、見出しを折り返した MIB が末尾コメントの
+        # 後ろに連結されると区切れず、全部が 1 つのモジュールに混ざった
+        # （実測: B-MIB の Trap が C-MIB の配下に付いた）。行末ちょうどの
+        # 縛りだけは残すので、`::= { bogus 9 }` が続く幽霊の見出しは弾ける
         inside = re.compile(
-            r'[ \t]*[\w-]+[ \t]+DEFINITIONS[ \t]*::=[ \t]*BEGIN'
+            r'[ \t]*[\w-]+[\s' + bom + r']+DEFINITIONS\s*::=\s*BEGIN'
             r'[ \t]*(?:--[^\r\n]*)?\r?$', re.MULTILINE)
+        # 直前のモジュールが閉じているか。詳しくは docstring を見ること
+        closed = re.compile(r'\bEND\b')
         out = []
         prev = 0
         for i in positions:
-            ahead = outside if masked[i] == bom else inside
+            if masked[i] == bom:
+                split = outside.match(raw, i + 1) is not None
+            else:
+                split = (inside.match(raw, i + 1) is not None
+                         and closed.search(masked, prev, i) is not None)
             out.append(raw[prev:i])
-            out.append('\n' if ahead.match(raw, i + 1) else ' ')
+            out.append('\n' if split else ' ')
             prev = i + 1
         out.append(raw[prev:])
         return ''.join(out)
