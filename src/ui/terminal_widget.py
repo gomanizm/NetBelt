@@ -1114,6 +1114,11 @@ class TerminalWidget(QWidget):
         pending = []                        # (属性, [文字列, ...]) の並び
         column = region.positionInBlock()   # 溜めた分を書いた後の行内位置
         probe_text = None
+        if screen.take_history_dropped():
+            # 押し出された行が多すぎて、画面側が古い方を捨てた（ESC[nS の
+            # 連打）。文書の先頭を切り捨てたのと同じことなので、「全ログ
+            # 保存」の欠落警告をここでも立てる
+            terminal._log_truncated = True
         for line, wrapped in screen.take_new_history():
             # 折り返しで続いている行は、改行で切らずに次の行と繋げる。
             # 切ると、窓を縮めている間に流れた出力が刻まれたまま記録に

@@ -87,11 +87,19 @@ def _split_wide(line, i):
 
 
 class Screen(object):
+    # 描画側へ渡す履歴の差分 (_new_history) を持てる行数。
+    # 描画側は文書を MAX_DOCUMENT_BLOCKS 行で頭から切り詰めるので、
+    # それより古い行は書いた先から捨てられるだけ。上限をそれ以上に
+    # 取り、捨てるのを古い方に限ってあるので、描き終えた文書は上限が
+    # 無かったときと同じになる (下げると文書から行が消える)
+    MAX_NEW_HISTORY = 20000
+
     def __init__(self, rows=24, cols=80, max_history=5000):
         self.rows = rows
         self.cols = cols
         self.history = collections.deque(maxlen=max_history)
-        self._new_history = []
+        self._new_history = collections.deque(maxlen=self.MAX_NEW_HISTORY)
+        self._history_dropped = False
         self.title = ""
         self.responses = []             # 機器へ送り返す応答 (DSR/DA)
         self.reset()
@@ -158,11 +166,32 @@ class Screen(object):
         return ["".join(cell[0] for cell in line).rstrip()
                 for line in self.lines]
 
+    def _record_new_history(self, line, wrapped):
+        """描画側へ渡す履歴の差分へ 1 行足す。あふれたら古い方から捨てる。
+
+        ESC[nS (SU) と ESC[nM (DL) が 1 命令で動かす行数は範囲の高さで
+        頭打ちになっているが、命令の繰り返し回数には上限が無い。1 回の
+        描画単位 16384 文字を 200x500 の画面へ流すと 546,000 行が作られ、
+        2.2GB を確保して GUI が 20.6 秒止まった (実測)。文書はそのうち
+        MAX_DOCUMENT_BLOCKS 行しか残さないので、大半は捨てられるためだけ
+        に確保され書き込まれていた。self.history は deque(maxlen) で既に
+        抑えられている。
+        """
+        if len(self._new_history) == self._new_history.maxlen:
+            self._history_dropped = True
+        self._new_history.append((line, wrapped))
+
     def take_new_history(self):
         """前回から増えた履歴を (行, 折り返しで続くか) で返して忘れる。"""
-        new = self._new_history
-        self._new_history = []
+        new = list(self._new_history)
+        self._new_history.clear()
         return new
+
+    def take_history_dropped(self):
+        """前回から履歴の差分を上限で捨てたかを返して忘れる。"""
+        dropped = self._history_dropped
+        self._history_dropped = False
+        return dropped
 
     def take_dirty(self):
         """描き直しが要る行番号を返して忘れる。"""
@@ -226,8 +255,8 @@ class Screen(object):
                 main_marks.pop()
             else:
                 self.history.append(main.pop(0))
-                self._new_history.append((self.history[-1],
-                                          main_marks.pop(0)))
+                self._record_new_history(self.history[-1],
+                                         main_marks.pop(0))
                 keep_row = max(0, keep_row - 1)
         while len(main) < rows:
             main.append([BLANK] * cols)
@@ -506,7 +535,7 @@ class Screen(object):
             # 記録しない。
             if not self.alt_active and self.scroll_top == 0:
                 self.history.append(removed)
-                self._new_history.append((removed, removed_wrap))
+                self._record_new_history(removed, removed_wrap)
         # 範囲の上端から出ていった行が 1 つ上の行の続きだったなら、続きは
         # もう下に無い。上端が画面の先頭のときは上の行が無いので、押し
         # 出された行を履歴へ送る既存の扱いは変わらない。下端へ入る空行の
@@ -879,7 +908,7 @@ class Screen(object):
             self.history.append(line)
             # 最後の行の続き (空白の行) は記録しないので、次へ続く印を
             # 渡すと、描画側が消去のあとに来た出力と 1 行に繋げる
-            self._new_history.append((line, self.wrapped[r] and r < last))
+            self._record_new_history(line, self.wrapped[r] and r < last)
 
     def _erase_line(self, mode):
         if mode not in (0, 1, 2):
@@ -935,7 +964,7 @@ class Screen(object):
                 if (not self.alt_active and self.scroll_top == 0
                         and self.cursor_row == 0):
                     self.history.append(removed)
-                    self._new_history.append((removed, removed_wrap))
+                    self._record_new_history(removed, removed_wrap)
         # カーソル行へは別の行 (DL) か空行 (IL) が来た。1 つ上の行の続きは
         # もう下に無いので印を外す。残すと、無関係な 2 つの論理行が履歴・
         # コピー・文書で 1 行に繋がる
