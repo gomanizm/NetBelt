@@ -303,8 +303,10 @@ class ConfigManager:
                 # 落ちる）。復号も機器が dict であることを前提にしているので、
                 # 隔離はその前に済ませる
                 self._quarantine_invalid_devices(config)
-                # 重複した機器名は除外まではしないが、知らせる（除外された
-                # 機器を数に入れないよう、隔離のあとで見る）
+                # 重複した機器名・グループ名は除外まではしないが、知らせる
+                # （除外された機器や、名前を補われたグループを数に入れない
+                # よう、隔離のあとで見る）
+                self._notify_duplicate_group_names(config)
                 self._notify_duplicate_device_names(config)
                 # パスワードを復号化
                 self._decrypt_passwords(config)
@@ -538,6 +540,39 @@ class ConfigManager:
         print(f"[Config] {message}")
         self.load_warning = (f"{self.load_warning}\n\n{message}"
                              if self.load_warning else message)
+
+    def _notify_duplicate_group_names(self, config: Dict) -> None:
+        """同じ名前のグループが複数ある設定を読んだら、その名前を挙げて知らせる。
+
+        グループもまた名前だけで探す（get_group は先頭の 1 件を返す）ので、
+        2 つ目以降の同名グループに入っている機器には update_device /
+        remove_device / move_device のどれも届かない。画面には並んでいるのに
+        操作だけが黙って失敗するため、機器名の重複と同じく名指しで知らせる。
+
+        黙って除外・改名すると利用者の機器やグループが消えるので、設定は
+        書き換えない。rename_group も get_group 経由で 1 つ目しか掴めない
+        ため、直す場所として config.json を案内する。
+        """
+        seen = set()
+        duplicates = []
+        for group in config.get("groups", []):
+            if not isinstance(group, dict):
+                continue
+            name = group.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+            if name not in seen:
+                seen.add(name)
+            elif name not in duplicates:
+                duplicates.append(name)
+        if not duplicates:
+            return
+        self._append_load_warning(
+            "設定ファイル (config.json) に同じ名前のグループが複数あります: "
+            + "、".join(duplicates)
+            + "\nグループも名前で探すため、2 つ目以降の同名グループにある機器は"
+              "編集も削除も移動もできません。config.json でグループ名を"
+              "分けてください。")
 
     def _notify_duplicate_device_names(self, config: Dict) -> None:
         """同じ名前の機器が複数ある設定を読んだら、その名前を挙げて知らせる。
