@@ -513,6 +513,10 @@ class Screen(object):
             self.wrapped.insert(self.scroll_top, False)
         # 範囲の上端へ空行が割り込んだ。1 つ上の行の続きはそこには無い
         self._drop_mark_above(self.scroll_top)
+        # 下端も同じ。下端にあった行は範囲の外へ続きを置いたまま捨てられ、
+        # 代わりに 1 つ上の行が上がってくる。その行の続きは今捨てた行
+        # なので、印を残すと範囲の外の行と 1 行に繋がる
+        self.wrapped[self.scroll_bottom] = False
         self.dirty.update(range(self.scroll_top, self.scroll_bottom + 1))
 
     # ---- CSI -------------------------------------------------------
@@ -926,6 +930,12 @@ class Screen(object):
         # もう下に無いので印を外す。残すと、無関係な 2 つの論理行が履歴・
         # コピー・文書で 1 行に繋がる
         self._drop_mark_above(self.cursor_row)
+        if insert:
+            # IL は範囲の下端の行を、続きを範囲の外へ置いたまま捨てて
+            # 1 つ上の行を下端へ上げる。上がってきた行の続きは今捨てた行
+            # なので、印を残すと範囲の外の行と 1 行に繋がる。DL は下端へ
+            # 空行を入れる側なので、印は最初から立っていない
+            self.wrapped[self.scroll_bottom] = False
         self.dirty.update(range(self.cursor_row, self.scroll_bottom + 1))
         # DEC の IL/DL はカーソルを左マージンへ戻す (xterm も同じ)。
         # 戻さないと、直後に位置指定なしで印字したとき桁がずれる
