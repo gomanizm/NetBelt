@@ -36,8 +36,9 @@ class SFTPManager(QObject):
     # シグナル定義
     file_list_ready = pyqtSignal(list)  # ファイル一覧取得完了 [(name, size, mtime, mode, is_dir), ...]
     # ワーカーから GUI スレッドへ「一覧が取れた」を運ぶ内部用。current_path の
-    # 更新と file_list_ready の発火を同じスレッド・同じ順序で行うために挟む
-    _listing_done = pyqtSignal(str, list)
+    # 更新と file_list_ready の発火を同じスレッド・同じ順序で行うために挟む。
+    # 先頭は要求番号（発行順）で、古い一覧を捨てるために使う
+    _listing_done = pyqtSignal(int, str, list)
     # 転送進捗 (転送済みバイト数, 全体バイト数)
     # int で宣言すると C++ の 32bit int に対応し、2GiB を超えるバイト数が
     # 例外も出さずに黙って丸められる（負値や桁落ちした値になる）。
@@ -63,6 +64,10 @@ class SFTPManager(QObject):
         self.ssh_client: Optional[paramiko.SSHClient] = None
         self.is_connected = False
         self.current_path = "/"
+        # 一覧の要求に振る通し番号。最後に発行したものだけを採る
+        # （list_directory は転送スレッドからも呼ばれるのでロックで守る）
+        self._listing_seq = 0
+        self._listing_seq_lock = threading.Lock()
         self._listing_done.connect(self._on_listing_done)
     
     # GUI スレッドから直接呼ぶ操作が、転送の終わりを待つ最大時間。
@@ -215,13 +220,20 @@ class SFTPManager(QObject):
                   "（SSH の切断で解放されます）")
         self.disconnected.emit()
     
-    def _on_listing_done(self, path: str, file_list: list):
+    def _on_listing_done(self, seq: int, path: str, file_list: list):
         """一覧が取れたときの GUI スレッド側の処理。
 
         current_path の更新と file_list_ready の発火を、同じスレッドで
         この順に行う。受け手（パネル）はスロットの中で get_current_path()
         を見て表示を組み立てるので、通知より先に更新されている必要がある。
+
+        一覧は 1 件ごとに別スレッドで、しかも通信のロックを離してから
+        変換・ソートするので、先に頼んだ分が後から届くことがある。そのまま
+        current_path を書くと、移った先が勝手に元へ戻る。最後に発行した
+        要求の分だけを採り、追い越された分は捨てる。
         """
+        if seq != self._listing_seq:
+            return
         self.current_path = path
         self.file_list_ready.emit(file_list)
 
@@ -238,7 +250,13 @@ class SFTPManager(QObject):
         
         if path is None:
             path = self.current_path
-        
+
+        # 発行の順番を控える。これより新しい要求が出ていたら、この一覧は
+        # 届いても捨てられる
+        with self._listing_seq_lock:
+            self._listing_seq += 1
+            seq = self._listing_seq
+
         def list_thread():
             import stat as stat_mod
             try:
@@ -305,7 +323,7 @@ class SFTPManager(QObject):
                 # シグナルが GUI へ届くまでの間「場所は新しい、画面は古い一覧」
                 # になり、その窓で始めた操作が見ていないディレクトリへ飛ぶ。
                 # 更新と通知を GUI スレッドで同じ順序に行う
-                self._listing_done.emit(path, file_list)
+                self._listing_done.emit(seq, path, file_list)
                 
             except Exception as e:
                 self._fail("ディレクトリ一覧取得エラー", e)
