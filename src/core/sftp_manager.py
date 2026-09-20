@@ -717,7 +717,11 @@ class SFTPManager(QObject):
                                 raise IOError(
                                     "最終名への置き換えに失敗しました。" + gone +
                                     "転送済みの内容は"
-                                    "機器の一時名 %s に残っています: %s" % (tmp_remote, e))
+                                    "機器の一時名 %s に残っています: %s"
+                                    # paramiko は切断した読み取りで素の
+                                    # EOFError() を上げる（str が空）。
+                                    # そのまま連結すると「: 」で終わる
+                                    % (tmp_remote, str(e) or e.__class__.__name__))
                 
                 # 完了通知
                 self.transfer_complete.emit(f"アップロード完了: {os.path.basename(local_path)}")
