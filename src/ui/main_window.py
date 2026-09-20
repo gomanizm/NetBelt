@@ -1899,24 +1899,53 @@ class MainWindow(QMainWindow):
         
         dialog.exec()
     
+    def _session_is_live(self, device_name: str, what: str) -> bool:
+        """「ツール」から来た要求を、いまも繋がっているときだけ通す
+
+        メニューの項目の有効・無効は、メニューを作った時点の状態で決まる
+        （DeviceTree._add_tools_menu）。開いている間に相手機器が切れても
+        項目は有効なままなので、選ぶと切断済みの機器名で処理が走る。
+        キープアライブなら新しいタイマーが立ち、そのあと同じ名前で繋ぎ
+        直すと新しいセッションへ CR が飛ぶ。しかもその状態の「ツール」は
+        接続なしとして灰色になるため、ツリーからは止められない。
+
+        Args:
+            device_name: 機器名
+            what: できなかったことの名前（ステータスバーの文面に使う）
+
+        Returns:
+            bool: その機器の接続が残っていれば True
+        """
+        if device_name in self.connections:
+            return True
+        self.status_bar.showMessage(
+            f"{device_name}: 接続が切れているため{what}できません")
+        return False
+
     def _on_keepalive_start_requested(self, device_name: str):
         """
         右クリックメニューからキープアライブ開始が要求されたときの処理
-        
+
         Args:
             device_name: 機器名
         """
+        # メニューを開いている間に切れていたら何もしない
+        if not self._session_is_live(device_name, "キープアライブを開始"):
+            return
         # 保存された間隔を使用（未設定の場合はデフォルト60秒）
         interval = self.keepalive_intervals.get(device_name, 60)
         self._start_keepalive(device_name, interval)
-    
+
     def _on_keepalive_stop_requested(self, device_name: str):
         """
         右クリックメニューからキープアライブ停止が要求されたときの処理
-        
+
         Args:
             device_name: 機器名
         """
+        # 切れていれば、切断時の後始末（cleanup_device）で既に止まっている
+        if not self._session_is_live(device_name, "キープアライブを停止"):
+            return
         # キープアライブを停止
         self._stop_keepalive(device_name)
     
