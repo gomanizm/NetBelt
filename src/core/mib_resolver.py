@@ -312,7 +312,23 @@ class MIBResolver:
                               f"（壊れたリンク、またはパスが長すぎる"
                               f"可能性があります）")
                     continue
-                stamp = _mib_file_stamp(filepath)
+                try:
+                    stamp = _mib_file_stamp(filepath)
+                except OSError as e:
+                    # 一覧に出たあと os.stat までの間に消える・読めなく
+                    # なることがある（ウイルス対策の隔離、起動中の
+                    # mibs/ の入れ替え、同期クライアント）。ここで
+                    # 素通りさせると FileNotFoundError が
+                    # MIBResolver.__init__ まで上がり、生き残っている
+                    # MIB まで 1 件も読めなくなる（実測: 画面には何も
+                    # 出ず、標準出力に「バックグラウンドMIB読み込み
+                    # エラー」が 1 行出るだけ）。読めない MIB と同じ
+                    # ように理由を 1 行残して外し、残りで続ける
+                    print(f"[MIBResolver] {filename} の情報を取得でき"
+                          f"ません（{e}）。このファイルは読み込みから"
+                          f"外します（読み込み中に消えた、またはアクセス"
+                          f"できなくなった可能性があります）")
+                    continue
                 cached = cached_files.get(filename)
                 if (stamp['sha1'] is None and isinstance(cached, dict)
                         and cached.get('mtime') == stamp['mtime']
