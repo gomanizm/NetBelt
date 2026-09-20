@@ -1339,12 +1339,19 @@ class TerminalWidget(QWidget):
             logs.append((target, events))
         self._render_screen(terminal)
 
+        # 記録へは、機器へ応答を送る前に書き切る。応答の送信は key_pressed
+        # → 接続の send_command と同期でつながっていて、そこで失敗すると
+        # error_occurred → 切断扱い → show_notice と、その場でここへ再入する。
+        # 書くのを後ろに置くと、再入側が残量 0 になった停止ログを先に閉じて
+        # しまい、外側は閉じたハンドルへ書いて失敗する（停止より前に受信した
+        # 末尾がまるごと失われ、モーダル警告まで出る）。記録中のログでも、
+        # 切断案内が元の受信本文より先に記録されて画面と順序が食い違う
+        self._write_logs(device_name, logs)
+
         # 機器からの問い合わせ (カーソル位置・装置識別) に答える。
         # key_pressed はキー入力と同じ「機器へ送る文字」の経路
         for response in terminal._screen.take_responses():
             terminal._queue_send(response)
-
-        self._write_logs(device_name, logs)
 
     def _split_for_logs(self, device_name: str, text: str) -> list:
         """描き待ちから取り出した text を、書き込む記録ごとに区切る。
