@@ -877,15 +877,19 @@ class SNMPPanel(QWidget):
         import csv
         # BOM 付き（utf-8-sig）。日本語版 Excel は BOM の無い UTF-8 の CSV を
         # cp932 として開くため、見出しも機器から来た日本語も文字化けする
+        # 注記の改行は csv.writer に合わせて CRLF。newline="" で開いている
+        # ので LF はそのまま出て、注記の行だけが LF・結果の行が CRLF という
+        # 1 ファイル内の混在になる。CRLF だけを行の区切りとする厳しめの
+        # パーサは、注記行と見出し行を 1 行と見なしうる（実測）
         with atomic_text_write(file_path, newline="", encoding="utf-8-sig") as f:
             if reason:
                 # 途中までの結果であることを、見出しの前に残す
-                f.write("# 途中まで: %s のため中断。全部ではありません\n" % reason)
+                f.write("# 途中まで: %s のため中断。全部ではありません\r\n" % reason)
             if host:
                 # どの機器から採った結果かを、見出しの前に残す。JSON の
                 # "host"・TXT の「対象ホスト:」に当たるものが CSV だけ
                 # 抜けていて、ファイルを並べると取り違えても気づけなかった
-                f.write("# 対象ホスト: %s\n" % host)
+                f.write("# 対象ホスト: %s\r\n" % host)
             writer = csv.writer(f)
             writer.writerow(["OID", "Type", "Value"])
             for row in results:
