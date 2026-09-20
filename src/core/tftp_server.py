@@ -452,12 +452,16 @@ class TFTPServer:
                     expected = (expected + 1) & 0xFFFF
                 else:
                     xs.sendto(struct.pack("!HH", OP_ACK, block), addr)  # 重複 DATA へ再 ACK
-            # 書き込みは終わっている。最終 ACK の後の待ち（_dally）まで
-            # 予約を握ると、同じファイルをすぐ置き直す機器を断ってしまう
+            # 書き込みは終わっている。完了を先に知らせてから予約を外す。逆順だと、
+            # 外してから知らせるまでの間に同じ相手・同じ名前の次の WRQ が確立でき、
+            # 後続がこの転送と同じ台帳の行へ相乗りする（先行の完了で done になり、
+            # 後続の失敗が成功済みの重複として握り潰される）
+            self.on_event("transfer_complete", addr[0], (filename, received, total, "upload"))
+            # 最終 ACK の後の待ち（_dally）まで予約を握ると、同じファイルを
+            # すぐ置き直す機器を断ってしまうので、待ちに入る前にここで外す
             if reserved:
                 self._release_target(target)
                 reserved = False
-            self.on_event("transfer_complete", addr[0], (filename, received, total, "upload"))
             # 最終 ACK が落ちたときの再送に応えられるよう、閉じる前に少し待つ。
             # 待つ間は同時転送の枠を空ける（待ちの枠が埋まっていれば待たない）
             if self._enter_dally():
