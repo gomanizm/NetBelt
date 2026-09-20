@@ -484,6 +484,9 @@ class SFTPManager(QObject):
         # 期限切れで抜けるときに添える補足（転送済みの一時名など）。
         # _fail の期限切れ文面は固定なので、前置きの側へ足す
         timed_out_note = [""]
+        # 元の失敗そのものが期限切れだったときの補足。通知は 1 回にまとめる
+        # ので、finally ではなく元の失敗の文面へ足す
+        cleanup_note = [""]
 
         def unknown_outcome(e, final_removed: bool = False):
             """置き換わったか確かめられないときの扱いを返す。
@@ -716,13 +719,22 @@ class SFTPManager(QObject):
                         # 応答がずれたまま使えない。元の失敗を伝えたうえで、
                         # 期限切れの経路と同じように畳む（ロックの中では
                         # 畳めない。畳むのは finally）
-                        probe_timed_out[0] = True
-                        timed_out_note[0] = (
-                            "（送りかけの一時名 %s を片づけられませんでした）"
-                            % tmp_remote)
+                        note = ("（送りかけの一時名 %s を片づけられませんでした）"
+                                % tmp_remote)
+                        if isinstance(e, TimeoutError):
+                            # 元の失敗そのものが期限切れ。すぐ下の _fail が
+                            # 既に切断まで伝えるので、印は立てない（立てると
+                            # finally がもう一度 _fail を呼び、同じ文面と
+                            # disconnected が 2 回出る）。死んだチャンネルでは
+                            # put が期限切れなら後始末の remove も期限切れに
+                            # なるので、この重なりは珍しくない
+                            cleanup_note[0] = note
+                        else:
+                            probe_timed_out[0] = True
+                            timed_out_note[0] = note
                     except Exception:
                         pass
-                self._fail("アップロードエラー", e)
+                self._fail("アップロードエラー" + cleanup_note[0], e)
             finally:
                 # ロックの外。理由を出して接続を畳むのは _fail に任せる
                 if probe_timed_out[0]:
