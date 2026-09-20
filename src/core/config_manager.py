@@ -6,7 +6,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 from .crypto import PasswordCrypto
 
 # ファイルロックの実装。依存パッケージは足さず、標準ライブラリだけで作る
@@ -271,6 +271,10 @@ class ConfigManager:
         # 読み込み時に復号できなかった機器: 機器名 -> そのとき残った暗号文。
         # 接続の入口がここを見て、暗号文をパスワードとして送らないようにする
         self.undecryptable_devices: Dict[str, str] = {}
+        # 同じ機器名が 2 グループにあると、上の辞書には後から読んだ方の
+        # 暗号文しか残らない。値そのものでも見分けられるよう、読み込み時に
+        # 出会った暗号文をここにも貯める
+        self.undecryptable_values: Set[str] = set()
         # 直前のグループ操作が「保存だけ失敗した」のか「そもそも受け付け
         # られなかった（同名・対象なし）」のか。戻り値の False だけでは
         # 区別できず、呼び出し側が案内を書き分けられない
@@ -299,6 +303,9 @@ class ConfigManager:
                 # 落ちる）。復号も機器が dict であることを前提にしているので、
                 # 隔離はその前に済ませる
                 self._quarantine_invalid_devices(config)
+                # 重複した機器名は除外まではしないが、知らせる（除外された
+                # 機器を数に入れないよう、隔離のあとで見る）
+                self._notify_duplicate_device_names(config)
                 # パスワードを復号化
                 self._decrypt_passwords(config)
                 self._notify_undecryptable()
@@ -420,10 +427,13 @@ class ConfigManager:
                     # 本物の DPAPI 暗号文だけを覚える。"DPAPI:cisco123" の
                     # ような平文の合言葉まで覚えると、接続の入口がそれを
                     # 暗号文とみなして、正しいパスワードの機器を断る
-                    name = device.get("name")
-                    if (isinstance(name, str) and name
-                            and self.crypto.is_dpapi_ciphertext(decrypted)):
-                        self.undecryptable_devices[name] = decrypted
+                    if self.crypto.is_dpapi_ciphertext(decrypted):
+                        # 名前は上書きされうるが、値は同名の機器が何台あっても
+                        # それぞれ残る
+                        self.undecryptable_values.add(decrypted)
+                        name = device.get("name")
+                        if isinstance(name, str) and name:
+                            self.undecryptable_devices[name] = decrypted
                 device["password"] = decrypted
 
         # トークンは件数に数えない。復号できないときの案内は
@@ -459,13 +469,50 @@ class ConfigManager:
         n = getattr(self, "_undecryptable_count", 0)
         if not n:
             return
-        message = (f"{n}件のパスワードを復号できませんでした。"
-                   "別の Windows アカウント/PC で保存された設定の可能性があります。"
-                   "該当機器のパスワードは、機器の編集で入れ直してください。"
-                   "（設定ファイル内の元の値は保護されており、上書きされません）")
+        self._append_load_warning(
+            f"{n}件のパスワードを復号できませんでした。"
+            "別の Windows アカウント/PC で保存された設定の可能性があります。"
+            "該当機器のパスワードは、機器の編集で入れ直してください。"
+            "（設定ファイル内の元の値は保護されており、上書きされません）")
+
+    def _append_load_warning(self, message: str) -> None:
+        """起動時の警告を書き足す（先に記録された警告を消さない）。"""
         print(f"[Config] {message}")
         self.load_warning = (f"{self.load_warning}\n\n{message}"
                              if self.load_warning else message)
+
+    def _notify_duplicate_device_names(self, config: Dict) -> None:
+        """同じ名前の機器が複数ある設定を読んだら、その名前を挙げて知らせる。
+
+        機器名は全グループを通して一意である前提で、接続の管理も所属グループの
+        検索も名前だけで行う（add_device / update_device は重複を断る）。
+        しかし読み込みは重複を弾かないので、手編集・他ツール由来・他 PC から
+        持ち込んだ config.json では、どちらの機器が選ばれるか決まらないまま
+        動くことになる。黙って除外すると利用者の機器が消えるので、消さずに
+        名前を挙げるだけにする。
+        """
+        seen = set()
+        duplicates = []
+        for group in config.get("groups", []):
+            if not isinstance(group, dict):
+                continue
+            for device in group.get("devices", []):
+                if not isinstance(device, dict):
+                    continue
+                name = device.get("name")
+                if not isinstance(name, str) or not name:
+                    continue
+                if name not in seen:
+                    seen.add(name)
+                elif name not in duplicates:
+                    duplicates.append(name)
+        if not duplicates:
+            return
+        self._append_load_warning(
+            "設定ファイル (config.json) に同じ名前の機器が複数あります: "
+            + "、".join(duplicates)
+            + "\n接続も設定の操作も機器名で相手を探すため、どちらが選ばれるかは"
+              "決まりません。機器の編集で名前を分けてください。")
 
     def has_undecryptable_password(self, device_name, password) -> bool:
         """その機器のパスワードが、読み込み時に復号できなかった暗号文のままか。
@@ -473,9 +520,17 @@ class ConfigManager:
         接続の入口が使う。is_encrypted の推測ではなく読み込み時の記録で
         見分けるので、機器へ本当に "DPAPI:..." を設定している場合や、
         この画面で入れ直したばかりの値を断ることはない。
+
+        名前の記録だけでは、同じ名前の機器が 2 グループにあるときに片方
+        しか覚えられない（手編集や他 PC 由来の config.json では重複が
+        読み込まれる）。値そのものとも照合して、どちらの機器も断る。
+        入れ直した新しいパスワードは読み込み時の集合に入らないので、
+        「編集で断られなくなる」性質は変わらない。
         """
         recorded = self.undecryptable_devices.get(device_name)
-        return bool(recorded) and password == recorded
+        if recorded and password == recorded:
+            return True
+        return isinstance(password, str) and password in self.undecryptable_values
 
     def _refresh_undecryptable(self, old_name: str, device_info: Dict) -> None:
         """機器を差し替えたあとの記録を合わせる。
