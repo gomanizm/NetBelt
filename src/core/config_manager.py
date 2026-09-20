@@ -719,9 +719,11 @@ class ConfigManager:
         """まだ使われていない「(名前なし)」系の表示名を返す。
 
         同名のグループを作ってはいけない。グループは名前で指すため、
-        get_group() は先頭の 1 件を返すのに remove_group() は同名を
-        すべて消す。同じ補完名が並ぶと、空のグループを消したつもりで
-        同名の別グループの機器まで消える。
+        get_group() も remove_group() も先頭の 1 件しか掴まない（実測。
+        remove_group() が同名をすべて消していたのは直す前の話で、いまは
+        tests/test_config_unnamed_group_removal.py が 1 件だけであることを
+        押さえている）。同じ補完名が並ぶと、2 つ目以降のグループには編集も
+        削除も届かず、消したつもりの操作は毎回 1 つ目に当たる。
         """
         name = self.UNNAMED_GROUP_NAME
         number = 1
