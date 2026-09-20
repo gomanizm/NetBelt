@@ -11,7 +11,9 @@ class DeviceTree(QWidget):
     # シグナル定義
     device_connect = pyqtSignal(str, dict)  # グループ名, 機器データ
     device_edit = pyqtSignal(str, dict)     # グループ名, 機器データ
-    device_delete = pyqtSignal(str, str)    # グループ名, 機器名
+    # グループ名, 機器名, 機器データ。機器データも添えるのは、同じグループに
+    # 同名が並んでいるときに、右クリックした項目を名前だけでは指せないため
+    device_delete = pyqtSignal(str, str, dict)
     device_duplicate = pyqtSignal(str, dict) # グループ名, 機器データ
     connect_requested = pyqtSignal(dict)    # 機器データ
     device_moved = pyqtSignal(str, str, str)  # 移動元グループ名, 移動先グループ名, デバイス名
@@ -404,7 +406,7 @@ class DeviceTree(QWidget):
         elif action == edit_action and edit_action is not None:
             self.device_edit.emit(group_name, device_data)
         elif action == delete_action and delete_action is not None:
-            self.device_delete.emit(group_name, device_data["name"])
+            self.device_delete.emit(group_name, device_data["name"], device_data)
         elif action == duplicate_action and duplicate_action is not None:
             self.device_duplicate.emit(group_name, device_data)
         elif is_serial and baudrate_actions:

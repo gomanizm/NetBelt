@@ -1249,19 +1249,27 @@ class ConfigManager:
         group["devices"][:] = before   # 保存できなかったらメモリも戻す
         return False
 
-    def remove_device(self, group_name: str, device_name: str) -> bool:
-        """機器を削除（対象の機器が無いときも False）"""
+    def remove_device(self, group_name: str, device_name: str,
+                      endpoint=None) -> bool:
+        """機器を 1 件だけ削除（対象の機器が無いときも False）
+
+        名前で絞ると、同じグループに同名が 2 台あるときに 2 台とも消える。
+        画面の確認も完了も 1 台の話をするので、消えたことが伝わらない
+        （remove_group は先頭の 1 件だけを消す形に揃っている）。
+        endpoint には削除したい機器の接続先（device_endpoint() の戻り値）を
+        渡す。省略すると先頭の 1 件を消す。
+        """
         group = self.get_group(group_name)
         if not group:
             return False
 
         before = list(group["devices"])
-        remaining = [d for d in before if d["name"] != device_name]
-        if len(remaining) == len(before):
+        index = self._device_index(before, device_name, endpoint)
+        if index is None:
             # 何も消していないので保存もしない。保存結果の True を返すと、
             # 呼び出し側が「削除しました」と案内してしまう（remove_group と同じ）
             return False
-        group["devices"] = remaining
+        group["devices"] = before[:index] + before[index + 1:]
         if self.save_config():
             self.undecryptable_devices.pop(device_name, None)
             return True

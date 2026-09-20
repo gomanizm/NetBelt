@@ -619,13 +619,15 @@ class MainWindow(QMainWindow):
             else:
                 QMessageBox.warning(self, "エラー", "機器の更新に失敗しました。設定は変更されていません。")
     
-    def _on_device_delete(self, group_name: str, device_name: str):
+    def _on_device_delete(self, group_name: str, device_name: str,
+                          device_data: dict = None):
         """
         機器削除
-        
+
         Args:
             group_name: グループ名
             device_name: 機器名
+            device_data: 削除を頼んだ項目の機器データ（省略時は先頭の 1 件）
         """
         # タブを開いている（接続が残っている）機器の削除は、改名と同じく断る。
         # 消すと接続先リストから項目が無くなり、実行中のマクロを「ツール」
@@ -653,7 +655,11 @@ class MainWindow(QMainWindow):
             group = self.config_manager.get_group(group_name) or {}
             existed = any(d.get("name") == device_name
                           for d in group.get("devices", []))
-            if self.config_manager.remove_device(group_name, device_name):
+            # 同じグループに同名が並んでいるときは、右クリックした項目の
+            # 接続先で 1 台に絞る（名前だけだと別の 1 台が消える）
+            if self.config_manager.remove_device(
+                    group_name, device_name,
+                    endpoint=self._endpoint_of(device_data)):
                 # 消した機器の接続情報を残さない（残すと、開いたままの
                 # タブで Enter を押したときに消したはずの機器へ繋がる）
                 self.device_info.pop(device_name, None)

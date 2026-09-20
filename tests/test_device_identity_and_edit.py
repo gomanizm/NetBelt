@@ -4,7 +4,8 @@
 名前の重複を禁止していなかった。G1 と G2 に同名・別ホストの R を登録して
 G2 の R へ接続すると、先に見つかる G1 の auto_commands が G2 の機器へ
 送られる（実測: 実ソケットに G1 のコマンドが届いた）。同一グループ内の
-重複は remove_device でまとめて消える。
+重複は、当時 remove_device が 2 台ともまとめて消していた（現在は 1 件だけを
+消す。tests/test_same_group_duplicate_device_delete.py を参照）。
 
 機器の編集は remove_device（保存）→ add_device（保存）の 2 段階で、
 削除側の保存だけ失敗するとメモリからは消えたまま画面に残り、次の無関係な
