@@ -1,7 +1,7 @@
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QTextEdit, QTabWidget
 from PyQt6.QtGui import (QFont, QColor, QPalette, QKeyEvent, QContextMenuEvent,
                          QTextCursor, QTextCharFormat)
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal, QCoreApplication, QEvent
 from collections import deque
 from itertools import groupby
 from operator import itemgetter
@@ -641,6 +641,8 @@ class TerminalWidget(QWidget):
         # _flush_pending_output が 1 片を渡している機器（append_output が
         # 溜まり分の後ろへ並べずに描くための目印）
         self._flushing_device = None
+        # _deliver_queued_output の中かどうか（配った先から呼び直させない）
+        self._delivering_queued = False
         self._output_timer = QTimer(self)
         self._output_timer.setSingleShot(True)
         self._output_timer.setInterval(0)
@@ -1649,6 +1651,34 @@ class TerminalWidget(QWidget):
             )
             self.tab_widget.addTab(welcome_terminal, "ホーム")
     
+    def _deliver_queued_output(self) -> None:
+        """受信スレッドが emit 済みで、まだ配られていない分だけを配る。
+
+        受信スレッドのシグナルは Qt のイベントキューに積まれ、GUI スレッドへ
+        配られてはじめて queue_output が呼ばれる。閉じる処理はイベント
+        ループへ戻らないまま進むので、その間の受信は未配送のまま溜まり、
+        _pending_output しか見ない記録の書き切りからは見えないまま捨てられて
+        いた。MainWindow.closeEvent は記録を書き切る前に SNMP の
+        cancel_operation と MIB 読み込み待ちを通り、そこで最大 10 秒
+        固まりうる（SNMPPanel.wait_for_background_work）ので、欠けるのは
+        その間に受信した全部になる（実測: 0.5 秒の固まりで 241 行全部）。
+
+        配るのは MetaCall（キューに積まれたシグナル呼び出し）だけにする。
+        描画も、溜まり分を描くタイマーも走らせないので、閉じるのが遅く
+        なることはない。受信スレッドは動いたままなので取りこぼしの窓は
+        0 にはならないが、固まっていた間ぶんから 1 回の配送ぶんへ縮む。
+        """
+        if self._delivering_queued:
+            return
+        self._delivering_queued = True
+        try:
+            QCoreApplication.sendPostedEvents(None, QEvent.Type.MetaCall)
+        except Exception as e:
+            # 閉じる途中なので、ここで投げると記録を書き切る前に抜ける
+            print(f"[Terminal] 未配送の受信の取り込みに失敗: {e}")
+        finally:
+            self._delivering_queued = False
+
     def _log_pending_on_close(self, device_name: str) -> None:
         """閉じるタブの描いていない受信を、画面へは描かずに記録へだけ書く。
 
@@ -1657,6 +1687,7 @@ class TerminalWidget(QWidget):
         無く、記録していないタブでも全部通すと GUI が止まっていた（実測:
         色付きの 70 文字前後の行で 16MiB が 1.0 秒、64MiB が 4.6 秒）。
         """
+        self._deliver_queued_output()
         pending = self._pending_output.pop(device_name, None)
         terminal = self._terminals.get(device_name)
         if pending and terminal is not None:
