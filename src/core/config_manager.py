@@ -645,6 +645,20 @@ class ConfigManager:
                 and isinstance(device.get("host"), str) and bool(device["host"]))
 
     @staticmethod
+    def _is_valid_auto_commands(commands) -> bool:
+        """接続時に自動送信できる形（文字列だけの list）かを返す。
+
+        手編集や他ツールの config.json には "auto_commands": "show version"
+        のような値が混ざる。送信側は list(commands) にしてから 1 要素ずつ
+        CR を付けて送るので、文字列は 1 文字ずつのコマンドに化け、辞書は
+        キーだけが送られる。list() できない値（数値など）は送信を仕掛ける
+        QTimer のコールバックの中で TypeError になり、PyQt6 はスロット内の
+        未捕捉例外で終了するため、接続した瞬間にアプリごと落ちる。
+        """
+        return (isinstance(commands, list)
+                and all(isinstance(c, str) for c in commands))
+
+    @staticmethod
     def _normalize_password(device) -> Optional[str]:
         """機器のパスワード欄を文字列にそろえる。直したら種別を返す。
 
@@ -715,6 +729,7 @@ class ConfigManager:
         emptied_groups = 0
         numeric_passwords = []   # 文字列に直した機器名
         emptied_passwords = []   # パスワードを空にした機器名
+        broken_auto = []         # 自動実行コマンドを無効にしたグループ名
         kept_groups = []
         # 手で付けられた名前とも衝突させない
         used_names = {g["name"] for g in config.get("groups", [])
@@ -729,6 +744,13 @@ class ConfigManager:
                 group["name"] = self._unused_group_name(used_names)
                 used_names.add(group["name"])
                 renamed_groups += 1
+            # 自動実行コマンドの形。接続しただけで実機へ流れるので、読めない
+            # 形なら送らずに知らせる（利用者が書いていない操作を送るより安全）。
+            # キーごと無いのは「自動実行なし」なので触らない
+            if ("auto_commands" in group
+                    and not self._is_valid_auto_commands(group["auto_commands"])):
+                group["auto_commands"] = []
+                broken_auto.append(group["name"])
             devices = group.get("devices")
             if isinstance(devices, list):
                 kept = []
@@ -756,7 +778,8 @@ class ConfigManager:
         if dropped_groups:
             config["groups"] = kept_groups
         if not (removed or reserved or renamed_groups or dropped_groups
-                or emptied_groups or numeric_passwords or emptied_passwords):
+                or emptied_groups or numeric_passwords or emptied_passwords
+                or broken_auto):
             return
         self._backup_corrupted_config()
         parts = []
@@ -788,6 +811,12 @@ class ConfigManager:
                          "機器があり、パスワードを空にしました。"
                          "機器の編集で入れ直してください: "
                          + "、".join(emptied_passwords))
+        if broken_auto:
+            parts.append("設定ファイル (config.json) で自動実行コマンドが"
+                         "文字列の配列になっていないグループがあり、"
+                         "そのグループの自動実行を無効にしました。"
+                         "グループの編集で入れ直してください: "
+                         + "、".join(broken_auto))
         message = "\n".join(parts)
         if self.backup_path:
             message += f"\n\n元のファイルはバックアップしました:\n  {self.backup_path}"
@@ -797,7 +826,8 @@ class ConfigManager:
               f"グループ{renamed_groups}件を改名、グループ{dropped_groups}件を除外、"
               f"グループ{emptied_groups}件の機器一覧を空にしました "
               f"(パスワードを文字列化={len(numeric_passwords)}, "
-              f"空にした={len(emptied_passwords)})")
+              f"空にした={len(emptied_passwords)}, "
+              f"自動実行を無効にしたグループ={len(broken_auto)})")
 
     def _backup_corrupted_config(self) -> None:
         """
@@ -1037,9 +1067,16 @@ class ConfigManager:
             commands: 自動実行コマンドのリスト（空リスト可）
 
         Returns:
-            設定成功時True、グループが無ければFalse
+            設定成功時True、グループが無ければFalse。
+            commands が文字列だけの list でないときも False（保存しない）
         """
         self.last_save_failed = False
+        # 文字列を渡されると list() が 1 文字ずつに分解する。そのまま保存すると
+        # 次の接続で 1 文字ずつが実機へ送られるので、書き込む前に断る
+        if not self._is_valid_auto_commands(commands):
+            print(f"エラー: グループ '{group_name}' の自動実行コマンドは"
+                  f"文字列の配列で指定してください")
+            return False
         missing = object()
         for group in self.config.get("groups", []):
             if group.get("name") == group_name:
