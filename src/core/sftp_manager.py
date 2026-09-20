@@ -10,6 +10,26 @@ from paramiko.sftp import (CMD_HANDLE, CMD_OPEN, SFTP_FLAG_CREATE, SFTP_FLAG_EXC
                            SFTP_FLAG_WRITE)
 
 
+class _DroppedConnection(IOError):
+    """接続が切れた失敗を、案内文で包み直したあとも見分けるための印
+
+    upload_file は改名の失敗を「どう確かめるか」を添えた IOError に包んで
+    上へ送るので、包んだ時点で元の例外の型が消える。_fail が接続を畳む
+    判断をできるよう、原因が切断・壊れた応答だったものだけこの型にする。
+    """
+
+
+# paramiko がトランスポートの死んだ読み取り・壊れた応答で上げる例外。
+# OSError の仲間ではないので、IOError だけ見ていると取りこぼす
+_DROPPED_CONNECTION_ERRORS = (EOFError, paramiko.SSHException,
+                              paramiko.SFTPError, _DroppedConnection)
+
+
+def _is_dropped_connection(e: Exception) -> bool:
+    """接続が切れた・応答が壊れたと分かる失敗か"""
+    return isinstance(e, _DROPPED_CONNECTION_ERRORS)
+
+
 class SFTPManager(QObject):
     """SFTPファイル転送を管理するクラス"""
     
@@ -78,12 +98,16 @@ class SFTPManager(QObject):
         return False
 
     def _fail(self, prefix: str, e: Exception):
-        """操作の失敗を通知する。応答待ちの期限切れなら接続も畳む
+        """操作の失敗を通知する。接続が使えなくなったと分かるなら接続も畳む
 
         期限で戻ったあとも要求と応答はずれたままなので、同じチャンネルの
         以後の操作は失敗し続ける。それでも接続中のままだと、操作のたびに
         期限ぶん画面が固まり、しかも socket.timeout は str が空なので
         理由の無いエラーだけが並ぶ。使用不能と分かる形にして再接続を促す。
+
+        切断・壊れた応答も同じ（利用者の決定 2026-09-20）。トランスポートが
+        死んだ印なのに接続中の表示のまま残ると、以後の一覧・転送がすべて
+        同じ失敗を繰り返すだけになる。
 
         ロックを持ったまま呼ばない（disconnect がロックを取りにいく）。
         """
@@ -93,7 +117,16 @@ class SFTPManager(QObject):
                 "SFTP接続を切断しました。接続し直してください")
             self.disconnect()
             return
-        self.error_occurred.emit(f"{prefix}: {str(e) or e.__class__.__name__}")
+        reason = str(e) or e.__class__.__name__
+        if _is_dropped_connection(e):
+            # paramiko の 'Server connection dropped: ' のように、理由が
+            # コロンで終わることがある。そのまま続けると「: 。」になる
+            self.error_occurred.emit(
+                f"{prefix}: {reason.strip().rstrip(':').rstrip()}。"
+                "SFTP接続を切断しました。接続し直してください")
+            self.disconnect()
+            return
+        self.error_occurred.emit(f"{prefix}: {reason}")
 
     def connect(self, ssh_client: paramiko.SSHClient) -> bool:
         """
@@ -517,9 +550,13 @@ class SFTPManager(QObject):
             送ったあとに落ちたのなら、置き換わったかどうかは分からない。
             確定した失敗として外側へ落とすと keep_tmp が立たず、後始末が
             転送した唯一の完全な写し（一時名）まで消す。
+
+            原因が切断・壊れた応答だったものは _DroppedConnection にして、
+            包んだあとも _fail が接続を畳む判断をできるようにする。
             """
             keep_tmp[0] = True
-            return IOError("%s: %s" % (
+            wrapper = _DroppedConnection if _is_dropped_connection(e) else IOError
+            return wrapper("%s: %s" % (
                 unknown_outcome_note(final_removed,
                                      "（接続が切れたか応答が壊れています）"),
                 str(e) or e.__class__.__name__))
