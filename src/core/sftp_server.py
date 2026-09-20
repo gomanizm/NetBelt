@@ -294,6 +294,7 @@ class SFTPServerManager(QObject):
     stopped = pyqtSignal()
     client_connected = pyqtSignal(str)  # クライアントIP
     client_disconnected = pyqtSignal(str)  # クライアントIP
+    client_activity = pyqtSignal(str, str)  # ip, message
     file_uploaded = pyqtSignal(str, str)  # クライアントIP, ファイル名
     file_downloaded = pyqtSignal(str, str)  # クライアントIP, ファイル名
     error_occurred = pyqtSignal(str)
@@ -320,6 +321,26 @@ class SFTPServerManager(QObject):
         self.banner_timeout_seconds = 15.0
         self.auth_timeout_seconds = 30.0
 
+        # GUI へ渡したまま、まだ処理されていない通知の件数の上限。
+        # 認証を通さない TCP 接続→即切断だけで接続と切断の両方が出るので、
+        # GUI が他の処理で塞がっている間に Qt の配送キューへ際限なく積み上がる
+        # （実測: 20 秒で 13130 件・約 11MB）。32 接続の上限は切断ごとに枠が
+        # 戻るので累積を止めない。パネルのログの行数上限が効くのは配送の後。
+        # FTP の max_pending_notices・TFTP の同名の仕掛けと同じく、超過中は
+        # 数えるだけにして、はけた時点で省略した件数を 1 行だけ出す
+        self.max_pending_notices = 1000
+        self._notice_lock = threading.Lock()
+        self._pending_notices = 0
+        self._dropped_notices = 0
+        # 接続を届けたかを接続ごとに覚える（_client_lock の下で読み書きする）。
+        # 届けた接続の切断を省くと、パネルの「接続クライアント: N」が戻らない
+        self._notice_shown = {}
+        # 自分の信号を自分でも受ける。待受スレッド・ハンドラから emit した分は
+        # キュー経由で GUI スレッドへ届くので、呼ばれたことが
+        # 「GUI が 1 件処理した」の合図
+        for signal in (self.client_connected, self.client_disconnected):
+            signal.connect(self._on_notice_delivered)
+
         # サーバー設定
         self.port = 2222
         self.root_dir = "./sftp_root"
@@ -329,6 +350,47 @@ class SFTPServerManager(QObject):
         # ホストキーは start() で読み込む（起動を待たせないため遅延）
         self.host_key = None
     
+    def _take_notice(self, force=False):
+        """配送待ちを 1 件ぶん確保する。確保できたら True（呼び出し側が emit する）。
+
+        上限に達している間は False にして省略件数へ足す。force は上限を
+        超えても確保する（接続を届けた相手の切断。捨てると接続数が戻らない）
+        """
+        with self._notice_lock:
+            if not force and self._pending_notices >= self.max_pending_notices:
+                self._dropped_notices += 1
+                return False
+            self._pending_notices += 1
+            return True
+
+    def _take_closing_notice(self, shown):
+        """切断を渡すかを決める。
+
+        接続を届けた相手（shown が True）の切断は必ず渡す。接続を省いた相手
+        （False）のものは渡さずに省略件数へ足す。記録が無い（None）ものは
+        上限の範囲でだけ渡す
+        """
+        if shown:
+            return self._take_notice(force=True)
+        if shown is False:
+            with self._notice_lock:
+                self._dropped_notices += 1
+            return False
+        return self._take_notice()
+
+    def _on_notice_delivered(self, *_args):
+        """GUI が通知を 1 件処理したので配送待ちを戻す（GUI スレッドで動く）"""
+        with self._notice_lock:
+            if self._pending_notices > 0:
+                self._pending_notices -= 1
+            dropped = 0
+            if self._pending_notices == 0:
+                dropped, self._dropped_notices = self._dropped_notices, 0
+        if dropped:
+            # この 1 行は数えない（GUI が追いついた時点でしか出ない）
+            self.client_activity.emit(
+                "", "表示が追いつかず %d 件の通知を省略しました" % dropped)
+
     def _load_or_create_host_key(self):
         """ホストキーをユーザデータディレクトリから読み込む。無ければ生成して保存する。
 
@@ -542,6 +604,7 @@ class SFTPServerManager(QObject):
                     # 閉じられず join もされず、ハンドラが停止後に起きて
                     # 破棄済みかもしれないマネージャへ emit する
                     accepted = False
+                    notice = False
                     reject_reason = ""
                     with self._client_lock:
                         if stop_event.is_set():
@@ -577,6 +640,11 @@ class SFTPServerManager(QObject):
                                 self.client_threads[:] = [t for t in self.client_threads
                                                           if t.is_alive()]
                                 self.client_threads.append(client_thread)
+                                # 配送枠はこのロックの下で決めて覚える。
+                                # ハンドラの後始末も同じロックを取るので、
+                                # 切断側がこの記録より先に読むことはない
+                                notice = self._take_notice()
+                                self._notice_shown[client_socket] = notice
                                 accepted = True
 
                     if not accepted:
@@ -589,7 +657,8 @@ class SFTPServerManager(QObject):
                         continue
 
                     print(f"[SFTP Server] Client connected from {client_addr[0]}:{client_addr[1]}")
-                    self.client_connected.emit(client_addr[0])
+                    if notice:
+                        self.client_connected.emit(client_addr[0])
 
                 except socket.timeout:
                     # タイムアウトは正常（停止チェックのため）
@@ -658,5 +727,9 @@ class SFTPServerManager(QObject):
             client_socket.close()
             with self._client_lock:
                 self._client_sockets.discard(client_socket)
-            self.client_disconnected.emit(client_addr[0])
+                shown = self._notice_shown.pop(client_socket, None)
+            # 接続を届けた相手の切断は必ず届ける。省くとパネルの
+            # 「接続クライアント: N」が減らないまま残る
+            if self._take_closing_notice(shown):
+                self.client_disconnected.emit(client_addr[0])
             print(f"[SFTP Server] Client disconnected from {client_addr[0]}")

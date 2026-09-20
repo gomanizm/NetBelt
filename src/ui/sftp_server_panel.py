@@ -169,6 +169,7 @@ class SFTPServerPanel(QWidget):
         self.sftp_server.stopped.connect(self._on_server_stopped)
         self.sftp_server.client_connected.connect(self._on_client_connected)
         self.sftp_server.client_disconnected.connect(self._on_client_disconnected)
+        self.sftp_server.client_activity.connect(self._on_activity_event)
         self.sftp_server.error_occurred.connect(self._on_error)
     
     def _on_browse_directory(self):
@@ -271,6 +272,10 @@ class SFTPServerPanel(QWidget):
         
         self._add_log(f"クライアント切断: {client_ip}")
     
+    def _on_activity_event(self, ip: str, message: str):
+        """サーバーからのお知らせ（省略した通知の件数など）をログへ出す"""
+        self._add_log("[%s] %s" % (ip, message) if ip else message)
+
     def _on_error(self, error_message: str):
         """エラー発生時の処理"""
         self._add_log(f"エラー: {error_message}")
