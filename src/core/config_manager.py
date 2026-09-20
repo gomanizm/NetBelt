@@ -365,6 +365,20 @@ class ConfigManager:
     # 画面では伏字にしているのにディスクは平文、という状態を避ける。
     _ENCRYPTED_SETTING_SECTIONS = ("ftp_server", "sftp_server")
 
+    # 「その画面で入れ直してください」と案内してよいセクション。
+    # 入れ直せるのは、settings のパスワードを実際に読み書きしている画面が
+    # あるものだけ。FTPServerPanel は config_manager を受け取り
+    # _restore_settings() / set_server_settings() で settings.ftp_server を
+    # 読み書きするが、SFTPServerPanel は config_manager を受け取らず
+    # （ui/sftp_server_panel.py の __init__(self, parent=None)）、
+    # settings.sftp_server を読みも書きもしない。案内どおりパネルを開いても
+    # 設定ファイルのその値を直す場所が無いので、ここには入れない。
+    # 暗号化の対象（_ENCRYPTED_SETTING_SECTIONS）からは外さない。手で置かれた
+    # 平文をディスクへ残さない性質は、読まれない値でも変えない。
+    # SFTP サーバーパネルが settings を読むようになったら sftp_server をここへ戻す
+    # （tests/test_sftp_server_password_notice_target.py が signature で見張っている）。
+    _SETTING_SECTIONS_WITH_EDITOR = ("ftp_server",)
+
     # 復号できなかったときに、どのタブを開けばよいか伝えるための表示名
     _SETTING_SECTION_LABELS = {
         "ftp_server": "FTPサーバー",
@@ -480,6 +494,11 @@ class ConfigManager:
         「機器の編集で入れ直してください」と出すと、機器が 1 台も絡まない
         ときにも機器の話をしてしまい、開いても直すところが無い。由来ごとに
         分けて数え、書き分ける。
+
+        内蔵サーバの中でも、その画面が settings を読み書きしているもの
+        （_SETTING_SECTIONS_WITH_EDITOR）だけに入れ直しを案内する。
+        読まれない値は直す場所が無く、起動を断られる原因にもならないので、
+        知らせるだけにして「動作には影響しない」と書く。
         """
         devices = getattr(self, "_undecryptable_count", 0)
         sections = getattr(self, "_undecryptable_settings", [])
@@ -487,18 +506,32 @@ class ConfigManager:
         if devices:
             parts.append(f"{devices}件の機器のパスワードを復号できませんでした。"
                          "該当機器のパスワードは、機器の編集で入れ直してください。")
-        if sections:
-            labels = "、".join(self._SETTING_SECTION_LABELS.get(name, name)
-                              for name in sections)
-            parts.append(f"{labels}のパスワードを復号できませんでした。"
+        editable = [n for n in sections
+                    if n in self._SETTING_SECTIONS_WITH_EDITOR]
+        unused = [n for n in sections
+                  if n not in self._SETTING_SECTIONS_WITH_EDITOR]
+        if editable:
+            parts.append(f"{self._section_labels(editable)}の"
+                         "パスワードを復号できませんでした。"
                          "その画面で入れ直してください"
                          "（表示メニューから開けます）。")
+        if unused:
+            parts.append(f"{self._section_labels(unused)}の"
+                         "パスワードを復号できませんでした。"
+                         "この版では設定ファイルのこの値を読まないため、"
+                         "サーバーの動作には影響しません"
+                         "（その画面で入力したパスワードが使われます）。")
         if not parts:
             return
         self._append_load_warning(
             "\n".join(parts)
             + "\n別の Windows アカウント/PC で保存された設定の可能性があります。"
               "（設定ファイル内の元の値は保護されており、上書きされません）")
+
+    def _section_labels(self, names) -> str:
+        """settings のセクション名を、画面に出す表示名へ並べ直す。"""
+        return "、".join(self._SETTING_SECTION_LABELS.get(name, name)
+                        for name in names)
 
     def _append_load_warning(self, message: str) -> None:
         """起動時の警告を書き足す（先に記録された警告を消さない）。"""
