@@ -473,13 +473,28 @@ class TFTPServer:
             self.on_event("protocol_error", addr[0],
                           (filename, "アップロード失敗: %s" % e, "upload"))
         finally:
+            # バッファ付きファイルは close() で最後の書き出しをするので、中断で
+            # 終わったときもここでディスク満杯などが初めて例外になる。そのまま
+            # 上げると下の 2 文へ到達せず、保存先の予約が残って同名の置き直しを
+            # File busy で断り続け（サーバを止めるまで直らない）、転送用ソケットも
+            # 閉じられず、転送スレッドは未処理例外で落ちる
+            close_error = None
             if f:
-                f.close()
+                try:
+                    f.close()
+                except OSError as e:
+                    close_error = e
             # 成功・失敗・停止・相手の ERROR・タイムアウトのどれで終わっても
             # 必ず外す。残すと、その保存先へ二度と書けなくなる
             if reserved:
                 self._release_target(target)
             xs.close()
+            if close_error is not None:
+                # 最終 DATA の経路と同じ知らせ方。「中断」だけを見て
+                # 保存できたと誤解させない
+                self.on_event("protocol_error", addr[0],
+                              (filename, "アップロード失敗（保存できません）: %s" % close_error,
+                               "upload"))
 
     def _transfer_timeout(self, xs, neg):
         """転送で使う待ち時間（秒）を決め、ソケットの待ちを小刻みに設定する。
