@@ -1448,6 +1448,14 @@ class TerminalWidget(QWidget):
                 "ませんでした:\n%s\n\n記録は失敗する前の行までです。"
                 % (device_name, error))
 
+    def has_open_log_recordings(self) -> bool:
+        """まだ閉じていない記録があるか（記録中と、停止して書き終えていない分）
+
+        アプリを閉じる側が、記録を閉じる前の寄り道（配送待ちの受信を捌く）を
+        するかどうかの判断に使う。
+        """
+        return bool(self._log_files or self._closing_logs)
+
     def finish_log_recordings(self) -> None:
         """記録中の全機器について、描いていない受信分を記録し切ってから記録を止める
 

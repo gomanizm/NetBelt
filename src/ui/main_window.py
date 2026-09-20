@@ -2556,6 +2556,28 @@ for details.
             self.config_manager.set_skipped_version(update_info.get('version'))
             self.status_bar.showMessage(f"バージョン {update_info.get('version')} をスキップしました")
     
+    def _drain_output_before_log_finish(self) -> None:
+        """記録を閉じる前に、配送待ちの受信通知を捌く
+
+        受信スレッドのシグナルは GUI スレッドのイベントキューへ積まれる。
+        emit 済みでもまだ配送されていない分は queue_output に届いておらず、
+        finish_log_recordings では救えない（実測: 受信スレッドから 200 行
+        emit してイベントループを回さずに閉じると、200 行とも記録に無い）。
+        終了処理はサーバの停止や MIB 読み込みの待機を通るので、時間が
+        かかるほどここに溜まる（実測: 0.5 秒かかる状況で 216 行が欠けた）。
+        接続を切って受信スレッドを止めたあとに一度だけ捌き、記録へ回す。
+
+        記録が開いていないときは何もしない。終了処理の途中で配送を始める
+        のは、記録を救うためだけの寄り道なので広げない。利用者の操作は
+        受け付けない（ExcludeUserInputEvents）。
+        """
+        if not self.terminal_widget.has_open_log_recordings():
+            return
+        from PyQt6.QtCore import QEventLoop
+        from PyQt6.QtWidgets import QApplication
+        QApplication.processEvents(
+            QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+
     def closeEvent(self, event):
         """
         アプリケーション終了時の処理
@@ -2612,11 +2634,6 @@ for details.
             except Exception as e:
                 print(f"[Main] MIB 読み込みの待機エラー: {e}")
 
-        # 受信済みでまだ描いていない出力を記録し切ってから、記録を止めて
-        # ファイルを閉じる。記録へ書くのは描くときなので、ここで済ませないと
-        # 画面が流れている最中に閉じた分が記録から欠ける
-        self.terminal_widget.finish_log_recordings()
-
         # すべてのマクロをクリーンアップ
         for device_name in list(self.connections.keys()):
             self.macro_manager.cleanup_device(device_name)
@@ -2629,11 +2646,22 @@ for details.
                 pass
         self.sftp_managers.clear()
         
-        # すべての接続を切断（SSH/シリアル）
-        for device_name, conn in list(self.connections.items()):
-            conn.disconnect()
+        # すべての接続を切断（SSH/シリアル）。記録を閉じるより先に切るのは、
+        # 受信スレッドを止めてからでないと記録し切れないため（下の
+        # _drain_output_before_log_finish）。conn.disconnect() ではなく
+        # _dispose_connection() を使う。disconnect() は disconnected を出し、
+        # その先の _on_connection_closed が切断バナーを端末へ書くので、
+        # まだ開いている記録へ終了時の案内が混ざる
+        for device_name in list(self.connections.keys()):
+            self._dispose_connection(device_name)
         
         self.connections.clear()
+
+        # 受信済みでまだ描いていない出力を記録し切ってから、記録を止めて
+        # ファイルを閉じる。記録へ書くのは描くときなので、ここで済ませないと
+        # 画面が流れている最中に閉じた分が記録から欠ける
+        self._drain_output_before_log_finish()
+        self.terminal_widget.finish_log_recordings()
         
         # 別ウィンドウにしたツールを閉じる。開いたままだと可視のトップ
         # レベルが残り、quitOnLastWindowClosed が既定 True のためイベント
