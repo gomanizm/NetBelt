@@ -340,6 +340,31 @@ class SFTPManager(QObject):
     # 使えないことまで分かるので、呼び出し側が切断へ回せるよう分ける
     _REMOTE_TIMEOUT = "timeout"
 
+    # 一時名の basename に許す長さ。多くのファイルシステムが名前を 255 で
+    # 切る（Linux は 255 バイト、NTFS は 255 文字）ので、両方の数え方で見る
+    TMP_NAME_LIMIT = 255
+
+    @classmethod
+    def _fit_tmp_basename(cls, basename: str, extra: int) -> str:
+        """一時名が長さの制限に触れないよう、元の名前を前方だけ残して切り詰める
+
+        一時名はどちらの向きも元の basename 全体を含むので、元の名前が
+        ファイルシステムの制限内でも一時名だけが超えることがある（実測:
+        240 文字の保存先で mkstemp が [Errno 22] Invalid argument）。
+        元の名前は手掛かりとして前方を残す。完全に捨てて短い識別子だけに
+        すると、「一時名 X が残っています」の案内から元ファイルを辿れない。
+
+        Args:
+            basename: 元のファイル名
+            extra: 一時名で basename に足す分の長さ（接頭辞・識別子・接尾辞）
+        """
+        room = max(cls.TMP_NAME_LIMIT - extra, 0)
+        fitted = basename[:room]
+        # バイトで数える相手に合わせる（日本語名なら 1 文字 3 バイト）
+        while fitted and len(fitted.encode("utf-8", "replace")) > room:
+            fitted = fitted[:-1]
+        return fitted
+
     def _remote_probe(self, remote_path: str):
         """送る直前のリモートの状態を stat で確かめる（ロック内で呼ぶ）
 
@@ -533,8 +558,12 @@ class SFTPManager(QObject):
         # 固定名だと、置き換えに失敗して残した「唯一の完全な写し」を次の試行が
         # 黙って上書きし、その試行が失敗すれば後始末が消してしまう。一意なら
         # 消す相手は必ず今回作った一時名に限られる
-        tmp_remote = (tmp_dir + ".%s.netbelt-part.%d-%s"
-                      % (remote_name, os.getpid(), uuid.uuid4().hex[:8]))
+        tmp_tag = "%d-%s" % (os.getpid(), uuid.uuid4().hex[:8])
+        # '.' + 名前 + '.netbelt-part.' + 識別子。名前以外の長さを先に数える
+        tmp_remote = (tmp_dir + ".%s.netbelt-part.%s"
+                      % (self._fit_tmp_basename(
+                          remote_name, len(".") + len(".netbelt-part.") + len(tmp_tag)),
+                         tmp_tag))
         # 最終名を消したあとで置き換えに失敗した場合は、一時名が唯一の完全な
         # 写しになるので消さない
         keep_tmp = [False]
@@ -935,8 +964,13 @@ class SFTPManager(QObject):
         # 同じ一時名の取り合いで片方が誤って失敗する）
         import tempfile
         try:
+            # 名前 + '.' + mkstemp の乱数 8 文字 + '.netbelt-part'。
+            # 名前以外の長さを先に数えて、元の名前をそのぶん切り詰める
             fd, tmp_local = tempfile.mkstemp(
-                prefix=os.path.basename(local_path) + ".", suffix=".netbelt-part",
+                prefix=self._fit_tmp_basename(
+                    os.path.basename(local_path),
+                    len(".") + 8 + len(".netbelt-part")) + ".",
+                suffix=".netbelt-part",
                 dir=os.path.dirname(os.path.abspath(local_path)))
             os.close(fd)
         except OSError as e:
