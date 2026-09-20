@@ -35,7 +35,9 @@ class SftpTransferAtomicityTest(unittest.TestCase):
         from core.sftp_manager import SFTPManager
         m = SFTPManager()
         m.is_connected = True
-        m.sftp_client = mock.Mock()
+        # 改名の期限切れでは接続を畳んで m.sftp_client を手放すので、
+        # 呼び出しの記録は控えたほうで見る
+        self.client = m.sftp_client = mock.Mock()
         m.sftp_client.normalize.side_effect = lambda p: p
         # リモートに同名は無い（stat が失敗する）。upload_file は overwrite を
         # 明示されない限り、送る直前に stat で既存を確かめるようになった
@@ -219,9 +221,9 @@ class SftpTransferAtomicityTest(unittest.TestCase):
         m.upload_file(local, "/flash/running.cfg", overwrite=True)
 
         self.assertTrue(self._wait(lambda: self.errors), "失敗が通知されない")
-        removed = [c[0][0] for c in m.sftp_client.remove.call_args_list]
+        removed = [c[0][0] for c in self.client.remove.call_args_list]
         self.assertEqual(removed, [], "期限切れなのに消しにいっている: %s" % removed)
-        m.sftp_client.rename.assert_not_called()
+        self.client.rename.assert_not_called()
         self.assertIn(".running.cfg.netbelt-part", self.errors[0],
                       "機器側で確かめる一時名を知らせていない: %s" % self.errors)
 
@@ -237,9 +239,9 @@ class SftpTransferAtomicityTest(unittest.TestCase):
         m.upload_file(local, "/flash/running.cfg")
 
         self.assertTrue(self._wait(lambda: self.errors), "失敗が通知されない")
-        removed = [c[0][0] for c in m.sftp_client.remove.call_args_list]
+        removed = [c[0][0] for c in self.client.remove.call_args_list]
         self.assertEqual(removed, [], "期限切れなのに消しにいっている: %s" % removed)
-        self.assertEqual(m.sftp_client.rename.call_count, 1,
+        self.assertEqual(self.client.rename.call_count, 1,
                          "期限切れのあとに rename をやり直している")
 
     def test_a_successful_upload_is_moved_into_place(self):

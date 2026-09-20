@@ -15,10 +15,8 @@ upload_thread はそれを受けたら改名へ進まず、転送した内容を
 転送後の再確認の期限切れと同じ経路）。期限切れでない失敗（mode を当て
 られない機器）は、これまでどおり転送の失敗にしない。
 
-残る限界: 改名（posix_rename / rename）そのものの期限切れでは、まだ接続が
-残る。畳むと sftp_client が None になり、失敗後に m.sftp_client を読む既存の
-テスト（test_sftp_final_rename_timeout.py、test_sftp_transfer_atomicity.py の
-期限切れ 2 件）が AttributeError になるため、この変更では扱っていない。
+改名（posix_rename / rename）そのものの期限切れも、利用者の決定
+（2026-09-20）で同じ扱いにそろえた（test_sftp_rename_timeout_disconnect.py）。
 """
 import io
 import os

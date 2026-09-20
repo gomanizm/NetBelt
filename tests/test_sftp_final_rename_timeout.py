@@ -41,7 +41,9 @@ class SftpFinalRenameTimeoutTest(unittest.TestCase):
 
         m = SFTPManager()
         m.is_connected = True
-        m.sftp_client = mock.Mock()
+        # 改名の期限切れでは接続を畳んで m.sftp_client を手放すので、
+        # 呼び出しの記録は控えたほうで見る
+        self.client = m.sftp_client = mock.Mock()
         m.list_directory = mock.Mock()      # 転送後の一覧更新は動かさない
         self.errors, self.done = [], []
         m.error_occurred.connect(self.errors.append)
@@ -84,7 +86,7 @@ class SftpFinalRenameTimeoutTest(unittest.TestCase):
 
         self.assertIn(".running.cfg.netbelt-part", self.errors[0],
                       "機器に残った一時名を知らせていない: %s" % self.errors)
-        removed = [c[0][0] for c in m.sftp_client.remove.call_args_list]
+        removed = [c[0][0] for c in self.client.remove.call_args_list]
         self.assertEqual(
             removed, ["/flash/running.cfg"],
             "一時名まで消している、または最終名の remove が変わった: %s" % removed)
