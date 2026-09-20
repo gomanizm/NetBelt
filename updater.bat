@@ -159,19 +159,28 @@ echo ================================================
 echo.
 
 REM 引数チェック
+REM 第1引数が無いときは、消すべき写しの在り処そのものが分からないので、
+REM ここだけは何も消さずに止まる（NetBelt は必ず ZIP のパスを渡す）。
 if "%~1"=="" (
     echo エラー: ZIPファイルパスが指定されていません
     pause
     exit /b 1
 )
 
+REM ZIP_FILE は第2引数の検査より前に決める。この中止もインストール先へ
+REM 何も書かずに終わるので、他の中止と同じく :drop_apply_copy へ写しの
+REM 在り処を渡せるようにしておく。実測（検査役 cx5g-verify-release の
+REM p3_nocopy_and_args.py）: 以前はここだけが呼ばずに止まり、更新フォルダに
+REM NetBelt-apply-*.zip と控え 2 つが残っていた。
+set "ZIP_FILE=%~1"
+
 if "%~2"=="" (
     echo エラー: アプリケーションパスが指定されていません
+    call :drop_apply_copy
     pause
     exit /b 1
 )
 
-set "ZIP_FILE=%~1"
 set "APP_PATH=%~2"
 REM インストール先。TEMP の写しから走るので %~dp0 は当てにならない。
 REM 呼び出し元が第4引数で渡してくる（手で直接実行されたときだけ %~dp0）。
