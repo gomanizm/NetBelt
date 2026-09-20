@@ -39,6 +39,9 @@ class DeviceTree(QWidget):
         self._tools_target_check = None
         # _set_baudrate の最中か（restore_baudrate の作り直しを 1 回にまとめる）
         self._applying_baudrate = False
+        # 「コンソール接続」の折りたたみ状態（None = まだ一度も作っていない）。
+        # 作り直すたびに開き直さないよう、作り直す直前の値をここへ控える
+        self._console_group_expanded: Optional[bool] = None
         self._create_ui()
         
         # シリアルポート監視用
@@ -91,6 +94,8 @@ class DeviceTree(QWidget):
         Args:
             groups: グループリスト
         """
+        # 作り直しで消える折りたたみ状態を、消す前に控える
+        self._remember_console_expanded()
         self.tree.clear()
         
         for group_data in groups:
@@ -156,8 +161,30 @@ class DeviceTree(QWidget):
             # デバイスデータを保存
             device_item.setData(0, Qt.ItemDataRole.UserRole, device_data)
         
-        # グループを展開
-        console_group.setExpanded(True)
+        # 折りたたみ状態を戻す（まだ一度も作っていなければ開いた状態）
+        console_group.setExpanded(
+            True if self._console_group_expanded is None
+            else self._console_group_expanded)
+
+    def _find_console_group(self) -> Optional[QTreeWidgetItem]:
+        """ツリーにある「コンソール接続」グループを返す（無ければ None）"""
+        root = self.tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            item = root.child(i)
+            if item.text(0) == "コンソール接続":
+                return item
+        return None
+
+    def _remember_console_expanded(self):
+        """作り直しの前に「コンソール接続」の折りたたみ状態を控える
+
+        作り直すとグループは別の項目になるので、畳んだ状態は項目と一緒に
+        消える。消す直前の値をここで覚えておき、_add_serial_ports_group が
+        戻す。まだ一度も作っていないときは控えるものが無いので触らない。
+        """
+        item = self._find_console_group()
+        if item is not None:
+            self._console_group_expanded = item.isExpanded()
     
     def detected_port_names(self) -> Set[str]:
         """いまツリーに並んでいる自動検出ポートの名前を返す
@@ -204,13 +231,11 @@ class DeviceTree(QWidget):
     
     def refresh_serial_ports(self):
         """シリアルポート一覧を更新"""
-        # 既存のコンソール接続グループを削除
-        root = self.tree.invisibleRootItem()
-        for i in range(root.childCount()):
-            item = root.child(i)
-            if item.text(0) == "コンソール接続":
-                root.removeChild(item)
-                break
+        # 既存のコンソール接続グループを削除（折りたたみ状態は控えてから）
+        item = self._find_console_group()
+        if item is not None:
+            self._console_group_expanded = item.isExpanded()
+            self.tree.invisibleRootItem().removeChild(item)
         
         # 再度追加
         self._add_serial_ports_group()
