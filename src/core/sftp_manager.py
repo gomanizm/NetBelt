@@ -488,26 +488,41 @@ class SFTPManager(QObject):
         # ので、finally ではなく元の失敗の文面へ足す
         cleanup_note = [""]
 
-        def unknown_outcome_note(final_removed: bool = False) -> str:
-            """置き換わったか確かめられないときの補足を組み立てる。
+        def unknown_outcome_note(final_removed: bool = False,
+                                 cause: str = "") -> str:
+            """置き換わったか確かめられないときの説明を組み立てる。
 
             応答が期限切れになっただけで、機器側では置き換えが済んでいる
             ことがある。そこから「消してやり直す」手順へ進むと、置き換わった
             ばかりの最終名まで消し、転送した写しも一時名ごと失う。
             どちらの名前にも触れず、確かめ方だけを伝える。
 
-            理由（期限切れと、接続を畳んだこと）は _fail が添えるので、
-            ここでは書かない。他の期限切れの補足と同じ形にそろえる。
-
             Args:
                 final_removed: 復旧手順で最終名を既に remove したあとなら
                     True。利用者が最終名の無事を誤解しないよう書き添える
+                cause: 確かめられない理由。期限切れのときは _fail が理由と
+                    切断まで添えるので空のまま
             """
             gone = "最終名は置き換えの手順で既に消してあります。" if final_removed else ""
-            return ("（最終名へ置き換えられたか確かめられませんでした。"
-                    "機器側を確認してください。" + gone +
+            return ("最終名へ置き換えられたか確かめられませんでした%s。"
+                    "機器側を確認してください。" % cause + gone +
                     "一時名 %s が残っていれば置き換えは"
-                    "終わっていません）" % tmp_remote)
+                    "終わっていません" % tmp_remote)
+
+        def unknown_outcome_error(e, final_removed: bool = False) -> IOError:
+            """期限切れ以外で置き換わったか確かめられない失敗を作る。
+
+            paramiko は切断した読み取りや壊れた応答で、OSError の仲間でない
+            例外（EOFError / SFTPError / SSHException）を上げる。改名の要求を
+            送ったあとに落ちたのなら、置き換わったかどうかは分からない。
+            確定した失敗として外側へ落とすと keep_tmp が立たず、後始末が
+            転送した唯一の完全な写し（一時名）まで消す。
+            """
+            keep_tmp[0] = True
+            return IOError("%s: %s" % (
+                unknown_outcome_note(final_removed,
+                                     "（接続が切れたか応答が壊れています）"),
+                str(e) or e.__class__.__name__))
 
         def upload_thread():
             try:
@@ -640,7 +655,7 @@ class SFTPManager(QObject):
                         # （ロックの中では畳めない。畳むのは finally）
                         keep_tmp[0] = True
                         probe_timed_out[0] = True
-                        timed_out_note[0] = unknown_outcome_note()
+                        timed_out_note[0] = "（%s）" % unknown_outcome_note()
                         return
                     except (AttributeError, IOError) as first_error:
                         if not overwrite:
@@ -664,7 +679,7 @@ class SFTPManager(QObject):
                             # 1 本目と同じ。畳むのは finally
                             keep_tmp[0] = True
                             probe_timed_out[0] = True
-                            timed_out_note[0] = unknown_outcome_note()
+                            timed_out_note[0] = "（%s）" % unknown_outcome_note()
                             return
                         except IOError:
                             # remove が断られたら最終名は残っている。消えたと
@@ -699,7 +714,7 @@ class SFTPManager(QObject):
                                 # チャンネルは抜けてから畳む
                                 keep_tmp[0] = True
                                 probe_timed_out[0] = True
-                                timed_out_note[0] = unknown_outcome_note(
+                                timed_out_note[0] = "（%s）" % unknown_outcome_note(
                                     final_removed=final_removed)
                                 return
                             except Exception as e:
@@ -722,7 +737,18 @@ class SFTPManager(QObject):
                                     # EOFError() を上げる（str が空）。
                                     # そのまま連結すると「: 」で終わる
                                     % (tmp_remote, str(e) or e.__class__.__name__))
-                
+                        except Exception as e:
+                            # 2 本目の rename が、機器の答えた失敗ではなく
+                            # 接続の切断や壊れた応答で落ちた。置き換わったかは
+                            # 分からないので、最終名を消してやり直す復旧手順へ
+                            # は進まない
+                            raise unknown_outcome_error(e)
+                    except Exception as e:
+                        # 1 本目（posix_rename / rename）が同じように落ちた。
+                        # 代わりの rename へ進んでも同じチャンネルなので、
+                        # 置き換わったか不明なまま一時名を残して知らせる
+                        raise unknown_outcome_error(e)
+
                 # 完了通知
                 self.transfer_complete.emit(f"アップロード完了: {os.path.basename(local_path)}")
                 
