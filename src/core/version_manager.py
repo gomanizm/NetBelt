@@ -639,6 +639,19 @@ class VersionManager:
             # 成功を返したのに ZIP が無く控えだけが残った（600 回中 4 回）。
             # 同じプロセスの中では 1 本ずつにする（別プロセスとの重なりは防げない）。
             with _finalize_lock(zip_path):
+                # ロックを待っている間に押された中止も拾う。手前の確認は
+                # ロックを取る前なので、待たされた分だけ見落としが生じる。
+                # 実測（tests/test_update_cancel_during_finalize_lock.py）:
+                # 待ちの間に中止しても最終名で公開され、次回起動時に
+                # 「未適用の更新」として提示された。まだ何も動かしていない
+                # ので、捨てるのは今回の .part 3 つだけでよい。
+                if cancel_check is not None and cancel_check():
+                    print("[VersionManager] ダウンロードを中止しました")
+                    self._discard(sha_part)
+                    self._discard(ver_part)
+                    self._discard(part_path)
+                    return None
+
                 stash = part_path[:-len('.part')] + '.prev.part'
                 saved = []   # (退避名, 元の名前)
                 placed = []  # 今回置いた最終名
