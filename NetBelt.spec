@@ -17,6 +17,7 @@ a = Analysis(
         'PyQt6',
         'PyQt6.QtCore',
         'PyQt6.QtGui',
+        'PyQt6.QtNetwork',  # 多重起動の防止（QLocalServer / QLocalSocket）
         'PyQt6.QtWidgets',
         'paramiko',
         'cryptography',

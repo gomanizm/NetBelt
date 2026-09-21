@@ -82,15 +82,30 @@ def main():
     # 落ちたとき、モジュール先頭で読み込んでいると退避が間に合わず、
     # 起動しない理由がどこにも残らない
     from PyQt6.QtWidgets import QApplication
+    from core.single_instance import SingleInstanceGuard
     from ui.main_window import MainWindow
 
     app = QApplication(sys.argv)
     app.setApplicationName("NetBelt")
 
+    # 2 つ起動すると、あとから保存した方が相手の追加した機器・パスワード・
+    # グループ・マクロを警告なしに消す（config.json は読み込み以降の更新を
+    # 見ずに丸ごと書き戻すため）。2 つ目は起動せず、動いている方の窓を
+    # 前へ出して終わる
+    guard = SingleInstanceGuard()
+    if guard.another_instance_is_running():
+        return
+    guard.listen()
+
     window = MainWindow()
+    guard.set_window(window)
     window.show()
 
-    sys.exit(app.exec())
+    try:
+        code = app.exec()
+    finally:
+        guard.close()
+    sys.exit(code)
 
 
 if __name__ == "__main__":
