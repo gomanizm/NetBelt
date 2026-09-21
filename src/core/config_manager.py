@@ -30,6 +30,20 @@ def is_reserved_device_name(name) -> bool:
     return isinstance(name, str) and name.strip() in RESERVED_DEVICE_NAMES
 
 
+def is_readable_macro(macro) -> bool:
+    """そのマクロを画面に出せるか（辞書で、名前が文字列であること）
+
+    読み込み時の隔離（_quarantine_invalid_devices）と、3 つの読み手
+    （DeviceTree の「ツール」・MacroDialog のプリセット一覧・DeviceDialog の
+    マクロ一覧）が同じ条件を使うためにここへ置く。以前は 4 か所がそれぞれ
+    「辞書かどうか」だけを見ていたため、辞書ではあるが name が文字列でない
+    要素（手編集の config の {"name": 5, ...} など）はすべて素通りし、
+    名前を画面へ入れる addAction / addItem が TypeError で落ちて、
+    右クリック・マクロ設定・機器編集が開かなくなっていた。
+    """
+    return isinstance(macro, dict) and isinstance(macro.get("name"), str)
+
+
 def device_endpoint(device_data):
     """機器データが指す接続先を、比べられる形で返す（辞書でなければ None）
 
@@ -838,7 +852,7 @@ class ConfigManager:
                         # 機器別マクロも、機器の編集ダイアログが for で回すので
                         # list であることが前提（要素は名前を持つ辞書）
                         if self._normalize_optional_list(
-                                d, "macros", lambda m: isinstance(m, dict)):
+                                d, "macros", is_readable_macro):
                             broken_macros.append(d["name"])
                         kept.append(d)
                 group["devices"] = kept
@@ -854,7 +868,7 @@ class ConfigManager:
         # ことを前提にしている（for で回す・list() で写す）。null のまま
         # 残ると、接続中の機器の「ツール」を作るだけで落ちる
         broken_global_macros = self._normalize_optional_list(
-            config, "global_macros", lambda m: isinstance(m, dict))
+            config, "global_macros", is_readable_macro)
         if dropped_groups:
             config["groups"] = kept_groups
         if not (removed or reserved or renamed_groups or dropped_groups

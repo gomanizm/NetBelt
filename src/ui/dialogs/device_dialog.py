@@ -6,7 +6,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt
 from typing import Dict, List, Optional
-from core.config_manager import is_reserved_device_name
+from core.config_manager import is_reserved_device_name, is_readable_macro
 from core.crypto import PasswordCrypto
 
 class DeviceDialog(QDialog):
@@ -157,7 +157,7 @@ class DeviceDialog(QDialog):
         # 直せなくなるので、読み手側でも読めない値は黙って飛ばす
         macros = self.device_data.get("macros")
         for macro in macros if isinstance(macros, list) else []:
-            if isinstance(macro, dict):
+            if is_readable_macro(macro):
                 self.macro_list.addItem(macro.get("name", ""))
     
     def _on_protocol_changed(self, protocol: str):

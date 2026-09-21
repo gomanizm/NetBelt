@@ -6,6 +6,7 @@ from PyQt6.QtCore import Qt, pyqtSignal, QTimer
 from PyQt6.QtGui import QDrag
 from typing import List, Dict, Optional, Set
 from core.serial_connection import list_serial_ports
+from core.config_manager import is_readable_macro
 
 class DeviceTree(QWidget):
     # シグナル定義
@@ -288,10 +289,11 @@ class DeviceTree(QWidget):
         else:
             tools.addAction("キープアライブ開始").triggered.connect(
                 lambda: self.keepalive_start_requested.emit(device_name))
-        # 読み手側の保険。状態は設定から来るので、リストでない値や辞書で
-        # ない要素が混ざると、ここで落ちて右クリックが一切開かなくなる
+        # 読み手側の保険。状態は設定から来るので、リストでない値や、名前で
+        # 指せない要素（辞書でない・name が文字列でない）が混ざると、
+        # ここで落ちて右クリックが一切開かなくなる
         raw_macros = state.get("macros")
-        macros = ([m for m in raw_macros if isinstance(m, dict)]
+        macros = ([m for m in raw_macros if is_readable_macro(m)]
                   if isinstance(raw_macros, list) else [])
         if macros:
             macro_menu = tools.addMenu("マクロ実行")
