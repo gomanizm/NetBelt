@@ -11,7 +11,7 @@ from typing import Dict, Optional
 # MIB 解析器の版。抽出・解決の規則を変えたら上げる。mib_cache.json は
 # この値も鍵にするので、古い解析器が作ったキャッシュがアプリの更新後に
 # そのまま使われることがなくなる。
-MIB_PARSER_VERSION = '2026-09-20.5'
+MIB_PARSER_VERSION = '2026-09-22.1'
 
 
 def app_dir() -> str:
@@ -484,20 +484,31 @@ class MIBResolver:
         + _MIB_DEFINITION_KEYWORDS + r'\b).)*?'
     )
     _MIB_ASSIGNMENT = r'::=\s*\{\s*([\w-]+)\s+(\d+)\s*\}'
+    # 定義の名前。全部大文字の語は名前として認めない。ASN.1 の値参照は
+    # 小文字で始まるので、IMPORTS / EXPORTS のような節のキーワードが
+    # 定義の名前になること自体が誤り。起点を `([\w-]+)` のまま何でも
+    # 通していたため、IMPORTS 節の直後に根があり、名前と型キーワードが
+    # 2 行以上離れていると（間に空行や、まるごとコメントの行がある形）、
+    # `IMPORTS` から始まった一致がその根の `::=` まで伸びて、企業 OID に
+    # `IMPORTS` という名前が付いていた（実測）。名前と型キーワードの
+    # 間の許容（_MIB_NAME_GAP）を広げ続けるのではなくここで弾くので、
+    # 折り返しの形に依存しない。
+    _MIB_NAME = r'(?![A-Z][A-Z0-9-]*\b)([\w-]+)'
     _MIB_DEFINITION_PATTERNS = (
-        r'([\w-]+)\s+OBJECT\s+IDENTIFIER\s*' + _MIB_ASSIGNMENT,
+        _MIB_NAME + r'\s+OBJECT\s+IDENTIFIER\s*' + _MIB_ASSIGNMENT,
         # 型キーワードから ::= までは「コロンを含まない並び」ではない。
         # 実 MIB はほぼ必ず DESCRIPTION を持ち、そこへ RFC 参照や URL を
         # 書くので、[^:]* にすると本文にコロンが出た時点で定義ごと
         # 取りこぼす。
-        r'([\w-]+)\s+OBJECT-TYPE\b' + _MIB_DEFINITION_BODY + _MIB_ASSIGNMENT,
-        r'([\w-]+)\s+NOTIFICATION-TYPE\b' + _MIB_DEFINITION_BODY
+        _MIB_NAME + r'\s+OBJECT-TYPE\b' + _MIB_DEFINITION_BODY
         + _MIB_ASSIGNMENT,
-        r'([\w-]+)\s+MODULE-IDENTITY\b' + _MIB_DEFINITION_BODY
+        _MIB_NAME + r'\s+NOTIFICATION-TYPE\b' + _MIB_DEFINITION_BODY
+        + _MIB_ASSIGNMENT,
+        _MIB_NAME + r'\s+MODULE-IDENTITY\b' + _MIB_DEFINITION_BODY
         + _MIB_ASSIGNMENT,
         # ベンダー MIB は中間ノードを OBJECT-IDENTITY で置くことが多い。
         # 拾わないと、その節も配下も丸ごと解決できない。
-        r'([\w-]+)\s+OBJECT-IDENTITY\b' + _MIB_DEFINITION_BODY
+        _MIB_NAME + r'\s+OBJECT-IDENTITY\b' + _MIB_DEFINITION_BODY
         + _MIB_ASSIGNMENT,
     )
 
