@@ -11,7 +11,7 @@ from typing import Dict, Optional
 # MIB 解析器の版。抽出・解決の規則を変えたら上げる。mib_cache.json は
 # この値も鍵にするので、古い解析器が作ったキャッシュがアプリの更新後に
 # そのまま使われることがなくなる。
-MIB_PARSER_VERSION = '2026-09-22.3'
+MIB_PARSER_VERSION = '2026-09-22.4'
 
 
 def app_dir() -> str:
@@ -498,7 +498,21 @@ class MIBResolver:
     # `IMPORTS` という名前が付いていた（実測）。名前と型キーワードの
     # 間の許容（_MIB_NAME_GAP）を広げ続けるのではなくここで弾くので、
     # 折り返しの形に依存しない。
-    _MIB_NAME = r'(?![A-Z][A-Z0-9-]*\b)([\w-]+)'
+    # 大文字の規則だけでは足りない。正規表現は 1 文字ずつ位置を
+    # ずらして試すので、全部大文字の語を弾いたあとにその語の途中から
+    # 始め直し、切れ端を名前として登録していた（実測: PDU-1 が '-1'、
+    # SNMP-TARGET が '-TARGET'、IEEE8021-PAE が '8021-PAE'。親が解決
+    # できる形なら、企業 OID に切れ端の名前が実際に付く）。偽名の
+    # 経路も全部大文字の語に限らず、IMPORTS 節の `FROM SNMPv2-TC` の
+    # ように小文字を含むモジュール名はそのまま名前になっていた
+    # （実測）。そこで大文字の規則に頼らず、名前を行頭に錨で留める。
+    # 定義の名前は必ず行頭（字下げのみ可）から始まるので、語の途中
+    # や行の途中から始め直せなくなる。左の境界を `\b` ではなく
+    # `(?![\w-])` で見るのは、`-` の直後にも境界が立つため。
+    # 行頭の錨は re.MULTILINE が無いと死ぬ（_MIB_DEFINITION_PATTERNS
+    # の finditer には付いている。_MIB_LOCAL_NAME の findall 側にも
+    # 渡すこと）。
+    _MIB_NAME = r'^[ \t]*(?![A-Z][A-Z0-9-]*(?![\w-]))([\w-]+)'
     _MIB_DEFINITION_PATTERNS = (
         _MIB_NAME + r'\s+OBJECT\s+IDENTIFIER\s*' + _MIB_ASSIGNMENT,
         # 型キーワードから ::= までは「コロンを含まない並び」ではない。
@@ -721,7 +735,8 @@ class MIBResolver:
                 local_names = self._module_local_names = {}
             for module, text in sections:
                 local_names.setdefault(module, set()).update(
-                    re.findall(self._MIB_LOCAL_NAME, text))
+                    re.findall(self._MIB_LOCAL_NAME, text,
+                               re.MULTILINE))
                 for pattern in self._MIB_DEFINITION_PATTERNS:
                     # DOTALL が要る。定義は複数行にまたがるので、`.` が改行を
                     # 拾わないと型キーワードから ::= まで届かない
