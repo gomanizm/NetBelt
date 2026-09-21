@@ -317,6 +317,13 @@ class Screen(object):
         # 「右端の 1 文字が上書きされる」が起きる行数だけの変更
         self._pending_wrap = (self._pending_wrap and logical_col >= cols
                               and cols >= was_cols)
+        if cols < was_cols:
+            # 保存してある折り返し待ち (DECSC / ?1048 / 1049) も同じ
+            # 理由で解く。戻したあとの 1 文字が同じ切り詰めを呼ぶ
+            self._saved = self._saved[:5] + (False,)
+            self._other_saved = self._other_saved[:5] + (False,)
+            if self._saved_main:
+                self._saved_main = self._saved_main[:5] + (False,)
         self.dirty = set(range(rows))
         self._reflowed = True
 
