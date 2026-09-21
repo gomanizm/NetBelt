@@ -11,7 +11,7 @@ from typing import Dict, Optional
 # MIB 解析器の版。抽出・解決の規則を変えたら上げる。mib_cache.json は
 # この値も鍵にするので、古い解析器が作ったキャッシュがアプリの更新後に
 # そのまま使われることがなくなる。
-MIB_PARSER_VERSION = '2026-09-22.4'
+MIB_PARSER_VERSION = '2026-09-22.5'
 
 
 def app_dir() -> str:
@@ -797,6 +797,19 @@ class MIBResolver:
         より、どのモジュールの親か確定できないときは名前を付けず OID の
         まま出す。諦めた件数は標準出力へ 1 行知らせる。
 
+        諦めるのは「よそのモジュールが同名を宣言している」＝本当に
+        曖昧なときだけ。宣言があって自分のモジュールで決まらないだけで
+        止めると、決定の範囲を超えて曖昧でない親まで捨てる。宣言の有無は
+        _MIB_LOCAL_NAME で見るので、抽出できない右辺（複数添字の
+        `::= { aRoot 0 1 }`、ラベル付きフルパスの
+        `::= { iso(1) org(3) ... 65001 }`）で宣言された節がこの網に入り、
+        実 MIB がそのまま当たっていた（実測: SMI 自身の internet が
+        抽出から落ちて directory / transmission / snmpDomains が消え、
+        custom_mibs.json にベンダー根を置いた一式ではベンダーの木が
+        丸ごと消えて、Trap の名前が 'alarmRaised' から 'acme.2.4.2' に
+        なった）。曖昧でなければ標準表 / custom_mibs.json / IMPORTS の
+        値をこれまでどおり使う。
+
         残る制限: 2 つのモジュールが同じ名前を定義し、第三のモジュールが
         その一方を IMPORTS しているとき、IMPORTS を見ていないのでどちらを
         指すか決められず、後に解決した方になる。「後に解決した方」は
@@ -834,6 +847,14 @@ class MIBResolver:
                     parent_oid = '1.3.6.1.4.1'
                 elif parent in declared[module]:
                     parent_oid = in_module.get(module, {}).get(parent)
+                    if parent_oid is None and not any(
+                            parent in names
+                            for other, names in declared.items()
+                            if other != module):
+                        # よそのモジュールに同名が無い＝曖昧ではない。
+                        # 標準表 / custom_mibs.json / IMPORTS の値を
+                        # これまでどおり使う
+                        parent_oid = known.get(parent)
                 else:
                     parent_oid = known.get(parent)
                 if parent_oid is None:
@@ -855,7 +876,10 @@ class MIBResolver:
         # 「黙って捨てた件数」になる。判断に使った条件と件数を 1 行残す
         gave_up = sum(1 for _, parent, _, module in pending
                       if parent != 'enterprises' and parent in declared[module]
-                      and parent in known)
+                      and parent in known
+                      and any(parent in names
+                              for other, names in declared.items()
+                              if other != module))
         if gave_up:
             print(f"[MIBResolver] 親の名前を自分のモジュールで解決できない"
                   f"定義が {gave_up}件ありました。同じ名前が別のモジュールに"
