@@ -122,6 +122,11 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         
+        # 終了処理に入ったか。終了処理は記録を救うために配送待ちのシグナルを
+        # その場で配るので、更新チェックの知らせがここで届きうる。受け手は
+        # モーダルなので、開くと終了が止まる（_show_update_dialog）
+        self._shutting_down = False
+
         # 更新通知シグナルを接続
         self.update_available.connect(self._show_update_dialog)
         self.update_check_error.connect(self._show_update_check_error)
@@ -2318,8 +2323,18 @@ for details.
         
         threading.Thread(target=check_thread, daemon=True).start()
     
+    def _closing_now(self) -> bool:
+        """終了処理に入っているか（更新チェックの知らせを出さない合図）
+
+        終了処理の途中で呼ばれたモーダルは、答えるまで終了を止める。その
+        時点でサーバも接続も止まっているので、開いても何もできない。
+        """
+        return getattr(self, "_shutting_down", False)
+
     def _show_no_update_message(self):
         """最新版使用中メッセージを表示"""
+        if self._closing_now():
+            return
         try:
             from __version__ import __version__
             version = __version__
@@ -2335,6 +2350,8 @@ for details.
     
     def _show_update_check_error(self, error: str):
         """更新チェックエラーを表示"""
+        if self._closing_now():
+            return
         QMessageBox.warning(
             self,
             "更新確認エラー",
@@ -2574,8 +2591,12 @@ for details.
     
     def _show_update_dialog(self, update_info: dict):
         """更新ダイアログを表示（メインスレッドで実行）"""
+        if self._closing_now():
+            # 終了処理の途中で配送された知らせ。ここで開くと、答えるまで
+            # 閉じられないうえ、「今すぐ更新」でダウンロードまで始まる
+            return
         from .dialogs.update_dialog import UpdateDialog
-        
+
         dialog = UpdateDialog(self, update_info)
         result = self._exec_dialog(dialog)
         
@@ -2616,6 +2637,13 @@ for details.
         Args:
             event: 終了イベント
         """
+        # 以降は終了処理。記録中の受信を取りこぼさないために、この先で
+        # 配送待ちのシグナルをその場で配る（_drain_output_before_log_finish と
+        # TerminalWidget._deliver_queued_output）。配られるのは受信だけでは
+        # なく、未配送のキュー接続すべてなので、別スレッドの更新チェックが
+        # 出した知らせもここで届く。受け手がモーダルを開くと、答えるまで
+        # 終了が止まる（実測: 記録中に閉じると更新ダイアログが開いた）
+        self._shutting_down = True
         # レイアウト（スプリッター幅・選択タブ）を保存
         self._save_layout()
         # Syslogレシーバーを停止
