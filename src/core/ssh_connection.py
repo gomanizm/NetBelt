@@ -16,6 +16,63 @@ from PyQt6.QtCore import QObject, pyqtSignal
 from .config_manager import known_hosts_guard as _known_hosts_guard
 
 
+def known_hosts_server_name(host, port):
+    """paramiko が known_hosts を引くときの名前を返す。
+
+    既定ポートはホスト名そのまま、それ以外は "[host]:port"。
+    SSHClient.connect が組み立てるのと同じ形にそろえる。
+    """
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        port = 22
+    return host if port == 22 else "[%s]:%d" % (host, port)
+
+
+def _hostnames_match(names, server_name):
+    """known_hosts の名前欄（カンマ区切り）が、その接続先を指すか"""
+    for name in names:
+        if name == server_name:
+            return True
+        # ハッシュ化された名前（|1|salt|hash）。paramiko の公開 API で
+        # 同じ塩を使って掛け直し、一致するかを見る
+        if name.startswith("|1|") and not server_name.startswith("|1|"):
+            try:
+                if paramiko.hostkeys.HostKeys.hash_host(server_name, name) == name:
+                    return True
+            except Exception:
+                pass
+    return False
+
+
+def unreadable_known_hosts_lines(path):
+    """paramiko が黙って読み飛ばす行を [(行番号, 行, 生バイト列)] で返す。
+
+    paramiko 4.0.0 の HostKeys.load は 1 行ごとに SSHException を握りつぶし、
+    HostKeyEntry.from_line はフィールド不足や未知の鍵種別（sk-* や証明書）で
+    None を返す。つまり壊れた行があっても読み込みは成功したように見え、
+    その接続先は「未知のホスト」に戻って TOFU が何も聞かずに受け入れる。
+    呼び出し側が自分で見つけられるよう、paramiko と同じ読み方で拾う。
+
+    生バイト列も返すのは、保存のときに書き戻して消さないため。
+    """
+    from paramiko.hostkeys import HostKeyEntry
+    broken = []
+    for lineno, raw_line in enumerate(
+            Path(str(path)).read_bytes().split(b"\n"), 1):
+        raw_line = raw_line.rstrip(b"\r")
+        text = raw_line.decode("utf-8", errors="replace").strip()
+        if not text or text.startswith("#"):
+            continue
+        try:
+            entry = HostKeyEntry.from_line(text, lineno)
+        except paramiko.SSHException:
+            entry = None
+        if entry is None:
+            broken.append((lineno, text, raw_line))
+    return broken
+
+
 def _save_known_hosts(client, known_hosts_path):
     """client が持つホスト鍵を known_hosts へ書き戻す。
 
@@ -32,9 +89,13 @@ def _save_known_hosts(client, known_hosts_path):
     """
     path = Path(str(known_hosts_path))
     with _known_hosts_guard(path.parent):
+        preserved = []
         if path.exists():
             # 他の接続がこの間に保存した鍵を取り込む
             client.load_host_keys(str(path))
+            # paramiko が読み飛ばした行は書き出しに入らないので、黙って
+            # 消える。利用者が直すはずの行なので、そのまま書き戻す
+            preserved = [raw for _, _, raw in unreadable_known_hosts_lines(path)]
         path.parent.mkdir(parents=True, exist_ok=True)
         # os.replace はドライブを跨げないので一時ファイルは同階層に作る
         fd, tmp_path = tempfile.mkstemp(
@@ -42,6 +103,11 @@ def _save_known_hosts(client, known_hosts_path):
         os.close(fd)
         try:
             client.save_host_keys(tmp_path)
+            if preserved:
+                # paramiko は text モードで書くので、改行もそれに合わせる
+                with open(tmp_path, "ab") as f:
+                    for raw in preserved:
+                        f.write(raw + os.linesep.encode("ascii"))
             os.replace(tmp_path, str(path))
             tmp_path = None      # 差し替え済み。後片付けの対象から外す
         finally:
@@ -162,24 +228,63 @@ class SSHConnection(QObject):
         # 他の接続の保存や引き継ぎが差し替えている最中に読まない。Windows では
         # Permission denied になり、下の中止に落ちる。NetBelt を 2 つ起動して
         # いると別プロセスの保存ともぶつかるので、錠はプロセスをまたぐ
+        broken = []
         try:
             with _known_hosts_guard(known_hosts_path.parent):
                 if known_hosts_path.exists():
                     client.load_host_keys(str(known_hosts_path))
+                    # paramiko は読めない行を黙って読み飛ばす。放っておくと
+                    # その接続先は「未知のホスト」に戻り、TOFU が何も聞かずに
+                    # 提示された鍵を受け入れる（鍵が変わっていても分からない）
+                    broken = unreadable_known_hosts_lines(known_hosts_path)
         except Exception as e:
             # 握りつぶして TOFU にすると、既知の機器でも「未知」扱いになり、
             # 鍵が変わっていても気づかずにパスワードを送る。検証できない
             # 状態で認証へ進まない
             raise HostKeyStoreError(
                 "既知ホスト鍵 (known_hosts) を読めないため接続を中止しました: %s\n%s\n"
-                "壊れた行が 1 つあるだけでも読めなくなります。該当行を修正または"
-                "削除するか、ファイルを退避してから接続し直してください"
+                "ファイルを開けない（権限・排他・入出力エラー）状態です。"
+                "権限を修正するか、ファイルを退避してから接続し直してください"
                 "（退避すると全機器が初回接続の扱いになります）。"
                 % (e, known_hosts_path))
+        if broken:
+            self._refuse_or_warn_broken_lines(broken, known_hosts_path)
         policy = _TofuHostKeyPolicy(known_hosts_path)
         policy._on_save_error = lambda message: self.output_received.emit(
             "\r\n[NetBelt] 警告: %s\r\n" % message)
         client.set_missing_host_key_policy(policy)
+
+    def _refuse_or_warn_broken_lines(self, broken, known_hosts_path):
+        """読めない行を名指しで知らせ、その行が指す接続先なら接続を中止する。
+
+        壊れた行を読み飛ばしたまま進むと、その接続先は初回接続の扱いに戻り、
+        鍵が変わっていても TOFU が黙って受け入れてしまう。そこで、いま繋ご
+        うとしている接続先を指す行があるときだけ中止する。ほかの接続先を
+        指す行は、知らせるだけで接続は今までどおり続ける。
+
+        Args:
+            broken: unreadable_known_hosts_lines() の戻り値
+            known_hosts_path: known_hosts のパス（案内に載せる）
+        """
+        server_name = known_hosts_server_name(self.host, self.port)
+        mine = [(no, text) for no, text, _ in broken
+                if _hostnames_match(text.split()[0].split(","), server_name)]
+        if mine:
+            raise HostKeyStoreError(
+                "known_hosts に読めない行があり、%s の鍵を検証できないため"
+                "接続を中止しました:\n%s\n%s\n"
+                "この行を直すか削除してから接続し直してください"
+                "（削除するとこの機器は初回接続の扱いになります）。"
+                % (server_name,
+                   "\n".join("  %d 行目: %s" % (no, text) for no, text in mine),
+                   known_hosts_path))
+        self.output_received.emit(
+            "\r\n[NetBelt] 警告: known_hosts に読めない行があります"
+            "（この機器の接続先を指す行ではないので、接続は続けます）:\r\n"
+            "%s\r\n%s\r\n"
+            % ("\r\n".join("  %d 行目: %s" % (no, text)
+                           for no, text, _ in broken),
+               known_hosts_path))
 
     def _auth_failure_message(self) -> str:
         """認証失敗の理由を、実際に使った手段に合わせて返す。
