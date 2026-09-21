@@ -875,13 +875,15 @@ class SFTPManager(QObject):
                         # 畳めない。畳むのは finally）
                         note = ("（送りかけの一時名 %s を片づけられませんでした）"
                                 % tmp_remote)
-                        if isinstance(e, TimeoutError):
-                            # 元の失敗そのものが期限切れ。すぐ下の _fail が
+                        if isinstance(e, TimeoutError) or _is_dropped_connection(e):
+                            # 元の失敗そのもので接続が畳まれる。すぐ下の _fail が
                             # 既に切断まで伝えるので、印は立てない（立てると
                             # finally がもう一度 _fail を呼び、同じ文面と
                             # disconnected が 2 回出る）。死んだチャンネルでは
                             # put が期限切れなら後始末の remove も期限切れに
-                            # なるので、この重なりは珍しくない
+                            # なるので、この重なりは珍しくない。切断・壊れた
+                            # 応答でも _fail は畳むので（利用者の決定
+                            # 2026-09-20）、同じ重なりが起きる
                             cleanup_note[0] = note
                         else:
                             probe_timed_out[0] = True
