@@ -1951,7 +1951,14 @@ class TerminalWidget(QWidget):
                 from .dialogs.log_save_dialog import LogSaveProgressDialog
                 
                 dialog = LogSaveProgressDialog(log_text, file_path, self)
-                if dialog.exec():
+                try:
+                    saved = dialog.exec()
+                finally:
+                    # 端末を親にしたダイアログは、閉じただけでは子として残る
+                    # （端末はアプリと同じ寿命なので、保存のたびに積み上がる）。
+                    # 走っているワーカーの始末も要るので、ダイアログに任せる
+                    dialog.release()
+                if saved:
                     QMessageBox.information(
                         self,
                         "ログ保存完了",

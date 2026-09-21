@@ -2372,7 +2372,9 @@ for details.
         msg.setText(info_text)
         msg.setIcon(QMessageBox.Icon.Information)
         msg.setStandardButtons(QMessageBox.StandardButton.Ok)
-        msg.exec()
+        # 開くたびに作る親付きのダイアログなので、ほかの窓と同じく
+        # 閉じたあとの破棄を予約する（QMessageBox も QDialog）
+        self._exec_dialog(msg)
     
     def _on_check_for_updates(self):
         """手動で更新をチェック"""
