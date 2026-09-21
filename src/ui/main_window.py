@@ -779,7 +779,14 @@ class MainWindow(QMainWindow):
             device_data: 機器データ
         """
         device_name = device_data['name']
-        
+
+        # 名前が同じでも接続先が違う項目からは、そのセッションへ繋がせない。
+        # 繋ぐとログの記録先・再接続用の写し・タブが、別の接続先のもので
+        # 上書きされる（「ツール」と同じ判定で断る）
+        if self._session_target_conflict(device_name, device_data):
+            self._warn_session_target_conflict(device_name)
+            return
+
         # 既に接続中かチェック
         if device_name in self.connections:
             self.status_bar.showMessage(f"{device_name} は既に接続されています")
@@ -1295,6 +1302,30 @@ class MainWindow(QMainWindow):
         return (session is not None
                 and self._endpoint_of(session) == self._endpoint_of(device_data))
 
+    def _session_target_conflict(self, device_name: str, device_data: dict) -> bool:
+        """その名前のセッションと、選んだ項目の接続先が食い違うかを返す
+
+        「ツール」と同じ照合を、接続・切断の入口にも使う。名前だけで
+        セッションを引くと、後から挿した自動検出の COM3 を選んで「切断」を
+        押したときに登録機器「COM3」の SSH セッションが切れ、切断済みで
+        タブだけ残っている「COM3」へ繋ぐとログの記録先と再接続用の写しが
+        乗っ取られる。
+
+        セッション（タブか接続）が無ければ、名前が空いているだけなので
+        通す。接続時の写しが無いときは接続先を比べられないので通す。
+        """
+        if not (self.terminal_widget.has_terminal(device_name)
+                or device_name in self.connections):
+            return False
+        if self.device_info.get(device_name) is None:
+            return False
+        return not self._tools_target_matches(device_name, device_data)
+
+    def _warn_session_target_conflict(self, device_name: str) -> None:
+        """接続先が食い違う項目から操作されたことを伝える"""
+        self.status_bar.showMessage(
+            f"{device_name}: 選んだ項目は、この名前のセッションの接続先と違います")
+
     def _on_serial_baudrate_changed(self, port: str, baudrate: int):
         """自動検出COMポートのボーレート変更を、開いている接続と再接続用の写しへ反映する
 
@@ -1547,6 +1578,12 @@ class MainWindow(QMainWindow):
         device_name = device_data.get('name')
         if device_name not in self.connections:
             self.status_bar.showMessage(f"{device_name} は接続されていません")
+            return
+
+        # 名前が同じでも接続先が違う項目からは切らない。「ツール」は同じ
+        # 判定で灰色になるのに、このボタンだけ無関係なセッションを切っていた
+        if self._session_target_conflict(device_name, device_data):
+            self._warn_session_target_conflict(device_name)
             return
 
         self._on_tab_closed(device_name)
