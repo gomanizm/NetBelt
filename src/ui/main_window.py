@@ -1880,7 +1880,8 @@ class MainWindow(QMainWindow):
             keepalive_active=keepalive_active,
             command_list_active=command_list_active,
             config_manager=self.config_manager,
-            keepalive_interval=self.keepalive_intervals.get(current_tab_name, 60)
+            keepalive_interval=self.keepalive_intervals.get(current_tab_name, 60),
+            connected=current_tab_name in self.connections
         )
         
         # シグナル接続
@@ -1902,16 +1903,31 @@ class MainWindow(QMainWindow):
         self._exec_dialog(dialog)
     
     def _start_keepalive(self, device_name: str, interval: int):
-        """キープアライブを開始してUI更新"""
+        """キープアライブを開始してUI更新
+
+        入口は「ツール」・メニューバーのマクロ設定・タブのマクロ設定の
+        3 つで、どれも開いている間に切れうる（切断してもタブは残るので、
+        切断済みのタブ名でマクロ設定を開ける）。受け口ごとに確かめると
+        1 つ抜けるので、必ず通るここで見る。切断時の後始末は
+        macro_manager.cleanup_device を直接呼ぶため巻き込まない
+        """
+        if not self._session_is_live(device_name, "キープアライブを開始"):
+            return
         # 間隔を保存
         self.keepalive_intervals[device_name] = interval
-        
+
         self.macro_manager.start_keepalive(device_name, interval)
         self.terminal_widget.set_keepalive_status(device_name, True)
         self.status_bar.showMessage(f"{device_name}: キープアライブ開始（{interval}秒間隔）")
     
     def _stop_keepalive(self, device_name: str):
-        """キープアライブを停止してUI更新"""
+        """キープアライブを停止してUI更新
+
+        開始と同じ 3 つの入口を通る。切れていれば、切断時の後始末
+        （cleanup_device）で既に止まっている
+        """
+        if not self._session_is_live(device_name, "キープアライブを停止"):
+            return
         self.macro_manager.stop_keepalive(device_name)
         self.terminal_widget.set_keepalive_status(device_name, False)
         self.status_bar.showMessage(f"{device_name}: キープアライブ停止")
@@ -1979,7 +1995,8 @@ class MainWindow(QMainWindow):
             keepalive_active=keepalive_active,
             command_list_active=command_list_active,
             config_manager=self.config_manager,
-            keepalive_interval=self.keepalive_intervals.get(device_name, 60)
+            keepalive_interval=self.keepalive_intervals.get(device_name, 60),
+            connected=device_name in self.connections
         )
         
         # シグナル接続（UI更新も行う）
@@ -2030,10 +2047,8 @@ class MainWindow(QMainWindow):
         Args:
             device_name: 機器名
         """
-        # メニューを開いている間に切れていたら何もしない
-        if not self._session_is_live(device_name, "キープアライブを開始"):
-            return
-        # 保存された間隔を使用（未設定の場合はデフォルト60秒）
+        # 保存された間隔を使用（未設定の場合はデフォルト60秒）。
+        # メニューを開いている間に切れていないかは _start_keepalive が見る
         interval = self.keepalive_intervals.get(device_name, 60)
         self._start_keepalive(device_name, interval)
 
@@ -2044,10 +2059,7 @@ class MainWindow(QMainWindow):
         Args:
             device_name: 機器名
         """
-        # 切れていれば、切断時の後始末（cleanup_device）で既に止まっている
-        if not self._session_is_live(device_name, "キープアライブを停止"):
-            return
-        # キープアライブを停止
+        # キープアライブを停止（切れていないかは _stop_keepalive が見る）
         self._stop_keepalive(device_name)
     
     @property

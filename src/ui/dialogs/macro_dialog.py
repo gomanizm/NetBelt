@@ -25,10 +25,15 @@ class MacroDialog(QDialog):
                  keepalive_active: bool = False,
                  command_list_active: bool = False,
                  config_manager=None,
-                 keepalive_interval: int = 60):
+                 keepalive_interval: int = 60,
+                 connected: bool = True):
         super().__init__(parent)
         self.device_name = device_name
         self.keepalive_active = keepalive_active
+        # いまも繋がっているか。切断してもタブは残るので、切断済みのタブ名で
+        # このダイアログを開ける。繋がっていない機器で「開始」を押しても
+        # MainWindow は始めないので、押せる見た目にしない
+        self.connected = connected
         # いま動いている（または前回使った）送信間隔。_create_ui より前に
         # 退避しておかないと、送信間隔の欄が既定値のままになり、
         # 動作中の表示も次の開始も実間隔とずれる
@@ -110,13 +115,16 @@ class MacroDialog(QDialog):
         # ステータスラベル
         self.keepalive_status_label = QLabel("状態: 停止中")
         layout.addWidget(self.keepalive_status_label)
-        
+
         layout.addStretch()
-        
+
         # 初期状態を反映
         if self.keepalive_active:
             self._update_keepalive_ui(True)
-        
+        elif not self.connected:
+            self.keepalive_start_btn.setEnabled(False)
+            self.keepalive_status_label.setText("状態: 停止中（接続が切れています）")
+
         return widget
     
     def _create_preset_tab(self) -> QWidget:
@@ -255,7 +263,7 @@ class MacroDialog(QDialog):
     def _update_keepalive_ui(self, active: bool):
         """キープアライブUIを更新"""
         self.keepalive_active = active
-        self.keepalive_start_btn.setEnabled(not active)
+        self.keepalive_start_btn.setEnabled(not active and self.connected)
         self.keepalive_stop_btn.setEnabled(active)
         self.keepalive_interval_spin.setEnabled(not active)
         
