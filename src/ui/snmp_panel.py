@@ -136,6 +136,13 @@ class MIBLoaderThread(QThread):
 class SNMPPanel(QWidget):
     """SNMPパネル"""
 
+    # アプリの終了処理に入ったか（MainWindow.closeEvent が立てる）。
+    # 立っている間はモーダルを開かない。終了処理は記録を救うために配送待ちの
+    # シグナルをその場で配るので、ワーカーや Trap 受信のスレッドが出した
+    # エラーもそこで届く。答えるまで終了が止まるうえ、そのとき SNMP は
+    # 停止済みで、開いても何もできない。
+    _closing = False
+
     # 保持する Trap の件数。上限が無いと、受信を張りっぱなしにする常用で
     # メモリが単調に増え続ける（VarBind 3件の Trap あたり約 12KB、
     # 100,000 件で約 1.2GB。クリアするまで解放されない）。
@@ -1330,7 +1337,9 @@ class SNMPPanel(QWidget):
             else:
                 self.status_label.setText(f"完了: {len(result)}件")
         else:
-            QMessageBox.critical(self, "エラー", str(result))
+            if not self._closing:
+                # 終了処理の途中なら開かない（_closing の説明を参照）
+                QMessageBox.critical(self, "エラー", str(result))
             self.status_label.setText("エラー")
     
     def _on_trap_received(self, trap_data: dict):
@@ -1428,4 +1437,8 @@ class SNMPPanel(QWidget):
         self._show_trap_stopped()
     
     def _on_error_occurred(self, error: str):
+        if self._closing:
+            # 終了処理の途中。黙って捨てずに記録だけ残す（_closing の説明を参照）
+            print(f"[SNMPPanel] 終了処理中のエラー通知: {error}")
+            return
         QMessageBox.warning(self, "警告", error)

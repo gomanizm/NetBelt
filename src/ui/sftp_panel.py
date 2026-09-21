@@ -15,7 +15,13 @@ from ui import theme
 
 class SFTPPanel(QWidget):
     """SFTPファイルブラウザパネル"""
-    
+
+    # アプリの終了処理に入ったか（MainWindow.closeEvent が立てる）。
+    # 立っている間はモーダルを開かない。終了処理は記録を救うために配送待ちの
+    # シグナルをその場で配るので、転送スレッドが出したエラーもそこで届く。
+    # 答えるまで終了が止まるうえ、そのとき接続は既に切ってある。
+    _closing = False
+
     # settings.sftp の既定値。src/resources/default_config.json に合わせてある
     SFTP_SETTING_DEFAULTS = {
         "default_download_path": "./downloads",
@@ -500,6 +506,9 @@ class SFTPPanel(QWidget):
         """
         self.progress_bar.setVisible(False)
         self.status_label.setText(f"エラー: {error_message}")
+        if self._closing:
+            # 終了処理の途中。表示だけ残して戻る（_closing の説明を参照）
+            return
         QMessageBox.warning(self, "SFTP エラー", error_message)
     
     def _on_item_double_clicked(self, index: QModelIndex):

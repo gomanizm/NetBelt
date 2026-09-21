@@ -13,6 +13,12 @@ from datetime import datetime
 class FTPServerPanel(QWidget):
     """FTPサーバー制御パネル"""
 
+    # アプリの終了処理に入ったか（MainWindow.closeEvent が立てる）。
+    # 立っている間はモーダルを開かない。終了処理は記録を救うために配送待ちの
+    # シグナルをその場で配るので、サーバのスレッドが出したエラーもそこで
+    # 届く。答えるまで終了が止まるうえ、そのときサーバは停止済み。
+    _closing = False
+
     # ログも転送履歴も、認証を通らない相手の要求だけで増やせる。上限が
     # 無いと遠隔から叩き続けるだけでメモリを食い潰せるため、頭打ちにする。
     # 行数は Syslog パネル（1000件）に合わせた。
@@ -336,6 +342,9 @@ class FTPServerPanel(QWidget):
         for st in self._active.values():
             self.history.setItem(st["row"], 5, QTableWidgetItem("エラー"))
         self._active.clear()
+        if self._closing:
+            # 終了処理の途中。ログだけ残して戻る（_closing の説明を参照）
+            return
         QMessageBox.critical(self, "FTPサーバー エラー", error_message)
 
     def _on_fw_allow(self):

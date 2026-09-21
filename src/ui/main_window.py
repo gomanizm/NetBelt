@@ -2412,6 +2412,30 @@ for details.
         """
         return getattr(self, "_shutting_down", False)
 
+    # 終了処理に入ったことを伝えるパネル。ここに挙げた受け手は、印が
+    # 立っている間 QMessageBox を開かない（表示とログへの記録は残す）
+    _PANELS_TOLD_WHEN_CLOSING = (
+        "sftp_panel",
+        "snmp_panel",
+        "tftp_server_panel",
+        "ftp_server_panel",
+        "sftp_server_panel",
+    )
+
+    def _tell_panels_closing(self) -> None:
+        """各パネルへ「閉じている」印を渡す
+
+        終了処理は記録を救うために配送待ちのシグナルをその場で配るので
+        （_drain_output_before_log_finish）、転送・ワーカー・受信の各
+        スレッドが出したエラーの知らせもここで届く。受け手がモーダルを
+        開くと、答えるまで終了が止まる。そのとき接続もサーバも停止済みで、
+        開いても何もできない。配送そのものは変えず、受け手の側で開かない。
+        """
+        for name in self._PANELS_TOLD_WHEN_CLOSING:
+            panel = getattr(self, name, None)
+            if panel is not None:
+                panel._closing = True
+
     def _show_no_update_message(self):
         """最新版使用中メッセージを表示"""
         if self._closing_now():
@@ -2723,8 +2747,11 @@ for details.
         # TerminalWidget._deliver_queued_output）。配られるのは受信だけでは
         # なく、未配送のキュー接続すべてなので、別スレッドの更新チェックが
         # 出した知らせもここで届く。受け手がモーダルを開くと、答えるまで
-        # 終了が止まる（実測: 記録中に閉じると更新ダイアログが開いた）
+        # 終了が止まる（実測: 記録中に閉じると更新ダイアログが開いた）。
+        # 更新チェック以外にも、SFTP 転送・SNMP・各サーバのエラーが同じ窓で
+        # モーダルを開くので、各パネルにも同じ印を渡す
         self._shutting_down = True
+        self._tell_panels_closing()
         # レイアウト（スプリッター幅・選択タブ）を保存
         self._save_layout()
         # Syslogレシーバーを停止

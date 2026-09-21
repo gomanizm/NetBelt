@@ -14,6 +14,12 @@ from ui import theme
 class SFTPServerPanel(QWidget):
     """SFTPサーバー制御パネル"""
 
+    # アプリの終了処理に入ったか（MainWindow.closeEvent が立てる）。
+    # 立っている間はモーダルを開かない。終了処理は記録を救うために配送待ちの
+    # シグナルをその場で配るので、サーバのスレッドが出したエラーもそこで
+    # 届く。答えるまで終了が止まるうえ、そのときサーバは停止済み。
+    _closing = False
+
     # 認証前の接続でもログは増える。上限が無いと遠隔から叩き続けるだけで
     # メモリを食い潰せるため、頭打ちにする。Syslog パネル（1000件）に合わせた。
     MAX_LOG_LINES = 1000
@@ -279,6 +285,9 @@ class SFTPServerPanel(QWidget):
     def _on_error(self, error_message: str):
         """エラー発生時の処理"""
         self._add_log(f"エラー: {error_message}")
+        if self._closing:
+            # 終了処理の途中。ログだけ残して戻る（_closing の説明を参照）
+            return
         QMessageBox.critical(self, "SFTPサーバー エラー", error_message)
     
     def _on_fw_allow(self):

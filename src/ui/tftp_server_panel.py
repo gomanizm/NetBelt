@@ -13,6 +13,12 @@ from ui import theme
 class TFTPServerPanel(QWidget):
     """TFTPサーバー制御パネル"""
 
+    # アプリの終了処理に入ったか（MainWindow.closeEvent が立てる）。
+    # 立っている間はモーダルを開かない。終了処理は記録を救うために配送待ちの
+    # シグナルをその場で配るので、サーバのスレッドが出したエラーもそこで
+    # 届く。答えるまで終了が止まるうえ、そのときサーバは停止済み。
+    _closing = False
+
     # TFTP は認証が無く、存在しないファイルへの RRQ だけでもログと履歴が
     # 1行ずつ増える。上限が無いと遠隔から叩き続けるだけでメモリを食い潰せる。
     # 行数は Syslog パネル（1000件）に合わせた。
@@ -326,6 +332,9 @@ class TFTPServerPanel(QWidget):
         転送ごとの事象は _on_protocol_event が扱う。
         """
         self._add_log(f"エラー: {error_message}")
+        if self._closing:
+            # 終了処理の途中。ログだけ残して戻る（_closing の説明を参照）
+            return
         QMessageBox.critical(self, "TFTPサーバー エラー", error_message)
 
     def _on_fw_allow(self):
