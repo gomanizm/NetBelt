@@ -1119,7 +1119,11 @@ class TerminalWidget(QWidget):
         if screen.take_history_dropped():
             # 押し出された行が多すぎて、画面側が古い方を捨てた（ESC[nS の
             # 連打）。文書の先頭を切り捨てたのと同じことなので、「全ログ
-            # 保存」の欠落警告をここでも立てる
+            # 保存」の欠落警告をここでも立てる。
+            # 今の上限（MAX_NEW_HISTORY == MAX_DOCUMENT_BLOCKS）では
+            # _trim_document も必ず同じ印を立てるので、ここだけが効く場面は
+            # 無い。効くのは MAX_NEW_HISTORY を下げたときで、その形は
+            # tests/test_terminal_history_dropped_warning.py で見ている
             terminal._log_truncated = True
         for line, wrapped in screen.take_new_history():
             # 折り返しで続いている行は、改行で切らずに次の行と繋げる。
