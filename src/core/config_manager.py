@@ -1584,15 +1584,19 @@ class ConfigManager:
         self._settings_section(key, create=True).update(values)
         return self.save_config()
     
-    def move_device(self, source_group_name: str, target_group_name: str, device_name: str) -> bool:
+    def move_device(self, source_group_name: str, target_group_name: str,
+                    device_name: str, endpoint=None) -> bool:
         """
         デバイスをグループ間で移動
-        
+
         Args:
             source_group_name: 移動元グループ名
             target_group_name: 移動先グループ名
             device_name: デバイス名
-            
+            endpoint: 掴んだ機器の接続先（device_endpoint() の戻り値）。
+                同じグループに同名が並んでいるとき、どの 1 台を動かすかを
+                これで決める。省略時は今までどおり先頭の 1 件
+
         Returns:
             移動成功時True、失敗時False
         """
@@ -1608,17 +1612,14 @@ class ConfigManager:
             print(f"エラー: 移動先グループ '{target_group_name}' が見つかりません")
             return False
         
-        # 移動対象デバイスを検索
-        device_to_move = None
-        for device in source_group["devices"]:
-            if device["name"] == device_name:
-                device_to_move = device
-                break
-        
-        if not device_to_move:
+        # 移動対象デバイスを検索。名前だけで探すと同名の先頭に当たるので、
+        # 掴んだ項目の接続先で 1 台に絞る（編集・削除と同じ）
+        index = self._device_index(source_group["devices"], device_name, endpoint)
+        if index is None:
             print(f"エラー: デバイス '{device_name}' が移動元グループに見つかりません")
             return False
-        
+        device_to_move = source_group["devices"][index]
+
         # 移動先グループに同名デバイスがないかチェック
         for device in target_group["devices"]:
             if device["name"] == device_name:
@@ -1629,8 +1630,9 @@ class ConfigManager:
         # 保存に失敗したら戻せるよう、両方の一覧を控える（update_device と同じ）
         source_before = list(source_group["devices"])
         target_before = list(target_group["devices"])
-        source_group["devices"].remove(device_to_move)
-        
+        # remove() は同じ中身の辞書が 2 つあると先頭を消すので、位置で消す
+        del source_group["devices"][index]
+
         # デバイスを移動先に追加
         target_group["devices"].append(device_to_move)
         

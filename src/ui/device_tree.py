@@ -16,7 +16,10 @@ class DeviceTree(QWidget):
     device_delete = pyqtSignal(str, str, dict)
     device_duplicate = pyqtSignal(str, dict) # グループ名, 機器データ
     connect_requested = pyqtSignal(dict)    # 機器データ
-    device_moved = pyqtSignal(str, str, str)  # 移動元グループ名, 移動先グループ名, デバイス名
+    # 移動元グループ名, 移動先グループ名, デバイス名, 機器データ。
+    # 機器データも添えるのは device_delete と同じ理由で、同じグループに
+    # 同名が並んでいるときに掴んだ項目を名前だけでは指せないため
+    device_moved = pyqtSignal(str, str, str, dict)
     group_add_requested = pyqtSignal()  # グループ追加要求
     group_edit_requested = pyqtSignal(str)  # グループ編集要求（グループ名）
     group_delete_requested = pyqtSignal(str)  # グループ削除要求（グループ名）
@@ -628,7 +631,8 @@ class DeviceTree(QWidget):
         # デバイス移動シグナルを発行
         device_name = device_data.get('name')
         if device_name:
-            self.device_moved.emit(source_group_name, target_group_name, device_name)
+            self.device_moved.emit(source_group_name, target_group_name,
+                                   device_name, device_data)
             event.accept()
         else:
             event.ignore()

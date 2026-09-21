@@ -747,17 +747,22 @@ class MainWindow(QMainWindow):
             else:
                 QMessageBox.warning(self, "エラー", "機器の追加に失敗しました。")
     
-    def _on_device_moved(self, source_group_name: str, target_group_name: str, device_name: str):
+    def _on_device_moved(self, source_group_name: str, target_group_name: str,
+                         device_name: str, device_data: dict = None):
         """
         機器移動（ドラッグアンドドロップ）
-        
+
         Args:
             source_group_name: 移動元グループ名
             target_group_name: 移動先グループ名
             device_name: デバイス名
+            device_data: 掴んだ項目の機器データ（省略時は先頭の 1 件）
         """
-        # ConfigManagerで移動処理を実行
-        if self.config_manager.move_device(source_group_name, target_group_name, device_name):
+        # ConfigManagerで移動処理を実行。同じグループに同名が並んでいるときは、
+        # 掴んだ項目の接続先で 1 台に絞る（名前だけだと別の 1 台が動く）
+        if self.config_manager.move_device(
+                source_group_name, target_group_name, device_name,
+                endpoint=self._endpoint_of(device_data)):
             # ツリーを再読み込み
             self._load_devices()
             self.status_bar.showMessage(
