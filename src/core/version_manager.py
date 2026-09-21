@@ -2,6 +2,7 @@
 バージョン管理とアップデート機能
 """
 
+import contextlib
 import os
 import sys
 import json
@@ -9,6 +10,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 import requests
 from typing import Optional, Dict, Callable
 from datetime import datetime
@@ -146,6 +148,77 @@ def _finalize_lock(zip_path: str) -> threading.Lock:
         if lock is None:
             lock = _finalize_locks[key] = threading.Lock()
         return lock
+
+
+# 別プロセスの NetBelt との重なりを避ける目印（download_update の確定の
+# 手順を参照）。目印が取れるまで待つ上限と、異常終了の置き土産とみなす
+# までの時間（秒）。確定は os.replace 数回ぶんなので、待つのは数秒でよい。
+FINALIZE_WAIT_SEC = 5.0
+FINALIZE_STALE_SEC = 60.0
+
+
+def _take_over_abandoned_finalize(marker: str) -> None:
+    """異常終了で残った確定の目印を引き取る（つかんでから消す）。
+
+    見てから消すと、同時に「古い」と見た2つが両方とも消してしまい、
+    後から消したほうが相手の取り直した目印を消す。改名は同時に1つしか
+    通らないので、引き取れるのは片方だけになる。
+    """
+    try:
+        if time.time() - os.path.getmtime(marker) < FINALIZE_STALE_SEC:
+            return
+    except OSError:
+        return
+    grabbed = '%s.%d.stale' % (marker, os.getpid())
+    try:
+        os.replace(marker, grabbed)
+        os.remove(grabbed)
+    except OSError:
+        pass
+
+
+@contextlib.contextmanager
+def _cross_process_finalize(zip_path: str):
+    """確定の手順を、別の NetBelt と 1 本ずつにする目印を取る。
+
+    更新フォルダ（%TEMP% の NetBeltUpdates）は全インスタンスで共通、最終名も
+    版ごとに固定なので、2 つの NetBelt が同じ新版を取れば同じ最終名を確定
+    しに行く。_finalize_lock はプロセスごとの辞書に載るため、そこには効かない。
+
+    実測（検査役 cx5j-check-release の p4_driver.py、別プロセス 2 本・60 回）:
+    2 回、片方が成功を返したのに最終名の ZIP が無く、控え 2 つだけが残った。
+    利用者から見ると「ダウンロード完了！」の直後に「更新ファイルが
+    見つかりません」になる。
+
+    取れたかを bool で返す。取れなかった側は嘘の成功を返さず失敗させる
+    （利用者の決定 2026-09-20 / release-04）。
+    """
+    marker = zip_path + '.finalizing'
+    owned = False
+    deadline = time.monotonic() + FINALIZE_WAIT_SEC
+    while True:
+        try:
+            os.close(os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+            owned = True
+            break
+        except FileExistsError:
+            pass
+        except OSError as e:
+            # 更新フォルダへ書けないなら、どのみち確定も通らない。
+            print(f"[VersionManager] 確定の目印を作れませんでした: {e}")
+            break
+        if time.monotonic() >= deadline:
+            break
+        _take_over_abandoned_finalize(marker)
+        time.sleep(0.05)
+    try:
+        yield owned
+    finally:
+        if owned:
+            try:
+                os.remove(marker)
+            except OSError as e:
+                print(f"[VersionManager] 確定の目印を外せませんでした: {e}")
 
 
 class VersionManager:
@@ -644,9 +717,11 @@ class VersionManager:
                 moves.append((ver_part, zip_path + '.version'))
             # 同じ版のダウンロード 2 本が同時にここへ来ると、互いの組を退避したり、
             # 失敗の後始末で相手が置いた最終名を消したりする。実測では、片方が
-            # 成功を返したのに ZIP が無く控えだけが残った（600 回中 4 回）。
-            # 同じプロセスの中では 1 本ずつにする（別プロセスとの重なりは防げない）。
-            with _finalize_lock(zip_path):
+            # 成功を返したのに ZIP が無く控えだけが残った（同じプロセスの中で
+            # 600 回中 4 回、別プロセス 2 本で 60 回中 2 回）。同じプロセスの中は
+            # ロックで、別の NetBelt とは更新フォルダの目印で 1 本ずつにする。
+            with _finalize_lock(zip_path), \
+                    _cross_process_finalize(zip_path) as owned:
                 # ロックを待っている間に押された中止も拾う。手前の確認は
                 # ロックを取る前なので、待たされた分だけ見落としが生じる。
                 # 実測（tests/test_update_cancel_during_finalize_lock.py）:
@@ -655,6 +730,16 @@ class VersionManager:
                 # ので、捨てるのは今回の .part 3 つだけでよい。
                 if cancel_check is not None and cancel_check():
                     print("[VersionManager] ダウンロードを中止しました")
+                    self._discard(sha_part)
+                    self._discard(ver_part)
+                    self._discard(part_path)
+                    return None
+
+                # 別の NetBelt が同じ最終名を確定している間は、待っても
+                # 取れなければ失敗として返す。ここで進むと、両方が成功を
+                # 返したのに ZIP が残らない形になりうる。
+                if not owned:
+                    print("[VersionManager] 別の NetBelt が同じ更新を保存中です")
                     self._discard(sha_part)
                     self._discard(ver_part)
                     self._discard(part_path)
