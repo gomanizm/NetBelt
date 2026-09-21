@@ -9,9 +9,12 @@
 どう直したか（利用者の決定 2026-09-20）: 打ちかけの入力がある間は、その回の
 キープアライブを送らずに飛ばす（溜めて後から送ることはしない。次の間隔で
 また判断する）。打ちかけとは、利用者の打鍵・貼り付け・IME 確定で機器へ送った
-文字のうち、最後の行送り（CR / LF）より後に何か送っている状態。Ctrl+C (0x03) と
-Ctrl+U (0x15) は行を捨てる操作なので打ちかけを解く。Backspace のように行が
-残っているか判断できない操作は打ちかけのまま扱い、送らない側へ倒す。
+文字のうち、最後の行送り（CR / LF）より後に何か送っている状態。行全体を捨てる
+Ctrl+C (0x03) は打ちかけを解く。Backspace や Ctrl+U (0x15) のように行が残って
+いるか判断できない操作は打ちかけのまま扱い、送らない側へ倒す。Ctrl+U を解く側
+から外したのは 2026-09-20 の決定（機器側の Ctrl+U はカーソルより前しか消さない
+ので、行頭へ移ってから押すと機器に行が残る。
+tests/test_keepalive_ctrl_u_midline.py）。
 マクロとキープアライブ自身の送信は数えない。接続し直したら打ちかけは解く。
 """
 import os
@@ -102,22 +105,39 @@ class KeepaliveSkipsHalfTypedLineTest(unittest.TestCase):
 
         self.assertEqual(sent, ["\r"], "キープアライブが止まったままになった")
 
-    def test_ctrl_c_and_ctrl_u_release_the_half_typed_line(self):
-        """行を捨てる Ctrl+C / Ctrl+U の後は、キープアライブを送ること。"""
+    def test_ctrl_c_releases_the_half_typed_line(self):
+        """行全体を捨てる Ctrl+C の後は、キープアライブを送ること。"""
         from PyQt6.QtCore import Qt
-        for name, key, ch in (("Ctrl+C", Qt.Key.Key_C, "\x03"),
-                              ("Ctrl+U", Qt.Key.Key_U, "\x15")):
-            with self.subTest(name):
-                terminal, manager, sent = self._session()
-                self._type(terminal, "reload")
-                self._control_key(terminal, key, ch)
-                self.assertEqual(sent[-1], ch, "前提: 制御文字を送っている")
-                del sent[:]
+        terminal, manager, sent = self._session()
+        self._type(terminal, "reload")
+        self._control_key(terminal, Qt.Key.Key_C, "\x03")
+        self.assertEqual(sent[-1], "\x03", "前提: 制御文字を送っている")
+        del sent[:]
 
-                manager._send_keepalive("dev")
+        manager._send_keepalive("dev")
 
-                self.assertEqual(sent, ["\r"],
-                                 "%s で行を捨てた後も送らないままだった" % name)
+        self.assertEqual(sent, ["\r"],
+                         "Ctrl+C で行を捨てた後も送らないままだった")
+
+    def test_ctrl_u_leaves_the_line_half_typed(self):
+        """Ctrl+U は行が残っているか分からないので、送らない側に倒すこと。
+
+        機器側の Ctrl+U はカーソルより前しか消さない。行末で押せば行は
+        空になるが、行頭へ移ってから押すと全文が残る。打鍵の並びからは
+        どちらか分からないので、打ちかけのまま扱う（2026-09-20 の決定。
+        経路ごとの実測は tests/test_keepalive_ctrl_u_midline.py）。
+        """
+        from PyQt6.QtCore import Qt
+        terminal, manager, sent = self._session()
+        self._type(terminal, "reload")
+        self._control_key(terminal, Qt.Key.Key_U, "\x15")
+        self.assertEqual(sent[-1], "\x15", "前提: 制御文字を送っている")
+        del sent[:]
+
+        manager._send_keepalive("dev")
+
+        self.assertEqual(sent, [],
+                         "Ctrl+U の後に CR を送ってしまった: %r" % sent)
 
     def test_a_backspace_leaves_the_line_half_typed(self):
         """Backspace は行が残っているか分からないので、送らない側に倒すこと。"""
