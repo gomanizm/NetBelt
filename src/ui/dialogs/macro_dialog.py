@@ -199,9 +199,36 @@ class MacroDialog(QDialog):
     def _on_preset_new(self):
         """新規プリセットを作成"""
         dialog = PresetEditDialog(self, config_manager=self.config_manager)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
+        if self._exec_preset_dialog(dialog) == QDialog.DialogCode.Accepted:
             self._load_presets()
-    
+
+    def _exec_preset_dialog(self, dialog) -> int:
+        """プリセット編集ダイアログを開き、閉じたあとの破棄を予約して結果を返す
+
+        このダイアログは parent=self（マクロ設定）で作るので、exec() から
+        抜けても非表示のまま子として残り続ける。マクロ設定を開いたまま
+        プリセットを作り直すたびに積み上がるので、他のダイアログと同じく
+        破棄を予約して手放す（MacroDialog からは MainWindow._exec_dialog を
+        呼べないので、同じ中身をここへ置く）。
+
+        親から外す（setParent(None)）形は採らない。同じリポジトリの
+        PasteConfirmDialog はその形だが、ダイアログの親をここで外すと
+        トップレベルの窓になり、offscreen で走らせた試験一式では、その後の
+        イベント配送でプロセスごと落ちた（0xC0000005 / 0xC0000409。
+        tests/test_preset_edit_dialogs_are_released.py の冒頭を参照）。
+        破棄の予約だけなら _exec_dialog を通る 8 か所と同じ扱いになる。
+
+        Args:
+            dialog: 開くプリセット編集ダイアログ
+
+        Returns:
+            int: exec() の戻り値（QDialog.DialogCode）
+        """
+        try:
+            return dialog.exec()
+        finally:
+            dialog.deleteLater()
+
     def _on_preset_edit(self):
         """プリセットを編集"""
         current_item = self.preset_list_widget.currentItem()
@@ -225,8 +252,8 @@ class MacroDialog(QDialog):
             commands=macro.get("commands", []),
             description=macro.get("description", "")
         )
-        
-        if dialog.exec() == QDialog.DialogCode.Accepted:
+
+        if self._exec_preset_dialog(dialog) == QDialog.DialogCode.Accepted:
             self._load_presets()
     
     def _on_preset_delete(self):
