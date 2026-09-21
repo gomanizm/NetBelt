@@ -288,7 +288,11 @@ class DeviceTree(QWidget):
         else:
             tools.addAction("キープアライブ開始").triggered.connect(
                 lambda: self.keepalive_start_requested.emit(device_name))
-        macros = state.get("macros") or []
+        # 読み手側の保険。状態は設定から来るので、リストでない値や辞書で
+        # ない要素が混ざると、ここで落ちて右クリックが一切開かなくなる
+        raw_macros = state.get("macros")
+        macros = ([m for m in raw_macros if isinstance(m, dict)]
+                  if isinstance(raw_macros, list) else [])
         if macros:
             macro_menu = tools.addMenu("マクロ実行")
             for macro in macros:

@@ -184,8 +184,12 @@ class MacroDialog(QDialog):
         self.preset_list_widget.clear()
         
         # プリセットを読み込み
+        # 読み手側の保険。設定から来るので、リストでない値や辞書でない要素が
+        # 混ざると、ここで落ちてマクロ設定が開かなくなる
         macros = self.config_manager.get_global_macros()
-        for macro in macros:
+        for macro in macros if isinstance(macros, list) else []:
+            if not isinstance(macro, dict):
+                continue
             name = macro.get("name", "")
             self.preset_list_widget.addItem(name)
     

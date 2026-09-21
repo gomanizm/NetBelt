@@ -850,11 +850,17 @@ class ConfigManager:
                 group["devices"] = []
                 emptied_groups += 1
             kept_groups.append(group)
+        # 3 つ目の任意リスト。機器の macros と同じく、読み手は list である
+        # ことを前提にしている（for で回す・list() で写す）。null のまま
+        # 残ると、接続中の機器の「ツール」を作るだけで落ちる
+        broken_global_macros = self._normalize_optional_list(
+            config, "global_macros", lambda m: isinstance(m, dict))
         if dropped_groups:
             config["groups"] = kept_groups
         if not (removed or reserved or renamed_groups or dropped_groups
                 or emptied_groups or numeric_passwords or emptied_passwords
-                or broken_macros or broken_auto_commands):
+                or broken_macros or broken_auto_commands
+                or broken_global_macros):
             return
         self._backup_corrupted_config()
         parts = []
@@ -890,6 +896,10 @@ class ConfigManager:
             parts.append("設定ファイル (config.json) でマクロの一覧が読めない機器が"
                          "あり、そのマクロを外しました。機器の編集で入れ直して"
                          "ください: " + "、".join(broken_macros))
+        if broken_global_macros:
+            parts.append("設定ファイル (config.json) で全体共通マクロの一覧が"
+                         "読めなかったため、読めない分を外しました。"
+                         "マクロ設定の「プリセット管理」で入れ直してください。")
         if broken_auto_commands:
             parts.append("設定ファイル (config.json) で自動実行コマンドが"
                          "文字列の配列になっていないグループがあり、"
