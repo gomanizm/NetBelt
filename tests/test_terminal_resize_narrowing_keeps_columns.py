@@ -28,6 +28,27 @@ _linefeed(from_wrap=True) の `del self.lines[row][self.cols:]` が
 これに合わせて tests/test_terminal_resize_pending_wrap.py の
 test_narrowing_keeps_the_pending_wrap を、新しい仕様
 (狭めたら落とす) の期待へ書き換えてある。
+
+守れているのは「狭めた直後の続きがちょうど 1 文字」のときだけだと
+実測で分かった。狭めた直後のカーソルは新しい右端 (cols - 1) に居る
+ので、1 文字目でまた折り返し待ちが立ち、2 文字目が
+_linefeed(from_wrap=True) を呼んで同じ切り詰めを起こす。
+
+実測 (334cd72): Screen(24, 80) へ ruler(80) -> set_size(24, 40)
+  '!'   -> 1 行目 80 文字 (受信した桁は残る)
+  '!!'  -> 1 行目 40 文字 (受信した 40 桁が消える。'!!!' 以降も同じ)
+  文書でも同じ (既定 49 桁 -> 24 桁で '!' は 49 文字、'!!' は 24 文字)
+実際の機器出力で続きが 1 文字だけということはまず無いので、残って
+いる欠落のほうが普通に当たる。基準 81664d2 では 1 文字目から消える
+ので改善ではあるが、直り切ってはいない。
+
+根治には、折り返し位置を行の長さで表す設計 (「行の長さ = 折り返し
+位置」) をやめて、行ごとに「どの桁で折り返したか」を持ち、
+_linefeed(from_wrap=True) の切り詰めをやめて描画側がその桁で繋ぐ
+必要がある。状態と描画の両方に触るので、1.3.1 (機能影響が大きい・
+使えない・性能に影響するものだけ、という利用者の線引き) の範囲外と
+し、次のメンテナンスリリース向けとする。ここでは守れている範囲だけ
+を言うようにテスト名と docstring を直した (本体は変えていない)。
 """
 import os
 import sys
@@ -64,8 +85,11 @@ class NarrowingKeepsColumnsTest(unittest.TestCase):
         feed(s, "A")
         self.assertEqual(s.text(), ["012A4567", "", ""])
 
-    def test_every_received_column_survives_a_narrowing(self):
-        """狭め方を変えても、受信した桁数がそのまま残ること。"""
+    def test_a_one_character_continuation_keeps_every_column(self):
+        """続きが 1 文字なら、狭め方を変えても受信した桁数が残ること。
+
+        2 文字目以降は今も消える (このファイルの docstring)。
+        """
         for was, now in ((80, 40), (80, 60), (20, 8)):
             with self.subTest(was=was, now=now):
                 s = feed(Screen(24, was), ruler(was))
