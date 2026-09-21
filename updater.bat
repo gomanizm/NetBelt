@@ -673,15 +673,14 @@ REM 目印を外せないほうが、次の更新を 10 分待たせる分だけ
 if not defined LOCK_HELD exit /b 0
 set "LOCK_HELD="
 if not defined LOCK_STAMPED goto :release_lock_rd
-set "LOCK_OWNER="
-set /p LOCK_OWNER=<"!LOCK_DIR!\holder.txt" 2>nul
-if not "!LOCK_OWNER!"=="!STAMP!" goto :release_lock_renamed
+set "LOCK_PASS=0"
+goto :release_lock_sweep
 :release_lock_rd
 rd /s /q "!LOCK_DIR!" 2>nul
 exit /b 0
 
-REM 正規名に自分の目印が無い。別の更新が回収しようと .old へ改名した直後
-REM かもしれないので、名前ではなく中身で自分のぶんを探して片付ける。
+REM 自分の目印を片付ける。別の更新が回収しようと .old へ改名した直後
+REM かもしれないので、名前ではなく中身で自分のぶんを探す。
 REM 「つかむための改名」は、生きている目印を一瞬だけ正規名から消す。その窓の
 REM 中で持ち主が終わると、名前だけを見ていた以前はこうなった（実測: 検査役
 REM cx5j-check-release の p11_lock_resurrection.py / p12_grabber_dies.py）:
@@ -689,10 +688,26 @@ REM   (a) 改名した側が「まだ新しい」と気づいて元の名前へ�
 REM       いない目印が復活し、次の更新が約10分のあいだ弾かれ続けた。
 REM   (b) 改名した側がその窓の中で死ぬと、.old がインストール先に置き去りに
 REM       なった（次の更新も名前が違うので拾わない）。
+REM 正規名を一度見て分岐するだけでは (a) が残る。見てから掃くまでの間に
+REM 改名を戻されると、.old はもう無く、正規名は見た後なので、どちらにも
+REM 引っかからない（実測: 検査役 cx5m-check-release の
+REM p21_release_lock_window.py と cx5m-check-release-2 の b1_putback_vs_sweep.py、
+REM どちらも 2/2）。鏡像（見た直後・rd の手前で改名される）も同じ
+REM 2 文のあいだにある。
+REM そこで「正規名 → .old」を 2 周する。つかんだ側の戻しは 1 回きり
+REM （:lock_put_back は :lock_busy へ抜けて終わる）なので、目印がどちらの
+REM 名前にあるかの移り変わりも 1 回しか起きない。4 回見れば、その 1 回が
+REM どこで起きても必ずどちらかで捕まる。待ちを挟まないので、余分に
+REM かかるのは読み取り数回ぶんだけ。
 REM 消すのは holder.txt が自分の識別子と一致するものだけなので、動いている
 REM 別の更新の目印にも、利用者が置いたものにも当たらない。
-:release_lock_renamed
+:release_lock_sweep
+set /a LOCK_PASS+=1
+set "LOCK_OWNER="
+set /p LOCK_OWNER=<"!LOCK_DIR!\holder.txt" 2>nul
+if "!LOCK_OWNER!"=="!STAMP!" rd /s /q "!LOCK_DIR!" 2>nul
 for /d %%o in ("!APP_DIR!NetBelt-update-lock.*.old") do call :release_lock_old "%%~fo"
+if !LOCK_PASS! lss 2 goto :release_lock_sweep
 exit /b 0
 
 :release_lock_old
