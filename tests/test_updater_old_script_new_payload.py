@@ -30,6 +30,7 @@ cmd.exe はバッチファイルを「次に読むバイト位置」を覚えな
 替わって updater.bat が旧版のまま残る混在は実際に起こりうるので、新しい
 NetBelt が古い updater.bat を、今より多い引数で叩く形になりうる。
 """
+import hashlib
 import io
 import os
 import shutil
@@ -188,8 +189,15 @@ class ExtraArgumentsAreToleratedTest(unittest.TestCase):
     更新が半端に終わると、新しい exe と旧版の updater.bat が同じフォルダに
     残る（実測: アプリを掴んだまま 1.2.0 から当てた場合）。その状態の
     NetBelt が、今より多い引数で古い updater.bat を叩いても、余りは
-    読み飛ばされて更新が当たること。第3引数以降は入り直し用の内部引数
-    なので、外から渡されたぶんは入り直しの時点で捨てられる。
+    読み飛ばされて更新が当たること。
+
+    追記（8 周目の統合時）: このテストは当初「第3引数（版のような値）も
+    読み飛ばされる」を期待していた。同じ周に入った利用者の決定
+    （2026-09-20 / release-03）で、第3引数は「NetBelt が確かめた ZIP の
+    SHA-256」になり、食い違えば展開せずに中止する。つまり `9.9.9` のような
+    値を第3引数に渡して当たってしまうほうが誤りなので、期待を「正しい
+    ハッシュを渡せば当たり、第4引数以降は読み飛ばされる」へ直した。
+    食い違うハッシュを拒むことは tests/test_updater_zip_hash_argument.py が見ている。
     """
 
     def setUp(self):
@@ -228,17 +236,25 @@ class ExtraArgumentsAreToleratedTest(unittest.TestCase):
         with io.open(self.app_path, "rb") as f:
             return f.read()
 
-    def test_one_more_argument_is_ignored(self):
-        """第3引数が増えても当たること（版を渡すようにした場合など）。"""
-        code, out = self._run("9.9.9")
+    def _zip_sha256(self):
+        """渡す ZIP の SHA-256（第3引数に載る値）。"""
+        h = hashlib.sha256()
+        with io.open(self.zip_path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    def test_the_hash_argument_lets_the_update_through(self):
+        """第3引数に正しいハッシュを渡せば当たること。"""
+        code, out = self._run(self._zip_sha256())
 
         self.assertEqual(code, 0, out)
         self.assertIn("更新が完了しました", out, out)
         self.assertEqual(self._installed(), NEW_EXE, out)
 
-    def test_several_more_arguments_are_ignored(self):
-        """引数がいくつ増えても当たること。"""
-        code, out = self._run("9.9.9", "--future", "x")
+    def test_arguments_after_the_hash_are_ignored(self):
+        """ハッシュより後ろの引数が増えても当たること。"""
+        code, out = self._run(self._zip_sha256(), "--future", "x")
 
         self.assertEqual(code, 0, out)
         self.assertIn("更新が完了しました", out, out)
