@@ -140,6 +140,12 @@ class Screen(object):
         self.bracketed_paste = False            # ?2004 (入力側が見る)
         self._g = {"(": "B", ")": "B"}          # G0/G1 の指示文字
         self._charset = "("                     # SI/SO でどちらを使うか
+        # self.lines が丸ごと空白で、折り返しの印も無いと分かっている。
+        # 立てるのは白紙にした直後 (ここと ED の全消去) だけ。中身を
+        # 書き込める経路 (印字) と、self.lines そのものが入れ替わる・
+        # 行の長さが変わる経路 (代替画面の出入り・set_size) で落とす。
+        # スクロールや消去は空白の行を動かすだけなので落とさない
+        self._screen_blank = True
         self.dirty = set(range(self.rows))
 
     def _blank_lines(self):
@@ -243,6 +249,9 @@ class Screen(object):
         """
         if (rows, cols) == (self.rows, self.cols) or rows < 1 or cols < 1:
             return
+        # 空でも行の長さは変わる (狭めた側は切らないので桁より長いまま
+        # 残る)。次の消去では作り直させる
+        self._screen_blank = False
         # 折り返しで次へ続く行は埋めない。行の長さがそのまま「どこで
         # 折り返したか」なので、埋めると繋いだときに埋め草ぶんの隙間が
         # 開く (窓を広げると鍵の途中に空白が入る、として報告された)
@@ -329,6 +338,10 @@ class Screen(object):
 
     def _print_chars(self, text, entry_row, entry_mark):
         """text を 1 文字ずつ書く。(entry_row, entry_mark) を更新して返す。"""
+        # 画面へ中身が入るのはここと _print_narrow だけ。空だという
+        # 覚えは、_print ではなくこの 2 つで落とす (_print を差し替える
+        # 検証用の派生画面が、この下だけを呼ぶため)
+        self._screen_blank = False
         for ch in text:
             if ch == "\x7f":            # DEL は表示しない
                 continue
@@ -418,6 +431,7 @@ class Screen(object):
         の印とカーソルは最後の文字の結果が残る。(entry_row, entry_mark)
         を更新して返す。
         """
+        self._screen_blank = False      # _print_chars と同じ (中身が入る)
         cols = self.cols
         cell_attr = itertools.repeat(self.attr)
         start, stop = 0, len(text)
@@ -765,6 +779,8 @@ class Screen(object):
 
     def _switch_screen(self, to_alt, with_cursor, clear=True):
         """代替画面と行き来する。clear は代替画面を白紙にするか。"""
+        # self.lines が別の画面に差し替わる。空だという覚えは持ち越せない
+        self._screen_blank = False
         if to_alt == self.alt_active:
             if to_alt and clear:
                 # 代替画面にいるまま 1049h を受けた。xterm は切り替えが
@@ -908,15 +924,23 @@ class Screen(object):
         else:
             self._erase_line(1)
             rng = range(0, self.cursor_row)
-        for r in rng:
-            self.lines[r] = self._blank_line()
-            self.wrapped[r] = False
+        # 画面が既に丸ごと空白なら、作り直しても同じ行になる。1 回の
+        # 受信分に収まる ESC[2J の繰り返しだけで、履歴を 1 行も増やさない
+        # まま 100x300 で 3.7 秒 GUI が止まっていた (走査と作り直しが
+        # 命令ごとに 行 x 桁 ぶん走るため)
+        if not self._screen_blank:
+            for r in rng:
+                self.lines[r] = self._blank_line()
+                self.wrapped[r] = False
         self.dirty.update(rng)
+        if wipes_all:
+            self._screen_blank = True
         self._pending_wrap = False
 
     def _record_screen(self):
         """画面全体が消える前に、最後の非空行までを履歴へ送る。"""
-        if self.alt_active:
+        # 空だと分かっている画面には送る中身が無い。走査ごと省く
+        if self.alt_active or self._screen_blank:
             return
         last = -1
         for r in range(self.rows):
