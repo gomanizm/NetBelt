@@ -31,6 +31,22 @@ def known_hosts_server_name(host, port):
     return host if port == 22 else "[%s]:%d" % (host, port)
 
 
+def known_hosts_names(text):
+    """known_hosts の 1 行が指す接続先名を返す（カンマ区切りは分解する）。
+
+    OpenSSH の @cert-authority / @revoked は名前欄の前に置く印なので、
+    印があるときは 1 つ読み飛ばす。paramiko 4.0.0 は印を剥がさずに
+    読もうとして行ごと「読めない行」にしてしまうが、利用者から見れば
+    正規の書式なので、どの接続先を指す行かはこちらで読み取る。
+    """
+    fields = text.split()
+    if fields and fields[0].startswith("@"):
+        fields = fields[1:]
+    if not fields:
+        return []
+    return fields[0].split(",")
+
+
 def _hostnames_match(names, server_name):
     """known_hosts の名前欄（カンマ区切り）が、その接続先を指すか"""
     for name in names:
@@ -47,19 +63,21 @@ def _hostnames_match(names, server_name):
     return False
 
 
-def unreadable_known_hosts_lines(path):
-    """paramiko が黙って読み飛ばす行を [(行番号, 行, 生バイト列)] で返す。
+def _iter_known_hosts_lines(path):
+    """known_hosts を paramiko と同じ読み方で 1 行ずつ見る。
 
-    paramiko 4.0.0 の HostKeys.load は 1 行ごとに SSHException を握りつぶし、
-    HostKeyEntry.from_line はフィールド不足や未知の鍵種別（sk-* や証明書）で
-    None を返す。つまり壊れた行があっても読み込みは成功したように見え、
-    その接続先は「未知のホスト」に戻って TOFU が何も聞かずに受け入れる。
-    呼び出し側が自分で見つけられるよう、paramiko と同じ読み方で拾う。
+    返すのは (行番号, 行, 生バイト列, entry)。entry が None なら読めない行。
 
-    生バイト列も返すのは、保存のときに書き戻して消さないため。
+    paramiko 4.0.0 の HostKeyEntry.from_line は、フィールド不足や未知の
+    鍵種別（sk-* や証明書）では None を返すが、鍵欄が base64 として
+    壊れていると InvalidHostKey を投げる。これは SSHException を継承して
+    いない素の Exception なので（実測: issubclass(...) → False）、
+    HostKeys.load の except SSHException では拾えず、読み込み全体が例外に
+    なる。@cert-authority / @revoked で始まる行も、印を剥がさないために
+    3 つ目の欄が鍵種別の文字列になり、同じく InvalidHostKey になる。
+    ここでは種類を問わず握りつぶし、読めない行として扱う。
     """
     from paramiko.hostkeys import HostKeyEntry
-    broken = []
     for lineno, raw_line in enumerate(
             Path(str(path)).read_bytes().split(b"\n"), 1):
         raw_line = raw_line.rstrip(b"\r")
@@ -68,11 +86,59 @@ def unreadable_known_hosts_lines(path):
             continue
         try:
             entry = HostKeyEntry.from_line(text, lineno)
-        except paramiko.SSHException:
+        except Exception:
             entry = None
+        yield lineno, text, raw_line, entry
+
+
+def unreadable_known_hosts_lines(path):
+    """paramiko が読み込めない行を [(行番号, 行, 生バイト列)] で返す。
+
+    壊れた行があっても paramiko の読み込みは成功したように見えたり
+    （読み飛ばし）、逆に読み込み全体が例外になったりする。どちらでも
+    その接続先は「未知のホスト」に戻って TOFU が何も聞かずに受け入れる
+    か、関係のない機器まで繋がらなくなる。呼び出し側が行を名指しで
+    知らせられるよう、paramiko と同じ読み方で拾う。
+
+    生バイト列も返すのは、保存のときに書き戻して消さないため。
+    """
+    return [(lineno, text, raw)
+            for lineno, text, raw, entry in _iter_known_hosts_lines(path)
+            if entry is None]
+
+
+def load_known_hosts(hostkeys, path):
+    """読める行だけを paramiko の HostKeys へ入れる（例外を投げない）。
+
+    paramiko の HostKeys.load / SSHClient.load_host_keys は、鍵欄が壊れた
+    行や @cert-authority / @revoked の行があると例外になり、読める行まで
+    失われる（実測: 1 行壊れているだけで全機器が繋がらなくなる）。
+    読めない行は unreadable_known_hosts_lines() が名指しで知らせるので、
+    ここでは読める行だけを取り込む。名前ごとに add するのは
+    HostKeys.load と同じ（複数名の行は名前の数だけ登録される）。
+    """
+    for _lineno, _text, _raw, entry in _iter_known_hosts_lines(path):
         if entry is None:
-            broken.append((lineno, text, raw_line))
-    return broken
+            continue
+        for name in entry.hostnames:
+            hostkeys.add(name, entry.key.get_name(), entry.key)
+
+
+def _load_known_hosts_into_client(client, path, broken):
+    """known_hosts を client へ読み込む。
+
+    読めない行が無ければ paramiko にそのまま読ませる（保存前の再読込先と
+    して client がファイル名を覚える、従来どおりの動き）。読めない行が
+    あるときだけ自前のローダを使う。paramiko に読ませると例外になり、
+    読める行の鍵まで失って関係のない機器が繋がらなくなるため。
+
+    Args:
+        broken: unreadable_known_hosts_lines() の戻り値
+    """
+    if broken:
+        load_known_hosts(client.get_host_keys(), path)
+    else:
+        client.load_host_keys(str(path))
 
 
 def _key_fingerprint(key):
@@ -99,7 +165,9 @@ def _refuse_conflicting_host_key(path, hostname, key):
     if not path.exists():
         return
     disk = paramiko.HostKeys()
-    disk.load(str(path))
+    # HostKeys.load は壊れた行で例外になる。ここで落ちると「保存できない」
+    # 扱いになり、他の機器の初回鍵まで保存されなくなる
+    load_known_hosts(disk, path)
     stored = disk.lookup(hostname)
     if stored is None or disk.check(hostname, key):
         return
@@ -144,11 +212,12 @@ def _save_known_hosts(client, known_hosts_path, verify=None):
             _refuse_conflicting_host_key(path, verify[0], verify[1])
         preserved = []
         if path.exists():
+            # paramiko が読めない行は書き出しに入らないので、黙って消える。
+            # 利用者が直すはずの行なので、そのまま書き戻す
+            broken = unreadable_known_hosts_lines(path)
             # 他の接続がこの間に保存した鍵を取り込む
-            client.load_host_keys(str(path))
-            # paramiko が読み飛ばした行は書き出しに入らないので、黙って
-            # 消える。利用者が直すはずの行なので、そのまま書き戻す
-            preserved = [raw for _, _, raw in unreadable_known_hosts_lines(path)]
+            _load_known_hosts_into_client(client, path, broken)
+            preserved = [raw for _, _, raw in broken]
         path.parent.mkdir(parents=True, exist_ok=True)
         # os.replace はドライブを跨げないので一時ファイルは同階層に作る
         fd, tmp_path = tempfile.mkstemp(
@@ -295,19 +364,23 @@ class SSHConnection(QObject):
         try:
             with _known_hosts_guard(known_hosts_path.parent):
                 if known_hosts_path.exists():
-                    client.load_host_keys(str(known_hosts_path))
+                    # 読めない行の点検が先。paramiko の読み込みは壊れた行が
+                    # あると例外になるので、あとに回すと点検まで辿り着けない
+                    broken = unreadable_known_hosts_lines(known_hosts_path)
                     # paramiko は読めない行を黙って読み飛ばす。放っておくと
                     # その接続先は「未知のホスト」に戻り、TOFU が何も聞かずに
                     # 提示された鍵を受け入れる（鍵が変わっていても分からない）
-                    broken = unreadable_known_hosts_lines(known_hosts_path)
+                    _load_known_hosts_into_client(
+                        client, known_hosts_path, broken)
         except Exception as e:
             # 握りつぶして TOFU にすると、既知の機器でも「未知」扱いになり、
             # 鍵が変わっていても気づかずにパスワードを送る。検証できない
             # 状態で認証へ進まない
             raise HostKeyStoreError(
                 "既知ホスト鍵 (known_hosts) を読めないため接続を中止しました: %s\n%s\n"
-                "ファイルを開けない（権限・排他・入出力エラー）状態です。"
-                "権限を修正するか、ファイルを退避してから接続し直してください"
+                "ファイルを開けない（権限・排他・入出力エラー）か、中身を"
+                "読み取れない状態です。権限を修正するか、該当行を修正・削除"
+                "するか、ファイルを退避してから接続し直してください"
                 "（退避すると全機器が初回接続の扱いになります）。"
                 % (e, known_hosts_path))
         if broken:
@@ -331,7 +404,7 @@ class SSHConnection(QObject):
         """
         server_name = known_hosts_server_name(self.host, self.port)
         mine = [(no, text) for no, text, _ in broken
-                if _hostnames_match(text.split()[0].split(","), server_name)]
+                if _hostnames_match(known_hosts_names(text), server_name)]
         if mine:
             raise HostKeyStoreError(
                 "known_hosts に読めない行があり、%s の鍵を検証できないため"
