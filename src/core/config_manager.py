@@ -333,13 +333,18 @@ class ConfigManager:
                 # パスワードを復号化
                 self._decrypt_passwords(config)
                 self._notify_undecryptable()
-                # Defaultグループが存在しない場合は追加（戻り値でフラグを受け取る）
-                need_save = self._ensure_default_group(config)
-                # 一時的にconfigを設定して保存
-                if need_save:
-                    self.config = config
-                    self.save_config()
-                return config
+            # Defaultグループが存在しない場合は追加（戻り値でフラグを受け取る）
+            # 補いと保存は、読み込み用に開いたファイルを閉じてから行う。
+            # save_config() は一時ファイルを os.replace で本体へ差し替えるが、
+            # Windows では開いたままの本体へ差し替えると PermissionError
+            # [WinError 5] になり、補った Default グループが毎回の起動で
+            # 保存できないまま終わる（実測: 5 回中 5 回）
+            need_save = self._ensure_default_group(config)
+            # 一時的にconfigを設定して保存
+            if need_save:
+                self.config = config
+                self.save_config()
+            return config
         except Exception as e:
             print(f"[ERROR] 設定ファイルの読み込みエラー: {e}")
             # エラー情報を保存
