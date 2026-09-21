@@ -785,8 +785,6 @@ class Screen(object):
 
     def _switch_screen(self, to_alt, with_cursor, clear=True):
         """代替画面と行き来する。clear は代替画面を白紙にするか。"""
-        # self.lines が別の画面に差し替わる。空だという覚えは持ち越せない
-        self._screen_blank = False
         if to_alt == self.alt_active:
             if to_alt and clear:
                 # 代替画面にいるまま 1049h を受けた。xterm は切り替えが
@@ -799,6 +797,11 @@ class Screen(object):
                 self.dirty.update(range(self.rows))
                 self._pending_wrap = False
             return
+        # self.lines が別の画面に差し替わる。空だという覚えは持ち越せない。
+        # 入れ替えない呼び出し (上の早期 return) は白紙にするだけで中身を
+        # 増やさないので、印を落とさない (落とすと、続く消去が
+        # 画面全体を走査する)
+        self._screen_blank = False
         pending = False                 # 1049 の復元でだけ書き換わる
         if to_alt and with_cursor:
             # 1049 は DECSC 相当の保存・復元 (XTerm ctlseqs)。文字集合
@@ -894,10 +897,10 @@ class Screen(object):
         # 丸ごと空になる (1 行目が空の 1 画面目や、ホームへ戻らない ED 2 の
         # あとの最下行など)。下の ED 1 の blank_after と対称に履歴へ送る
         # (消し方は mode == 0 の枝のまま)
-        blank_before = mode == 0 and not any(
+        blank_before = mode == 0 and (self._screen_blank or not any(
             c != BLANK
             for r in range(0, self.cursor_row + 1)
-            for c in self.lines[r][:col if r == self.cursor_row else None])
+            for c in self.lines[r][:col if r == self.cursor_row else None]))
         # ED 1 も、カーソルより下に中身が残らなければ画面は丸ごと
         # 空白になる。最下行の右端に限らず、機器が数行出した直後の
         # ESC[1J (24x80 で 2 行だけ、など) が該当する。消える中身は
@@ -911,10 +914,10 @@ class Screen(object):
         start = self.cursor_col + 1
         if start < len(row) and row[start][0] == "":
             start += 1
-        blank_after = mode == 1 and not any(
+        blank_after = mode == 1 and (self._screen_blank or not any(
             c != BLANK
             for r in range(self.cursor_row, self.rows)
-            for c in self.lines[r][start if r == self.cursor_row else 0:])
+            for c in self.lines[r][start if r == self.cursor_row else 0:]))
         if wipes_all or blank_before or blank_after:
             self._record_screen()
         if wipes_all:
