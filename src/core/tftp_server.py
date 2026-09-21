@@ -488,17 +488,24 @@ class TFTPServer:
                     f.close()
                 except OSError as e:
                     close_error = e
-            # 成功・失敗・停止・相手の ERROR・タイムアウトのどれで終わっても
-            # 必ず外す。残すと、その保存先へ二度と書けなくなる
-            if reserved:
-                self._release_target(target)
-            xs.close()
-            if close_error is not None:
-                # 最終 DATA の経路と同じ知らせ方。「中断」だけを見て
-                # 保存できたと誤解させない
-                self.on_event("protocol_error", addr[0],
-                              (filename, "アップロード失敗（保存できません）: %s" % close_error,
-                               "upload"))
+            try:
+                if close_error is not None:
+                    # 最終 DATA の経路と同じ知らせ方。「中断」だけを見て
+                    # 保存できたと誤解させない。完了の通知と同じく、予約を
+                    # 外すより先に出す。逆順だと、外してから知らせるまでの間に
+                    # 同じ相手・同じ名前の次の WRQ が確立でき、この失敗通知が
+                    # 後続の台帳の行を掴んで、成功する転送を「エラー」の行で
+                    # 閉じてしまう（理由も先行のものが後続の名前で出る）
+                    self.on_event("protocol_error", addr[0],
+                                  (filename, "アップロード失敗（保存できません）: %s" % close_error,
+                                   "upload"))
+            finally:
+                # 成功・失敗・停止・相手の ERROR・タイムアウトのどれで終わっても
+                # 必ず外す。残すと、その保存先へ二度と書けなくなる。通知の側で
+                # 例外が出てもここへ到達させるため finally に置く
+                if reserved:
+                    self._release_target(target)
+                xs.close()
 
     def _transfer_timeout(self, xs, neg):
         """転送で使う待ち時間（秒）を決め、ソケットの待ちを小刻みに設定する。
