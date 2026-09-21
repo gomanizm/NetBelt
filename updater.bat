@@ -395,6 +395,18 @@ set "LOCK_TRY=0"
 set /a LOCK_TRY+=1
 md "!LOCK_DIR!" 2>nul
 if not errorlevel 1 goto :lock_claimed
+REM md が失敗する理由は 2 つある。同じ名前が既にある（＝同じインストール先
+REM への更新が重なった）か、そのフォルダへそもそも書けないか。両方を重なりと
+REM して扱っていたため、書けない場所（Program Files 配下など）へ置いた利用者
+REM には、待っても直らないものを待たせていた。実測（8d316a7、
+REM tests/test_updater_appdir_unwritable.py と同じ小さな作り物で、インストール
+REM 先の書き込みを icacls で拒否）: 「エラー: 別の更新が進行中です」で exit 1。
+REM 誰とも重ならない名前（目印と同じ STAMP を借りる）で作ってみれば、どちらの
+REM 理由かが分かる。作れたときは片付けて、これまでどおり重なりとして扱う。
+set "PROBE_DIR=!APP_DIR!NetBelt-update-probe.!STAMP!"
+md "!PROBE_DIR!" 2>nul
+if not exist "!PROBE_DIR!" goto :lock_nowrite
+rd /s /q "!PROBE_DIR!" 2>nul
 if !LOCK_TRY! geq 2 goto :lock_busy
 set "PS_LOCK=!LOCK_DIR!"
 call :lock_is_stale
@@ -423,6 +435,17 @@ echo エラー: 別の更新が進行中です
 echo   同じインストール先への更新が既に動いています。インストール先の
 echo   ファイルは何も変えていません。先の更新が終わるのを待ってから、
 echo   もう一度お試しください。
+rd /s /q "!TEMP_DIR!" 2>nul
+call :drop_apply_copy
+pause
+exit /b 1
+
+:lock_nowrite
+echo エラー: インストール先へ書き込めません
+echo   場所: !APP_DIR!
+echo   このフォルダへ書き込む権限が無いため、更新を当てられません。
+echo   インストール先のファイルは何も変えていません。書き込める場所へ
+echo   NetBelt を置き直すか、管理者に権限を確かめてもらってください。
 rd /s /q "!TEMP_DIR!" 2>nul
 call :drop_apply_copy
 pause
