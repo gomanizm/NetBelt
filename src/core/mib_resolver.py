@@ -598,8 +598,12 @@ class MIBResolver:
         並んだ 2 つ目以降のモジュールの中に由来コメントがあると、前の
         モジュールの END が区間に入って区切ってはいけない場所で区切り、
         区切りの BOM が 2 つ続くと区間が空になって区切れなかった。
-        後ろ向きに空白だけを飛ばすので、BOM の数やファイルの長さに
-        関係なく一定時間で決まる。
+        pos には呼び出し側が「空白でも BOM でもない最後の文字の次の
+        位置」を渡す（_normalize_module_boms が前へ進めるカーソル）。
+        そこまで来ていれば直前は必ず実テキストなので、ここでの歩きは
+        0 歩で終わる。生の BOM の位置を渡すと、コメントが空白に
+        なっているファイルでは 1 個あたり O(n) 歩き、全体が O(n^2)
+        になる（実測: 215KB・BOM 4000 個で 16.5 秒）。
         """
         bom = chr(0xFEFF)
         j = pos
@@ -658,14 +662,28 @@ class MIBResolver:
             r'[ \t]*(?:--[^\r\n]*)?\r?$', re.MULTILINE)
         out = []
         prev = 0
+        # 空白でも BOM でもない最後の文字の次の位置。positions は
+        # 昇順なので、masked を 1 回だけ前へ進めながらこれを覚えて
+        # おけば、BOM ごとに後ろへ歩き直さずに済む。後ろ向きに歩いて
+        # いたときは、BOM 入りの由来コメントの間に実テキストが無い
+        # ファイル（コメントは空白になっている）で 1 個あたり O(n) に
+        # なり、全体が O(n^2) だった（実測: 215KB・BOM 4000 個で
+        # 16.5 秒。BOM の間に実テキストがある同じ大きさの形は 0.027 秒）
+        solid = 0
+        scan = 0
         for i in positions:
+            while scan < i:
+                ch = masked[scan]
+                if not (ch.isspace() or ch == bom):
+                    solid = scan + 1
+                scan += 1
             if masked[i] == bom:
                 split = outside.match(raw, i + 1) is not None
             else:
                 # 直前のモジュールが閉じているか。詳しくは
                 # _ends_with_end と docstring を見ること
                 split = (inside.match(raw, i + 1) is not None
-                         and cls._ends_with_end(masked, i))
+                         and cls._ends_with_end(masked, solid))
             out.append(raw[prev:i])
             out.append('\n' if split else ' ')
             prev = i + 1
