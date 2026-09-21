@@ -49,6 +49,12 @@ class SingleInstanceGuard(QObject):
         self._name = name or default_server_name()
         self._server = None
         self._window = None
+        # 窓を覚える前に届いた「前へ出せ」の合図。MainWindow を作る途中で
+        # モーダル（設定ファイルの警告など）が開くと、そのモーダルが回す
+        # 入れ子のイベントループで 2 つ目の起動の接続が処理されてしまい、
+        # 窓がまだ無いまま raise_window() が呼ばれる。捨てると利用者には
+        # 「2 回目のダブルクリックで何も起きない」ように見える
+        self._pending_raise = False
 
     def another_instance_is_running(self) -> bool:
         """既に動いている NetBelt があれば True（その窓を前へ出させる）"""
@@ -89,13 +95,22 @@ class SingleInstanceGuard(QObject):
             return False
 
     def set_window(self, window) -> None:
-        """2 つ目の起動があったときに前へ出すウィンドウを覚える"""
+        """2 つ目の起動があったときに前へ出すウィンドウを覚える。
+
+        覚える前に合図が届いていたら、この時点で前へ出す（合図は 1 回で
+        使い切る）。
+        """
         self._window = window
+        if window is not None and self._pending_raise:
+            self._pending_raise = False
+            self.raise_window()
 
     def raise_window(self) -> None:
         """覚えているウィンドウを前へ出す（最小化されていれば戻す）"""
         window = self._window
         if window is None:
+            # まだ窓が無い。合図を取っておき、set_window() で前へ出す
+            self._pending_raise = True
             return
         state = window.windowState()
         if state & Qt.WindowState.WindowMinimized:
