@@ -11,7 +11,7 @@ from typing import Dict, Optional
 # MIB 解析器の版。抽出・解決の規則を変えたら上げる。mib_cache.json は
 # この値も鍵にするので、古い解析器が作ったキャッシュがアプリの更新後に
 # そのまま使われることがなくなる。
-MIB_PARSER_VERSION = '2026-09-22.1'
+MIB_PARSER_VERSION = '2026-09-22.2'
 
 
 def app_dir() -> str:
@@ -554,6 +554,32 @@ class MIBResolver:
                 i += 1
         return ''.join(out)
 
+    @staticmethod
+    def _ends_with_end(text: str, pos: int) -> bool:
+        """text の pos の直前が（空白と BOM を除いて）`END` で終わるか。
+
+        コメントの中の BOM を連結の区切りとみなしてよいかの判定に使う。
+        text はコメント・文字列を空白にしたもの（位置は元のまま）なので、
+        由来を書いたコメントの直前は `STATUS current` などで終わって END に
+        ならず、連結の境目だけが END で終わる。
+
+        以前は「直前の BOM からこの位置までに END があるか」を区間で
+        見ていたため、2 方向に外れていた（どちらも実測）。1 ファイルに
+        並んだ 2 つ目以降のモジュールの中に由来コメントがあると、前の
+        モジュールの END が区間に入って区切ってはいけない場所で区切り、
+        区切りの BOM が 2 つ続くと区間が空になって区切れなかった。
+        後ろ向きに空白だけを飛ばすので、BOM の数やファイルの長さに
+        関係なく一定時間で決まる。
+        """
+        bom = chr(0xFEFF)
+        j = pos
+        while j > 0 and (text[j - 1].isspace() or text[j - 1] == bom):
+            j -= 1
+        # END の手前が語の続き（fooEND）でないことまで見る
+        return (j >= 3 and text[j - 3:j] == 'END'
+                and (j == 3 or not (text[j - 4].isalnum()
+                                    or text[j - 4] in '_-')))
+
     @classmethod
     def _normalize_module_boms(cls, raw: str) -> str:
         """本文に残る BOM（U+FEFF）を、1 文字ずつ改行か空白へ置き換えて返す。
@@ -570,10 +596,10 @@ class MIBResolver:
         なる（実測: 由来を書いたコメントの中の見出しで、直後の定義が区間
         ごと打ち切られて解決できなくなった）。コメント・文字列の中の BOM は、
         その行の残りがモジュールの見出しちょうど（連結したファイルの先頭が
-        そのまま続く形）で、かつ直前のモジュールが END で閉じているときだけ
-        区切りとして扱う。連結の境目は必ず直前のファイルの END の後ろに
-        来るのに対し、由来を書いたコメントはモジュールの途中にあるので、
-        この 1 点で分けられる。
+        そのまま続く形）で、かつ「その BOM の直前の実テキストが END で
+        終わっている」ときだけ区切りとして扱う。連結の境目は必ず直前の
+        ファイルの END の後ろに空白とコメントしか無いのに対し、由来を書いた
+        コメントはモジュールの途中にあるので、この 1 点で分けられる。
 
         見出しにならない BOM は空白にする。どちらも 1 文字→1 文字なので、
         あとで位置を使う処理がずれない。
@@ -600,16 +626,16 @@ class MIBResolver:
         inside = re.compile(
             r'[ \t]*[\w-]+[\s' + bom + r']+DEFINITIONS\s*::=\s*BEGIN'
             r'[ \t]*(?:--[^\r\n]*)?\r?$', re.MULTILINE)
-        # 直前のモジュールが閉じているか。詳しくは docstring を見ること
-        closed = re.compile(r'\bEND\b')
         out = []
         prev = 0
         for i in positions:
             if masked[i] == bom:
                 split = outside.match(raw, i + 1) is not None
             else:
+                # 直前のモジュールが閉じているか。詳しくは
+                # _ends_with_end と docstring を見ること
                 split = (inside.match(raw, i + 1) is not None
-                         and closed.search(masked, prev, i) is not None)
+                         and cls._ends_with_end(masked, i))
             out.append(raw[prev:i])
             out.append('\n' if split else ' ')
             prev = i + 1
