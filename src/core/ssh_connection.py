@@ -121,7 +121,32 @@ class SSHConnection(QObject):
         # _stop_reading と違い connect() の入口で戻さないので、接続スレッドが
         # 動き出す前に着地した dispose() でも消えない
         self._disposed = False
-    
+        # 画面の描き待ちが多すぎる間、受信を止めておくための関所
+        # （TerminalWidget.output_gate。set_read_gate で受け取る）
+        self._read_gate = None
+
+    def set_read_gate(self, gate) -> None:
+        """受信を止める合図（threading.Event）を受け取る
+
+        set されている間だけチャネルから読む。閉じている間は recv を
+        呼ばないので paramiko がチャネルの窓を広げず、機器側は送るのを
+        待つ。捨てずに待たせるので、記録には全量が残る。
+        """
+        self._read_gate = gate
+
+    def _wait_while_gated(self) -> bool:
+        """受信を止められていれば少し待つ。待ったなら True
+
+        待ちは短く区切る。止められている間も、停止（_stop_reading）や
+        切断に気づけるようにするため。
+        """
+        gate = self._read_gate
+        if gate is None or gate.is_set():
+            return False
+        gate.wait(0.05)
+        return True
+
+
     def _setup_host_keys(self, client):
         """既知ホスト鍵を読み込み、TOFUポリシーを設定する。
         既知ホストで鍵が変わった場合は接続時に BadHostKeyException となる。
@@ -507,6 +532,8 @@ class SSHConnection(QObject):
         decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
         while not self._stop_reading and self.is_connected:
             try:
+                if self._wait_while_gated():
+                    continue
                 if self.channel and self.channel.recv_ready():
                     data = self.channel.recv(4096)
                     if data:

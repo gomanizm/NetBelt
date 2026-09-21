@@ -838,6 +838,7 @@ class MainWindow(QMainWindow):
         # 接続オブジェクトを束縛して渡す。機器名だけで辞書を引くと、
         # 接続中にタブを閉じて同名で繋ぎ直したあと、旧スレッドの遅れた
         # 通知（TCP タイムアウトは最大 20〜30 秒後）が新しい接続を捨てる
+        self._attach_read_gate(device_name, ssh)
         ssh.output_received.connect(
             lambda text, c=ssh: self._on_connection_output(device_name, text, c))
         ssh.connected.connect(
@@ -1008,6 +1009,7 @@ class MainWindow(QMainWindow):
         # 接続オブジェクトを束縛して渡す。機器名だけで辞書を引くと、
         # 接続中にタブを閉じて同名で繋ぎ直したあと、旧スレッドの遅れた
         # 通知（TCP タイムアウトは最大 20〜30 秒後）が新しい接続を捨てる
+        self._attach_read_gate(device_name, telnet)
         telnet.output_received.connect(
             lambda text, c=telnet: self._on_connection_output(device_name, text, c))
         telnet.connected.connect(
@@ -1082,6 +1084,18 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"[Connection] {device_name} の旧接続の後始末に失敗: {e}")
         self._release_object(conn)
+
+    def _attach_read_gate(self, device_name: str, conn) -> None:
+        """画面の描き待ちが多すぎる間、この接続の受信を止められるようにする
+
+        TCP で繋ぐ接続（SSH / Telnet）だけに渡す。読むのを止めると相手側は
+        ウィンドウが開くまで送るのを待つので、取りこぼしは起きない。
+        シリアルにはその折り返しが無く（止めれば取りこぼす）、速度も
+        描画が追いつかない域には届かないので渡さない。
+        """
+        setter = getattr(conn, "set_read_gate", None)
+        if setter is not None:
+            setter(self.terminal_widget.output_gate(device_name))
 
     def _on_connection_output(self, device_name: str, text: str, conn=None):
         """受信出力をターミナルへ流す（置き換え済みの接続からは流さない）

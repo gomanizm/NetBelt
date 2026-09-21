@@ -42,7 +42,32 @@ class TelnetConnection(QObject):
         self.is_connected = False
         self._read_thread: Optional[threading.Thread] = None
         self._stop_reading = False
-    
+        # 画面の描き待ちが多すぎる間、受信を止めておくための関所
+        # （TerminalWidget.output_gate。set_read_gate で受け取る）
+        self._read_gate = None
+
+    def set_read_gate(self, gate) -> None:
+        """受信を止める合図（threading.Event）を受け取る
+
+        set されている間だけソケットから読む。閉じている間は読まないので
+        OS の受信バッファが埋まり、TCP のウィンドウが閉じて機器側が送るのを
+        待つ。捨てずに待たせるので、記録には全量が残る。
+        """
+        self._read_gate = gate
+
+    def _wait_while_gated(self) -> bool:
+        """受信を止められていれば少し待つ。待ったなら True
+
+        待ちは短く区切る。止められている間も、停止（_stop_reading）や
+        切断に気づけるようにするため。
+        """
+        gate = self._read_gate
+        if gate is None or gate.is_set():
+            return False
+        gate.wait(0.05)
+        return True
+
+
     def connect(self) -> bool:
         """
         Telnet接続を開始
@@ -153,6 +178,8 @@ class TelnetConnection(QObject):
 
         while not self._stop_reading and self.is_connected:
             try:
+                if self._wait_while_gated():
+                    continue
                 if self.socket:
                     try:
                         data = self.socket.recv(4096)

@@ -2,6 +2,7 @@ from PyQt6.QtWidgets import QWidget, QVBoxLayout, QTextEdit, QTabWidget
 from PyQt6.QtGui import (QFont, QColor, QPalette, QKeyEvent, QContextMenuEvent,
                          QTextCursor, QTextCharFormat)
 from PyQt6.QtCore import Qt, pyqtSignal, QCoreApplication, QEvent
+import threading
 from collections import deque
 from itertools import groupby
 from operator import itemgetter
@@ -610,6 +611,21 @@ class TerminalWidget(QWidget):
     # 小さいと描き直しの回数が増えて追いつくのが遅れる
     OUTPUT_SLICE = 16384
 
+    # 描き待ちに許す最大文字数。超えている間は受信スレッドにソケットから
+    # 読むのを止めさせ、TCP のウィンドウ（SSH は paramiko のチャネル窓）で
+    # 機器側を待たせる（output_gate）。捨てずに待たせるので記録は全量残る。
+    #
+    # 値の根拠: 描き切る速さの実測は 80 桁の行で 4〜5.6 MB/s、色付きで
+    # 2.07 MB/s、セッションが進むと実効 2.7 MB/s 程度。溜まるのは受信が
+    # これより速いときだけで、実機からの 1 コマンドの出力で最大級の
+    # show tech-support でも数 MB に収まる。8 MiB あれば、いちばん遅い
+    # 色付きでも 4 秒ぶんの描き待ちを飲み込めるので、通常の操作では
+    # ここまで届かない。届くのは 127.0.0.1 級の速さで流し続けたとき
+    # （実測: 上限が無いと 27.5 秒で 21.3 MB まで単調に増えた）。
+    PENDING_HIGH_WATER = 8 * 1024 * 1024
+    # ここまで減らしてから再開する。上限の直下で開け閉めを繰り返さない
+    PENDING_LOW_WATER = 2 * 1024 * 1024
+
     # タブが閉じられたときのシグナル（機器名を送信）
     tab_closed = pyqtSignal(str)
     # 表示中のタブが変わったことを知らせる（機器名。タブが無ければ空文字）。
@@ -645,11 +661,16 @@ class TerminalWidget(QWidget):
         self._resize_timer.timeout.connect(self._apply_pending_resizes)
         # まだ描いていない受信出力（機器名 -> _PendingOutput。空になったら外す）
         self._pending_output: Dict[str, _PendingOutput] = {}
+        # 機器ごとの受信の関所（機器名 -> threading.Event）。受信スレッドは
+        # set されている間だけソケットから読む（output_gate）
+        self._output_gates: Dict[str, threading.Event] = {}
         # _flush_pending_output が 1 片を渡している機器（append_output が
         # 溜まり分の後ろへ並べずに描くための目印）
         self._flushing_device = None
         # _deliver_queued_output の中かどうか（配った先から呼び直させない）
         self._delivering_queued = False
+        # _draw_pending_now の中かどうか（譲っている間に入り直させない）
+        self._drawing_pending_now = False
         self._output_timer = QTimer(self)
         self._output_timer.setSingleShot(True)
         self._output_timer.setInterval(0)
@@ -1497,8 +1518,37 @@ class TerminalWidget(QWidget):
         if device_name not in self._terminals:
             return
         self._pending_output.setdefault(device_name, _PendingOutput()).append(text)
+        self._update_output_gate(device_name)
         if not self._output_timer.isActive():
             self._output_timer.start()
+
+    def output_gate(self, device_name: str) -> threading.Event:
+        """その機器の受信の関所を返す（set されている間だけ読んでよい）
+
+        受信スレッドへ渡して使う（SSH / Telnet の set_read_gate）。描き待ちが
+        PENDING_HIGH_WATER を超えている間は閉じ、PENDING_LOW_WATER まで減ったら
+        開ける。閉じている間に受信側がソケットから読まないでいると、OS の
+        受信バッファ（SSH なら paramiko のチャネル窓）が埋まって機器側が送るのを
+        待つ。捨てずに待たせるので、画面にも記録にも全量が残る（利用者の決定
+        2026-09-20）。GUI スレッドだけが開け閉てし、受信スレッドは見るだけ。
+        """
+        gate = self._output_gates.get(device_name)
+        if gate is None:
+            gate = threading.Event()
+            gate.set()
+            self._output_gates[device_name] = gate
+        return gate
+
+    def _update_output_gate(self, device_name: str) -> None:
+        """描き待ちの量に応じて、その機器の受信を止める・再開する"""
+        gate = self._output_gates.get(device_name)
+        if gate is None:
+            return
+        waiting = len(self._pending_output.get(device_name, ()))
+        if waiting >= self.PENDING_HIGH_WATER:
+            gate.clear()
+        elif waiting <= self.PENDING_LOW_WATER:
+            gate.set()
 
     def _flush_pending_output(self) -> None:
         """溜めた出力を機器ごとに OUTPUT_SLICE 文字まで描き、残りは次の回へ回す"""
@@ -1518,18 +1568,54 @@ class TerminalWidget(QWidget):
                 self.append_output(device_name, text)
             finally:
                 self._flushing_device = None
+            self._update_output_gate(device_name)
         if self._pending_output:
             self._output_timer.start()
 
     def _draw_pending_now(self, device_name: str) -> None:
-        """その機器の溜まり分を、いまここで全部描く（画面を付け直す前など）"""
-        pending = self._pending_output.pop(device_name, None)
-        if pending and device_name in self._terminals:
-            self._flushing_device = device_name
-            try:
-                self.append_output(device_name, pending.take())
-            finally:
-                self._flushing_device = None
+        """その機器の溜まり分を、いまここで全部描く（画面を付け直す前など）
+
+        1 回の append_output へ丸ごと渡すと、描き終わるまでイベントループへ
+        戻らない（実測: 16,640,000 文字を溜めて再接続すると 11.9 秒固まった）。
+        _flush_pending_output と同じく OUTPUT_SLICE 文字ずつ描き、片ごとに
+        イベントループへ譲る。利用者の操作は配らないので、譲っている間に
+        再接続やタブ閉じでここへ入り直すことはない。
+
+        描き切るのは呼ばれた時点で溜まっていた分まで。譲っている間に届いた
+        受信は同じ溜まりの後ろへ並び、普段どおりタイマーが描く（順番は
+        変わらない）。溜まりを辞書から外さずに取り出すのは、後から届いた分を
+        追い越して描かないため。
+        """
+        from PyQt6.QtCore import QEventLoop
+        from PyQt6.QtWidgets import QApplication
+
+        if self._drawing_pending_now:
+            return
+        pending = self._pending_output.get(device_name)
+        if not pending or device_name not in self._terminals:
+            return
+        self._drawing_pending_now = True
+        remaining = len(pending)
+        try:
+            while remaining > 0 and device_name in self._terminals:
+                pending = self._pending_output.get(device_name)
+                if not pending:
+                    break
+                text = pending.take(min(self.OUTPUT_SLICE, remaining))
+                remaining -= len(text)
+                if not pending:
+                    del self._pending_output[device_name]
+                self._flushing_device = device_name
+                try:
+                    self.append_output(device_name, text)
+                finally:
+                    self._flushing_device = None
+                self._update_output_gate(device_name)
+                if remaining > 0:
+                    QApplication.processEvents(
+                        QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+        finally:
+            self._drawing_pending_now = False
 
     def _discard_log_dialog(self, dialog) -> None:
         """記録中ダイアログを閉じて、捨てる。
@@ -1662,6 +1748,11 @@ class TerminalWidget(QWidget):
         if tab_name in self._terminals:
             del self._terminals[tab_name]
         self._pending_output.pop(tab_name, None)
+        # 受信を止めたまま閉じない。開けてから外さないと、まだ動いている
+        # 受信スレッドが待ち続ける（切断の検知もその先にある）
+        gate = self._output_gates.pop(tab_name, None)
+        if gate is not None:
+            gate.set()
 
         # タブを削除（ページごと捨てる）
         self._discard_page(index)
