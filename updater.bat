@@ -383,8 +383,9 @@ REM 両方が「更新が完了しました！」を出した。ren は同時に
 REM しないので、負けた側は何も消せずに中止できる。
 REM つかんだ後にもう一度古さを見るのは、見てから掴むまでの間に別の更新が
 REM 取り直しているかもしれないため。そのときは元の名前へ戻して譲る。
-REM 目印を作れない理由が重なり以外（インストール先へ書けない等）でも、
-REM その場合はどのみち更新を当てられないので、同じ中止でよい。
+REM 目印を作れない理由には、重なり以外（インストール先へ書けない）もある。
+REM どちらもここで中止するが、待てば直るものかどうかが違うので、下の
+REM probe で見分けて案内を変える。
 set "LOCK_DIR=!APP_DIR!NetBelt-update-lock"
 set "LOCK_OLD_NAME=NetBelt-update-lock.!STAMP!.old"
 set "LOCK_OLD=!APP_DIR!!LOCK_OLD_NAME!"
