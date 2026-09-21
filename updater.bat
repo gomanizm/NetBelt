@@ -643,9 +643,30 @@ set "LOCK_HELD="
 if not defined LOCK_STAMPED goto :release_lock_rd
 set "LOCK_OWNER="
 set /p LOCK_OWNER=<"!LOCK_DIR!\holder.txt" 2>nul
-if not "!LOCK_OWNER!"=="!STAMP!" exit /b 0
+if not "!LOCK_OWNER!"=="!STAMP!" goto :release_lock_renamed
 :release_lock_rd
 rd /s /q "!LOCK_DIR!" 2>nul
+exit /b 0
+
+REM 正規名に自分の目印が無い。別の更新が回収しようと .old へ改名した直後
+REM かもしれないので、名前ではなく中身で自分のぶんを探して片付ける。
+REM 「つかむための改名」は、生きている目印を一瞬だけ正規名から消す。その窓の
+REM 中で持ち主が終わると、名前だけを見ていた以前はこうなった（実測: 検査役
+REM cx5j-check-release の p11_lock_resurrection.py / p12_grabber_dies.py）:
+REM   (a) 改名した側が「まだ新しい」と気づいて元の名前へ戻すため、誰も持って
+REM       いない目印が復活し、次の更新が約10分のあいだ弾かれ続けた。
+REM   (b) 改名した側がその窓の中で死ぬと、.old がインストール先に置き去りに
+REM       なった（次の更新も名前が違うので拾わない）。
+REM 消すのは holder.txt が自分の識別子と一致するものだけなので、動いている
+REM 別の更新の目印にも、利用者が置いたものにも当たらない。
+:release_lock_renamed
+for /d %%o in ("!APP_DIR!NetBelt-update-lock.*.old") do call :release_lock_old "%%~fo"
+exit /b 0
+
+:release_lock_old
+set "LOCK_OWNER="
+set /p LOCK_OWNER=<"%~1\holder.txt" 2>nul
+if "!LOCK_OWNER!"=="!STAMP!" rd /s /q "%~1" 2>nul
 exit /b 0
 
 REM ================================================================
