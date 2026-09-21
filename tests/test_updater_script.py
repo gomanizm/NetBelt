@@ -583,8 +583,10 @@ class UpdaterLaunchTest(unittest.TestCase):
                          "ZIP を元と別のフォルダから渡している: %r" % sent)
         self.assertIn('"%s"' % handed, sent,
                       "ZIP のパスが引用符で包まれていない: %r" % sent)
-        self.assertEqual(sent.count('"'), 6,
-                         "3 つの引数それぞれを包むこと: %r" % sent)
+        # 第4引数は、展開の直前に updater.bat が突き合わせる期待ハッシュ
+        # （2026-09-20 の決定 / release-03）。16進64桁なので包むだけでよい。
+        self.assertEqual(sent.count('"'), 8,
+                         "4 つの引数それぞれを包むこと: %r" % sent)
 
     def test_paths_cmd_would_mangle_are_refused(self):
         """cmd が意味を変えてしまう文字を含むパスは、黙って失敗させないこと。
@@ -701,8 +703,10 @@ class UpdaterLaunchTest(unittest.TestCase):
                          "ZIP を元と別のフォルダから渡している: %r" % sent)
         self.assertIn('"%s"' % handed, sent,
                       "ZIP のパスが引用符で包まれていない: %r" % sent)
-        self.assertEqual(sent.count('"'), 6,
-                         "3 つの引数それぞれを包むこと: %r" % sent)
+        # 第4引数は、展開の直前に updater.bat が突き合わせる期待ハッシュ
+        # （2026-09-20 の決定 / release-03）。16進64桁なので包むだけでよい。
+        self.assertEqual(sent.count('"'), 8,
+                         "4 つの引数それぞれを包むこと: %r" % sent)
 
 
 if __name__ == "__main__":

@@ -51,6 +51,11 @@ chcp 65001 >nul
 set "SELF=%~f0"
 set "A1=%~1"
 set "A2=%~2"
+rem The SHA-256 NetBelt verified. Empty when run by hand, or by a
+rem NetBelt that predates this argument. The re-entry below fills %3
+rem with --utf8, so the child is handed this as %6 instead.
+rem (ASCII only above :run - see the note at the top of the file.)
+set "A3=%~3"
 rem Where to install. Taken here, because the run below happens from a
 rem copy in TEMP, where %~dp0 would point at TEMP, not the install folder.
 rem The trailing backslash is dropped so that a quoted "...\" does not
@@ -96,7 +101,7 @@ rem the exit code survives; split across lines, nothing after the child
 rem runs at all, which would leak the work folder in TEMP.
 rem (An earlier comment here claimed the opposite. It was wrong: the
 rem experiment behind it never replaced the parent file.)
-cmd /d /c ""!TMPRUNNER!" "!A1!" "!A2!" --utf8 "!HOME_DIR!" "!WORK_DIR!"" & set "RC=!errorlevel!" & rd /s /q "!WORK_DIR!" >nul 2>&1 & exit /b !RC!
+cmd /d /c ""!TMPRUNNER!" "!A1!" "!A2!" --utf8 "!HOME_DIR!" "!WORK_DIR!" "!A3!"" & set "RC=!errorlevel!" & rd /s /q "!WORK_DIR!" >nul 2>&1 & exit /b !RC!
 
 :nowork
 rem Nothing in the install folder has been written, so drop the apply copy
@@ -148,9 +153,10 @@ REM ================================================================
 REM 引数:
 REM   %1 = ダウンロードしたZIPファイルのパス
 REM   %2 = アプリケーション実行ファイルのパス
-REM   %3 = --utf8（コードページ設定後の再入を示す内部用）
+REM   %3 = 期待する SHA-256（省略可。再入のときは --utf8 が入る）
 REM   %4 = インストール先（内部用。TEMP の写しでは %~dp0 が使えない）
 REM   %5 = 親が確保した作業フォルダ（内部用。展開先の親になる）
+REM   %6 = 期待する SHA-256（内部用。再入のときに %3 から移したもの）
 REM ================================================================
 
 echo ================================================
@@ -208,6 +214,9 @@ if not "!STAMP_FROM!"=="" for %%w in ("!STAMP_FROM!") do set "STAMP=%%~nxw"
 set "STAGED_NAME=NetBelt.exe.!STAMP!.new"
 set "STAGED_PATH=!APP_DIR!!STAGED_NAME!"
 
+REM NetBelt が確かめた ZIP の SHA-256。展開の直前に突き合わせる。
+set "ZIP_SHA=%~6"
+
 echo [1/6] 更新情報
 echo   ZIPファイル: !ZIP_FILE!
 echo   アプリパス: !APP_PATH!
@@ -264,6 +273,29 @@ echo.
 
 REM ZIPファイルを展開
 echo [4/6] ZIPファイルを展開中...
+REM 展開する前に、NetBelt が確かめたバイト列と同じものかを見る。
+REM NetBelt は検証した ZIP の写しを作って渡してくるが（version_manager.py の
+REM stage_for_apply）、写しの置き場は元と同じ更新フォルダで、そこへ書ける
+REM 相手はフォルダを列挙すれば写しの名前も知れる。実測（検査役
+REM cx5j-check-release の p5_staged_swap.py）: 写しだけを別の有効な ZIP へ
+REM 置き換えると、渡されたパスを Expand-Archive で開くだけだったため、
+REM 控えと食い違う中身がそのまま据わり「更新が完了しました」まで出た。
+REM 期待値が無いのは、この引数を知らない古い NetBelt から呼ばれたときと、
+REM 切り分けのために手で叩いたときだけ。そのときは従来どおり展開する。
+if not defined ZIP_SHA goto :zip_sha_ok
+set "PS_ZIP=!ZIP_FILE!"
+set "PS_SHA=!ZIP_SHA!"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "try { if ((Get-FileHash -LiteralPath $env:PS_ZIP -Algorithm SHA256 -ErrorAction Stop).Hash -eq $env:PS_SHA) { exit 0 } } catch { }; exit 1"
+if not errorlevel 1 goto :zip_sha_ok
+echo エラー: 更新ファイルの中身が、確認した時点から変わっています
+echo   展開の直前に計算した SHA-256 が、NetBelt が確かめた値と違いました。
+echo   インストール先のファイルは何も変えていません。
+echo   もう一度ダウンロードしてから、更新をやり直してください。
+rd /s /q "!TEMP_DIR!" 2>nul
+call :drop_apply_copy
+pause
+exit /b 1
+:zip_sha_ok
 REM PowerShell の '...' に生のパスを埋めると、パスに ' が入っただけで
 REM 文字列が閉じて壊れる。環境変数で渡せば引用符の問題が起きない。
 set "PS_ZIP=!ZIP_FILE!"

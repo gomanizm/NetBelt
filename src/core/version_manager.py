@@ -35,7 +35,8 @@ except ImportError:
 _CMD_UNSAFE = "&^%!"
 
 
-def updater_command(updater_path: str, zip_path: str, app_path: str) -> str:
+def updater_command(updater_path: str, zip_path: str, app_path: str,
+                    expected_sha256: Optional[str] = None) -> str:
     """updater.bat を起動するコマンド行を組み立てる
 
     subprocess にリストで渡すと、Windows の list2cmdline は空白かタブを
@@ -51,6 +52,10 @@ def updater_command(updater_path: str, zip_path: str, app_path: str) -> str:
     ValueError にする。呼び出し側はどちらも QMessageBox で理由を出せる。
     updater.bat 自身も同じ理由で ! を検出して中止する。
 
+    expected_sha256 を渡すと第4引数として付ける。updater.bat は展開の直前に
+    その値と ZIP のハッシュを突き合わせる（VersionManager.launch_updater の
+    説明を参照）。16進64桁しか渡さないので、引用符で包めば cmd は素通しする。
+
     Raises:
         ValueError: cmd が意味を変えてしまう文字がパスに含まれるとき
     """
@@ -61,7 +66,10 @@ def updater_command(updater_path: str, zip_path: str, app_path: str) -> str:
                 "パスに %s が含まれているため、更新を適用できません。\n"
                 "フォルダ名を変えるか、新しい ZIP を手で展開してください。\n"
                 "対象: %s" % (" ".join(found), path))
-    return '"{}" "{}" "{}"'.format(updater_path, zip_path, app_path)
+    command = '"{}" "{}" "{}"'.format(updater_path, zip_path, app_path)
+    if expected_sha256:
+        command += ' "{}"'.format(expected_sha256)
+    return command
 
 
 # ソース実行で更新を当てようとしたときに出す案内。
@@ -770,11 +778,10 @@ class VersionManager:
         かけ、通ったら写しのパスを updater.bat へ渡す。写している最中に
         元が差し替えられた場合は、写しと控えが食い違うのでここで止まる。
 
-        残る制限: 写しの置き場は元と同じ更新フォルダで、そこへ書ける相手
-        （＝同じ利用者の権限で既にコードを実行できている相手）は、フォルダを
-        列挙すれば写しの名前も知れる。窓を完全に閉じるには、展開の直前に
-        updater.bat 側でも受け取った期待値とハッシュを突き合わせる必要が
-        あり、それは updater.bat 側で別に追う。
+        写しの置き場は元と同じ更新フォルダで、そこへ書ける相手（＝同じ
+        利用者の権限で既にコードを実行できている相手）は、フォルダを列挙
+        すれば写しの名前も知れる。そのため updater.bat へは控えたハッシュも
+        渡し、展開の直前にもう一度突き合わせる（launch_updater の説明を参照）。
 
         元の ZIP はここでは消さない（updater.bat が消すのは渡した写しの
         ほう）。当たらなかったときに手元から失わせないためで、残ったぶんは
@@ -815,6 +822,18 @@ class VersionManager:
             return None, problem
         return staged, None
 
+    @staticmethod
+    def recorded_sha256(zip_path: str) -> Optional[str]:
+        """傍らの .sha256 に控えた値を返す（無い・壊れていれば None）。"""
+        try:
+            with open(zip_path + '.sha256', encoding='ascii') as f:
+                value = (f.read() or '').strip().split()[0].lower()
+        except Exception:
+            return None
+        if len(value) != 64 or value.strip('0123456789abcdef'):
+            return None
+        return value
+
     def _discard_staged(self, staged: str) -> None:
         """用意しかけた写しを、控えごと片付ける。"""
         for suffix in ('', '.sha256', '.version'):
@@ -830,12 +849,21 @@ class VersionManager:
         溜まり、検証記録つきの .zip として未適用の更新の候補にも並んでいた。
         起動元の 2 箇所（更新ダイアログと起動時の未適用更新）が同じここを
         通るので、片方だけ直る形にならない。
+
+        ダウンロード時に控えた SHA-256 も渡す。写しを作ってから updater.bat が
+        Expand-Archive で開き直すまでには間があり、更新フォルダへ書ける相手は
+        その写しも置き換えられる。実測（検査役 cx5j-check-release の
+        p5_staged_swap.py）: 写しだけを別の有効な ZIP へ置き換えると、
+        updater.bat は渡されたパスを開くだけだったので、控えと食い違う中身が
+        そのまま据わり「更新が完了しました」まで出た。控えが無い・壊れている
+        ときは渡さない（updater.bat はこれまでどおり展開する）。
         """
         try:
             # リストで渡すと、パスの , や = で引数が途中で切れる
             # （updater_command の説明を参照）
             subprocess.Popen(
-                updater_command(updater_path, staged_path, app_path),
+                updater_command(updater_path, staged_path, app_path,
+                                self.recorded_sha256(staged_path)),
                 creationflags=subprocess.CREATE_NEW_CONSOLE,
                 env=updater_env())
         except Exception:
