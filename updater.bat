@@ -408,8 +408,21 @@ set "PROBE_DIR=!APP_DIR!NetBelt-update-probe.!STAMP!"
 md "!PROBE_DIR!" 2>nul
 if not exist "!PROBE_DIR!" goto :lock_nowrite
 rd /s /q "!PROBE_DIR!" 2>nul
-if !LOCK_TRY! geq 2 goto :lock_busy
+REM 名前が取られている理由が「更新の目印」以外のこともある。実測（検査役
+REM cx5j-check-release の p1_stale_lock_content.py）: 同じ名前のフォルダへ
+REM 利用者が memo.txt と switch-config\core1.cfg を置いていると、更新日時が
+REM 10分より古いというだけで目印とみなして丸ごと消し、そのまま完走していた
+REM （伝えたのは「前の更新が残した目印を取り除きました」の 1 行だけ）。
+REM 同じ名前のファイルでも、ren でつかんでから rd に失敗し、事実と違う
+REM 「別の更新が進行中です」で止まっていた。
+REM 更新が作る目印は「md の直後（空）」か「holder.txt 入り」のどちらかに
+REM しかならない。それ以外＝ファイル、または holder.txt の無い中身つき
+REM フォルダは、古さを見るより先に、消さずに中止する（利用者の決定
+REM 2026-09-20 / release-01）。
 set "PS_LOCK=!LOCK_DIR!"
+call :lock_is_foreign
+if not errorlevel 1 goto :lock_foreign
+if !LOCK_TRY! geq 2 goto :lock_busy
 call :lock_is_stale
 if errorlevel 1 goto :lock_busy
 ren "!LOCK_DIR!" "!LOCK_OLD_NAME!" 2>nul
@@ -447,6 +460,16 @@ echo   場所: !APP_DIR!
 echo   このフォルダへ書き込む権限が無いため、更新を当てられません。
 echo   インストール先のファイルは何も変えていません。書き込める場所へ
 echo   NetBelt を置き直すか、管理者に権限を確かめてもらってください。
+rd /s /q "!TEMP_DIR!" 2>nul
+call :drop_apply_copy
+pause
+exit /b 1
+
+:lock_foreign
+echo エラー: NetBelt-update-lock という名前のものがありますが、更新が作った目印ではないようです。
+echo   中身を確かめて名前を変えるか移動してください。
+echo   場所: !LOCK_DIR!
+echo   インストール先のファイルは何も変えていません。
 rd /s /q "!TEMP_DIR!" 2>nul
 call :drop_apply_copy
 pause
@@ -633,4 +656,15 @@ REM なければ 1。フォルダの更新日時は holder.txt を書いた時�
 REM 時刻になる。回収では 2 回呼ぶ（つかむ前と、つかんだ後）。
 :lock_is_stale
 powershell -NoProfile -ExecutionPolicy Bypass -Command "try { $d = Get-Item -LiteralPath $env:PS_LOCK -Force -ErrorAction Stop; if ($d.LastWriteTime -lt (Get-Date).AddMinutes(-10)) { exit 0 } } catch { }; exit 1"
+exit /b !errorlevel!
+
+REM ================================================================
+REM その名前が、更新の目印でないものに使われていないかを見る（call で呼ぶ）
+REM ================================================================
+REM PS_LOCK に見るものを入れて呼ぶ。更新が作った目印に見えなければ
+REM errorlevel 0、見えれば 1。目印は md の直後なら空、holder.txt を
+REM 書いた後ならそれが入っている。ファイル、または holder.txt の無い
+REM 中身つきフォルダは、利用者が置いたものとして扱う。
+:lock_is_foreign
+powershell -NoProfile -ExecutionPolicy Bypass -Command "try { $i = Get-Item -LiteralPath $env:PS_LOCK -Force -ErrorAction Stop; if (-not $i.PSIsContainer) { exit 0 }; if (Test-Path -LiteralPath (Join-Path $i.FullName 'holder.txt')) { exit 1 }; if (@(Get-ChildItem -LiteralPath $i.FullName -Force -ErrorAction SilentlyContinue).Count -gt 0) { exit 0 } } catch { }; exit 1"
 exit /b !errorlevel!
