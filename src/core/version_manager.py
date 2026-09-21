@@ -155,6 +155,51 @@ def _finalize_lock(zip_path: str) -> threading.Lock:
 # までの時間（秒）。確定は os.replace 数回ぶんなので、待つのは数秒でよい。
 FINALIZE_WAIT_SEC = 5.0
 FINALIZE_STALE_SEC = 60.0
+# 取れなかったときに利用者へ出す文言（利用者の決定 2026-09-20 / release-04）。
+# print だけだったときは、凍結ビルドではログファイル行きで画面に出ず、
+# ダイアログは『チェックサムが一致しない場合も含みます』と、原因と違う
+# ことを名指ししていた。
+FINALIZE_BUSY_MESSAGE = ('別の NetBelt が同じ更新を保存中です。'
+                         '先の保存が終わってから、もう一度お試しください。')
+
+
+def _finalize_token() -> bytes:
+    """この確定を他と見分ける印。
+
+    同じプロセスの中でも、同じスレッドが続けて呼んだときでも重ならない
+    よう、pid・スレッド・時刻を並べる（.part の名前と同じ考え方）。
+    """
+    return ('%d-%d-%d' % (os.getpid(), threading.get_ident(),
+                          time.monotonic_ns())).encode('ascii')
+
+
+def _drop_finalize_marker(marker: str, token: bytes) -> None:
+    """自分が置いた確定の目印だけを外す。
+
+    名前だけを見て消していたときは、引き取りが起きた後で同じ名前が
+    別の確定のものになっているのに、それを外していた。実測（検査役
+    cx5m-check-release の p23_finalize_marker.py、FINALIZE_STALE_SEC=0.2 /
+    FINALIZE_WAIT_SEC=2）: P1 の確定が古さの境を越えると P2 が引き取り、
+    そのあと P1 の後始末が P2 の目印を消して、待たされるはずの P3 が
+    0.00 秒で通った（同時に持つ数 = 2）。updater.bat 側が holder.txt で
+    避けている型の穴と同じ。
+
+    中身が自分の印のときだけ、引き取りと同じく一意な名前へ改名してから
+    消す（読んでから消すまでの窓を狭める）。改名先を引き取りと同じ .stale に
+    そろえておくと、残ったときの掃除の条件を 1 つにできる。
+    """
+    try:
+        with open(marker, 'rb') as f:
+            if f.read(len(token) + 1) != token:
+                return
+    except OSError:
+        return
+    dropped = '%s.%s.stale' % (marker, token.decode('ascii'))
+    try:
+        os.replace(marker, dropped)
+        os.remove(dropped)
+    except OSError as e:
+        print(f"[VersionManager] 確定の目印を外せませんでした: {e}")
 
 
 def _take_over_abandoned_finalize(marker: str) -> None:
@@ -194,11 +239,14 @@ def _cross_process_finalize(zip_path: str):
     （利用者の決定 2026-09-20 / release-04）。
     """
     marker = zip_path + '.finalizing'
+    token = _finalize_token()
     owned = False
     deadline = time.monotonic() + FINALIZE_WAIT_SEC
     while True:
         try:
-            os.close(os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+            fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            with os.fdopen(fd, 'wb') as f:
+                f.write(token)
             owned = True
             break
         except FileExistsError:
@@ -215,10 +263,7 @@ def _cross_process_finalize(zip_path: str):
         yield owned
     finally:
         if owned:
-            try:
-                os.remove(marker)
-            except OSError as e:
-                print(f"[VersionManager] 確定の目印を外せませんでした: {e}")
+            _drop_finalize_marker(marker, token)
 
 
 class VersionManager:
@@ -244,6 +289,10 @@ class VersionManager:
         self.github_token = sanitized_token(github_token)
         # 受信中の応答。中止の要求が来たら、これを閉じて読み取りを打ち切る
         self._response = None
+        # 直前の download_update が None を返した理由（画面へ出せる文言）。
+        # 分かっているときだけ入る。None のときは呼ぶ側がこれまでどおりの
+        # 一般的な文言を出す。
+        self.last_failure: Optional[str] = None
         # 更新用ディレクトリを作成。
         # ここで例外を外へ出さない。起動時の未適用更新チェックは同期で
         # VersionManager を作るだけなので、%TEMP%\NetBeltUpdates が通常
@@ -587,6 +636,8 @@ class VersionManager:
         """
         # 受信中に例外が出ても書きかけを残さないよう、外側でも掴んでおく
         part_path = None
+        # 前回の理由を残したままにしない
+        self.last_failure = None
         try:
             # ファイル名を生成（版ごとに分ける）
             filename = self._download_filename(url, version)
@@ -739,7 +790,8 @@ class VersionManager:
                 # 取れなければ失敗として返す。ここで進むと、両方が成功を
                 # 返したのに ZIP が残らない形になりうる。
                 if not owned:
-                    print("[VersionManager] 別の NetBelt が同じ更新を保存中です")
+                    print(f"[VersionManager] {FINALIZE_BUSY_MESSAGE}")
+                    self.last_failure = FINALIZE_BUSY_MESSAGE
                     self._discard(sha_part)
                     self._discard(ver_part)
                     self._discard(part_path)
@@ -1016,15 +1068,24 @@ class VersionManager:
         # 書きかけの傍らの控え（.part.sha256 / .part.version）と、取り直しの
         # 退避名（.prev.part とその控え）も同じ扱い。確定の途中でプロセスが
         # 終わると残り、'.part' だけを見ていた以前は控えが残り続けていた。
+        # 確定の目印（.finalizing）と、引き取り・後始末の改名先
+        # （.finalizing.<印>.stale）もここで見る。kill されると contextmanager の
+        # finally が走らず、どちらも 0 バイトのまま残る（実測: 48 時間前の
+        # 日付で置いても cleanup_old_updates(24) の消した数は 0）。同じ版を二度と
+        # 落とさなければ、そのまま居座り続ける。保持期間を過ぎたものだけなので、
+        # 今まさに確定している目印（数秒）には当たらない。
         try:
             for filename in os.listdir(self.UPDATE_DIR):
-                if not filename.endswith(('.part', '.part.sha256', '.part.version')):
+                if not (filename.endswith(('.part', '.part.sha256',
+                                           '.part.version', '.finalizing'))
+                        or ('.finalizing.' in filename
+                            and filename.endswith('.stale'))):
                     continue
                 part_path = os.path.join(self.UPDATE_DIR, filename)
                 try:
                     if current_time - os.path.getmtime(part_path) > max_age_seconds:
                         os.remove(part_path)
-                        print(f"[VersionManager] 書きかけの更新ファイルを削除: {part_path}")
+                        print(f"[VersionManager] 置き去りの作業ファイルを削除: {part_path}")
                         deleted_count += 1
                 except Exception as e:
                     print(f"[VersionManager] ファイル削除エラー: {e}")

@@ -111,7 +111,14 @@ class DownloadThread(QThread):
             if zip_path:
                 self.download_completed.emit(zip_path)
             else:
+                # 理由が分かっているときは、それを伝える。一律に
+                # 「チェックサムが一致しない場合も含みます」と出していたため、
+                # 別の NetBelt が同じ更新を保存中でも、原因と違うことを
+                # 名指ししていた（凍結ビルドでは print はログファイル行きで、
+                # 画面には何も出ない）。
+                reason = getattr(self.version_mgr, "last_failure", None)
                 self.download_failed.emit(
+                    reason or
                     "ダウンロードに失敗しました"
                     "（チェックサムが一致しない場合も含みます）")
         
