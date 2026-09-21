@@ -157,7 +157,13 @@ class DuplicateDeviceNameUndecryptableTest(unittest.TestCase):
 
         ssh2, warn2 = self._connect(window, "拠点2")
         ssh2.assert_not_called()
-        warn2.assert_called_once()
+        # 断る理由は、利用者の決定（2026-09-20）で接続先の食い違いが先に
+        # なった。拠点1 のタブが開いたままなので、同じ名前で接続先が違う
+        # 拠点2 は、パスワードを見るより前に断られる
+        # （tests/test_session_endpoint_guards_connect_buttons.py）。
+        # 繋がないことは変わらない
+        warn2.assert_not_called()
+        self.assertIn("接続先と違います", window.status_bar.currentMessage())
 
 
 if __name__ == "__main__":
