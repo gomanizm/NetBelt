@@ -254,16 +254,29 @@ class MacroDialog(QDialog):
                 QMessageBox.warning(self, "エラー", "プリセットの削除に失敗しました。")
     
     def _on_keepalive_start(self):
-        """キープアライブ開始"""
+        """キープアライブ開始を要求する（表示は進めない）
+
+        connected は開いた時点の値なので、開いている最中に機器側が切れると
+        「開始」は有効のまま残る。押しても MainWindow は始めないのに、
+        ここで _update_keepalive_ui(True) まで進めていたため、
+        「状態: 動作中」の表示だけが進んでいた。表示は要求ではなく実際に
+        始まったかで進めるので、受け口（MainWindow）に更新させる。
+        """
         interval = self.keepalive_interval_spin.value()
         self.keepalive_start_requested.emit(interval)
-        self._update_keepalive_ui(True)
-    
+
     def _on_keepalive_stop(self):
-        """キープアライブ停止"""
+        """キープアライブ停止を要求する（表示は進めない。開始と同じ理由）"""
         self.keepalive_stop_requested.emit()
-        self._update_keepalive_ui(False)
-    
+
+    def show_keepalive_running(self, active: bool):
+        """いま動いているかを表示へ反映する（受け口の MainWindow が呼ぶ）
+
+        Args:
+            active: macro_manager が実際にタイマーを持っているか
+        """
+        self._update_keepalive_ui(active)
+
     def _update_keepalive_ui(self, active: bool):
         """キープアライブUIを更新"""
         self.keepalive_active = active

@@ -1885,12 +1885,7 @@ class MainWindow(QMainWindow):
         )
         
         # シグナル接続
-        dialog.keepalive_start_requested.connect(
-            lambda interval: self._start_keepalive(current_tab_name, interval)
-        )
-        dialog.keepalive_stop_requested.connect(
-            lambda: self._stop_keepalive(current_tab_name)
-        )
+        self._bind_keepalive_buttons(dialog, current_tab_name)
         dialog.command_list_start_requested.connect(
             lambda commands, delay: self.macro_manager.start_command_list(
                 current_tab_name, commands, delay
@@ -1902,6 +1897,33 @@ class MainWindow(QMainWindow):
         
         self._exec_dialog(dialog)
     
+    def _bind_keepalive_buttons(self, dialog, device_name: str):
+        """マクロ設定ダイアログの開始・停止を繋ぎ、表示を実状態で更新する
+
+        ダイアログへ渡す connected は開いた時点の値なので、開いている最中に
+        相手機器が切れても「開始」は有効のまま残る。押しても
+        _start_keepalive が断るのに、ダイアログが自分で
+        _update_keepalive_ui(True) まで進めていたため、「状態: 動作中」の
+        表示だけが進んでいた。表示は要求ではなく、macro_manager が実際に
+        タイマーを持っているかで進める。
+
+        Args:
+            dialog: 繋ぐマクロ設定ダイアログ
+            device_name: 機器名
+        """
+        def start(interval: int):
+            self._start_keepalive(device_name, interval)
+            dialog.show_keepalive_running(
+                self.macro_manager.is_keepalive_active(device_name))
+
+        def stop():
+            self._stop_keepalive(device_name)
+            dialog.show_keepalive_running(
+                self.macro_manager.is_keepalive_active(device_name))
+
+        dialog.keepalive_start_requested.connect(start)
+        dialog.keepalive_stop_requested.connect(stop)
+
     def _start_keepalive(self, device_name: str, interval: int):
         """キープアライブを開始してUI更新
 
@@ -2000,12 +2022,7 @@ class MainWindow(QMainWindow):
         )
         
         # シグナル接続（UI更新も行う）
-        dialog.keepalive_start_requested.connect(
-            lambda interval: self._start_keepalive(device_name, interval)
-        )
-        dialog.keepalive_stop_requested.connect(
-            lambda: self._stop_keepalive(device_name)
-        )
+        self._bind_keepalive_buttons(dialog, device_name)
         dialog.command_list_start_requested.connect(
             lambda commands, delay: self.macro_manager.start_command_list(
                 device_name, commands, delay
