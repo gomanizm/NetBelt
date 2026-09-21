@@ -2561,8 +2561,10 @@ for details.
             # だけ起動してアプリは表示され続ける（updater.bat は 3 秒後に
             # ロック中の NetBelt.exe へ上書きを試みる）。singleShot(0) で
             # 予約すれば、exec() に入った直後に処理される
-            from PyQt6.QtWidgets import QApplication
-            QTimer.singleShot(0, QApplication.quit)
+            # 終わらせる前にこのウィンドウを閉じ、記録中のログを書き切って
+            # 閉じる後始末（closeEvent）を通す（quit_for_update）
+            from .dialogs.update_dialog import quit_for_update
+            QTimer.singleShot(0, lambda: quit_for_update(self))
         except Exception as e:
             QMessageBox.critical(
                 self,

@@ -20,6 +20,36 @@ from core.version_manager import (
 _RUNNING_DOWNLOADS = set()
 
 
+def quit_for_update(window=None) -> None:
+    """更新を当てるためにアプリを終わらせる（後始末を通してから）。
+
+    QApplication.quit() はウィンドウへ closeEvent を送らない。そのまま呼ぶと
+    MainWindow.closeEvent だけが通る後始末 — 接続の切断、配送待ちの受信の
+    取り込み、TerminalWidget.finish_log_recordings による記録の書き切りと
+    停止 — を飛ばして終わる。記録中のログはファイルを閉じられず、描き待ちの
+    受信はそのまま捨てられていた（実測: 記録を始めてから描き待ちを 19 文字
+    作って quit すると、その分が記録に残らない）。
+
+    先に閉じて通常の終了と同じ道を通す。window を渡さなければ、表示中の
+    トップレベルの窓をまとめて閉じる（更新ダイアログからの適用。呼ぶ側は
+    まだ exec() の中で、親を辿るより Qt に任せる方が確実）。起動時の適用は
+    メインウィンドウがまだ表示されていないことがあるので、その窓を渡す。
+
+    閉じる方に失敗しても updater.bat は既に起動していて、数秒後に実行中の
+    ファイルを置き換えに来るので、終わらせる方は必ず通す。
+    """
+    from PyQt6.QtWidgets import QApplication
+
+    try:
+        if window is not None:
+            window.close()
+        else:
+            QApplication.closeAllWindows()
+    except Exception as e:
+        print(f"[Update] 終了前の後始末に失敗: {e}")
+    QApplication.quit()
+
+
 def _release_when_finished(thread):
     """切り離したスレッドを、終わるまで見届ける。"""
     from PyQt6.QtWidgets import QApplication
@@ -411,11 +441,14 @@ class UpdateDialog(QDialog):
 
             # ダイアログを閉じる
             self.done(self.UPDATE_NOW)
-            
-            # アプリケーションを終了
-            from PyQt6.QtWidgets import QApplication
-            QApplication.quit()
-        
+
+            # アプリケーションを終了する。記録中のログを閉じずに終わらない
+            # よう、窓の closeEvent を通してから終わらせる（quit_for_update）。
+            # ここはまだ exec() の中なので、入れ子のループを抜けてから
+            # 後始末が走るように予約する
+            from PyQt6.QtCore import QTimer
+            QTimer.singleShot(0, quit_for_update)
+
         except Exception as e:
             QMessageBox.critical(
                 self,
