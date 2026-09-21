@@ -11,7 +11,7 @@ from typing import Dict, Optional
 # MIB 解析器の版。抽出・解決の規則を変えたら上げる。mib_cache.json は
 # この値も鍵にするので、古い解析器が作ったキャッシュがアプリの更新後に
 # そのまま使われることがなくなる。
-MIB_PARSER_VERSION = '2026-09-22.2'
+MIB_PARSER_VERSION = '2026-09-22.3'
 
 
 def app_dir() -> str:
@@ -94,6 +94,9 @@ class MIBResolver:
         # 直前の読み込みで mib_cache.json をそのまま使えたか。
         # 読み込み件数の知らせに「（キャッシュ使用）」を付けるかを決める
         self._mib_cache_used = False
+        # モジュール名→そのモジュールが宣言している名前。抽出のあいだに
+        # 貯めて解決で使う。詳しくは _MIB_LOCAL_NAME を見ること
+        self._module_local_names: Dict[str, set] = {}
         self._load_default_mibs()
         self._load_custom_mibs()
     
@@ -389,6 +392,8 @@ class MIBResolver:
             all_definitions = []
             per_file = {}
             unread = set()
+            # 解析し直すたびに取り直す（前回の mibs/ の名前を残さない）
+            self._module_local_names = {}
             for filename in current_files.keys():
                 filepath = os.path.join(mibs_dir, filename)
                 try:
@@ -511,6 +516,17 @@ class MIBResolver:
         _MIB_NAME + r'\s+OBJECT-IDENTITY\b' + _MIB_DEFINITION_BODY
         + _MIB_ASSIGNMENT,
     )
+    # そのモジュールが宣言している名前。上の抽出は `::= { 親 添字 }` の形
+    # しか拾わないので、実 MIB にある複数添字の右辺（`::= { aRoot 0 1 }`）
+    # で宣言された名前は定義の一覧から落ちる。落ちた名前を「このモジュール
+    # には無い」とみなすと、全モジュール共通の表にある別モジュールの同名が
+    # 親になり、その子がよその名前空間へ入る（実測: A-MIB の aAlarm が
+    # B-MIB の 1.3.6.1.4.1.2222.1 に登録され、B ベンダーの OID で来た Trap に
+    # 他社の名前が出た）。OID を決められなくても「名前 + 型キーワード」の
+    # 並びは残るので、そちらから宣言の有無だけを拾う。
+    _MIB_LOCAL_NAME = (_MIB_NAME + r'\s+(?:OBJECT\s+IDENTIFIER|OBJECT-TYPE'
+                       r'|NOTIFICATION-TYPE|MODULE-IDENTITY'
+                       r'|OBJECT-IDENTITY)\b')
 
     @staticmethod
     def _blank_comments_and_strings(text: str) -> str:
@@ -696,7 +712,16 @@ class MIBResolver:
                             for i, h in enumerate(headers)]
             else:
                 sections = [(os.path.basename(filepath), content)]
+            # そのモジュールが宣言している名前。抽出できた定義だけでは
+            # なく「名前 + 型キーワード」の並びからも集める。詳しくは
+            # _MIB_LOCAL_NAME を見ること
+            local_names = getattr(self, '_module_local_names', None)
+            if local_names is None:
+                # __init__ を通さずに作った（検証用の __new__）ときの保険
+                local_names = self._module_local_names = {}
             for module, text in sections:
+                local_names.setdefault(module, set()).update(
+                    re.findall(self._MIB_LOCAL_NAME, text))
                 for pattern in self._MIB_DEFINITION_PATTERNS:
                     # DOTALL が要る。定義は複数行にまたがるので、`.` が改行を
                     # 拾わないと型キーワードから ::= まで届かない
@@ -731,6 +756,14 @@ class MIBResolver:
         同名を使わずに次の回を待つ。同じモジュールに無い親（IMPORTS）は
         これまでどおりモジュールをまたいで探す。
 
+        「同じモジュールにあるか」は、抽出できた定義だけでなく
+        _MIB_LOCAL_NAME で集めた宣言も見る。そのモジュールの宣言が抽出から
+        落ちていると（複数添字の右辺など）、よその同名が親になって子が別
+        ベンダーの名前空間へ入るため（実測）。宣言はあるが OID が決まらない
+        親の子は、最後まで解決しないまま残る。利用者の決定（2026-09-20）に
+        より、どのモジュールの親か確定できないときは名前を付けず OID の
+        まま出す。諦めた件数は標準出力へ 1 行知らせる。
+
         残る制限: 2 つのモジュールが同じ名前を定義し、第三のモジュールが
         その一方を IMPORTS しているとき、IMPORTS を見ていないのでどちらを
         指すか決められず、後に解決した方になる。「後に解決した方」は
@@ -751,6 +784,11 @@ class MIBResolver:
         declared = {}
         for name, _, _, module in definitions:
             declared.setdefault(module, set()).add(name)
+        # 抽出から落ちた宣言（複数添字の右辺など）も「そのモジュールの
+        # 宣言」として数える。詳しくは _MIB_LOCAL_NAME を見ること
+        local_names = getattr(self, '_module_local_names', {})
+        for module in declared:
+            declared[module] |= local_names.get(module, set())
         in_module = {}
         resolved = {}
         pending = list(definitions)
@@ -777,6 +815,20 @@ class MIBResolver:
                 # これ以上どれも解決できない（親がどこにも無い）
                 break
             pending = still_pending
+
+        # 残ったもののうち、よそのモジュールの同名を親にすれば解決できた
+        # ものの数。利用者の決定（2026-09-20）により、どのモジュールの親か
+        # 確定できないときは名前を付けずに OID のまま出すので、ここは
+        # 「黙って捨てた件数」になる。判断に使った条件と件数を 1 行残す
+        gave_up = sum(1 for _, parent, _, module in pending
+                      if parent != 'enterprises' and parent in declared[module]
+                      and parent in known)
+        if gave_up:
+            print(f"[MIBResolver] 親の名前を自分のモジュールで解決できない"
+                  f"定義が {gave_up}件ありました。同じ名前が別のモジュールに"
+                  f"もありますが、どちらの親か決められないので、この定義は"
+                  f"解決せず OID のまま表示します（よその名前が付くのを"
+                  f"避けるため）")
 
         return resolved
 
