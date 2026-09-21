@@ -28,6 +28,16 @@ else 0) を取り、cursor_col = min(logical_col, cols - 1)、折り返し待ち
 logical_col >= 新しい cols のときだけ残す。桁が広がったときは折り返し
 待ちを解いて、カーソルを旧桁の位置へ進める ('ABCD' のあとの 'X' が
 5 桁目に入る)。
+
+追記 (8 周目): 桁が狭くなる側は持ち越さないことにした。持ち越すと
+次の 1 文字が _linefeed(from_wrap=True) を呼び、その切り詰めが
+「新しい (狭い) 桁」で行を切って、右端の外に書かれていた
+旧桁 - 新桁 文字が画面・文書・コピー・全ログ保存から消える。
+失う量が直る量 (1 文字) より大きいので、狭める側は元の振る舞いへ
+戻した。それに合わせて test_narrowing_keeps_the_pending_wrap は
+test_narrowing_drops_the_pending_wrap へ期待ごと書き換えてある。
+欠落そのものは tests/test_terminal_resize_narrowing_keeps_columns.py
+で見ている。
 """
 import os
 import sys
@@ -83,13 +93,19 @@ class ResizePendingWrapTest(unittest.TestCase):
         feed(s, "X")
         self.assertEqual(s.text()[0], "ABCDX")
 
-    def test_narrowing_keeps_the_pending_wrap(self):
-        """桁が狭くなったときは、折り返し待ちのまま次の行へ送ること。"""
+    def test_narrowing_drops_the_pending_wrap(self):
+        """桁が狭くなったときは、折り返し待ちを落とすこと。
+
+        持ち越すと次の 1 文字が _linefeed(from_wrap=True) を呼び、
+        その切り詰めが「新しい桁」で行を切って、右端の外に書かれて
+        いた 旧桁 - 新桁 文字が消える
+        (tests/test_terminal_resize_narrowing_keeps_columns.py)。
+        """
         s = feed(Screen(24, 80), "-" * 80)
         s.set_size(24, 60)
-        self.assertTrue(s._pending_wrap, "折り返し待ちが落ちている")
-        feed(s, "continued")
-        self.assertEqual(s.text()[1], "continued")
+        self.assertFalse(s._pending_wrap, "折り返し待ちを持ち越している")
+        feed(s, "!")
+        self.assertEqual(s.text()[0], "-" * 59 + "!" + "-" * 20)
 
     def test_a_resize_without_a_pending_wrap_still_clamps_the_cursor(self):
         """折り返し待ちでないときの桁の丸めは、これまでどおりであること。"""

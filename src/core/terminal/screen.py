@@ -303,14 +303,20 @@ class Screen(object):
         # 桁で丸める前に論理位置へ直しておかないと、右端ちょうどまで
         # 書いて出力が止まっている瞬間に窓の大きさや文字の大きさを変え
         # たとき、続きの 1 文字目が右端の文字を上書きして黙って消す
+        was_cols = self.cols
         logical_col = self.cursor_col + (1 if self._pending_wrap else 0)
         self.rows, self.cols = rows, cols
         self.scroll_top, self.scroll_bottom = 0, rows - 1
         self.cursor_row = min(self.cursor_row, rows - 1)
         self.cursor_col = min(logical_col, cols - 1)
         # 桁が広がったら折り返す必要が無くなるので、待ちを解いて旧桁の
-        # 位置から続ける。桁が同じか狭いときは待ちのまま持ち越す
-        self._pending_wrap = self._pending_wrap and logical_col >= cols
+        # 位置から続ける。桁が狭くなるときも解く。持ち越すと次の 1 文字
+        # が _linefeed(from_wrap=True) を呼び、その中の切り詰めが「新しい
+        # 桁」で行を切って、右端の外に書かれていた 旧桁 - 新桁 文字が
+        # 画面からも文書からも消える。持ち越しが要るのは、直したかった
+        # 「右端の 1 文字が上書きされる」が起きる行数だけの変更
+        self._pending_wrap = (self._pending_wrap and logical_col >= cols
+                              and cols >= was_cols)
         self.dirty = set(range(rows))
         self._reflowed = True
 
