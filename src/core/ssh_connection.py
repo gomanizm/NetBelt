@@ -1,5 +1,7 @@
 """SSH接続管理"""
+import base64
 import codecs
+import hashlib
 import os
 import paramiko
 import tempfile
@@ -73,7 +75,50 @@ def unreadable_known_hosts_lines(path):
     return broken
 
 
-def _save_known_hosts(client, known_hosts_path):
+def _key_fingerprint(key):
+    """鍵の指紋を OpenSSH と同じ形（SHA256:...）で返す"""
+    digest = hashlib.sha256(key.asbytes()).digest()
+    return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
+
+
+def _refuse_conflicting_host_key(path, hostname, key):
+    """ディスクに同じ接続先の別の鍵があれば、上書きせず中止する。
+
+    missing_host_key が呼ばれるのは「読み込んだ時点でこの接続先の鍵を
+    持っていなかった」ときだけなので、ここでディスクに鍵があるなら、
+    自分が読んだあとに別の NetBelt（または別の接続）が保存したもの。
+    そのまま保存すると、paramiko の書き出しが先に保存された鍵をすべて
+    自分の鍵で置き換えてしまい（実測: 3 行とも後から来た鍵になる）、
+    先に登録した機器は次から BadHostKeyException で繋がらなくなる。
+    黙って上書きするより、食い違いを伝えて止める。
+
+    Raises:
+        HostKeyMismatchError: 同じ接続先に別の鍵が保存済みのとき
+    """
+    path = Path(str(path))
+    if not path.exists():
+        return
+    disk = paramiko.HostKeys()
+    disk.load(str(path))
+    stored = disk.lookup(hostname)
+    if stored is None or disk.check(hostname, key):
+        return
+    raise HostKeyMismatchError(
+        "ホスト鍵が食い違います。%s の鍵として別の鍵が known_hosts に"
+        "保存されているため、上書きせず接続を中止しました。\n"
+        "  known_hosts の鍵: %s\n"
+        "  今回提示された鍵: %s %s\n"
+        "%s\n"
+        "機器を入れ替えたなどで変更が意図したものなら、known_hosts の"
+        "該当行を削除してから接続し直してください。"
+        % (hostname,
+           " / ".join("%s %s" % (name, _key_fingerprint(stored[name]))
+                      for name in sorted(stored.keys())),
+           key.get_name(), _key_fingerprint(key),
+           path))
+
+
+def _save_known_hosts(client, known_hosts_path, verify=None):
     """client が持つホスト鍵を known_hosts へ書き戻す。
 
     paramiko 4.0.0 の SSHClient.save_host_keys は保存先を "w" で開いて
@@ -86,9 +131,17 @@ def _save_known_hosts(client, known_hosts_path):
     書く直前に既存のファイルを読み直して自分の鍵と合流させ、一時
     ファイルへ書いてから os.replace で差し替える。差し替えは不可分な
     ので、途中で落ちても前の known_hosts がそのまま残る。
+
+    Args:
+        verify: (接続先名, 提示された鍵)。渡すと、書き込む前に同じ
+            接続先の別の鍵がディスクに無いかを錠の中で確かめる
     """
     path = Path(str(known_hosts_path))
     with _known_hosts_guard(path.parent):
+        if verify is not None:
+            # 確かめてから書くまでを錠の中で通す。外で見ると、その間に
+            # 別のプロセスが保存した鍵を見落とす
+            _refuse_conflicting_host_key(path, verify[0], verify[1])
         preserved = []
         if path.exists():
             # 他の接続がこの間に保存した鍵を取り込む
@@ -129,7 +182,13 @@ class _TofuHostKeyPolicy(paramiko.MissingHostKeyPolicy):
     def missing_host_key(self, client, hostname, key):
         client.get_host_keys().add(hostname, key.get_name(), key)
         try:
-            _save_known_hosts(client, self._known_hosts_path)
+            _save_known_hosts(client, self._known_hosts_path,
+                              verify=(hostname, key))
+        except HostKeyMismatchError:
+            # 食い違いは「保存できなかった」ではなく「保存してはいけない」。
+            # 警告で済ませず、そのまま接続を中止させる（client はこのあと
+            # 接続処理の後始末で閉じられる）
+            raise
         except Exception as e:
             # 黙って続けると、次回もこの機器の鍵を検証できないまま任意の
             # 鍵を受け入れる。接続は続けるが、そのことを画面に出す
@@ -142,6 +201,10 @@ class _TofuHostKeyPolicy(paramiko.MissingHostKeyPolicy):
 
 class HostKeyStoreError(Exception):
     """既知ホスト鍵の保存場所を読めない。検証できない状態で認証へ進まない"""
+
+
+class HostKeyMismatchError(Exception):
+    """同じ接続先の別の鍵が known_hosts にある。上書きせず接続を中止する"""
 
 
 class SSHConnection(QObject):
@@ -540,6 +603,10 @@ class SSHConnection(QObject):
             
             return True
             
+        except HostKeyMismatchError as e:
+            # 文言は保存側が組み立てている（どちらの鍵かを含む）ので、
+            # そのまま出す
+            return self._fail(str(e), client, transports)
         except paramiko.AuthenticationException:
             return self._fail(self._auth_failure_message(), client, transports)
         except paramiko.BadHostKeyException:

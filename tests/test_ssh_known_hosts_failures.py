@@ -81,7 +81,10 @@ class SshKnownHostsFailuresTest(unittest.TestCase):
         key = mock.Mock()
         key.get_name.return_value = "ssh-ed25519"
 
-        policy.missing_host_key(client, "192.0.2.1", key)
+        # known_hosts に無い接続先で試す。既にある接続先に別の鍵を出すのは
+        # 「保存できない」ではなく「鍵の食い違い」で、こちらは接続を中止する
+        # （test_known_hosts_key_conflict.py）。ここで見たいのは保存の失敗
+        policy.missing_host_key(client, "192.0.2.2", key)
 
         self.assertTrue(any("known_hosts" in o for o in output),
                         "保存の失敗を画面に出していない: %s" % output)
@@ -95,7 +98,8 @@ class SshKnownHostsFailuresTest(unittest.TestCase):
         key = mock.Mock()
         key.get_name.return_value = "ssh-ed25519"
 
-        policy.missing_host_key(client, "192.0.2.1", key)
+        # 上と同じ理由で、known_hosts に無い接続先で試す
+        policy.missing_host_key(client, "192.0.2.2", key)
 
         self.assertEqual(output, [])
 
