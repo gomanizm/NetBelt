@@ -1368,6 +1368,17 @@ class MainWindow(QMainWindow):
         commands = group.get("auto_commands", [])
         if not commands:
             return
+        # 送る直前にもう一度、文字列だけの list かを確かめる。読み込みと
+        # 保存の経路は同じ検査をしているが、そこを通らずにメモリへ入った
+        # 値（外部から config を差し替えられた場合など）をそのまま list()
+        # すると、文字列は 1 文字ずつ、辞書はキーだけが実機へ送られる
+        if not ConfigManager._is_valid_auto_commands(commands):
+            print(f"[WARNING] グループ '{group.get('name')}' の自動実行コマンドが"
+                  f"文字列の配列ではないため送信しません")
+            self.status_bar.showMessage(
+                f"{device_name}: グループの自動実行コマンドの形式が正しくない"
+                f"ため送信しません")
+            return
         from PyQt6.QtCore import QTimer
         # シェルのプロンプトが出るまで少し待ってから送信する。待っている間に
         # 切断・再接続されていたら始めない（同名の新しい接続へ前の接続向けの

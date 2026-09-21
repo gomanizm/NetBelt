@@ -1053,9 +1053,20 @@ class ConfigManager:
         if self.get_group(group_name):
             return False
 
+        # 読み込み・set_group_auto_commands と同じ検査をここでも行う。
+        # ここだけ素通しにすると、そのセッションの間は
+        # MainWindow._run_auto_commands が壊れた値をそのまま list() して
+        # 送るので、接続した瞬間に 1 文字ずつが実機へ届く（実測）。
+        # None や空の値は「自動実行なし」なので今までどおり [] にそろえる
+        commands = auto_commands or []
+        if not self._is_valid_auto_commands(commands):
+            print(f"エラー: グループ '{group_name}' の自動実行コマンドは"
+                  f"文字列の配列で指定してください")
+            return False
+
         new_group = {
             "name": group_name,
-            "auto_commands": auto_commands or [],
+            "auto_commands": commands,
             "devices": []
         }
 
