@@ -232,19 +232,25 @@ class SNMPPanel(QWidget):
         # 接続設定
         conn_group = QGroupBox("接続設定")
         conn_layout = QGridLayout()
+        # ホスト・ポート・バージョンを 1 列に縦へ並べる。ポートをホストの
+        # 右隣に置くと、横に伸びるホスト欄に押されてポートだけが右へ出て
+        # いき（実測: 幅 520 でホストの右端より 113px 右）、窓を狭めた場面で
+        # 最初に切れて見えなくなる
         conn_layout.addWidget(QLabel("ホスト:"), 0, 0)
         self.host_edit = QLineEdit()
         conn_layout.addWidget(self.host_edit, 0, 1)
-        conn_layout.addWidget(QLabel("ポート:"), 0, 2)
+        conn_layout.addWidget(QLabel("ポート:"), 1, 0)
         self.port_spinbox = QSpinBox()
         self.port_spinbox.setRange(1, 65535)
         self.port_spinbox.setValue(161)
-        conn_layout.addWidget(self.port_spinbox, 0, 3)
-        conn_layout.addWidget(QLabel("バージョン:"), 1, 0)
+        # 1 列ぶんに間延びさせない（FTP/TFTP/SFTP のポート欄と同じ幅）
+        self.port_spinbox.setMaximumWidth(100)
+        conn_layout.addWidget(self.port_spinbox, 1, 1)
+        conn_layout.addWidget(QLabel("バージョン:"), 2, 0)
         self.version_combo = QComboBox()
         self.version_combo.addItems(["v2c", "v1", "v3"])
         self.version_combo.currentTextChanged.connect(self._on_version_changed)
-        conn_layout.addWidget(self.version_combo, 1, 1)
+        conn_layout.addWidget(self.version_combo, 2, 1)
         conn_group.setLayout(conn_layout)
         layout.addWidget(conn_group)
         
