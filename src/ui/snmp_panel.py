@@ -211,15 +211,16 @@ class SNMPPanel(QWidget):
         
         # メインタブ
         main_tabs = QTabWidget()
-        
+        self.main_tabs = main_tabs
+
         # GET/WALKタブ
         get_walk_widget = self._create_get_walk_tab()
         main_tabs.addTab(get_walk_widget, "GET / WALK")
-        
+
         # Trap受信タブ
         trap_widget = self._create_trap_tab()
         main_tabs.addTab(trap_widget, "Trap受信")
-        
+
         layout.addWidget(main_tabs)
         self.setLayout(layout)
     
@@ -357,8 +358,11 @@ class SNMPPanel(QWidget):
         self.result_table.setAlternatingRowColors(True)
         layout.addWidget(self.result_table)
         
-        # ステータス
+        # ステータス。「途中まで: N件（… のため中断。全部ではありません）」
+        # のような長い文面が入るので折り返す。折り返さないと、その文面が
+        # 出た瞬間にタブの最小幅が伸び、窓を縮められなくなる
         self.status_label = QLabel("準備完了")
+        self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
         
         widget.setLayout(layout)
@@ -418,10 +422,14 @@ class SNMPPanel(QWidget):
         self.trap_v3_engine_ids_edit.setPlaceholderText("8000000001020304")
         trap_layout.addWidget(self.trap_v3_engine_ids_edit, 6, 1, 1, 3)
 
-        trap_layout.addWidget(QLabel(
+        # 折り返さないと、この 1 行ぶんの幅がタブの最小幅になり（実測
+        # 796px）、窓をそこまでしか縮められない。はみ出した右側のボタンは
+        # 窓の外へ出て押せなくなる
+        engine_id_note = QLabel(
             "v3 Trap は送信元機器の EngineID を登録しないと受信できません。"
-            "1行に1つ、16進で入力してください（Cisco IOS なら show snmp engineID）。"),
-            7, 0, 1, 4)
+            "1行に1つ、16進で入力してください（Cisco IOS なら show snmp engineID）。")
+        engine_id_note.setWordWrap(True)
+        trap_layout.addWidget(engine_id_note, 7, 0, 1, 4)
 
         trap_group.setLayout(trap_layout)
         layout.addWidget(trap_group)
@@ -452,6 +460,9 @@ class SNMPPanel(QWidget):
         trap_status_group = QGroupBox("受信状態")
         trap_status_layout = QVBoxLayout()
         self.trap_status_label = QLabel("🔴 停止中")
+        # ファイアウォール許可の結果など長い文面が入るので折り返す（理由は
+        # GET/WALK の status_label と同じ）
+        self.trap_status_label.setWordWrap(True)
         self.trap_status_label.setStyleSheet("color: #f44336; font-weight: bold; font-size: 14px;")
         trap_status_layout.addWidget(self.trap_status_label)
         trap_status_group.setLayout(trap_status_layout)

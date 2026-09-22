@@ -408,8 +408,11 @@ class SyslogPanel(QWidget):
         
         layout.addWidget(self.table_view)
         
-        # ステータスバー
+        # ステータスバー。ファイアウォール許可の結果など長い文面が入るので
+        # 折り返す。折り返さないと、その文面が出た瞬間にパネルの最小幅が
+        # 伸び、窓を縮められなくなる
         self.status_label = QLabel("メッセージ: 0")
+        self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
         
         self.setLayout(layout)
