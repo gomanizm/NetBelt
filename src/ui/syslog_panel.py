@@ -387,7 +387,10 @@ class SyslogPanel(QWidget):
         # フィルタエリア
         filter_group = self._create_filter_area()
         layout.addWidget(filter_group)
-        
+
+        # 表示操作ボタン（一覧のすぐ上に左寄せ1行。SNMP の Trap 受信と同じ形）
+        layout.addLayout(self._create_list_buttons())
+
         # テーブルビュー
         self.table_view = QTableView()
         self.table_view.setModel(self.proxy_model)
@@ -452,19 +455,11 @@ class SyslogPanel(QWidget):
         toolbar.addAction(self.pause_action)
         
         toolbar.addSeparator()
-        
-        # クリアボタン
-        clear_action = QAction("🗑 クリア", self)
-        clear_action.triggered.connect(self._clear_messages)
-        toolbar.addAction(clear_action)
-        
-        # エクスポートボタン
-        export_action = QAction("💾 エクスポート", self)
-        export_action.triggered.connect(self._export_messages)
-        toolbar.addAction(export_action)
-        
-        toolbar.addSeparator()
-        
+
+        # クリアとエクスポートはツールバーに置かない。他の画面と同じく
+        # 一覧のすぐ上のボタン行（_create_list_buttons）へ移した。
+        # ここに残すのは受信まわり（プロトコルとポート・一時停止）だけ
+
         # 自動スクロールチェックボックス
         self.auto_scroll_checkbox = QCheckBox("自動スクロール")
         self.auto_scroll_checkbox.setChecked(self.auto_scroll)
@@ -473,6 +468,23 @@ class SyslogPanel(QWidget):
         
         return toolbar
     
+    def _create_list_buttons(self):
+        """一覧のすぐ上に置く、左寄せ1行のボタン行を作る
+
+        押したときの動きはツールバーにあったときと同じ（クリアは確認を
+        出し、エクスポートは記録中のファイルを断る）。
+        """
+        row = QHBoxLayout()
+        self.export_button = QPushButton("エクスポート")
+        self.export_button.clicked.connect(self._export_messages)
+        row.addWidget(self.export_button)
+        self.clear_button = QPushButton("クリア")
+        self.clear_button.clicked.connect(self._clear_messages)
+        row.addWidget(self.clear_button)
+        # 余った幅は行末の空きへ（無いとボタン自身が横へ間延びする）
+        row.addStretch()
+        return row
+
     def _create_filter_area(self):
         """フィルタエリアの作成"""
         group = QGroupBox("フィルタ")

@@ -349,13 +349,15 @@ class SNMPPanel(QWidget):
         self.stop_button.clicked.connect(self._on_stop_clicked)
         self.stop_button.setVisible(False)
         btn_layout.addWidget(self.stop_button)
-        btn_layout.addStretch()
         self.export_button = QPushButton("エクスポート")
         self.export_button.clicked.connect(self._on_export_clicked)
         btn_layout.addWidget(self.export_button)
         self.clear_button = QPushButton("クリア")
         self.clear_button.clicked.connect(self._on_clear_clicked)
         btn_layout.addWidget(self.clear_button)
+        # 余った幅は行末の空きへ。ボタンの間に空きを挟むとエクスポートと
+        # クリアだけが右端へ飛ばされ、画面ごとに置き場所が変わってしまう
+        btn_layout.addStretch()
         layout.addLayout(btn_layout)
         
         # 結果テーブル
@@ -488,6 +490,9 @@ class SNMPPanel(QWidget):
         self.trap_clear_button = QPushButton("クリア")
         self.trap_clear_button.clicked.connect(self._on_trap_clear_clicked)
         btn_layout.addWidget(self.trap_clear_button)
+        # 余った幅は行末の空きへ。無いとボタン自身が横へ間延びする
+        # （実測: 幅 1100 で 1 個あたり 264px）
+        btn_layout.addStretch()
         layout.addLayout(btn_layout)
         
         # TrapツリーView
