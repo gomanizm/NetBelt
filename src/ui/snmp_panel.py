@@ -16,6 +16,7 @@ import math
 import os
 import re
 import tempfile
+from core import save_defaults
 from core.mib_resolver import get_resolver, MIBResolver
 from core.snmp_manager import v3_password_error
 
@@ -803,7 +804,7 @@ class SNMPPanel(QWidget):
         file_path, _ = QFileDialog.getSaveFileName(
             self,
             "SNMP結果をエクスポート",
-            default_name,
+            save_defaults.initial_path(self.config_manager, default_name),
             "テキストファイル (*.txt);;CSVファイル (*.csv);;JSONファイル (*.json)"
         )
         if not file_path:
@@ -821,6 +822,8 @@ class SNMPPanel(QWidget):
                 self._export_results_to_json(file_path, results, host, reason)
             else:
                 self._export_results_to_txt(file_path, results, host, reason)
+            # 書き終えてから覚える（取り消し・失敗では変えない）
+            save_defaults.remember(self.config_manager, file_path)
             QMessageBox.information(self, "成功", "SNMP結果をエクスポートしました:\n" + file_path)
         except Exception as e:
             QMessageBox.critical(self, "エラー",
@@ -1167,13 +1170,14 @@ class SNMPPanel(QWidget):
             return
 
         # ファイル保存ダイアログ
+        default_name = f"trap_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
         file_path, selected_filter = QFileDialog.getSaveFileName(
             self,
             "Trapログをエクスポート",
-            f"trap_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+            save_defaults.initial_path(self.config_manager, default_name),
             "テキストファイル (*.txt);;CSVファイル (*.csv);;JSONファイル (*.json)"
         )
-        
+
         if not file_path:
             return
 
@@ -1189,7 +1193,9 @@ class SNMPPanel(QWidget):
                 self._export_to_json(file_path, traps)
             else:  # .txt or other
                 self._export_to_txt(file_path, traps)
-            
+
+            # 書き終えてから覚える（取り消し・失敗では変えない）
+            save_defaults.remember(self.config_manager, file_path)
             QMessageBox.information(self, "成功", f"Trapログをエクスポートしました:\n{file_path}")
         except Exception as e:
             QMessageBox.critical(self, "エラー",

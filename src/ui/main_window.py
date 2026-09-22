@@ -344,7 +344,7 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self.device_tree)
         
         # 右側: ターミナル
-        self.terminal_widget = TerminalWidget()
+        self.terminal_widget = TerminalWidget(config_manager=self.config_manager)
         self.terminal_widget.tab_closed.connect(self._on_tab_closed)
         self.terminal_widget.current_tab_changed.connect(
             self._on_terminal_tab_changed)

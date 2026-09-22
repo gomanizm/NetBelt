@@ -13,6 +13,8 @@ import json
 import os
 import tempfile
 
+from core import save_defaults
+
 
 def _write_text_file_atomically(filename, write_body):
     """保存先を壊さずにテキストを書き出す
@@ -709,9 +711,10 @@ class SyslogPanel(QWidget):
 
     def _export_messages(self):
         """メッセージをエクスポート"""
+        default_name = f"syslog_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
         filename, _ = QFileDialog.getSaveFileName(
             self, "メッセージをエクスポート",
-            f"syslog_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+            save_defaults.initial_path(self.config_manager, default_name),
             "テキストファイル (*.txt);;JSONファイル (*.json);;すべてのファイル (*.*)"
         )
 
@@ -744,6 +747,8 @@ class SyslogPanel(QWidget):
 
                     _write_text_file_atomically(filename, write_lines)
 
+                # 書き終えてから覚える（取り消し・失敗では変えない）
+                save_defaults.remember(self.config_manager, filename)
                 QMessageBox.information(self, "成功", f"メッセージを {filename} にエクスポートしました。")
             except Exception as e:
                 QMessageBox.critical(self, "エラー", f"エクスポートに失敗しました: {e}")
@@ -826,9 +831,10 @@ class SyslogPanel(QWidget):
             if msg:
                 messages.append(msg)
 
+        default_name = f"syslog_selected_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
         filename, _ = QFileDialog.getSaveFileName(
             self, "選択行を保存",
-            f"syslog_selected_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+            save_defaults.initial_path(self.config_manager, default_name),
             "テキストファイル (*.txt);;すべてのファイル (*.*)"
         )
 
@@ -842,6 +848,8 @@ class SyslogPanel(QWidget):
 
                 _write_text_file_atomically(filename, write_lines)
 
+                # 書き終えてから覚える（取り消し・失敗では変えない）
+                save_defaults.remember(self.config_manager, filename)
                 QMessageBox.information(self, "成功", f"選択行を {filename} に保存しました。")
             except Exception as e:
                 QMessageBox.critical(self, "エラー", f"保存に失敗しました: {e}")

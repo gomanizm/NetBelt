@@ -308,6 +308,12 @@ def app_data_dir():
     return new_dir
 
 
+# 前回保存したフォルダの置き場所（settings.paths.last_save_dir）。
+# 保存ダイアログを前回と同じ場所から開くためだけに使う（core/save_defaults.py）
+_LAST_SAVE_DIR_SECTION = "paths"
+_LAST_SAVE_DIR_KEY = "last_save_dir"
+
+
 class ConfigManager:
     """設定ファイルの読み書きを管理するクラス"""
     
@@ -1618,6 +1624,26 @@ class ConfigManager:
 
         return section
     
+    def get_last_save_dir(self):
+        """前回保存したフォルダを返す（覚えていなければ None）
+
+        保存ダイアログを前回と同じ場所から開くためだけの値。覚えるのは
+        フォルダのパス 1 つで、ファイル名も機器の情報も入れない。
+        config.json は手で編集できるので、文字列以外が入っていたら
+        覚えていない扱いにする（os.path.isdir へ渡して落とさない）。
+        """
+        value = self._settings_section(_LAST_SAVE_DIR_SECTION).get(
+            _LAST_SAVE_DIR_KEY)
+        if isinstance(value, str) and value:
+            return value
+        return None
+
+    def set_last_save_dir(self, directory) -> bool:
+        """前回保存したフォルダを覚える"""
+        self._settings_section(_LAST_SAVE_DIR_SECTION,
+                               create=True)[_LAST_SAVE_DIR_KEY] = directory
+        return self.save_config()
+
     def get_server_settings(self, key):
         """サーバー設定 dict を返す（key='tftp_server'/'ftp_server'/'sftp_server'）。"""
         return self._settings_section(key)

@@ -638,8 +638,12 @@ class TerminalWidget(QWidget):
     # 端末の行数・桁数が変わった（機器名, 桁, 行）。機器への通知に使う
     terminal_resized = pyqtSignal(str, int, int)
 
-    def __init__(self):
+    def __init__(self, config_manager=None):
         super().__init__()
+        # 保存ダイアログを前回保存した場所から開くために持つ（core/save_defaults.py）。
+        # 端末の外観設定などは MainWindow 側から渡されるので、ここでは
+        # 受け取らなくても動く（省略時はこれまでどおり cwd/logs から始まる）
+        self.config_manager = config_manager
         self._terminals: Dict[str, InteractiveTerminal] = {}  # 機器名 -> ターミナル
         self._log_files: Dict[str, object] = {}  # 機器名 -> ログファイルハンドル
         # 停止したが、停止より前に受信してまだ描いていない分を書き終えていない
@@ -1873,7 +1877,6 @@ class TerminalWidget(QWidget):
         """現在アクティブなターミナルのログを保存"""
         from PyQt6.QtWidgets import QFileDialog, QMessageBox
         from datetime import datetime
-        import os
         
         # 現在のタブを取得
         current_index = self.tab_widget.currentIndex()
@@ -1931,16 +1934,17 @@ class TerminalWidget(QWidget):
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             default_filename = f"{tab_name}_{timestamp}.log"
 
-            logs_dir = self._default_log_dir()
-
-            # ファイル保存ダイアログを表示
+            # ファイル保存ダイアログを表示。前回保存した場所を覚えていれば
+            # そこから、無ければこれまでどおり cwd/logs から始める
+            from core import save_defaults
             file_path, _ = QFileDialog.getSaveFileName(
                 self,
                 "ログファイル保存",
-                os.path.join(logs_dir, default_filename),
+                save_defaults.initial_path(self.config_manager, default_filename,
+                                           self._default_log_dir()),
                 "ログファイル (*.log);;テキストファイル (*.txt);;すべてのファイル (*.*)"
             )
-            
+
             if file_path:
                 in_use_by = self._recording_device_using(file_path)
                 if in_use_by is not None:
@@ -1959,6 +1963,8 @@ class TerminalWidget(QWidget):
                     # 走っているワーカーの始末も要るので、ダイアログに任せる
                     dialog.release()
                 if saved:
+                    # 書き終えてから覚える（取り消し・失敗では変えない）
+                    save_defaults.remember(self.config_manager, file_path)
                     QMessageBox.information(
                         self,
                         "ログ保存完了",
@@ -1969,7 +1975,6 @@ class TerminalWidget(QWidget):
         """現在アクティブなターミナルのログ記録を開始"""
         from PyQt6.QtWidgets import QFileDialog, QMessageBox
         from datetime import datetime
-        import os
         
         # 現在のタブを取得
         current_index = self.tab_widget.currentIndex()
@@ -2001,16 +2006,17 @@ class TerminalWidget(QWidget):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         default_filename = f"{tab_name}_{timestamp}.log"
 
-        logs_dir = self._default_log_dir()
-
-        # ファイル保存ダイアログを表示
+        # ファイル保存ダイアログを表示。エクスポートと同じ「前回保存した場所」
+        # を使う（利用者にとってはどちらもログファイルの置き場所）
+        from core import save_defaults
         file_path, _ = QFileDialog.getSaveFileName(
             self,
             "ログ記録ファイル選択",
-            os.path.join(logs_dir, default_filename),
+            save_defaults.initial_path(self.config_manager, default_filename,
+                                       self._default_log_dir()),
             "ログファイル (*.log);;テキストファイル (*.txt);;すべてのファイル (*.*)"
         )
-        
+
         if file_path:
             in_use_by = self._recording_device_using(file_path)
             if in_use_by is not None:
@@ -2036,6 +2042,8 @@ class TerminalWidget(QWidget):
                 self._log_bytes[tab_name] = 0   # 'w' で切り詰めたので 0 から
                 from core import log_recording
                 log_recording.start(tab_name, file_path)
+                # 開けたところまで来たら覚える（開けなければ except へ抜ける）
+                save_defaults.remember(self.config_manager, file_path)
                 
                 # ターミナルの記録フラグを設定
                 if isinstance(current_widget, InteractiveTerminal):
