@@ -435,16 +435,17 @@ class ConfigManager:
 
     # 「その画面で入れ直してください」と案内してよいセクション。
     # 入れ直せるのは、settings のパスワードを実際に読み書きしている画面が
-    # あるものだけ。FTPServerPanel は config_manager を受け取り
-    # _restore_settings() / set_server_settings() で settings.ftp_server を
-    # 読み書きするが、SFTPServerPanel は config_manager を受け取らず
-    # （ui/sftp_server_panel.py の __init__(self, parent=None)）、
-    # settings.sftp_server を読みも書きもしない。案内どおりパネルを開いても
-    # 設定ファイルのその値を直す場所が無いので、ここには入れない。
+    # あるものだけ。FTPServerPanel は _restore_settings() /
+    # set_server_settings() で settings.ftp_server を読み書きするが、
+    # SFTPServerPanel は settings.sftp_server を読みも書きもしない
+    # （config_manager は受け取るが、使うのは保存先のフォルダの記憶だけ）。
+    # 案内どおりパネルを開いても設定ファイルのその値を直す場所が無いので、
+    # ここには入れない。
     # 暗号化の対象（_ENCRYPTED_SETTING_SECTIONS）からは外さない。手で置かれた
     # 平文をディスクへ残さない性質は、読まれない値でも変えない。
     # SFTP サーバーパネルが settings を読むようになったら sftp_server をここへ戻す
-    # （tests/test_sftp_server_password_notice_target.py が signature で見張っている）。
+    # （tests/test_sftp_server_password_notice_target.py が、そのパネルが
+    # get_server_settings / set_server_settings を呼んでいないかで見張っている）。
     _SETTING_SECTIONS_WITH_EDITOR = ("ftp_server",)
 
     # 復号できなかったときに、どのタブを開けばよいか伝えるための表示名

@@ -11,12 +11,17 @@ SNMPPanel._refuse_if_recording）に合わせる:
   - 端末のログ記録に使われているファイルを選ばれたら断る。差し替えが通れば
     記録済みの内容は失われ、端末は開いたままのハンドルで自分のオフセットから
     書き続けるので、双方のファイルが壊れる。
+  - 保存先のフォルダは core/save_defaults.py へ覚える。利用者から見れば
+    端末・SNMP・Syslog の保存と同じ「ログファイルの置き場所」なので、
+    ここだけ毎回フォルダを辿り直させない（覚える先も 1 つを共有する）。
 """
 import os
 import tempfile
 from datetime import datetime
 
 from PyQt6.QtWidgets import QFileDialog, QMessageBox
+
+from core import save_defaults
 
 # 保存ダイアログの選択肢。中身は素のテキストなので txt と log を出す
 FILE_FILTER = ("テキストファイル (*.txt);;ログファイル (*.log);;"
@@ -57,7 +62,8 @@ def export_log_text(panel, text: str, stem: str,
     """画面に出ているログを 1 つのテキストファイルへ保存する
 
     Args:
-        panel: ダイアログの親にするウィジェット
+        panel: ダイアログの親にするウィジェット。config_manager を持って
+            いれば、前回保存したフォルダの出し入れにも使う
         text: 保存する本文（呼ぶ側が画面から取って渡す）
         stem: 既定のファイル名の頭（"tftp_log" など）
         title: 保存ダイアログと警告の見出し
@@ -65,8 +71,13 @@ def export_log_text(panel, text: str, stem: str,
     Returns:
         保存したパス。取り消したときと保存できなかったときは None。
     """
+    # config_manager を持たない相手（素のウィジェットを渡すテスト等）でも
+    # 保存自体は通す。save_defaults は None を「覚えていない」として扱う
+    config_manager = getattr(panel, "config_manager", None)
     file_path, _ = QFileDialog.getSaveFileName(
-        panel, title, default_file_name(stem), FILE_FILTER)
+        panel, title,
+        save_defaults.initial_path(config_manager, default_file_name(stem)),
+        FILE_FILTER)
     if not file_path:
         return None
 
@@ -89,6 +100,8 @@ def export_log_text(panel, text: str, stem: str,
         QMessageBox.critical(panel, "エラー",
                              "エクスポートに失敗しました: %s" % error)
         return None
+    # 書き終えてから覚える（取り消し・断り・失敗では変えない）
+    save_defaults.remember(config_manager, file_path)
     QMessageBox.information(panel, "成功",
                             "ログを %s にエクスポートしました。" % file_path)
     return file_path

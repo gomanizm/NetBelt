@@ -17,6 +17,15 @@ _SETTING_SECTIONS_WITH_EDITOR として分けた。暗号化の対象
 ディスクへ残さない性質は変えない。復号できなかったこと自体は引き続き知らせるが、
 文面は「この版では読まないので動作に影響しない」に書き分けた。
 
+見張りの書き換え（2026-09-23）: 最後のテストは当初
+SFTPServerPanel.__init__ の signature に config_manager が無いことで
+「settings を読んでいない」を代用していた。サーバーのログのエクスポートも
+保存先のフォルダを覚える（利用者の決定）ことになり、SFTP サーバーパネルも
+他の 2 つと同じ形で config_manager を受け取るようになったため、この代用は
+成り立たない。受け取っても使うのは保存先の記憶だけで、settings.sftp_server
+は読みも書きもしないままなので、見張りを本来の条件
+（get_server_settings / set_server_settings を呼んでいないこと）へ直した。
+
 なお検査役の案は「案内の対象から外す（何も出さない）」だったが、それは既存の
 tests/test_undecryptable_notice_scope.py の
 test_a_settings_only_failure_does_not_send_the_user_to_the_device_editor が
@@ -123,23 +132,31 @@ class SFTPServerPasswordNoticeTargetTest(unittest.TestCase):
                             "SFTP サーバーのパスワードが平文で保存されている")
 
     def test_the_notice_target_matches_which_panel_reads_settings(self):
-        """どの画面が settings を読むかと、案内の対象を一致させておくこと。"""
-        from core.config_manager import ConfigManager
-        from ui.ftp_server_panel import FTPServerPanel
-        from ui.sftp_server_panel import SFTPServerPanel
+        """どの画面が settings を読むかと、案内の対象を一致させておくこと。
 
-        self.assertIn(
-            "config_manager",
-            inspect.signature(FTPServerPanel.__init__).parameters,
-            "前提: FTP サーバーパネルは settings を読み書きする")
+        見張るのは「そのパネルが settings のセクションを読み書きするか」。
+        config_manager を受け取っているかどうかでは代われない: SFTP
+        サーバーパネルは、ログのエクスポート先（前回保存したフォルダ）を
+        覚えるためだけに config_manager を受け取るようになったが、
+        settings.sftp_server は読みも書きもしないままで、案内の対象として
+        正しいのは変わらず FTP だけである。
+        """
+        import ui.ftp_server_panel
+        import ui.sftp_server_panel
+        from core.config_manager import ConfigManager
+
+        ftp_source = inspect.getsource(ui.ftp_server_panel)
+        self.assertIn('get_server_settings("ftp_server")', ftp_source,
+                      "前提: FTP サーバーパネルは settings を読み書きする")
         self.assertIn("ftp_server",
                       ConfigManager._SETTING_SECTIONS_WITH_EDITOR)
 
-        self.assertNotIn(
-            "config_manager",
-            inspect.signature(SFTPServerPanel.__init__).parameters,
-            "SFTP サーバーパネルが settings を読むようになった。"
-            "_SETTING_SECTIONS_WITH_EDITOR へ sftp_server を戻すこと")
+        sftp_source = inspect.getsource(ui.sftp_server_panel)
+        for call in ("get_server_settings", "set_server_settings"):
+            self.assertNotIn(
+                call, sftp_source,
+                "SFTP サーバーパネルが settings を読み書きするようになった。"
+                "_SETTING_SECTIONS_WITH_EDITOR へ sftp_server を戻すこと")
         self.assertNotIn("sftp_server",
                          ConfigManager._SETTING_SECTIONS_WITH_EDITOR)
 

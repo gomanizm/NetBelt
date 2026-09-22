@@ -24,15 +24,21 @@ class SFTPServerPanel(QWidget):
     # メモリを食い潰せるため、頭打ちにする。Syslog パネル（1000件）に合わせた。
     MAX_LOG_LINES = 1000
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, config_manager=None):
         """
         初期化
-        
+
         Args:
             parent: 親ウィジェット
+            config_manager: ログのエクスポート先（前回保存したフォルダ）の
+                出し入れに使う。FTP / TFTP と違い、無ければ新しく作らずに
+                None のまま持つ。このパネルは settings.sftp_server を読み
+                書きしないので作る理由が無く、作ると単体で組み立てただけで
+                利用者の config.json を掴んでしまう
         """
         super().__init__(parent)
-        
+
+        self.config_manager = config_manager
         self.sftp_server = SFTPServerManager(self)
         self.connected_clients = 0
         
