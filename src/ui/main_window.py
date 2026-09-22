@@ -2769,6 +2769,9 @@ for details.
         # モーダルを開くので、各パネルにも同じ印を渡す
         self._shutting_down = True
         self._tell_panels_closing()
+        # 機器一覧の定期確認（1 秒ごとのシリアルポート走査）を止める。
+        # 閉じたあとも鳴り続け、終了処理の途中で機器一覧を組み直す
+        self.device_tree.stop_serial_monitor()
         # レイアウト（スプリッター幅・選択タブ）を保存
         self._save_layout()
         # Syslogレシーバーを停止

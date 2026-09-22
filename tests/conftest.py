@@ -90,6 +90,47 @@ def no_startup_update_check():
         yield
 
 
+@pytest.fixture(autouse=True)
+def stop_leftover_serial_monitors():
+    """テストが残した窓の「シリアルポート定期確認」を、次のテストへ渡さない。
+
+    DeviceTree は作られた時点で 1 秒ごとの QTimer を起こし、シリアルポート
+    の増減を見る（_check_serial_ports）。テストは窓を作っては置き去りに
+    するので、GC に拾われるまで（拾われない窓もある）鳴り続ける。鳴って
+    いる最中に GC が別の窓を捨てると、走っているスロットの足元で C++ の
+    オブジェクトが消えてプロセスごと落ちる。
+
+    実測（QT_QPA_PLATFORM=offscreen で pytest -q -p no:cacheprovider
+    tests/）: まとめの行を出さないまま進捗 30% 付近で終了コード 0xC0000409
+    が 5 回中 5 回。落ちる時点で、前のテストが置き去りにした DeviceTree が
+    20 個鳴っていた。gc.disable() を入れた回と、このタイマーを鳴らさなく
+    した回は最後まで通った。
+
+    個々のテストが自分で止める形だと、書き忘れたファイルから漏れる
+    （実測: 置き去りが多い 4 ファイルへ足しても、別の 1 ファイルの置き去り
+    だけで同じ落ち方をした）。更新チェックと同じく、ここで一律に止める。
+    窓を閉じる側の直しは MainWindow.closeEvent にある。
+    """
+    yield
+    device_tree = sys.modules.get("ui.device_tree")
+    widgets = sys.modules.get("PyQt6.QtWidgets")
+    if device_tree is None or widgets is None:
+        return      # PyQt を使わないテストでは何も作られていない
+    app = widgets.QApplication.instance()
+    if app is None:
+        return
+    for widget in widgets.QApplication.topLevelWidgets():
+        try:
+            if isinstance(widget, device_tree.DeviceTree):
+                widget.stop_serial_monitor()
+                continue
+            tree = getattr(widget, "device_tree", None)
+            if isinstance(tree, device_tree.DeviceTree):
+                tree.stop_serial_monitor()
+        except RuntimeError:
+            pass    # 破棄済みのラッパ
+
+
 def free_udp_port():
     """空いている UDP ポートを1つ調べて返す。"""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

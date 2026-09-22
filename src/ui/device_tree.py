@@ -214,6 +214,16 @@ class DeviceTree(QWidget):
                         names.add(name)
         return names
 
+    def stop_serial_monitor(self) -> None:
+        """シリアルポートの定期確認を止める
+
+        窓を閉じるときに呼ぶ。閉じたあとも 1 秒ごとに走り続け、その中で
+        機器一覧を組み直すことがある。閉じた窓に用は無いうえ、生き残った
+        まま鳴り続けるタイマーは、鳴っている最中に GC が窓を捨てると
+        プロセスごと落とす（実測: テスト一式で 0xC0000409）。
+        """
+        self._serial_monitor_timer.stop()
+
     def _check_serial_ports(self):
         """シリアルポートの変化を定期的にチェック"""
         # 現在のシリアルポート一覧を取得
