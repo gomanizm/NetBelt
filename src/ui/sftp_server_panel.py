@@ -73,11 +73,13 @@ class SFTPServerPanel(QWidget):
         root_layout = QHBoxLayout()
         self.root_dir_edit = QLineEdit()
         self.root_dir_edit.setText("./sftp_root")
-        root_layout.addWidget(self.root_dir_edit)
+        # 余った幅は入力欄だけが受け取り、参照ボタンは自分の幅を保つ。
+        # 以前は setMaximumWidth(60) でボタンの頭を押さえていたので、
+        # 自然な幅 80px に対していつも 60px へ潰れ、押しにくかった
+        root_layout.addWidget(self.root_dir_edit, 1)
         self.browse_btn = QPushButton("参照")
         self.browse_btn.clicked.connect(self._on_browse_directory)
-        self.browse_btn.setMaximumWidth(60)
-        root_layout.addWidget(self.browse_btn)
+        root_layout.addWidget(self.browse_btn, 0)
         settings_layout.addLayout(root_layout, 1, 1)
         
         # ユーザー名

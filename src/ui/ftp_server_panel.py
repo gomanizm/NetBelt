@@ -59,10 +59,13 @@ class FTPServerPanel(QWidget):
         settings_layout.addWidget(QLabel("ルートディレクトリ:"), 1, 0)
         root_layout = QHBoxLayout()
         self.root_dir_edit = QLineEdit("./ftp_root")
-        root_layout.addWidget(self.root_dir_edit)
+        # 余った幅は入力欄だけが受け取り、参照ボタンは自分の幅を保つ。
+        # 以前は setMaximumWidth(60) でボタンの頭を押さえていたので、
+        # 自然な幅 80px に対していつも 60px へ潰れ、押しにくかった
+        root_layout.addWidget(self.root_dir_edit, 1)
         self.browse_btn = QPushButton("参照")
-        self.browse_btn.clicked.connect(self._on_browse_directory); self.browse_btn.setMaximumWidth(60)
-        root_layout.addWidget(self.browse_btn)
+        self.browse_btn.clicked.connect(self._on_browse_directory)
+        root_layout.addWidget(self.browse_btn, 0)
         settings_layout.addLayout(root_layout, 1, 1)
         settings_layout.addWidget(QLabel("ユーザー名:"), 2, 0)
         self.username_edit = QLineEdit()
