@@ -245,9 +245,15 @@ def _import_legacy_known_hosts_unlocked(new_dir):
         return None
     new_kh = new_dir / "known_hosts"
     try:
+        # utf-8-sig で読む。メモ帳や PowerShell 5.1 が付けた先頭の BOM を
+        # 剥がすだけで、ほかは utf-8 と同じ。剥がさずに読むと 1 行目の
+        # ホスト名が BOM 付きになり、新しい known_hosts の「途中」へ
+        # そのまま書かれる。途中の BOM は読み込み側では剥がせないので、
+        # その機器だけ黙って「未知」へ戻り（TOFU が別の鍵を受け入れる）、
+        # cp932 環境では以後の保存が毎回失敗して新しい鍵が残らない。
         old_lines = old_kh.read_text(
-            encoding="utf-8", errors="replace").splitlines()
-        current = (new_kh.read_text(encoding="utf-8", errors="replace")
+            encoding="utf-8-sig", errors="replace").splitlines()
+        current = (new_kh.read_text(encoding="utf-8-sig", errors="replace")
                    .splitlines() if new_kh.exists() else [])
         known = set(filter(None, (_known_hosts_entry_id(l) for l in current)))
         added = [l for l in old_lines
