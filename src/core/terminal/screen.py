@@ -76,6 +76,15 @@ def _cell_width(ch):
     return 1
 
 
+def _is_blank(cells):
+    """cells が全部 BLANK なら True。
+
+    list.count は C 側で回るので、同じ判定を Python の生成式で書くより
+    ひと桁速い。空の画面への消去の費用はこの走査で決まる
+    """
+    return cells.count(BLANK) == len(cells)
+
+
 def _split_wide(line, i):
     """i 番目が全角の継続セルなら、その全角 (i-1 と i) を空白にする。
 
@@ -904,10 +913,9 @@ class Screen(object):
         # 丸ごと空になる (1 行目が空の 1 画面目や、ホームへ戻らない ED 2 の
         # あとの最下行など)。下の ED 1 の blank_after と対称に履歴へ送る
         # (消し方は mode == 0 の枝のまま)
-        blank_before = mode == 0 and (self._screen_blank or not any(
-            c != BLANK
-            for r in range(0, self.cursor_row + 1)
-            for c in self.lines[r][:col if r == self.cursor_row else None]))
+        blank_before = mode == 0 and (self._screen_blank or all(
+            _is_blank(self.lines[r][:col if r == self.cursor_row else None])
+            for r in range(0, self.cursor_row + 1)))
         # ED 1 も、カーソルより下に中身が残らなければ画面は丸ごと
         # 空白になる。最下行の右端に限らず、機器が数行出した直後の
         # ESC[1J (24x80 で 2 行だけ、など) が該当する。消える中身は
@@ -921,10 +929,9 @@ class Screen(object):
         start = self.cursor_col + 1
         if start < len(row) and row[start][0] == "":
             start += 1
-        blank_after = mode == 1 and (self._screen_blank or not any(
-            c != BLANK
-            for r in range(self.cursor_row, self.rows)
-            for c in self.lines[r][start if r == self.cursor_row else 0:]))
+        blank_after = mode == 1 and (self._screen_blank or all(
+            _is_blank(self.lines[r][start if r == self.cursor_row else 0:])
+            for r in range(self.cursor_row, self.rows)))
         if wipes_all or blank_before or blank_after:
             self._record_screen()
         if wipes_all:
@@ -944,12 +951,20 @@ class Screen(object):
         # 受信分に収まる ESC[2J の繰り返しだけで、履歴を 1 行も増やさない
         # まま 100x300 で 3.7 秒 GUI が止まっていた (走査と作り直しが
         # 命令ごとに 行 x 桁 ぶん走るため)
-        if not self._screen_blank:
-            for r in rng:
+        for r in rng:
+            # 覚えがあっても、窓を狭めた跡で桁より長い行は作り直す。
+            # 長さまで同じでないと「作り直しても同じ行」にならない
+            if not self._screen_blank or len(self.lines[r]) != self.cols:
                 self.lines[r] = self._blank_line()
                 self.wrapped[r] = False
         self.dirty.update(rng)
-        if wipes_all:
+        # 走査で「残りは全部空白」と分かった ED 0 / ED 1 のあとも画面は
+        # 丸ごと空白。ここで覚え直さないと、窓や文字の大きさを変えたあと
+        # (set_size が落とす) や代替画面から戻ったあとの連打で、毎回また
+        # 画面全体を走査する。折り返しの印が残るうちは覚えない (全セルが
+        # 空白でも印だけ残る状態は実在する。右端の桁で折り返したあとなど)
+        if wipes_all or ((blank_before or blank_after)
+                         and not any(self.wrapped)):
             self._screen_blank = True
         self._pending_wrap = False
 
@@ -960,7 +975,7 @@ class Screen(object):
             return
         last = -1
         for r in range(self.rows):
-            if any(c != BLANK for c in self.lines[r]):
+            if not _is_blank(self.lines[r]):
                 last = r
         for r, line in enumerate(self.lines[:last + 1]):
             # 呼び出し元が同じ行をその場で消すことがある (ED 1)。
