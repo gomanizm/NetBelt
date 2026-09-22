@@ -835,6 +835,20 @@ class MIBResolver:
         local_names = getattr(self, '_module_local_names', {})
         for module in declared:
             declared[module] |= local_names.get(module, set())
+        # 名前→その名前を宣言しているモジュールの数。「よそのモジュールも
+        # 同じ名前を宣言しているか」を、declared の全モジュールを走らずに
+        # 引けるようにする。走査していたときは
+        # 回数 x 未解決の定義数 x モジュール数 になり、実 MIB の書き方
+        # （親が後ろにある＝1 回目の回では未解決）でそのまま効いた
+        # （実測: 400 モジュール 24400 定義の解決が 11.2 秒、3000
+        # モジュールの mibs/ の冷えた解析が 8.3 秒）。下の 2 か所は
+        # どちらも `parent in declared[module]` が真の場所なので、
+        # 件数 2 以上＝よそのモジュールも宣言している、と同値
+        declaring = {}
+        for _module_names in declared.values():
+            for _declared_name in _module_names:
+                declaring[_declared_name] = (
+                    declaring.get(_declared_name, 0) + 1)
         in_module = {}
         resolved = {}
         pending = list(definitions)
@@ -847,10 +861,7 @@ class MIBResolver:
                     parent_oid = '1.3.6.1.4.1'
                 elif parent in declared[module]:
                     parent_oid = in_module.get(module, {}).get(parent)
-                    if parent_oid is None and not any(
-                            parent in names
-                            for other, names in declared.items()
-                            if other != module):
+                    if parent_oid is None and declaring.get(parent, 0) < 2:
                         # よそのモジュールに同名が無い＝曖昧ではない。
                         # 標準表 / custom_mibs.json / IMPORTS の値を
                         # これまでどおり使う
@@ -877,9 +888,7 @@ class MIBResolver:
         gave_up = sum(1 for _, parent, _, module in pending
                       if parent != 'enterprises' and parent in declared[module]
                       and parent in known
-                      and any(parent in names
-                              for other, names in declared.items()
-                              if other != module))
+                      and declaring.get(parent, 0) > 1)
         if gave_up:
             print(f"[MIBResolver] 親の名前を自分のモジュールで解決できない"
                   f"定義が {gave_up}件ありました。同じ名前が別のモジュールに"
