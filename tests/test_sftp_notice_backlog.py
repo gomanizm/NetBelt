@@ -101,11 +101,32 @@ class SftpNoticeBacklogTest(unittest.TestCase):
                     break
                 time.sleep(0.01)
 
+    @staticmethod
+    def _settled(log, quiet=0.3, timeout=5.0):
+        """通知が出そろうまで待つ（増えなくなってから quiet 秒）。
+
+        _knock は「マネージャが掴んでいるソケットが無くなったか」で待つが、
+        通知を出すのはその後片付けと同じスレッドの別の場所なので、戻った
+        時点ではまだ 1 件出ていないことがある（実測: 5 回に 1 回ほど
+        connected が 4 件のまま）。数を確かめる前にここで落ち着かせる。
+        """
+        deadline = time.time() + timeout
+        last = None
+        stable_since = time.time()
+        while time.time() < deadline:
+            now = (len(log["connected"]), len(log["disconnected"]))
+            if now != last:
+                last, stable_since = now, time.time()
+            elif time.time() - stable_since >= quiet:
+                return
+            time.sleep(0.02)
+
     # --- 本題 ------------------------------------------------------------
 
     def test_unauthenticated_knocking_cannot_pile_up_notices(self):
         m, port, log = self._manager(max_pending=6)
         self._knock(m, port, 40)
+        self._settled(log)
 
         issued = len(log["connected"]) + len(log["disconnected"])
         # 上限 + 「届けた接続の切断は必ず届ける」ぶんで頭打ちになる
@@ -119,6 +140,7 @@ class SftpNoticeBacklogTest(unittest.TestCase):
         """パネルの「接続クライアント: N」が戻らなくならないこと"""
         m, port, log = self._manager(max_pending=6)
         self._knock(m, port, 40)
+        self._settled(log)
 
         self.assertEqual(len(log["connected"]), len(log["disconnected"]),
                          "接続と切断の数が合わない: %d / %d"
@@ -141,6 +163,7 @@ class SftpNoticeBacklogTest(unittest.TestCase):
         """対照: 上限に余裕があればこれまでどおり全部届く"""
         m, port, log = self._manager(max_pending=1000)
         self._knock(m, port, 5)
+        self._settled(log)
 
         self.assertEqual(len(log["connected"]), 5)
         self.assertEqual(len(log["disconnected"]), 5)
