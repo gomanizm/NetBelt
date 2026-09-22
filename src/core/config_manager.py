@@ -31,8 +31,9 @@ def is_reserved_device_name(name) -> bool:
 
 
 def is_readable_macro(macro) -> bool:
-    """そのマクロを画面に出せるか（辞書で、名前が文字列であること）
+    """そのマクロを画面に出して実行できるか
 
+    条件は「辞書で、名前が文字列で、commands が文字列だけの list」。
     読み込み時の隔離（_quarantine_invalid_devices）と、3 つの読み手
     （DeviceTree の「ツール」・MacroDialog のプリセット一覧・DeviceDialog の
     マクロ一覧）が同じ条件を使うためにここへ置く。以前は 4 か所がそれぞれ
@@ -40,8 +41,20 @@ def is_readable_macro(macro) -> bool:
     要素（手編集の config の {"name": 5, ...} など）はすべて素通りし、
     名前を画面へ入れる addAction / addItem が TypeError で落ちて、
     右クリック・マクロ設定・機器編集が開かなくなっていた。
+
+    commands も同じ理由で見る。送信側は commands[index] で 1 要素ずつ
+    取り出して CR を付けて送るので、"show version" のような文字列は
+    1 文字ずつのコマンドに化けて実機へ流れ、数値・辞書・非文字列を含む
+    list は送信を仕掛ける QTimer のスロットの中で TypeError / KeyError に
+    なる。PyQt6 はスロット内の未捕捉例外で終了するため、1 行送った後に
+    アプリごと落ちる。グループの auto_commands は _is_valid_auto_commands が
+    同じ条件で弾いており、マクロにだけこの検査が無かった。
+    commands キーが無いのは「コマンド未設定」なので、既定値 [] で通す。
     """
-    return isinstance(macro, dict) and isinstance(macro.get("name"), str)
+    return (isinstance(macro, dict)
+            and isinstance(macro.get("name"), str)
+            and isinstance(macro.get("commands", []), list)
+            and all(isinstance(c, str) for c in macro.get("commands", [])))
 
 
 def device_endpoint(device_data):
