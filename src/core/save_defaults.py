@@ -11,6 +11,8 @@
 import os
 import re
 
+from PyQt6.QtWidgets import QMessageBox
+
 # 覚えたフォルダの置き場所は ConfigManager が持つ
 # （settings.paths.last_save_dir。get_last_save_dir / set_last_save_dir）
 
@@ -67,6 +69,62 @@ def apply_filter_suffix(file_path, selected_filter, default_name):
         # 既定の名前のまま種類だけ変えた＝選んだ種類が利用者の意思
         return root + allowed[0]
     return file_path
+
+
+def confirm_suffix_overwrite(parent, title, file_path, new_path):
+    """付け替えた先が既にあるとき、上書きしてよいか訊く
+
+    保存ダイアログの上書き確認は、利用者がその場で選んだ名前についてしか
+    行われない。こちらが絞り込みに合わせて拡張子を付け替えると、付け替えた
+    後の名前は誰も確かめていないので、out.csv があるフォルダで out.txt と
+    入れて CSV を選ぶだけで、確認なしに out.csv が置き換わっていた（実測）。
+
+    訊くのは付け替えでパスが変わったときだけ。利用者がダイアログで既存の
+    ファイルを直に選んだときは、ダイアログ側で既に訊かれている。
+
+    Args:
+        parent: 確認ダイアログの親にするウィジェット
+        title: 見出し（保存の入口の名前）
+        file_path: ダイアログが返した保存先
+        new_path: 拡張子を付け替えた後の保存先
+
+    Returns:
+        保存してよければ True。断られたら False（保存も記憶もしない）
+    """
+    if not new_path or new_path == file_path:
+        return True
+    try:
+        if not os.path.exists(new_path):
+            return True
+    except (OSError, ValueError):
+        # 確かめられない置き場所（長すぎるパス等）。ここで止めると保存
+        # 自体ができなくなるので、これまでどおり進める
+        return True
+    reply = QMessageBox.question(
+        parent, title,
+        "'%s' が既にあります。上書きしますか？\n%s"
+        % (os.path.basename(new_path), new_path),
+        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        QMessageBox.StandardButton.No
+    )
+    return reply == QMessageBox.StandardButton.Yes
+
+
+def apply_filter_suffix_confirmed(parent, title, file_path, selected_filter,
+                                  default_name):
+    """拡張子を付け替え、付け替え先が既にあれば上書きの確認を取る
+
+    保存の入口から呼ぶのはこちら。apply_filter_suffix だけを呼ぶと、
+    付け替えた先の上書きが誰にも確認されないまま通る。
+
+    Returns:
+        保存してよいパス。取り消し・断られたときは ""（呼ぶ側の
+        `if file_path:` がそのまま使えるよう、None ではなく空文字）
+    """
+    new_path = apply_filter_suffix(file_path, selected_filter, default_name)
+    if not confirm_suffix_overwrite(parent, title, file_path, new_path):
+        return ""
+    return new_path
 
 
 def last_dir(config_manager):

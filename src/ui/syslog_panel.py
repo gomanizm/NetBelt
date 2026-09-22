@@ -781,9 +781,13 @@ class SyslogPanel(QWidget):
 
         if filename:
             # 選んだ種類に合わせて拡張子を付け替える（中身は拡張子で決まるので、
-            # ここで揃えないと CSV を選んでもテキストが書かれる）
-            filename = save_defaults.apply_filter_suffix(
-                filename, selected_filter, default_name)
+            # ここで揃えないと CSV を選んでもテキストが書かれる）。付け替えた
+            # 先が既にあれば、ダイアログが訊いていない上書きなので確認する
+            filename = save_defaults.apply_filter_suffix_confirmed(
+                self, "メッセージをエクスポート", filename, selected_filter,
+                default_name)
+            if not filename:
+                return
             if self._refuse_if_recording("メッセージをエクスポート", filename):
                 return
             try:
@@ -908,8 +912,10 @@ class SyslogPanel(QWidget):
 
         if filename:
             # エクスポートと同じく、選んだ種類へ拡張子を合わせる
-            filename = save_defaults.apply_filter_suffix(
-                filename, selected_filter, default_name)
+            filename = save_defaults.apply_filter_suffix_confirmed(
+                self, "選択行を保存", filename, selected_filter, default_name)
+            if not filename:
+                return
             if self._refuse_if_recording("選択行を保存", filename):
                 return
             try:

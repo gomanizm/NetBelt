@@ -810,9 +810,13 @@ class SNMPPanel(QWidget):
         if not file_path:
             return
         # 選んだ種類に合わせて拡張子を付け替える（中身は拡張子で決まるので、
-        # ここで揃えないと CSV を選んでもテキストが書かれる）
-        file_path = save_defaults.apply_filter_suffix(
-            file_path, selected_filter, default_name)
+        # ここで揃えないと CSV を選んでもテキストが書かれる）。付け替えた先が
+        # 既にあれば、ダイアログが訊いていない上書きなのでここで確認する
+        file_path = save_defaults.apply_filter_suffix_confirmed(
+            self, "SNMP結果をエクスポート", file_path, selected_filter,
+            default_name)
+        if not file_path:
+            return
         if self._refuse_if_recording("SNMP結果をエクスポート", file_path):
             return
         try:
@@ -1186,8 +1190,11 @@ class SNMPPanel(QWidget):
             return
 
         # 選んだ種類に合わせて拡張子を付け替える（結果のエクスポートと同じ）
-        file_path = save_defaults.apply_filter_suffix(
-            file_path, selected_filter, default_name)
+        file_path = save_defaults.apply_filter_suffix_confirmed(
+            self, "Trapログをエクスポート", file_path, selected_filter,
+            default_name)
+        if not file_path:
+            return
 
         if self._refuse_if_recording("Trapログをエクスポート", file_path):
             return

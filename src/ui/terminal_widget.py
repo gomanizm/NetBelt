@@ -1945,9 +1945,11 @@ class TerminalWidget(QWidget):
                 "ログファイル (*.log);;テキストファイル (*.txt);;すべてのファイル (*.*)"
             )
             # 選んだ種類に合わせて拡張子を付け替える。中身はどちらも同じ
-            # 生の出力だが、テキストを選んだのに .log で残ると紛らわしい
-            file_path = save_defaults.apply_filter_suffix(
-                file_path, selected_filter, default_filename)
+            # 生の出力だが、テキストを選んだのに .log で残ると紛らわしい。
+            # 付け替えた先が既にあれば、ダイアログが訊いていない上書きなので
+            # ここで確認する（断られたら保存しない）
+            file_path = save_defaults.apply_filter_suffix_confirmed(
+                self, "ログ保存", file_path, selected_filter, default_filename)
 
             if file_path:
                 in_use_by = self._recording_device_using(file_path)
@@ -2020,9 +2022,10 @@ class TerminalWidget(QWidget):
                                        self._default_log_dir()),
             "ログファイル (*.log);;テキストファイル (*.txt);;すべてのファイル (*.*)"
         )
-        # 全ログ保存と同じく、選んだ種類へ拡張子を合わせる
-        file_path = save_defaults.apply_filter_suffix(
-            file_path, selected_filter, default_filename)
+        # 全ログ保存と同じく、選んだ種類へ拡張子を合わせ、付け替えた先が
+        # 既にあれば上書きを確認する（'w' で開くので断られたら開かない）
+        file_path = save_defaults.apply_filter_suffix_confirmed(
+            self, "ログ記録", file_path, selected_filter, default_filename)
 
         if file_path:
             in_use_by = self._recording_device_using(file_path)
