@@ -326,13 +326,6 @@ class Screen(object):
         # 「右端の 1 文字が上書きされる」が起きる行数だけの変更
         self._pending_wrap = (self._pending_wrap and logical_col >= cols
                               and cols >= was_cols)
-        if cols < was_cols:
-            # 保存してある折り返し待ち (DECSC / ?1048 / 1049) も同じ
-            # 理由で解く。戻したあとの 1 文字が同じ切り詰めを呼ぶ
-            self._saved = self._saved[:5] + (False,)
-            self._other_saved = self._other_saved[:5] + (False,)
-            if self._saved_main:
-                self._saved_main = self._saved_main[:5] + (False,)
         self.dirty = set(range(rows))
         self._reflowed = True
 
@@ -754,6 +747,14 @@ class Screen(object):
         self._g = dict(g)
         self._charset = charset
         self._move(row, col)
+        # 保存してあった折り返し待ちは、戻し先の行がいまの桁より長い
+        # とき (= 窓を狭めた跡があるとき) だけ解く。そのまま戻すと次の
+        # 1 文字が _linefeed(from_wrap=True) を呼び、その中の切り詰めが
+        # 新しい桁で行を切って、右端の外の 旧桁 - 新桁 文字を消す。
+        # 狭めたあと広げ直したときは行がまた桁に収まるので、解くと
+        # 逆に「待たずに上書き」で受信済みの桁を 1 つ潰すことになる
+        if pending and len(self.lines[self.cursor_row]) > self.cols:
+            pending = False
         # _move が折り返し待ちを落とすので、復元はそのあと
         self._pending_wrap = pending
 
@@ -864,6 +865,14 @@ class Screen(object):
                 self._charset = charset
                 self._move(row, col)
         self.dirty.update(range(self.rows))
+        # 保存してあった折り返し待ちは、戻し先の行がいまの桁より長い
+        # とき (= 窓を狭めた跡があるとき) だけ解く。そのまま戻すと次の
+        # 1 文字が _linefeed(from_wrap=True) を呼び、その中の切り詰めが
+        # 新しい桁で行を切って、右端の外の 旧桁 - 新桁 文字を消す。
+        # 狭めたあと広げ直したときは行がまた桁に収まるので、解くと
+        # 逆に「待たずに上書き」で受信済みの桁を 1 つ潰すことになる
+        if pending and len(self.lines[self.cursor_row]) > self.cols:
+            pending = False
         # 1049 で持ち帰った折り返し待ちだけは残す。_move も、白紙化の
         # あとの位置決めも落とすので、代入はいちばん最後
         self._pending_wrap = pending
