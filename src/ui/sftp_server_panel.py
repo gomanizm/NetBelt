@@ -8,7 +8,7 @@ from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QFont
 from core.sftp_server import SFTPServerManager
 from datetime import datetime
-from ui import theme
+from ui import log_export, theme
 
 
 class SFTPServerPanel(QWidget):
@@ -148,14 +148,22 @@ class SFTPServerPanel(QWidget):
         # 行数の上限。超えた分は Qt が先頭ブロックから捨てる
         self.log_text.document().setMaximumBlockCount(self.MAX_LOG_LINES)
         self.log_text.setStyleSheet("font-family: Consolas, monospace; font-size: 9pt;")
+
+        # ボタンはログのすぐ上に左寄せ1行（SNMP の Trap 受信と同じ形）。
+        # 行末の addStretch() が無いと、余った幅がボタン自身に配られて
+        # 横へ間延びする
+        log_btn_layout = QHBoxLayout()
+        self.export_log_btn = QPushButton("エクスポート")
+        self.export_log_btn.clicked.connect(self._on_export_log)
+        log_btn_layout.addWidget(self.export_log_btn)
+        self.clear_log_btn = QPushButton("クリア")
+        self.clear_log_btn.clicked.connect(self._on_clear_log)
+        log_btn_layout.addWidget(self.clear_log_btn)
+        log_btn_layout.addStretch()
+        log_layout.addLayout(log_btn_layout)
+
         log_layout.addWidget(self.log_text)
-        
-        # ログクリアボタン
-        clear_log_btn = QPushButton("ログをクリア")
-        clear_log_btn.clicked.connect(self._on_clear_log)
-        clear_log_btn.setMaximumWidth(120)
-        log_layout.addWidget(clear_log_btn)
-        
+
         log_group.setLayout(log_layout)
         layout.addWidget(log_group)
         
@@ -316,6 +324,11 @@ class SFTPServerPanel(QWidget):
     def _on_clear_log(self):
         """ログをクリア"""
         self.log_text.clear()
+    
+    def _on_export_log(self):
+        """画面に出ているアクティビティログをファイルへ保存する"""
+        log_export.export_log_text(self, self.log_text.toPlainText(),
+                                   "sftp_log")
     
     def closeEvent(self, event):
         """パネルが閉じられる時の処理"""
