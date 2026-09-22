@@ -42,10 +42,12 @@ def apply_filter_suffix(file_path, selected_filter, default_name):
     既定の名前は "....txt" 固定で、種類を CSV へ変えても名前は .txt の
     ままなので、CSV を選んだつもりでテキストが書かれていた。
 
-    付け替えるのは「こちらが用意した既定の拡張子のまま」だったときだけ。
-    利用者が既定とは違う拡張子を自分で書いたなら、そちらを尊重する
-    （種類は既定のまま名前だけ .json と打つ使い方を潰さないため）。
-    拡張子が無ければ、選んだ種類のものを足す。
+    付け替えるのは「こちらが用意した既定の名前のまま」だったときだけ。
+    つまり名前に触らず種類だけ選んだときで、そこだけが「選んだ種類が
+    利用者の意思」と言い切れる。拡張子で判定すると、既定の名前が必ず
+    ".txt" である以上、利用者が out.txt と打ち直した場合と区別が付かず、
+    名指しされたのとは別の名前のファイルが保存先になっていた。
+    拡張子が無ければ、名前を変えていても選んだ種類のものを足す。
 
     Args:
         file_path: ダイアログが返した保存先
@@ -64,8 +66,7 @@ def apply_filter_suffix(file_path, selected_filter, default_name):
     if not ext:
         return file_path + allowed[0]
 
-    default_ext = os.path.splitext(default_name or "")[1]
-    if default_ext and ext.lower() == default_ext.lower():
+    if default_name and os.path.basename(file_path) == default_name:
         # 既定の名前のまま種類だけ変えた＝選んだ種類が利用者の意思
         return root + allowed[0]
     return file_path
