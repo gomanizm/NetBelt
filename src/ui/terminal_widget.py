@@ -1937,13 +1937,17 @@ class TerminalWidget(QWidget):
             # ファイル保存ダイアログを表示。前回保存した場所を覚えていれば
             # そこから、無ければこれまでどおり cwd/logs から始める
             from core import save_defaults
-            file_path, _ = QFileDialog.getSaveFileName(
+            file_path, selected_filter = QFileDialog.getSaveFileName(
                 self,
                 "ログファイル保存",
                 save_defaults.initial_path(self.config_manager, default_filename,
                                            self._default_log_dir()),
                 "ログファイル (*.log);;テキストファイル (*.txt);;すべてのファイル (*.*)"
             )
+            # 選んだ種類に合わせて拡張子を付け替える。中身はどちらも同じ
+            # 生の出力だが、テキストを選んだのに .log で残ると紛らわしい
+            file_path = save_defaults.apply_filter_suffix(
+                file_path, selected_filter, default_filename)
 
             if file_path:
                 in_use_by = self._recording_device_using(file_path)
@@ -2009,13 +2013,16 @@ class TerminalWidget(QWidget):
         # ファイル保存ダイアログを表示。エクスポートと同じ「前回保存した場所」
         # を使う（利用者にとってはどちらもログファイルの置き場所）
         from core import save_defaults
-        file_path, _ = QFileDialog.getSaveFileName(
+        file_path, selected_filter = QFileDialog.getSaveFileName(
             self,
             "ログ記録ファイル選択",
             save_defaults.initial_path(self.config_manager, default_filename,
                                        self._default_log_dir()),
             "ログファイル (*.log);;テキストファイル (*.txt);;すべてのファイル (*.*)"
         )
+        # 全ログ保存と同じく、選んだ種類へ拡張子を合わせる
+        file_path = save_defaults.apply_filter_suffix(
+            file_path, selected_filter, default_filename)
 
         if file_path:
             in_use_by = self._recording_device_using(file_path)

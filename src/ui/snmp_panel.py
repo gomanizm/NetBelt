@@ -801,14 +801,18 @@ class SNMPPanel(QWidget):
             QMessageBox.information(self, "情報", "エクスポートするデータがありません。")
             return
         default_name = "snmp_result_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".txt"
-        file_path, _ = QFileDialog.getSaveFileName(
+        file_path, selected_filter = QFileDialog.getSaveFileName(
             self,
             "SNMP結果をエクスポート",
             save_defaults.initial_path(self.config_manager, default_name),
-            "テキストファイル (*.txt);;CSVファイル (*.csv);;JSONファイル (*.json)"
+            save_defaults.TABLE_FILTERS
         )
         if not file_path:
             return
+        # 選んだ種類に合わせて拡張子を付け替える（中身は拡張子で決まるので、
+        # ここで揃えないと CSV を選んでもテキストが書かれる）
+        file_path = save_defaults.apply_filter_suffix(
+            file_path, selected_filter, default_name)
         if self._refuse_if_recording("SNMP結果をエクスポート", file_path):
             return
         try:
@@ -1175,11 +1179,15 @@ class SNMPPanel(QWidget):
             self,
             "Trapログをエクスポート",
             save_defaults.initial_path(self.config_manager, default_name),
-            "テキストファイル (*.txt);;CSVファイル (*.csv);;JSONファイル (*.json)"
+            save_defaults.TABLE_FILTERS
         )
 
         if not file_path:
             return
+
+        # 選んだ種類に合わせて拡張子を付け替える（結果のエクスポートと同じ）
+        file_path = save_defaults.apply_filter_suffix(
+            file_path, selected_filter, default_name)
 
         if self._refuse_if_recording("Trapログをエクスポート", file_path):
             return

@@ -11,12 +11,14 @@ from PyQt6.QtGui import QColor, QBrush, QAction, QStandardItemModel, QStandardIt
 from datetime import datetime
 import json
 import os
+import re
 import tempfile
 
 from core import save_defaults
 
 
-def _write_text_file_atomically(filename, write_body):
+def _write_text_file_atomically(filename, write_body,
+                                encoding='utf-8', newline=None):
     """保存先を壊さずにテキストを書き出す
 
     保存先を直接 open('w') すると、その時点で旧内容は失われ、書き込み中の
@@ -30,6 +32,8 @@ def _write_text_file_atomically(filename, write_body):
     Args:
         filename: 保存先のパス
         write_body: 開いたファイルオブジェクトを受け取って中身を書く関数
+        encoding: 書き出す文字コード（CSV は Excel 向けに utf-8-sig）
+        newline: open() へ渡す改行の扱い（csv.writer は newline='' を要する）
     """
     tmp_path = None
     try:
@@ -37,7 +41,7 @@ def _write_text_file_atomically(filename, write_body):
         fd, tmp_path = tempfile.mkstemp(
             prefix=os.path.basename(target) + ".", suffix=".tmp",
             dir=os.path.dirname(target))
-        with open(fd, 'w', encoding='utf-8') as f:
+        with open(fd, 'w', encoding=encoding, newline=newline) as f:
             write_body(f)
 
         # 閉じてから差し替える（Windows では開いたままだと置き換えられない）
@@ -49,6 +53,35 @@ def _write_text_file_atomically(filename, write_body):
                 os.remove(tmp_path)
             except OSError:
                 pass   # 消せなくても保存先は無傷。残骸は .tmp なので見分けがつく
+
+
+# 表計算ソフトが数式として解釈しうる値の先頭文字と、素の数の形
+_CSV_FORMULA_STARTERS = "=+-@"
+_CSV_PLAIN_NUMBER = re.compile(r"^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$")
+
+
+def _csv_safe(value):
+    """表計算ソフトが数式として解釈しうる値を、文字列として書き出す
+
+    Syslog は認証なしの UDP で届き、本文もホスト名も送り手が決められる。
+    先頭が = + - @ の値をそのまま CSV へ書くと、受け取った側が Excel /
+    LibreOffice で開いた瞬間に数式（DDE を含む）として評価される。
+    エクスポートは障害チケットや報告書へ回る前提なので、発火するのは
+    こちらの端末とは限らない。
+
+    判定は SNMPPanel._csv_safe と同じ（前置きの空白は落としてから見る。
+    空白を 1 つ置くだけで抜けられるため）。数として読める値は、表として
+    読みにくくなるのでそのまま通す。
+    """
+    text = "" if value is None else str(value)
+    if not text:
+        return text
+    stripped = text.lstrip()
+    if not stripped or stripped[0] not in _CSV_FORMULA_STARTERS:
+        return text
+    if _CSV_PLAIN_NUMBER.match(stripped):
+        return text
+    return "'" + text
 
 
 class CheckableComboBox(QComboBox):
@@ -693,7 +726,7 @@ class SyslogPanel(QWidget):
 
     @staticmethod
     def _export_format(file_path: str) -> str:
-        """保存先の拡張子から書き出す形式を決める（"json" / "txt"）
+        """保存先の拡張子から書き出す形式を決める（"csv" / "json" / "txt"）
 
         大文字小文字は区別しない。区別すると out.JSON がテキストの中身で
         書かれたうえ「エクスポートしました」と成功扱いになり、中身と拡張子
@@ -705,25 +738,58 @@ class SyslogPanel(QWidget):
         当てはまらない拡張子は従来どおり TXT（既定の形式）。
         """
         ext = os.path.splitext(file_path)[1].lower()
-        if ext == '.json':
-            return 'json'
+        if ext in ('.csv', '.json'):
+            return ext[1:]
         return 'txt'
 
+    def _export_messages_to_csv(self, filename, messages):
+        """CSV で書き出す（1 件 1 行。列はテキスト形式と同じ並び）
+
+        BOM 付き（utf-8-sig）。日本語版 Excel は BOM の無い UTF-8 の CSV を
+        cp932 として開くため、見出しも機器から来た日本語も文字化けする
+        （SNMPPanel._export_results_to_csv と同じ）。
+
+        本文とホスト名はテキスト形式と同じく改行・タブを表記へ置き換える。
+        CSV は引用符で囲めば改行を持てるが、1 件が複数行になると行単位の
+        突き合わせで別機器の独立した記録と見分けが付かなくなる。
+        """
+        import csv
+
+        def write_rows(f):
+            writer = csv.writer(f)
+            writer.writerow(['時刻', '送信元', 'ホスト名', 'レベル', 'メッセージ'])
+            for msg in messages:
+                writer.writerow([_csv_safe(value) for value in (
+                    msg.timestamp,
+                    msg.source_ip,
+                    self._escape_for_export(msg.hostname),
+                    msg.level,
+                    self._escape_for_export(msg.message),
+                )])
+
+        _write_text_file_atomically(filename, write_rows,
+                                    encoding='utf-8-sig', newline='')
+
     def _export_messages(self):
-        """メッセージをエクスポート"""
+        """メッセージをエクスポート（txt/csv/json）"""
         default_name = f"syslog_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-        filename, _ = QFileDialog.getSaveFileName(
+        filename, selected_filter = QFileDialog.getSaveFileName(
             self, "メッセージをエクスポート",
             save_defaults.initial_path(self.config_manager, default_name),
-            "テキストファイル (*.txt);;JSONファイル (*.json);;すべてのファイル (*.*)"
+            save_defaults.TABLE_FILTERS
         )
 
         if filename:
+            # 選んだ種類に合わせて拡張子を付け替える（中身は拡張子で決まるので、
+            # ここで揃えないと CSV を選んでもテキストが書かれる）
+            filename = save_defaults.apply_filter_suffix(
+                filename, selected_filter, default_name)
             if self._refuse_if_recording("メッセージをエクスポート", filename):
                 return
             try:
                 messages = self.model.get_all_messages()
-                if self._export_format(filename) == 'json':
+                fmt = self._export_format(filename)
+                if fmt == 'json':
                     # JSON形式でエクスポート（送信元と受信生データも残す）
                     data = [
                         {
@@ -739,6 +805,8 @@ class SyslogPanel(QWidget):
                     _write_text_file_atomically(
                         filename,
                         lambda f: json.dump(data, f, ensure_ascii=False, indent=2))
+                elif fmt == 'csv':
+                    self._export_messages_to_csv(filename, messages)
                 else:
                     # テキスト形式でエクスポート
                     def write_lines(f):
@@ -832,13 +900,16 @@ class SyslogPanel(QWidget):
                 messages.append(msg)
 
         default_name = f"syslog_selected_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-        filename, _ = QFileDialog.getSaveFileName(
+        filename, selected_filter = QFileDialog.getSaveFileName(
             self, "選択行を保存",
             save_defaults.initial_path(self.config_manager, default_name),
-            "テキストファイル (*.txt);;すべてのファイル (*.*)"
+            "テキスト (*.txt);;すべてのファイル (*.*)"
         )
 
         if filename:
+            # エクスポートと同じく、選んだ種類へ拡張子を合わせる
+            filename = save_defaults.apply_filter_suffix(
+                filename, selected_filter, default_name)
             if self._refuse_if_recording("選択行を保存", filename):
                 return
             try:

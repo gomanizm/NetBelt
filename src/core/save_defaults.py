@@ -9,10 +9,65 @@
 覚えるのはフォルダのパス 1 つだけ。機器の設定や資格情報は書かない。
 """
 import os
+import re
 
 # config.json 上の置き場所（settings.<_SECTION>.<_KEY>）
 _SECTION = "paths"
 _KEY = "last_save_dir"
+
+# 表や一覧のある画面（SNMP の結果・Trap、Syslog）で使う絞り込み。
+# 並びと表記をここへ一本化しておかないと、画面ごとに順番も言い回しも
+# ばらけ、どの画面でどの形式を選べるのかが見た目から分からなくなる
+TABLE_FILTERS = "テキスト (*.txt);;CSV (*.csv);;JSON (*.json)"
+
+# 絞り込み 1 件から拡張子を拾う（"CSV (*.csv)" -> ".csv"）
+_FILTER_EXTENSION = re.compile(r"\*(\.[A-Za-z0-9_]+)")
+
+
+def _filter_extensions(selected_filter):
+    """選ばれた絞り込みが許す拡張子（小文字）。何でも可なら空リスト"""
+    if not selected_filter:
+        return []
+    if "*.*" in selected_filter:
+        # 「すべてのファイル (*.*)」。利用者が書いた名前をそのまま使う
+        return []
+    return [ext.lower() for ext in _FILTER_EXTENSION.findall(selected_filter)]
+
+
+def apply_filter_suffix(file_path, selected_filter, default_name):
+    """保存先の拡張子を、ダイアログで選んだ種類に合わせる
+
+    書き出す形式は拡張子で決まる（_export_format）。ところがダイアログの
+    既定の名前は "....txt" 固定で、種類を CSV へ変えても名前は .txt の
+    ままなので、CSV を選んだつもりでテキストが書かれていた。
+
+    付け替えるのは「こちらが用意した既定の拡張子のまま」だったときだけ。
+    利用者が既定とは違う拡張子を自分で書いたなら、そちらを尊重する
+    （種類は既定のまま名前だけ .json と打つ使い方を潰さないため）。
+    拡張子が無ければ、選んだ種類のものを足す。
+
+    Args:
+        file_path: ダイアログが返した保存先
+        selected_filter: ダイアログが返した選択中の絞り込み
+        default_name: こちらがダイアログへ渡した既定のファイル名
+    """
+    if not file_path:
+        return file_path
+    allowed = _filter_extensions(selected_filter)
+    if not allowed:
+        return file_path
+
+    root, ext = os.path.splitext(file_path)
+    if ext.lower() in allowed:
+        return file_path
+    if not ext:
+        return file_path + allowed[0]
+
+    default_ext = os.path.splitext(default_name or "")[1]
+    if default_ext and ext.lower() == default_ext.lower():
+        # 既定の名前のまま種類だけ変えた＝選んだ種類が利用者の意思
+        return root + allowed[0]
+    return file_path
 
 
 def last_dir(config_manager):
