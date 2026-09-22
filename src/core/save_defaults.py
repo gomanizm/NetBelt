@@ -11,9 +11,8 @@
 import os
 import re
 
-# config.json 上の置き場所（settings.<_SECTION>.<_KEY>）
-_SECTION = "paths"
-_KEY = "last_save_dir"
+# 覚えたフォルダの置き場所は ConfigManager が持つ
+# （settings.paths.last_save_dir。get_last_save_dir / set_last_save_dir）
 
 # 表や一覧のある画面（SNMP の結果・Trap、Syslog）で使う絞り込み。
 # 並びと表記をここへ一本化しておかないと、画面ごとに順番も言い回しも
