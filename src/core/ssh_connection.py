@@ -78,8 +78,14 @@ def _iter_known_hosts_lines(path):
     ここでは種類を問わず握りつぶし、読めない行として扱う。
     """
     from paramiko.hostkeys import HostKeyEntry
-    for lineno, raw_line in enumerate(
-            Path(str(path)).read_bytes().split(b"\n"), 1):
+    raw = Path(str(path)).read_bytes()
+    if raw.startswith(codecs.BOM_UTF8):
+        # Windows の編集ツール（メモ帳の「UTF-8 (BOM)」や PowerShell 5.1 の
+        # Out-File -Encoding utf8）が付ける BOM。剥がさないと 1 行目の
+        # ホスト名の頭に付いたまま登録され、その機器だけ黙って「未知」へ
+        # 戻る（実測）。保存時の書き戻しと行の点検にも同時に効く
+        raw = raw[len(codecs.BOM_UTF8):]
+    for lineno, raw_line in enumerate(raw.split(b"\n"), 1):
         raw_line = raw_line.rstrip(b"\r")
         text = raw_line.decode("utf-8", errors="replace").strip()
         if not text or text.startswith("#"):
@@ -124,6 +130,12 @@ def load_known_hosts(hostkeys, path):
             hostkeys.add(name, entry.key.get_name(), entry.key)
 
 
+def _has_utf8_bom(path):
+    """known_hosts の先頭に UTF-8 BOM があるか"""
+    with open(str(path), "rb") as f:
+        return f.read(len(codecs.BOM_UTF8)) == codecs.BOM_UTF8
+
+
 def _load_known_hosts_into_client(client, path, broken):
     """known_hosts を client へ読み込む。
 
@@ -131,6 +143,13 @@ def _load_known_hosts_into_client(client, path, broken):
     して client がファイル名を覚える、従来どおりの動き）。読めない行が
     あるときだけ自前のローダを使う。paramiko に読ませると例外になり、
     読める行の鍵まで失って関係のない機器が繋がらなくなるため。
+
+    先頭に UTF-8 BOM があるファイルも自前で読む。paramiko は BOM を
+    剥がさないので、BOM を読めてしまう locale では 1 行目の名前が BOM
+    付きで登録され、その機器だけ黙って「未知」に戻る（実測）。
+    自前で読む経路では _host_keys_filename を None に戻す。paramiko の
+    save_host_keys は書く前にこのファイルを読み直すので、戻さないと
+    壊れた行や BOM でまた落ち、初回接続の鍵が一度も保存されない。
 
     行としてはすべて読めるのに、ファイル全体が既定エンコーディングでは
     読めないことがある。paramiko の HostKeys.load は open(filename, "r")
@@ -142,7 +161,8 @@ def _load_known_hosts_into_client(client, path, broken):
     Args:
         broken: unreadable_known_hosts_lines() の戻り値
     """
-    if broken:
+    if broken or _has_utf8_bom(path):
+        client._host_keys_filename = None
         load_known_hosts(client.get_host_keys(), path)
         return
     try:
