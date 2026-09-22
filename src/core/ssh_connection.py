@@ -132,13 +132,27 @@ def _load_known_hosts_into_client(client, path, broken):
     あるときだけ自前のローダを使う。paramiko に読ませると例外になり、
     読める行の鍵まで失って関係のない機器が繋がらなくなるため。
 
+    行としてはすべて読めるのに、ファイル全体が既定エンコーディングでは
+    読めないことがある。paramiko の HostKeys.load は open(filename, "r")
+    なので、この環境（cp932）では注釈欄やコメント行に日本語があるだけで
+    UnicodeDecodeError になり、鍵の行が全部正しくても全機器が繋がらなく
+    なる（実測）。行ごとの点検は bytes で読むので「読めない行」は 0 件で、
+    行番号も出ない。デコードだけは受け止めて、読める行を取り込む。
+
     Args:
         broken: unreadable_known_hosts_lines() の戻り値
     """
     if broken:
         load_known_hosts(client.get_host_keys(), path)
-    else:
+        return
+    try:
         client.load_host_keys(str(path))
+    except UnicodeDecodeError:
+        # paramiko は読む前に _host_keys_filename を覚えるので、
+        # save_host_keys の読み直しが同じ例外を踏まないよう戻す。
+        # 保存前の取り込みは _save_known_hosts が自分で行う
+        client._host_keys_filename = None
+        load_known_hosts(client.get_host_keys(), path)
 
 
 def _key_fingerprint(key):
