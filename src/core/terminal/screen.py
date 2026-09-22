@@ -136,8 +136,11 @@ class Screen(object):
         self._pending_wrap = False
         # ESC 7 / ESC 8。位置・属性に加えて、VT100 と同じく
         # 文字集合の指示 (G0/G1) と SI/SO の状態、それに xterm と
-        # 同じく右端の折り返し待ち (_pending_wrap) も持つ
-        self._saved = (0, 0, DEFAULT, {"(": "B", ")": "B"}, "(", False)
+        # 同じく右端の折り返し待ち (_pending_wrap) も持つ。最後の桁数は
+        # 標準に無い持ち物で、戻すときに折り返し待ちを解くかどうかを
+        # 決めるためだけに使う (_restore_cursor)
+        self._saved = (0, 0, DEFAULT, {"(": "B", ")": "B"}, "(", False,
+                       self.cols)
         # 保存領域は画面ごと (xterm の screen->sc[])。裏へ回った画面の
         # ぶんはここへ退避する
         self._other_saved = self._saved
@@ -738,22 +741,27 @@ class Screen(object):
     def _save_cursor(self):
         """DECSC (ESC 7) と ?1048h の保存。xterm も同じ保存領域を使う。"""
         self._saved = (self.cursor_row, self.cursor_col, self.attr,
-                       dict(self._g), self._charset, self._pending_wrap)
+                       dict(self._g), self._charset, self._pending_wrap,
+                       self.cols)
 
     def _restore_cursor(self):
         """DECRC (ESC 8) と ?1048l の復元。"""
-        row, col, attr, g, charset, pending = self._saved
+        row, col, attr, g, charset, pending, saved_cols = self._saved
         self.attr = attr
         self._g = dict(g)
         self._charset = charset
         self._move(row, col)
-        # 保存してあった折り返し待ちは、戻し先の行がいまの桁より長い
-        # とき (= 窓を狭めた跡があるとき) だけ解く。そのまま戻すと次の
-        # 1 文字が _linefeed(from_wrap=True) を呼び、その中の切り詰めが
-        # 新しい桁で行を切って、右端の外の 旧桁 - 新桁 文字を消す。
-        # 狭めたあと広げ直したときは行がまた桁に収まるので、解くと
-        # 逆に「待たずに上書き」で受信済みの桁を 1 つ潰すことになる
-        if pending and len(self.lines[self.cursor_row]) > self.cols:
+        # 保存してあった折り返し待ちは、保存したときより桁が狭くなって
+        # いるときだけ解く。折り返し待ちは必ず保存時の右端 (桁 - 1) で
+        # 立つので、これは「待っていた右端がいまの桁の外か」と同じ。
+        # 持ち越すと次の 1 文字が _linefeed(from_wrap=True) を呼び、その
+        # 中の切り詰めが新しい桁で行を切って、右端の外の 旧桁 - 新桁
+        # 文字を消す。逆に、いまの桁で立った待ちまで解くと「待たずに
+        # 上書き」で受信済みの桁を 1 つ潰す。行の長さで見分けようとする
+        # と、窓を狭めた跡 (桁より長い行) は ED 2 が来るまで残るので、
+        # 狭めたあとに立った待ちや、広げて狭め直した跡の行で立った待ち
+        # まで巻き込んで解いてしまう
+        if pending and self.cols < saved_cols:
             pending = False
         # _move が折り返し待ちを落とすので、復元はそのあと
         self._pending_wrap = pending
@@ -819,14 +827,16 @@ class Screen(object):
         # 増やさないので、印を落とさない (落とすと、続く消去が
         # 画面全体を走査する)
         self._screen_blank = False
-        pending = False                 # 1049 の復元でだけ書き換わる
+        # 1049 の復元でだけ書き換わる。saved_cols を いまの桁 にして
+        # おけば、復元しなかったときは下の判定が成り立たない
+        pending, saved_cols = False, self.cols
         if to_alt and with_cursor:
             # 1049 は DECSC 相当の保存・復元 (XTerm ctlseqs)。文字集合
             # の指示まで持ち帰らないと、代替画面が ESC(0 のまま抜けた
             # ときに以降の出力も記録も罫線文字に化け続ける
             self._saved_main = (self.cursor_row, self.cursor_col, self.attr,
                                 dict(self._g), self._charset,
-                                self._pending_wrap)
+                                self._pending_wrap, self.cols)
         elif to_alt:
             # 47h / 1047h は保存しない。前の 1049 の保存を残すと、この
             # 代替画面から 1049l で出たときに古い位置・属性・文字集合へ
@@ -858,20 +868,16 @@ class Screen(object):
                 # 47 で入った代替画面では 1049 用の保存が無い。xterm の
                 # 1049l は CursorRestore なので、そのときはメイン画面の
                 # 保存領域 (入れ替えたあとの _saved、DECSC) から戻す
-                row, col, attr, g, charset, pending = (
+                row, col, attr, g, charset, pending, saved_cols = (
                     self._saved_main or self._saved)
                 self.attr = attr
                 self._g = dict(g)
                 self._charset = charset
                 self._move(row, col)
         self.dirty.update(range(self.rows))
-        # 保存してあった折り返し待ちは、戻し先の行がいまの桁より長い
-        # とき (= 窓を狭めた跡があるとき) だけ解く。そのまま戻すと次の
-        # 1 文字が _linefeed(from_wrap=True) を呼び、その中の切り詰めが
-        # 新しい桁で行を切って、右端の外の 旧桁 - 新桁 文字を消す。
-        # 狭めたあと広げ直したときは行がまた桁に収まるので、解くと
-        # 逆に「待たずに上書き」で受信済みの桁を 1 つ潰すことになる
-        if pending and len(self.lines[self.cursor_row]) > self.cols:
+        # 解く条件は _restore_cursor と同じ (理由もそちらに書いてある)。
+        # 保存したときより桁が狭いときだけ解く
+        if pending and self.cols < saved_cols:
             pending = False
         # 1049 で持ち帰った折り返し待ちだけは残す。_move も、白紙化の
         # あとの位置決めも落とすので、代入はいちばん最後
