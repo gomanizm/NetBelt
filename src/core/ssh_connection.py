@@ -139,17 +139,17 @@ def _has_utf8_bom(path):
 def _load_known_hosts_into_client(client, path, broken):
     """known_hosts を client へ読み込む。
 
-    読めない行が無ければ paramiko にそのまま読ませる（保存前の再読込先と
-    して client がファイル名を覚える、従来どおりの動き）。読めない行が
-    あるときだけ自前のローダを使う。paramiko に読ませると例外になり、
-    読める行の鍵まで失って関係のない機器が繋がらなくなるため。
+    読めない行が無ければ paramiko にそのまま読ませる（従来どおりの動き）。
+    読めない行があるときだけ自前のローダを使う。paramiko に読ませると
+    例外になり、読める行の鍵まで失って関係のない機器が繋がらなくなるため。
 
     先頭に UTF-8 BOM があるファイルも自前で読む。paramiko は BOM を
     剥がさないので、BOM を読めてしまう locale では 1 行目の名前が BOM
     付きで登録され、その機器だけ黙って「未知」に戻る（実測）。
-    自前で読む経路では _host_keys_filename を None に戻す。paramiko の
-    save_host_keys は書く前にこのファイルを読み直すので、戻さないと
-    壊れた行や BOM でまた落ち、初回接続の鍵が一度も保存されない。
+    自前で読む経路では _host_keys_filename を None に戻す。この client は
+    ファイルの一部しか持っていないので、paramiko の save_host_keys が
+    この名前を見て書き出すことが二度と無いようにしておく（保存は
+    _save_known_hosts がディスクから作り直して行う）。
 
     行としてはすべて読めるのに、ファイル全体が既定エンコーディングでは
     読めないことがある。paramiko の HostKeys.load は open(filename, "r")
@@ -168,9 +168,8 @@ def _load_known_hosts_into_client(client, path, broken):
     try:
         client.load_host_keys(str(path))
     except UnicodeDecodeError:
-        # paramiko は読む前に _host_keys_filename を覚えるので、
-        # save_host_keys の読み直しが同じ例外を踏まないよう戻す。
-        # 保存前の取り込みは _save_known_hosts が自分で行う
+        # paramiko は読む前に _host_keys_filename を覚える。読めたのは
+        # 一部だけなので、その名前を見て書き出されないよう戻す
         client._host_keys_filename = None
         load_known_hosts(client.get_host_keys(), path)
 
@@ -220,50 +219,64 @@ def _refuse_conflicting_host_key(path, hostname, key):
            path))
 
 
-def _save_known_hosts(client, known_hosts_path, verify=None):
-    """client が持つホスト鍵を known_hosts へ書き戻す。
+def _write_known_hosts_file(hostkeys, preserved, tmp_path):
+    """書き出す内容を一時ファイルへ作る（本体の差し替えはしない）。
+
+    HostKeys.save は _entries を 1 件 1 行で書き出すので、
+    SSHClient.save_host_keys（items() を回し、lookup がその接続先の
+    先頭エントリを返す）と違い、同じ行を何本も書いたり食い違う鍵を
+    取り違えたりしない。
+    """
+    hostkeys.save(str(tmp_path))
+    if preserved:
+        # paramiko は text モードで書くので、改行もそれに合わせる
+        with open(str(tmp_path), "ab") as f:
+            for raw in preserved:
+                f.write(raw + os.linesep.encode("ascii"))
+
+
+def _save_known_hosts(known_hosts_path, entry):
+    """今回の 1 件を known_hosts へ書き足す（ほかの行はディスクの現状のまま）。
+
+    接続開始時に読み込んだ client の HostKeys を丸ごと書き戻していた頃は、
+    その在庫が読み込んだ時点のものなので、あとでディスク側の行が消えても
+    memory からは消えず、別の機器の保存が消された行を復活させていた
+    （実測: 利用者が案内どおり該当行を削除して新しい鍵で登録し直すと、
+    入れ直した鍵がファイルから消え、古い鍵が同じ行 3 本に増殖して唯一の
+    正になる）。そこで、書く内容はそのつど錠の中でディスクから作り直し、
+    今回保存する 1 件だけを足す。
 
     paramiko 4.0.0 の SSHClient.save_host_keys は保存先を "w" で開いて
     先に切り詰めるため、書いている途中で落ちると保存済みの鍵をまとめて
-    失う。しかも保存前の再読込は load_host_keys 済みの client でしか
-    走らないので、known_hosts がまだ無い時点で始めた接続は、他の接続が
-    先に保存した鍵を上書きして消す。消された機器は次回また「未知」に
-    戻り、鍵が変わっていても確認なしで受け入れられる。
-
-    書く直前に既存のファイルを読み直して自分の鍵と合流させ、一時
-    ファイルへ書いてから os.replace で差し替える。差し替えは不可分な
-    ので、途中で落ちても前の known_hosts がそのまま残る。
+    失う。一時ファイルへ書いてから os.replace で差し替える。差し替えは
+    不可分なので、途中で落ちても前の known_hosts がそのまま残る。
 
     Args:
-        verify: (接続先名, 提示された鍵)。渡すと、書き込む前に同じ
-            接続先の別の鍵がディスクに無いかを錠の中で確かめる
+        entry: (接続先名, 提示された鍵)。書き足す 1 件。書き込む前に、
+            同じ接続先の別の鍵がディスクに無いかを錠の中で確かめる
     """
     path = Path(str(known_hosts_path))
     with _known_hosts_guard(path.parent):
-        if verify is not None:
-            # 確かめてから書くまでを錠の中で通す。外で見ると、その間に
-            # 別のプロセスが保存した鍵を見落とす
-            _refuse_conflicting_host_key(path, verify[0], verify[1])
+        # 確かめてから書くまでを錠の中で通す。外で見ると、その間に
+        # 別のプロセスが保存した鍵を見落とす
+        _refuse_conflicting_host_key(path, entry[0], entry[1])
+        hostkeys = paramiko.HostKeys()
         preserved = []
         if path.exists():
             # paramiko が読めない行は書き出しに入らないので、黙って消える。
             # 利用者が直すはずの行なので、そのまま書き戻す
             broken = unreadable_known_hosts_lines(path)
-            # 他の接続がこの間に保存した鍵を取り込む
-            _load_known_hosts_into_client(client, path, broken)
             preserved = [raw for _, _, raw in broken]
+            # ほかの行は、いまディスクにあるものだけを引き継ぐ
+            load_known_hosts(hostkeys, path)
+        hostkeys.add(entry[0], entry[1].get_name(), entry[1])
         path.parent.mkdir(parents=True, exist_ok=True)
         # os.replace はドライブを跨げないので一時ファイルは同階層に作る
         fd, tmp_path = tempfile.mkstemp(
             dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
         os.close(fd)
         try:
-            client.save_host_keys(tmp_path)
-            if preserved:
-                # paramiko は text モードで書くので、改行もそれに合わせる
-                with open(tmp_path, "ab") as f:
-                    for raw in preserved:
-                        f.write(raw + os.linesep.encode("ascii"))
+            _write_known_hosts_file(hostkeys, preserved, tmp_path)
             os.replace(tmp_path, str(path))
             tmp_path = None      # 差し替え済み。後片付けの対象から外す
         finally:
@@ -285,8 +298,7 @@ class _TofuHostKeyPolicy(paramiko.MissingHostKeyPolicy):
     def missing_host_key(self, client, hostname, key):
         client.get_host_keys().add(hostname, key.get_name(), key)
         try:
-            _save_known_hosts(client, self._known_hosts_path,
-                              verify=(hostname, key))
+            _save_known_hosts(self._known_hosts_path, (hostname, key))
         except HostKeyMismatchError:
             # 食い違いは「保存できなかった」ではなく「保存してはいけない」。
             # 警告で済ませず、そのまま接続を中止させる（client はこのあと

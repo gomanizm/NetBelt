@@ -50,10 +50,7 @@ def _worker(home, role, count):
     for i in range(int(count)):
         try:
             if role == "saver":
-                client = paramiko.SSHClient()
-                client.get_host_keys().add(
-                    "s%d.example.com" % i, key.get_name(), key)
-                _save_known_hosts(client, known_hosts)
+                _save_known_hosts(known_hosts, ("s%d.example.com" % i, key))
             else:
                 connection = SSHConnection("192.0.2.1", 22, "admin",
                                            password="pw")

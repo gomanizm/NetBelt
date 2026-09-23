@@ -74,7 +74,6 @@ class SshKnownHostsFailuresTest(unittest.TestCase):
     def test_a_failed_save_of_a_new_key_is_reported_on_screen(self):
         """保存できなければ、次回検証できないことを知らせること。"""
         client = mock.Mock()
-        client.save_host_keys.side_effect = PermissionError(13, "denied")
         conn, ok, errors, output = self._connect(client)
         self.assertTrue(ok)
         policy = client.set_missing_host_key_policy.call_args[0][0]
@@ -84,7 +83,9 @@ class SshKnownHostsFailuresTest(unittest.TestCase):
         # known_hosts に無い接続先で試す。既にある接続先に別の鍵を出すのは
         # 「保存できない」ではなく「鍵の食い違い」で、こちらは接続を中止する
         # （test_known_hosts_key_conflict.py）。ここで見たいのは保存の失敗
-        policy.missing_host_key(client, "192.0.2.2", key)
+        with mock.patch("core.ssh_connection._write_known_hosts_file",
+                        side_effect=PermissionError(13, "denied")):
+            policy.missing_host_key(client, "192.0.2.2", key)
 
         self.assertTrue(any("known_hosts" in o for o in output),
                         "保存の失敗を画面に出していない: %s" % output)

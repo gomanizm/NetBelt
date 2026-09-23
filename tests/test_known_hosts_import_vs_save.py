@@ -132,21 +132,24 @@ class KnownHostsImportVsSaveTest(unittest.TestCase):
             _entry(OLD_HOST, paramiko.ECDSAKey.generate()), encoding="utf-8")
 
         # S は鍵を足して保存する。書き終える前で止める
-        client_s = paramiko.SSHClient()
+        from core import ssh_connection
         key = paramiko.ECDSAKey.generate()
-        client_s.get_host_keys().add(NEW_HOST, key.get_name(), key)
-        real_save = client_s.save_host_keys
+        real_write = ssh_connection._write_known_hosts_file
         saving = threading.Event()
         resume = threading.Event()
         self.addCleanup(resume.set)
 
-        def paused_save(filename):
+        def paused_write(hostkeys, preserved, tmp_path):
             saving.set()
             resume.wait(5.0)
-            real_save(filename)
+            real_write(hostkeys, preserved, tmp_path)
 
-        client_s.save_host_keys = paused_save
-        thread_s, _ = self._run(lambda: _save_known_hosts(client_s, self.known_hosts))
+        writing = mock.patch("core.ssh_connection._write_known_hosts_file",
+                             paused_write)
+        writing.start()
+        self.addCleanup(writing.stop)
+        thread_s, _ = self._run(
+            lambda: _save_known_hosts(self.known_hosts, (NEW_HOST, key)))
         thread_s.start()
         self.assertTrue(saving.wait(5.0), "前提: 保存が書き込みまで進んでいない")
 
