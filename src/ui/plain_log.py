@@ -18,10 +18,48 @@ QTextEdit.append() が平文を渡されたときに行う処理と同じで、�
 の判定だけを通らない。document().setMaximumBlockCount による行数上限は
 これまでどおり効く。
 
+ただしそれだけでは、<br> の代わりに生の改行を入れれば同じ被害が出る
+（実測。chr(10) / chr(13) / CRLF / chr(11) / chr(12) / U+0085 / U+2028 /
+U+2029 のどれでも 2 行に割れた）。届いた文字列は insertText へ渡す前に
+fold_to_one_line() で 1 行へ畳む。値は捨てずに見える表記へ置き換えるので、
+要求名はログにもエクスポートにも残る。
+
 FTP / SFTP のログは転送名が届くのがログイン後なので前提は重いが、同じ
 実装を共有しているため 3 パネルとも同じ経路に揃える。
 """
 from PyQt6.QtGui import QTextCursor
+
+# 置き換え表。ソースへ生の制御文字を書かないよう chr() で組み立てる
+# （見えない文字はレビューでも差分でも追えない）。バックスラッシュも
+# エスケープの読み違いを避けるため同じ作り方にする。
+_BACKSLASH = chr(92)
+_LINE_BREAKS = (
+    (chr(0x0A), _BACKSLASH + "n"),
+    (chr(0x0D), _BACKSLASH + "r"),
+    (chr(0x0B), _BACKSLASH + "v"),
+    (chr(0x0C), _BACKSLASH + "f"),
+    (chr(0x85), _BACKSLASH + "u0085"),
+    (chr(0x2028), _BACKSLASH + "u2028"),
+    (chr(0x2029), _BACKSLASH + "u2029"),
+)
+
+
+def fold_to_one_line(line):
+    """行を割れる文字を見える表記へ置き換え、1 行に畳んで返す。
+
+    値そのものは捨てない。機器から届いた名前をあとから読み解けるように
+    しておく（捨てると、何を要求されたのか分からなくなる）。
+
+    Args:
+        line: 畳む前の 1 行
+
+    Returns:
+        改行を含まない 1 行
+    """
+    for char, shown in _LINE_BREAKS:
+        if char in line:
+            line = line.replace(char, shown)
+    return line
 
 
 def append_line(text_edit, line):
@@ -31,7 +69,7 @@ def append_line(text_edit, line):
 
     Args:
         text_edit: 追記先の QTextEdit
-        line: 足す 1 行。HTML として解釈されず、そのまま残る
+        line: 足す 1 行。HTML として解釈されず、改行で割れることもない
     """
     document = text_edit.document()
     cursor = QTextCursor(document)
@@ -39,7 +77,7 @@ def append_line(text_edit, line):
     cursor.beginEditBlock()
     if not document.isEmpty():
         cursor.insertBlock()
-    cursor.insertText(line)
+    cursor.insertText(fold_to_one_line(line))
     cursor.endEditBlock()
     scrollbar = text_edit.verticalScrollBar()
     scrollbar.setValue(scrollbar.maximum())
