@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtGui import QFont
 from core.tftp_server import TFTPServerManager
 from datetime import datetime
-from ui import log_export, theme
+from ui import log_export, plain_log, theme
 
 class TFTPServerPanel(QWidget):
     """TFTPサーバー制御パネル"""
@@ -355,9 +355,14 @@ class TFTPServerPanel(QWidget):
         self._add_log("ファイアウォール許可: %s (%s)" % ("完了" if ok else "未反映/失敗", msg))
 
     def _add_log(self, message: str):
-        """ログにメッセージを追加(自動スクロール付き)"""
-        self.log_text.append(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
-        self.log_text.verticalScrollBar().setValue(self.log_text.verticalScrollBar().maximum())
+        """ログにメッセージを追加(自動スクロール付き)
+
+        append() ではなく平文で積む。TFTP は認証が無いので、要求ファイル名に
+        <br> を入れるだけで偽の行を差し込めた（plain_log の説明を参照）。
+        """
+        plain_log.append_line(
+            self.log_text,
+            f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
 
     def _on_clear_log(self):
         """ログをクリア"""

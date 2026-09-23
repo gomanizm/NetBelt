@@ -8,7 +8,7 @@ from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QFont
 from core.sftp_server import SFTPServerManager
 from datetime import datetime
-from ui import log_export, theme
+from ui import log_export, plain_log, theme
 
 
 class SFTPServerPanel(QWidget):
@@ -318,14 +318,14 @@ class SFTPServerPanel(QWidget):
         self._add_log("ファイアウォール許可: %s (%s)" % ("完了" if ok else "未反映/失敗", msg))
 
     def _add_log(self, message: str):
-        """ログにメッセージを追加"""
+        """ログにメッセージを追加
+
+        append() ではなく平文で積む。届いた名前に <br> があると 1 件の通知が
+        2 行に割れ、偽の記録に見えた（plain_log の説明を参照）。
+        自動スクロールは append_line が行う。
+        """
         timestamp = datetime.now().strftime("%H:%M:%S")
-        log_message = f"[{timestamp}] {message}"
-        self.log_text.append(log_message)
-        
-        # 自動スクロール
-        scrollbar = self.log_text.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
+        plain_log.append_line(self.log_text, f"[{timestamp}] {message}")
     
     def _on_clear_log(self):
         """ログをクリア"""

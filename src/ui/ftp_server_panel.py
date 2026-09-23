@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtGui import QFont
 from core.ftp_server import FTPServerManager
-from ui import log_export, theme
+from ui import log_export, plain_log, theme
 from datetime import datetime
 
 class FTPServerPanel(QWidget):
@@ -368,9 +368,14 @@ class FTPServerPanel(QWidget):
         self._add_log("ファイアウォール許可: %s (%s)" % ("完了" if ok else "未反映/失敗", msg))
 
     def _add_log(self, message: str):
-        """ログにメッセージを追加(自動スクロール付き)"""
-        self.log_text.append(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
-        self.log_text.verticalScrollBar().setValue(self.log_text.verticalScrollBar().maximum())
+        """ログにメッセージを追加(自動スクロール付き)
+
+        append() ではなく平文で積む。届いた名前に <br> があると 1 件の通知が
+        2 行に割れ、偽の記録に見えた（plain_log の説明を参照）。
+        """
+        plain_log.append_line(
+            self.log_text,
+            f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
 
     def _on_clear_log(self):
         """ログをクリア"""
