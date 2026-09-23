@@ -14,18 +14,24 @@
   SSHClient.connect が start_client の前に行う _host_keys.get(...) で
   AssertionError('') になる。利用者に出るのは『接続エラー: 』（本文が空）
   だけで、どの接続先でも同じ。どの行が原因かも分からない。
-- paramiko の HostKeys.load を通る場合: load 内の check() で同じ例外になり、
-  「known_hosts を読めないため接続を中止しました」で全機器が止まる。
+- paramiko の HostKeys.load を通る場合: 崩れた行より後に行があれば、
+  load 内の check() で同じ例外になり「known_hosts を読めないため接続を
+  中止しました」（理由は空）で全機器が止まる。崩れた行が最後の行なら
+  load は通り、上と同じく connect で『接続エラー: 』（本文が空）になる。
 
 どちらも、1 行の崩れで関係のない機器まで繋がらなくなる。読めない行は
-行番号つきで知らせ、その行が指す接続先だけを断る、という既存の扱い
-（test_known_hosts_broken_line.py）から外れていた。
+行番号つきで知らせ、名前欄が接続先と一致する行があるときだけ断る、
+という既存の扱い（test_known_hosts_broken_line.py）から外れていた。
 
 どう直したか。_iter_known_hosts_lines で、名前欄のハッシュ化名に
 hash_host を掛けて例外になる行は、読めない行（entry=None）として返す。
 読めない行なので、ローダは取り込まず（lookup が落ちない）、警告で
 行番号つきで名指しされ、保存のときにもそのまま書き戻される（消えない）。
 形の正しいハッシュ化名の行は、これまでどおり読める行として扱う。
+
+崩れたハッシュ化名の行は、どの機器の行かをこちらで判別できない。
+警告は、ワイルドカードの行と同じく「この機器を指している可能性がある」
+ことを伝える（完全には一致しなかった、だけでは無関係だと読めてしまう）。
 """
 import os
 import shutil
@@ -42,8 +48,9 @@ from paramiko.hostkeys import HostKeys              # noqa: E402
 
 HOST_A = "192.0.2.1"
 HOST_B = "192.0.2.2"
-# 塩が 20 バイトにならないもの / base64 として壊れているもの
-MALFORMED_NAMES = ["|1|AAAA|AAAA", "|1|!!!!|AAAA"]
+# 塩が 20 バイトにならないもの（3 バイト / 空に復号される）と、
+# base64 として復号できないもの（binascii.Error）
+MALFORMED_NAMES = ["|1|AAAA|AAAA", "|1|!!!!|AAAA", "|1|abc|AAAA"]
 # 自前ローダの経路へ回すための、別の読めない行（鍵欄が無い）
 BROKEN_LINE = "[192.0.2.9]:2222 ssh-ed25519"
 
@@ -88,13 +95,15 @@ class KnownHostsMalformedHashedNameTest(unittest.TestCase):
         return client, messages
 
     def _cases(self):
-        """(説明, 崩れた行, known_hosts の中身) を返す。"""
+        """(説明, 崩れた行の行番号, 崩れた行, known_hosts の中身) を返す。"""
         for name in MALFORMED_NAMES:
             malformed = self._line(name, self.key_a)
             plain_a = self._line(HOST_A, self.key_a)
-            yield ("paramiko の読み込み経路: %s" % name, malformed,
+            yield ("paramiko の読み込み経路: %s" % name, 1, malformed,
                    [malformed, plain_a])
-            yield ("自前ローダの経路: %s" % name, malformed,
+            yield ("paramiko の読み込み経路・崩れた行が最後: %s" % name,
+                   2, malformed, [plain_a, malformed])
+            yield ("自前ローダの経路: %s" % name, 1, malformed,
                    [malformed, plain_a, BROKEN_LINE])
 
     # --- 崩れた行を読めない行として扱うこと ---
@@ -102,20 +111,20 @@ class KnownHostsMalformedHashedNameTest(unittest.TestCase):
     def test_a_malformed_hashed_name_is_listed_as_unreadable(self):
         """崩れたハッシュ化名の行が、行番号つきで読めない行に入ること。"""
         from core.ssh_connection import unreadable_known_hosts_lines
-        for title, malformed, lines in self._cases():
+        for title, lineno, malformed, lines in self._cases():
             with self.subTest(title):
                 self._write(lines)
 
                 broken = [(no, text) for no, text, _
                           in unreadable_known_hosts_lines(self.known_hosts)]
 
-                self.assertIn((1, malformed), broken,
+                self.assertIn((lineno, malformed), broken,
                               "崩れた行が読めない行に入っていない: %r"
                               % (broken,))
 
     def test_another_host_still_connects_and_the_line_is_named(self):
         """関係のない接続先の検証は進み、崩れた行を名指しで知らせること。"""
-        for title, malformed, lines in self._cases():
+        for title, lineno, malformed, lines in self._cases():
             with self.subTest(title):
                 self._write(lines)
 
@@ -126,14 +135,14 @@ class KnownHostsMalformedHashedNameTest(unittest.TestCase):
                 self.assertIsNotNone(found, "読めている A の鍵が失われている")
                 self.assertTrue(found[self.key_a.get_name()] == self.key_a,
                                 "A の検証に使う鍵が変わっている")
-                self.assertTrue(any("1 行目: " + malformed in m
+                self.assertTrue(any("%d 行目: %s" % (lineno, malformed) in m
                                     for m in messages),
                                 "崩れた行を名指しで知らせていない: %r"
                                 % (messages,))
 
     def test_saving_another_host_keeps_the_malformed_line(self):
         """B の初回接続を保存しても、崩れた行は消えず B も保存されること。"""
-        for title, malformed, lines in self._cases():
+        for title, _lineno, malformed, lines in self._cases():
             with self.subTest(title):
                 self._write(lines)
 
@@ -147,6 +156,26 @@ class KnownHostsMalformedHashedNameTest(unittest.TestCase):
                               "崩れた行が保存で消えている: %r" % (saved,))
                 self.assertIn(self._line(HOST_B, self.key_b), saved,
                               "B の鍵が保存されていない: %r" % (saved,))
+
+    def test_the_warning_does_not_read_as_unrelated(self):
+        """崩れたハッシュ化名の行が、この機器を指しうると警告で伝えること。
+
+        どの機器の行かを判別できないので、「完全には一致しなかった」だけ
+        では無関係だと読めてしまう（ワイルドカードの行と同じ扱い）。
+        """
+        for title, _lineno, _malformed, lines in self._cases():
+            with self.subTest(title):
+                self._write(lines)
+
+                _client, messages = self._setup(HOST_B)
+
+                warning = "".join(messages)
+                self.assertIn("ハッシュ化", warning,
+                              "崩れたハッシュ化名の行に触れていない: %r"
+                              % (warning,))
+                self.assertIn("可能性", warning,
+                              "この機器を指しうることを伝えていない: %r"
+                              % (warning,))
 
     # --- 今までどおりであること（対照） ---
 
