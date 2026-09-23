@@ -365,13 +365,17 @@ class SFTPManager(QObject):
                             # ここでやめて失敗として扱う（_fail が畳む）
                             raise
                         except Exception as link_error:
-                            if _is_dropped_connection(link_error):
+                            if (_is_dropped_connection(link_error)
+                                    or self._channel_closed()):
                                 # 切断・壊れた応答も期限切れと同じ扱い
                                 # （利用者の決定 2026-09-20）。ここで拾って
                                 # 続けると、既に切れたあとの一覧を「取得成功」
                                 # として配り、接続中の表示まで残る。取れた分を
                                 # 捨てることになるが、期限切れの枝が同じ選択を
-                                # している
+                                # している。機器が SFTP のチャンネルだけを
+                                # 閉じたとき（OSError('Socket is closed')）も
+                                # 同じで、型では分からないので状態で見る
+                                # （利用者の決定 2026-09-23。_fail が畳む）
                                 raise
                             continue
                         link_modes[item.filename] = getattr(target, "st_mode", None)
@@ -1280,13 +1284,21 @@ class SFTPManager(QObject):
                 # 接続中の表示が残る
                 raise
             except Exception:
-                pass   # 名前が読めなくても、権限は読めている
+                # 機器が SFTP のチャンネルだけを閉じていたら
+                # （OSError('Socket is closed')）、名前が読めなかったのでは
+                # なく以後使えない印。上の枝と同じく外へ出す
+                if self._channel_closed():
+                    raise
+                # 名前が読めなくても、権限は読めている
         except Exception as e:
             err = e
         finally:
             self._sftp_lock.release()
-        # 通知はロックを離してから（_fail が切断するときロックを取る）
-        if isinstance(err, _UNUSABLE_CHANNEL_ERRORS):
+        # 通知はロックを離してから（_fail が切断するときロックを取る）。
+        # チャンネルが閉じていた失敗は「リンク先を読めない」ではなく、
+        # 切断として畳む（利用者の決定 2026-09-23）
+        if isinstance(err, _UNUSABLE_CHANNEL_ERRORS) or (
+                err is not None and self._channel_closed()):
             # 理由の整形（空の str を型名にする・末尾のコロンを落とす）も
             # 切断の文面も _fail が持っている
             self._fail("リンク先の確認エラー", err)
