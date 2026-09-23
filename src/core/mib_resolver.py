@@ -11,7 +11,7 @@ from typing import Dict, Optional
 # MIB 解析器の版。抽出・解決の規則を変えたら上げる。mib_cache.json は
 # この値も鍵にするので、古い解析器が作ったキャッシュがアプリの更新後に
 # そのまま使われることがなくなる。
-MIB_PARSER_VERSION = '2026-09-22.5'
+MIB_PARSER_VERSION = '2026-09-23.1'
 
 
 def app_dir() -> str:
@@ -789,6 +789,16 @@ class MIBResolver:
         同名を使わずに次の回を待つ。同じモジュールに無い親（IMPORTS）は
         これまでどおりモジュールをまたいで探す。
 
+        「次の回を待つ」は、1 件も進まない回が来るまで続ける。そこで
+        初めて 1 回だけよその同名を借りることを許し、進んだらまた自分の
+        モジュール優先へ戻す。借用を遅らせずに 1 回目から許すと、抽出の
+        順（_MIB_DEFINITION_PATTERNS が種類ごとに finditer するので
+        ファイル内の順とは違う）しだいで、自分のモジュールの親がまだ
+        未解決のうちに内蔵表の同名で子が確定してしまう。確定した子は
+        本当の親が決まっても再計算されない（実測: ベンダーの alarm が
+        1.3.6.1.4.1.65001.1.99 ではなく標準 system 配下の
+        1.3.6.1.2.1.1.99 に入り、mib_cache.json にも残った）。
+
         「同じモジュールにあるか」は、抽出できた定義だけでなく
         _MIB_LOCAL_NAME で集めた宣言も見る。そのモジュールの宣言が抽出から
         落ちていると（複数添字の右辺など）、よその同名が親になって子が別
@@ -852,6 +862,9 @@ class MIBResolver:
         in_module = {}
         resolved = {}
         pending = list(definitions)
+        # よそのモジュール・内蔵表の同名を親にしてよい回か。
+        # 自分のモジュールの親が決まる見込みがある間は False
+        borrow = False
 
         while pending:
             still_pending = []
@@ -861,7 +874,8 @@ class MIBResolver:
                     parent_oid = '1.3.6.1.4.1'
                 elif parent in declared[module]:
                     parent_oid = in_module.get(module, {}).get(parent)
-                    if parent_oid is None and declaring.get(parent, 0) < 2:
+                    if (parent_oid is None and borrow
+                            and declaring.get(parent, 0) < 2):
                         # よそのモジュールに同名が無い＝曖昧ではない。
                         # 標準表 / custom_mibs.json / IMPORTS の値を
                         # これまでどおり使う
@@ -877,8 +891,17 @@ class MIBResolver:
                 resolved[oid] = name
                 progressed = True
             if not progressed:
+                if not borrow:
+                    # 自分のモジュールの親はもう決まらない。ここで
+                    # 初めて、よその同名を借りることを許す
+                    borrow = True
+                    pending = still_pending
+                    continue
                 # これ以上どれも解決できない（親がどこにも無い）
                 break
+            # 進んだ＝自分のモジュールの親が決まりつつある。
+            # 借用はまた禁じて、次の回も自モジュールを優先する
+            borrow = False
             pending = still_pending
 
         # 残ったもののうち、よそのモジュールの同名を親にすれば解決できた
