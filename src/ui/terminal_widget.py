@@ -1373,8 +1373,13 @@ class TerminalWidget(QWidget):
             events = terminal._parser.feed(piece)
             terminal._screen.apply(events)
             logs.append((target, events))
-        self._render_screen(terminal)
-
+        # 描くのに失敗しても、記録へは必ず書く。ここで飛ばすと、その片は
+        # 描き待ちから取り出し済みで二度と記録へ回らない（実測: 画面に
+        # 1365 行出ているのに記録は 0 行、停止した記録も _split_for_logs が
+        # 先に区間を減らしているぶんだけ黙って欠けた）。_write_logs は受信
+        # 事象だけを見ていて画面の状態に依らないので、途中で失敗した描画の
+        # 後でも書ける。例外は握り潰さずそのまま上へ返す
+        #
         # 記録へは、機器へ応答を送る前に書き切る。応答の送信は key_pressed
         # → 接続の send_command と同期でつながっていて、そこで失敗すると
         # error_occurred → 切断扱い → show_notice と、その場でここへ再入する。
@@ -1382,7 +1387,10 @@ class TerminalWidget(QWidget):
         # しまい、外側は閉じたハンドルへ書いて失敗する（停止より前に受信した
         # 末尾がまるごと失われ、モーダル警告まで出る）。記録中のログでも、
         # 切断案内が元の受信本文より先に記録されて画面と順序が食い違う
-        self._write_logs(device_name, logs)
+        try:
+            self._render_screen(terminal)
+        finally:
+            self._write_logs(device_name, logs)
 
         # 機器からの問い合わせ (カーソル位置・装置識別) に答える。
         # key_pressed はキー入力と同じ「機器へ送る文字」の経路
@@ -1556,25 +1564,32 @@ class TerminalWidget(QWidget):
 
     def _flush_pending_output(self) -> None:
         """溜めた出力を機器ごとに OUTPUT_SLICE 文字まで描き、残りは次の回へ回す"""
-        for device_name in list(self._pending_output):
-            pending = self._pending_output.get(device_name)
-            if not pending or device_name not in self._terminals:
-                self._pending_output.pop(device_name, None)
-                continue
-            text = pending.take(self.OUTPUT_SLICE)
-            if not pending:
-                # 描き残しがあれば残しておく。描いている最中（警告のモーダル
-                # などでイベントループが回ったとき）に届いた出力や案内は、
-                # この描き残しの後ろに並ぶ
-                del self._pending_output[device_name]
-            self._flushing_device = device_name
-            try:
-                self.append_output(device_name, text)
-            finally:
-                self._flushing_device = None
-            self._update_output_gate(device_name)
-        if self._pending_output:
-            self._output_timer.start()
+        # 描画が失敗しても、関所の開け直しと次の排出だけは続ける。飛ばすと
+        # 関所が閉じたまま受信スレッドが読まなくなり、新しい queue_output が
+        # 来ないので誰もタイマーを掛け直せない（実測: 残り 16,376 文字が
+        # 永久に描かれず、その機器の端末が恒久停止した）。取り出した片は
+        # パーサへ通し済みなので描き待ちへは戻さない（戻すと二重に描く）
+        try:
+            for device_name in list(self._pending_output):
+                pending = self._pending_output.get(device_name)
+                if not pending or device_name not in self._terminals:
+                    self._pending_output.pop(device_name, None)
+                    continue
+                text = pending.take(self.OUTPUT_SLICE)
+                if not pending:
+                    # 描き残しがあれば残しておく。描いている最中（警告の
+                    # モーダルなどでイベントループが回ったとき）に届いた
+                    # 出力や案内は、この描き残しの後ろに並ぶ
+                    del self._pending_output[device_name]
+                self._flushing_device = device_name
+                try:
+                    self.append_output(device_name, text)
+                finally:
+                    self._flushing_device = None
+                    self._update_output_gate(device_name)
+        finally:
+            if self._pending_output:
+                self._output_timer.start()
 
     def _draw_pending_now(self, device_name: str) -> None:
         """その機器の溜まり分を、いまここで全部描く（画面を付け直す前など）
