@@ -494,7 +494,12 @@ class SFTPPanel(QWidget):
             # 行を追加
             self.model.appendRow([name_item, size_item, perm_item, time_item])
         
-        self.status_label.setText(f"{len(file_list)} 項目")
+        # 一覧の変換はロックの外なので、届く前に SFTP が切れていることがある。
+        # 行は並べたまま（利用者の決定 2026-09-23）、切れた表示は残す
+        if self._manager_is_live():
+            self.status_label.setText(f"{len(file_list)} 項目")
+        else:
+            self.status_label.setText(self.DROPPED_TEXT)
     
     def _reset_progress(self):
         """進捗バーを片付ける
