@@ -437,6 +437,11 @@ REM probe で見分けて案内を変える。
 set "LOCK_DIR=!APP_DIR!NetBelt-update-lock"
 set "LOCK_OLD_NAME=NetBelt-update-lock.!STAMP!.old"
 set "LOCK_OLD=!APP_DIR!!LOCK_OLD_NAME!"
+set "TAKEOVER_DIR=!APP_DIR!NetBelt-update-takeover"
+set "TAKEOVER_OLD_NAME=NetBelt-update-takeover.!STAMP!.old"
+set "TAKEOVER_OLD=!APP_DIR!!TAKEOVER_OLD_NAME!"
+set "TAKEOVER_HELD="
+set "TAKEOVER_TRY="
 set "LOCK_HELD="
 set "LOCK_STAMPED="
 set "LOCK_TRY=0"
@@ -473,6 +478,23 @@ if not errorlevel 1 goto :lock_foreign
 if !LOCK_TRY! geq 2 goto :lock_busy
 call :lock_is_stale
 if errorlevel 1 goto :lock_busy
+REM ここから先（古さの見直し・ren・rd）は、同じインストール先への
+REM 取り直しを 1 本ずつにする。古いと見てから ren するまでの間に
+REM 別の更新が回収を終えて新しい目印を作っていると、ここの ren が
+REM 掴むのはその生きている目印になり、正規名が一瞬空く。実測
+REM （検査役 cx7a-verify-release の p02_lock_putback_third.py、
+REM 2/2）: その窓で 3 本目が md を通し、戻しは名前が塞がって失敗、
+REM 続く rd が持ち主の目印を消して、2 本が同時にインストール先を
+REM 書けた（両方が「更新が完了しました！」を出し、先に始めたほうが
+REM 承認した版とは別の exe が据わった）。取り直し用の目印を取って
+REM から古さを見直せば、その間は誰も回収できないので、見たものと
+REM 掴むものが必ず同じになる（利用者の決定 2026-09-23 /
+REM release-02）。
+call :claim_takeover
+if errorlevel 1 goto :lock_busy
+set "PS_LOCK=!LOCK_DIR!"
+call :lock_is_stale
+if errorlevel 1 goto :lock_busy
 ren "!LOCK_DIR!" "!LOCK_OLD_NAME!" 2>nul
 if not exist "!LOCK_OLD!" goto :lock_busy
 set "PS_LOCK=!LOCK_OLD!"
@@ -480,6 +502,7 @@ call :lock_is_stale
 if errorlevel 1 goto :lock_put_back
 rd /s /q "!LOCK_OLD!" 2>nul
 if exist "!LOCK_OLD!" goto :lock_put_back
+call :release_takeover
 echo   前の更新が残した目印を取り除きました
 goto :claim_lock
 
@@ -493,6 +516,7 @@ if exist "!LOCK_OLD!" rd /s /q "!LOCK_OLD!" 2>nul
 goto :lock_busy
 
 :lock_busy
+call :release_takeover
 echo エラー: 別の更新が進行中です
 echo   同じインストール先への更新が既に動いています。インストール先の
 echo   ファイルは何も変えていません。先の更新が終わるのを待ってから、
@@ -730,6 +754,67 @@ exit /b 0
 set "LOCK_OWNER="
 set /p LOCK_OWNER=<"%~1\holder.txt" 2>nul
 if "!LOCK_OWNER!"=="!STAMP!" rd /s /q "%~1" 2>nul
+exit /b 0
+
+REM ================================================================
+REM 古い目印の取り直しを 1 本ずつにする目印（call で呼ぶ）
+REM ================================================================
+REM 取れたら errorlevel 0、取れなければ 1。インストール先の目印
+REM （NetBelt-update-lock）は動いている更新が 1 本ずつ持つためのもので、
+REM 持ち主が死んだ後の「回収」までは束ねられない。回収の側だけを分けて
+REM 直列化する（利用者の決定 2026-09-23 / release-02）。
+REM 取れなかった側は待たずに中止する。回収は powershell 数回と rd だけで
+REM 終わるので、待っても得るものが無く、「更新が進行中」の案内を遅らせる
+REM だけになるため。
+REM この目印も異常終了（コンソールを閉じられた等）で残ることがある。
+REM 扱いはインストール先の目印と同じで、10分より古ければ回収してよい。
+REM 回収の仕方も同じく「ren でつかんでから消す」。ren は同時に 1 つしか
+REM 成功しないので、二重に回収されない。
+REM 利用者が同じ名前のものを置いていたときは、古さを見るより先に中止する
+REM （:lock_is_foreign。消さないほうを選ぶ＝release-01 と同じ判断）。
+:claim_takeover
+md "!TAKEOVER_DIR!" 2>nul
+if not errorlevel 1 goto :takeover_claimed
+if defined TAKEOVER_TRY exit /b 1
+set "TAKEOVER_TRY=1"
+set "PS_LOCK=!TAKEOVER_DIR!"
+call :lock_is_foreign
+if not errorlevel 1 exit /b 1
+call :lock_is_stale
+if errorlevel 1 exit /b 1
+ren "!TAKEOVER_DIR!" "!TAKEOVER_OLD_NAME!" 2>nul
+if not exist "!TAKEOVER_OLD!" exit /b 1
+set "PS_LOCK=!TAKEOVER_OLD!"
+call :lock_is_stale
+if errorlevel 1 goto :takeover_put_back
+rd /s /q "!TAKEOVER_OLD!" 2>nul
+if exist "!TAKEOVER_OLD!" goto :takeover_put_back
+goto :claim_takeover
+
+REM つかんだのは生きている取り直しだった（見てから掴むまでの間に別の
+REM 更新が取り直した）か、片付けられなかった。元の名前へ戻して譲る。
+REM 戻せないのはその間に別の更新が新しい目印を作ったときで、名前から
+REM 外れた以上もう誰の排他にもならないので、置き去りにせず消す
+REM （:lock_put_back と同じ判断）。
+:takeover_put_back
+ren "!TAKEOVER_OLD!" "NetBelt-update-takeover" 2>nul
+if exist "!TAKEOVER_OLD!" rd /s /q "!TAKEOVER_OLD!" 2>nul
+exit /b 1
+
+:takeover_claimed
+set "TAKEOVER_HELD=1"
+exit /b 0
+
+REM ================================================================
+REM 取り直し用の目印を外す（call で呼ぶ）
+REM ================================================================
+REM 自分が確保したときだけ外す。持っている時間は powershell 数回ぶん
+REM なので、インストール先の目印のような holder.txt での確かめは置いて
+REM いない（10分の古さの境を越えるほど長くは持たない）。
+:release_takeover
+if not defined TAKEOVER_HELD exit /b 0
+set "TAKEOVER_HELD="
+rd /s /q "!TAKEOVER_DIR!" 2>nul
 exit /b 0
 
 REM ================================================================
