@@ -298,9 +298,12 @@ class Screen(object):
             main_marks.append(False)
         if self.alt_active:
             if self._saved_main:
-                # 位置だけ画面に収め、属性と文字集合はそのまま持ち越す
+                # 行は履歴へ送ったぶんだけ減らした keep_row を持ち越す。
+                # 桁は丸めない。ここで丸めると窓を元へ広げ直しても戻ら
+                # ず、1049l が本来より左へ戻って、続く 1 文字が受信済み
+                # の桁を黙って潰す。画面へ収めるのは復元時の _move
                 self._saved_main = ((min(keep_row, rows - 1),
-                                     min(self._saved_main[1], cols - 1))
+                                     self._saved_main[1])
                                     + self._saved_main[2:])
         else:
             self.cursor_row = keep_row
