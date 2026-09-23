@@ -124,7 +124,7 @@ class SFTPManager(QObject):
             self.error_occurred.emit(
                 f"{prefix}: 機器が{self.CHANNEL_TIMEOUT_SECONDS:g}秒応答しません。"
                 "SFTP接続を切断しました。接続し直してください")
-            self.disconnect()
+            self._disconnect_after_notice()
             return
         reason = str(e) or e.__class__.__name__
         if _is_dropped_connection(e):
@@ -133,9 +133,30 @@ class SFTPManager(QObject):
             self.error_occurred.emit(
                 f"{prefix}: {reason.strip().rstrip(':').rstrip()}。"
                 "SFTP接続を切断しました。接続し直してください")
-            self.disconnect()
+            self._disconnect_after_notice()
             return
         self.error_occurred.emit(f"{prefix}: {reason}")
+
+    def _disconnect_after_notice(self):
+        """通知を配ったあとに接続を畳む（配達中に捨てられていても落ちない）
+
+        error_occurred は GUI スレッドからの操作では同期配送で、受け手の
+        パネルが QMessageBox を開くと入れ子のイベントループが回る。その間に
+        SSH の切断が届くと MainWindow がこのマネージャを deleteLater で
+        捨てるので、戻ってきたときには C++ 側だけが消えていて
+        disconnected.emit が『wrapped C/C++ object ... has been deleted』の
+        RuntimeError になる。共通の例外ハンドラが受けるので落ちはしないが、
+        SFTP エラーの警告を閉じた直後に「予期しないエラー」がもう 1 枚出る。
+
+        畳む仕事（is_connected を落とす・クライアントを閉じる）は emit の
+        前に終わっているので、この RuntimeError は飲んでよい。捨てた側も
+        同じ後始末を済ませている。
+        """
+        try:
+            self.disconnect()
+        except RuntimeError:
+            # 既に捨てられている。切断を知らせる相手も一緒に外れている
+            print("[SFTP] 通知の間に破棄されたため、切断の通知は省きました")
 
     def connect(self, ssh_client: paramiko.SSHClient) -> bool:
         """
