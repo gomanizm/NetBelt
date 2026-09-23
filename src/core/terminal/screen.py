@@ -140,11 +140,13 @@ class Screen(object):
         self._printed_at_last_col = False
         # ESC 7 / ESC 8。位置・属性に加えて、VT100 と同じく
         # 文字集合の指示 (G0/G1) と SI/SO の状態、それに xterm と
-        # 同じく右端の折り返し待ち (_pending_wrap) も持つ。最後の桁数は
-        # 標準に無い持ち物で、戻すときに折り返し待ちを解くかどうかを
-        # 決めるためだけに使う (_restore_cursor)
+        # 同じく右端の折り返し待ち (_pending_wrap) も持つ。末尾の
+        # 桁数と「最終桁へ印字した」覚え (_printed_at_last_col) は
+        # 標準に無い持ち物で、前者は戻すときに折り返し待ちを解くか
+        # どうかを決めるため、後者は結合文字を繋ぐ先を選ぶために
+        # 使う (_restore_cursor)
         self._saved = (0, 0, DEFAULT, {"(": "B", ")": "B"}, "(", False,
-                       self.cols)
+                       self.cols, False)
         # 保存領域は画面ごと (xterm の screen->sc[])。裏へ回った画面の
         # ぶんはここへ退避する
         self._other_saved = self._saved
@@ -741,6 +743,7 @@ class Screen(object):
             elif self.cursor_row:
                 self.cursor_row -= 1
             self._pending_wrap = False
+            self._printed_at_last_col = False   # 行が変わる
         elif seq.final == "E":          # NEL
             self.cursor_col = 0
             self._linefeed()
@@ -757,11 +760,12 @@ class Screen(object):
         """DECSC (ESC 7) と ?1048h の保存。xterm も同じ保存領域を使う。"""
         self._saved = (self.cursor_row, self.cursor_col, self.attr,
                        dict(self._g), self._charset, self._pending_wrap,
-                       self.cols)
+                       self.cols, self._printed_at_last_col)
 
     def _restore_cursor(self):
         """DECRC (ESC 8) と ?1048l の復元。"""
-        row, col, attr, g, charset, pending, saved_cols = self._saved
+        (row, col, attr, g, charset, pending, saved_cols,
+         printed) = self._saved
         self.attr = attr
         self._g = dict(g)
         self._charset = charset
@@ -778,8 +782,11 @@ class Screen(object):
         # まで巻き込んで解いてしまう
         if pending and self.cols < saved_cols:
             pending = False
-        # _move が折り返し待ちを落とすので、復元はそのあと
+        # _move が折り返し待ちを落とすので、復元はそのあと。
+        # 最終桁へ印字した覚えも同じ (落とすと、戻った最終桁の
+        # 文字に結合文字が付かず 1 つ左へずれる)
         self._pending_wrap = pending
+        self._printed_at_last_col = printed
 
     def _osc(self, text):
         num, _, rest = text.partition(";")
@@ -836,6 +843,7 @@ class Screen(object):
                     self.wrapped[r] = False
                 self.dirty.update(range(self.rows))
                 self._pending_wrap = False
+                self._printed_at_last_col = False
             elif not to_alt and with_cursor and self._saved_main:
                 # 47l / 1047l で先にメイン画面へ戻ったあとの 1049l。
                 # 画面の入れ替えは済んでいるが、1049h の保存はまだ
@@ -848,10 +856,12 @@ class Screen(object):
                 # 一度も受けていない迷子の 1049l (tput rmcup など)
                 # は保存が無いので、これまでどおり何もしない
                 row, col, attr, g, charset = self._saved_main[:5]
+                printed = self._saved_main[-1]
                 self.attr = attr
                 self._g = dict(g)
                 self._charset = charset
                 self._move(row, col)
+                self._printed_at_last_col = printed
                 self._saved_main = None
                 self.dirty.update(range(self.rows))
             return
@@ -862,14 +872,15 @@ class Screen(object):
         self._screen_blank = False
         # 1049 の復元でだけ書き換わる。saved_cols を いまの桁 にして
         # おけば、復元しなかったときは下の判定が成り立たない
-        pending, saved_cols = False, self.cols
+        pending, saved_cols, printed = False, self.cols, False
         if to_alt and with_cursor:
             # 1049 は DECSC 相当の保存・復元 (XTerm ctlseqs)。文字集合
             # の指示まで持ち帰らないと、代替画面が ESC(0 のまま抜けた
             # ときに以降の出力も記録も罫線文字に化け続ける
             self._saved_main = (self.cursor_row, self.cursor_col, self.attr,
                                 dict(self._g), self._charset,
-                                self._pending_wrap, self.cols)
+                                self._pending_wrap, self.cols,
+                                self._printed_at_last_col)
         elif to_alt:
             # 47h / 1047h は保存しない。前の 1049 の保存を残すと、この
             # 代替画面から 1049l で出たときに古い位置・属性・文字集合へ
@@ -901,8 +912,8 @@ class Screen(object):
                 # 47 で入った代替画面では 1049 用の保存が無い。xterm の
                 # 1049l は CursorRestore なので、そのときはメイン画面の
                 # 保存領域 (入れ替えたあとの _saved、DECSC) から戻す
-                row, col, attr, g, charset, pending, saved_cols = (
-                    self._saved_main or self._saved)
+                (row, col, attr, g, charset, pending, saved_cols,
+                 printed) = (self._saved_main or self._saved)
                 self.attr = attr
                 self._g = dict(g)
                 self._charset = charset
@@ -912,9 +923,11 @@ class Screen(object):
         # 保存したときより桁が狭いときだけ解く
         if pending and self.cols < saved_cols:
             pending = False
-        # 1049 で持ち帰った折り返し待ちだけは残す。_move も、白紙化の
-        # あとの位置決めも落とすので、代入はいちばん最後
+        # 1049 で持ち帰った折り返し待ちと、最終桁へ印字した覚えだけは
+        # 残す。_move も、白紙化のあとの位置決めも落とすので、代入は
+        # いちばん最後
         self._pending_wrap = pending
+        self._printed_at_last_col = printed
 
     def _set_margins(self, p):
         # 0 は省略と同じく既定値 (xterm と同じ)。0-1 = -1 を丸めると
@@ -1015,6 +1028,8 @@ class Screen(object):
                          and not any(self.wrapped)):
             self._screen_blank = True
         self._pending_wrap = False
+        # 消したセルはもう印字済みではない (_join_previous)
+        self._printed_at_last_col = False
 
     def _record_screen(self):
         """画面全体が消える前に、最後の非空行までを履歴へ送る。"""
@@ -1062,6 +1077,8 @@ class Screen(object):
             self.wrapped[self.cursor_row] = False
         self.dirty.add(self.cursor_row)
         self._pending_wrap = False
+        # 消したセルはもう印字済みではない (_join_previous)
+        self._printed_at_last_col = False
 
     def _shift_lines(self, n, insert):
         """IL / DL。スクロール範囲の中でだけ効く。"""
@@ -1139,6 +1156,8 @@ class Screen(object):
             self.wrapped[self.cursor_row] = False
         self.dirty.add(self.cursor_row)
         self._pending_wrap = False
+        # 消したセルはもう印字済みではない (_join_previous)
+        self._printed_at_last_col = False
 
     def _erase_chars(self, n):
         line = self.lines[self.cursor_row]
@@ -1155,3 +1174,5 @@ class Screen(object):
             self.wrapped[self.cursor_row] = False
         self.dirty.add(self.cursor_row)
         self._pending_wrap = False
+        # 消したセルはもう印字済みではない (_join_previous)
+        self._printed_at_last_col = False
