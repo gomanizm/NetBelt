@@ -155,6 +155,9 @@ def _finalize_lock(zip_path: str) -> threading.Lock:
 # までの時間（秒）。確定は os.replace 数回ぶんなので、待つのは数秒でよい。
 FINALIZE_WAIT_SEC = 5.0
 FINALIZE_STALE_SEC = 60.0
+# 目印の中身（_finalize_token の印）を読むときの上限。印は pid・スレッド・
+# 時刻を '-' で並べた ASCII で、64 バイトを超えることはない。
+_FINALIZE_TOKEN_MAX = 64
 # 取れなかったときに利用者へ出す文言（利用者の決定 2026-09-20 / release-04）。
 # print だけだったときは、凍結ビルドではログファイル行きで画面に出ず、
 # ダイアログは『チェックサムが一致しない場合も含みます』と、原因と違う
@@ -202,14 +205,48 @@ def _drop_finalize_marker(marker: str, token: bytes) -> None:
         print(f"[VersionManager] 確定の目印を外せませんでした: {e}")
 
 
+def _finalize_marker_is_alive(grabbed: str, seen: bytes) -> bool:
+    """掴んだ目印が、置き土産ではなく生きている確定のものか。
+
+    時刻が FINALIZE_STALE_SEC より新しいか、中身が見たときと違えば、
+    掴む前に別の確定が取り直したもの。読めない（もう無い）なら、
+    残しても意味が無いので生きていないものとして扱う。
+    """
+    try:
+        if time.time() - os.path.getmtime(grabbed) < FINALIZE_STALE_SEC:
+            return True
+        with open(grabbed, 'rb') as f:
+            return f.read(len(seen) + 1) != seen
+    except OSError:
+        return False
+
+
 def _take_over_abandoned_finalize(marker: str) -> None:
-    """異常終了で残った確定の目印を引き取る（つかんでから消す）。
+    """異常終了で残った確定の目印を引き取る（つかんで、見直してから消す）。
 
     見てから消すと、同時に「古い」と見た2つが両方とも消してしまい、
     後から消したほうが相手の取り直した目印を消す。改名は同時に1つしか
     通らないので、引き取れるのは片方だけになる。
+
+    掴めたことは「掴んだものが置き土産だ」とまでは言わない。見てから
+    掴むまでの間に別の NetBelt が同じ目印を引き取って自分の目印を作って
+    いれば、掴めるのはその生きている目印のほうになる。実測（検査役
+    cx7a-verify-release の p03_finalize_takeover.py、2/2）: B を
+    os.replace の直前で止め、A に引き取らせてから B を再開すると、B は
+    A の生きている目印を消し、続く os.open(O_CREAT|O_EXCL) が通って
+    A と B が同時に確定へ入った。自然な競走では 40 回中 0 回（負けた側の
+    隙間はマイクロ秒で、そこへ勝った側の 50 ms 以上が収まる必要がある）。
+
+    そこで updater.bat の :claim_lock と同じく、掴んでから見直す。
+    取り直された直後の目印は必ず FINALIZE_STALE_SEC より新しいので、
+    時刻と中身を読み直すだけで見分けられる。生きていたら消さずに
+    os.rename で名前を戻す。戻せない＝その間に誰かが新しい目印を作った
+    ときは、名前から外れた以上どの排他にもならないので捨てる
+    （updater.bat の :lock_put_back と同じ判断）。
     """
     try:
+        with open(marker, 'rb') as f:
+            seen = f.read(_FINALIZE_TOKEN_MAX)
         if time.time() - os.path.getmtime(marker) < FINALIZE_STALE_SEC:
             return
     except OSError:
@@ -217,6 +254,17 @@ def _take_over_abandoned_finalize(marker: str) -> None:
     grabbed = '%s.%d.stale' % (marker, os.getpid())
     try:
         os.replace(marker, grabbed)
+    except OSError:
+        return
+    if _finalize_marker_is_alive(grabbed, seen):
+        try:
+            # 空いている名前へだけ戻す。os.replace だと、その間に
+            # 作られた新しい目印を今度はこちらが消してしまう。
+            os.rename(grabbed, marker)
+            return
+        except OSError:
+            pass
+    try:
         os.remove(grabbed)
     except OSError:
         pass
