@@ -210,18 +210,28 @@ class InteractiveTerminal(QTextEdit):
 
         画面領域は「必ず行数ぶんの高さで描く」ので、折り返した 1 行も
         文書の上では行ごとに切れている（履歴へ押し出された行は繋がる）。
-        画面の r 行目は、画面領域の先頭ブロックから r 個あとのブロック
-        （0 行目は領域の始まりが行の途中でも、そのブロックで終わる）。
+        画面の r 行目の終わりは、画面領域の先頭ブロックから r 個あとの
+        ブロック（0 行目は領域の始まりが行の途中でも、そのブロックで
+        終わる）に、r 行目までに出てきた区切り文字（U+2029 など）の数を
+        足したもの。区切り文字は文書の上でブロックを 1 つ増やすので、
+        足さないと繋ぐ行を取り違え、再接続で本物の改行を消していた。
         """
         screen = getattr(self, "_screen", None)
         region = getattr(self, "_region", None)
         if screen is None or region is None:
             return frozenset()
         marks = screen.wrapped
-        first = self.document().findBlock(region.position()).blockNumber()
+        number = self.document().findBlock(region.position()).blockNumber()
+        blocks = []
         # 最後の行の印は、続く行が文書に無いので使わない
-        return frozenset(first + row for row in range(len(marks) - 1)
-                         if marks[row])
+        for row in range(len(marks) - 1):
+            # セルには結合文字が繋がっていることがあるので、文字列で数える
+            text = "".join(cell[0] for cell in screen.lines[row])
+            number += sum(map(text.count, _BLOCK_SEPARATORS))
+            if marks[row]:
+                blocks.append(number)
+            number += 1
+        return frozenset(blocks)
 
     def _join_wrapped_blocks(self) -> None:
         """いまの画面の折り返し行を、文書の上で 1 ブロックへ繋ぐ。
@@ -231,17 +241,24 @@ class InteractiveTerminal(QTextEdit):
         折り返しの位置で割れたまま永久に残り、コピーも全ログ保存も
         割れた行を返す（押し出された履歴は初めから繋がっている）。
         区切り文字を消すと後ろのブロック番号がずれるので、番号の大きい
-        方から消す。
+        方から消す。消す操作は 1 回の編集にまとめる。1 つずつ別の編集に
+        すると、消すたびに伸びていくブロックを組み直すので画面の大きさの
+        2 乗で重くなり、200x500 が全部折り返しの画面で再接続が 18 秒止まった。
         """
         document = self.document()
-        for number in sorted(self._wrapped_blocks(), reverse=True):
-            block = document.findBlockByNumber(number)
-            if not block.isValid() or not block.next().isValid():
-                continue
-            cut = QTextCursor(document)
-            # ブロックの長さには区切りの 1 文字が入っている。その 1 文字を消す
-            cut.setPosition(block.position() + block.length() - 1)
-            cut.deleteChar()
+        cut = QTextCursor(document)
+        cut.beginEditBlock()
+        try:
+            for number in sorted(self._wrapped_blocks(), reverse=True):
+                block = document.findBlockByNumber(number)
+                if not block.isValid() or not block.next().isValid():
+                    continue
+                # ブロックの長さには区切りの 1 文字が入っている。その 1 文字を消す
+                cut.setPosition(block.position() + block.length() - 1)
+                cut.deleteChar()
+        finally:
+            # 例外で抜けても閉じる。閉じ忘れると以後の変更が画面に出ない
+            cut.endEditBlock()
 
     def unwrapped_text(self, cursor=None) -> str:
         """文書から文字列を取り出す（画面領域の自動折り返しは 1 行に戻す）。
@@ -1329,7 +1346,13 @@ class TerminalWidget(QWidget):
         # キャレット位置がずれる
         after_history = terminal.document().blockCount()
 
-        cell_rows = [self._visible_cells(line) for line in screen.lines]
+        # 折り返しで次の行へ続く行は、押し出された履歴と同じく末尾を刈らない。
+        # 右端の桁の空白を落とすと、繋いだとき（コピー・再接続・全ログ保存）に
+        # 前後の語がくっつく。最後の行は _wrapped_blocks() と同じく繋がないので刈る
+        last = len(screen.lines) - 1
+        cell_rows = [list(line) if screen.wrapped[r] and r < last
+                     else self._visible_cells(line)
+                     for r, line in enumerate(screen.lines)]
         # カーソルの行は、カーソルの桁まで空白を残す。プロンプト末尾の
         # 空白 ("Router# ") を落とすとキャレットが $ に張り付いて見える
         pad = screen.cursor_col - len(cell_rows[screen.cursor_row])
