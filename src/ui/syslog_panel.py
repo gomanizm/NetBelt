@@ -84,6 +84,22 @@ def _csv_safe(value):
     return "'" + text
 
 
+# str.splitlines() が行の区切りとみなす文字のうち、改行・復帰（_escape_for_export
+# が置き換える）以外と、その見える表記。ソースへ生の制御文字を書かないよう
+# chr() で組み立てる（ui/plain_log.py と同じ作法・同じ表記）
+_BACKSLASH = chr(92)
+_TEXT_LINE_BREAKS = (
+    (chr(0x0B), _BACKSLASH + "v"),
+    (chr(0x0C), _BACKSLASH + "f"),
+    (chr(0x1C), _BACKSLASH + "x1c"),
+    (chr(0x1D), _BACKSLASH + "x1d"),
+    (chr(0x1E), _BACKSLASH + "x1e"),
+    (chr(0x85), _BACKSLASH + "u0085"),
+    (chr(0x2028), _BACKSLASH + "u2028"),
+    (chr(0x2029), _BACKSLASH + "u2029"),
+)
+
+
 class CheckableComboBox(QComboBox):
     """項目ごとにチェック ON/OFF できるドロップダウン。選択しても閉じない（複数トグル可）。"""
     changed = pyqtSignal()
@@ -702,10 +718,27 @@ class SyslogPanel(QWidget):
                 .replace("\t", "\\t"))
 
     @classmethod
+    def _escape_for_text(cls, text: str) -> str:
+        """テキストの 1 行へ入れる値を作る（テキスト保存・選択行の保存・コピー）
+
+        _escape_for_export に加えて、str.splitlines() が行の区切りとみなす残りの
+        文字（U+000B / U+000C / U+001C〜U+001E / U+0085 / U+2028 / U+2029）も
+        見える表記へ置き換える。残すと、Unicode の改行を解するビューアや
+        splitlines() では 1 件が割れ、続きが別機器の独立した記録に見える。
+        バックスラッシュは先に二重にしてあるので、元の綴りとは区別できる。
+        CSV は値を引用符で囲む形式なので使わない（中身を変えない）
+        """
+        text = cls._escape_for_export(text)
+        for char, shown in _TEXT_LINE_BREAKS:
+            if char in text:
+                text = text.replace(char, shown)
+        return text
+
+    @classmethod
     def _export_line(cls, msg: SyslogMessage) -> str:
         """保存用の1行を作る（画面と同じく送信元を含め、機器を区別できるようにする）"""
-        hostname = cls._escape_for_export(msg.hostname)
-        message = cls._escape_for_export(msg.message)
+        hostname = cls._escape_for_text(msg.hostname)
+        message = cls._escape_for_text(msg.message)
         return f"{msg.timestamp} {msg.source_ip} {hostname} [{msg.level}] {message}"
 
     def _refuse_if_recording(self, title: str, file_path: str) -> bool:
