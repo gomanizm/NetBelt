@@ -222,7 +222,14 @@ class MIBResolver:
 
         if os.path.exists(custom_mib_file):
             try:
-                with open(custom_mib_file, 'r', encoding='utf-8') as f:
+                # utf-8-sig: 利用者が手で書くファイルなので、Windows の
+                # 編集（メモ帳の「UTF-8 (BOM 付き)」・PowerShell 5.1 の
+                # Out-File -Encoding utf8）で BOM が付く。utf-8 のままだと
+                # json.load が 'Unexpected UTF-8 BOM' で落ち、下の except が
+                # コンソールへ出すだけなので、画面には何も出ないまま利用者が
+                # 登録した OID 名が全部消える（実測）。BOM が無ければ utf-8
+                # と同じ
+                with open(custom_mib_file, 'r', encoding='utf-8-sig') as f:
                     data = json.load(f)
                 custom_mibs = self._valid_custom_entries(
                     data.get('mibs', {}) if isinstance(data, dict) else {})
