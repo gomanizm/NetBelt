@@ -24,6 +24,10 @@ class _DroppedConnection(IOError):
 _DROPPED_CONNECTION_ERRORS = (EOFError, paramiko.SSHException,
                               paramiko.SFTPError, _DroppedConnection)
 
+# 以後このチャンネルが使えないと分かる失敗（期限切れ＋切断・壊れた応答）。
+# except 節へそのまま渡す
+_UNUSABLE_CHANNEL_ERRORS = (TimeoutError,) + _DROPPED_CONNECTION_ERRORS
+
 
 def _is_dropped_connection(e: Exception) -> bool:
     """接続が切れた・応答が壊れたと分かる失敗か"""
@@ -288,7 +292,15 @@ class SFTPManager(QObject):
                             # 期限を積み上げると一覧が何分も返らないので、
                             # ここでやめて失敗として扱う（_fail が畳む）
                             raise
-                        except Exception:
+                        except Exception as link_error:
+                            if _is_dropped_connection(link_error):
+                                # 切断・壊れた応答も期限切れと同じ扱い
+                                # （利用者の決定 2026-09-20）。ここで拾って
+                                # 続けると、既に切れたあとの一覧を「取得成功」
+                                # として配り、接続中の表示まで残る。取れた分を
+                                # 捨てることになるが、期限切れの枝が同じ選択を
+                                # している
+                                raise
                             continue
                         link_modes[item.filename] = getattr(target, "st_mode", None)
                 
@@ -573,6 +585,10 @@ class SFTPManager(QObject):
         # 期限切れで抜けるときに添える補足（転送済みの一時名など）。
         # _fail の期限切れ文面は固定なので、前置きの側へ足す
         timed_out_note = [""]
+        # 畳む理由として _fail へ渡す例外。印を立てる枝のほとんどは期限切れ
+        # なので既定は None（= TimeoutError）で、後始末で切断・壊れた応答を
+        # 観測したときだけ、その例外に差し替えて理由を正しく出す
+        fold_error = [None]
         # 元の失敗そのものが期限切れだったときの補足。通知は 1 回にまとめる
         # ので、finally ではなく元の失敗の文面へ足す
         cleanup_note = [""]
@@ -868,11 +884,14 @@ class SFTPManager(QObject):
                         with self._sftp_lock:
                             if self.is_connected and self.sftp_client is not None:
                                 self.sftp_client.remove(tmp_remote)
-                    except TimeoutError:   # socket.timeout の別名
-                        # 後始末まで期限切れなら、以後このチャンネルは要求と
-                        # 応答がずれたまま使えない。元の失敗を伝えたうえで、
-                        # 期限切れの経路と同じように畳む（ロックの中では
-                        # 畳めない。畳むのは finally）
+                    except _UNUSABLE_CHANNEL_ERRORS as cleanup_error:
+                        # 後始末が期限切れ・切断（EOFError / SFTPError /
+                        # SSHException）で落ちたなら、以後このチャンネルは
+                        # 要求と応答がずれたまま使えない。元の失敗を伝えた
+                        # うえで、期限切れの経路と同じように畳む（ロックの
+                        # 中では畳めない。畳むのは finally）。ここで飲むと、
+                        # 後始末が通った場合と出力が全く同じになり、切断を
+                        # 観測したことがどこにも残らない
                         note = ("（送りかけの一時名 %s を片づけられませんでした）"
                                 % tmp_remote)
                         if isinstance(e, TimeoutError) or _is_dropped_connection(e):
@@ -886,8 +905,11 @@ class SFTPManager(QObject):
                             # 2026-09-20）、同じ重なりが起きる
                             cleanup_note[0] = note
                         else:
+                            # 元の失敗は機器が答えた通常のもの。その文面を
+                            # 先に出し、畳む理由は後始末で観測したほうで伝える
                             probe_timed_out[0] = True
                             timed_out_note[0] = note
+                            fold_error[0] = cleanup_error
                     except Exception:
                         pass
                 self._fail("アップロードエラー" + cleanup_note[0], e)
@@ -895,7 +917,7 @@ class SFTPManager(QObject):
                 # ロックの外。理由を出して接続を畳むのは _fail に任せる
                 if probe_timed_out[0]:
                     self._fail("アップロードエラー" + timed_out_note[0],
-                               TimeoutError())
+                               fold_error[0] or TimeoutError())
         
         # バックグラウンドスレッドで実行
         threading.Thread(target=upload_thread, daemon=True).start()
@@ -1179,7 +1201,11 @@ class SFTPManager(QObject):
             mode = getattr(self.sftp_client.stat(path), "st_mode", None)
             try:
                 target = self.sftp_client.readlink(path)
-            except TimeoutError:   # socket.timeout の別名
+            except _UNUSABLE_CHANNEL_ERRORS:
+                # 期限切れも切断・壊れた応答も、以後このチャンネルは
+                # 使えない（利用者の決定 2026-09-20）。名前が読めなかった
+                # だけとして進むと、リンク先なしのダイアログが開いたうえに
+                # 接続中の表示が残る
                 raise
             except Exception:
                 pass   # 名前が読めなくても、権限は読めている
@@ -1188,7 +1214,9 @@ class SFTPManager(QObject):
         finally:
             self._sftp_lock.release()
         # 通知はロックを離してから（_fail が切断するときロックを取る）
-        if isinstance(err, TimeoutError):
+        if isinstance(err, _UNUSABLE_CHANNEL_ERRORS):
+            # 理由の整形（空の str を型名にする・末尾のコロンを落とす）も
+            # 切断の文面も _fail が持っている
             self._fail("リンク先の確認エラー", err)
             return None
         if err is not None or not isinstance(mode, int):
