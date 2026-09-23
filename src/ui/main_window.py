@@ -2438,6 +2438,7 @@ for details.
         "tftp_server_panel",
         "ftp_server_panel",
         "sftp_server_panel",
+        "syslog_panel",
     )
 
     def _tell_panels_closing(self) -> None:

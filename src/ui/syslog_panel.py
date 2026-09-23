@@ -320,6 +320,12 @@ class SyslogPanel(QWidget):
     # 保持するメッセージ件数の既定値
     DEFAULT_MAX_MESSAGES = 1000
 
+    # アプリの終了処理に入ったか（MainWindow.closeEvent が立てる）。
+    # 立っている間はモーダルを開かない。FTP / TFTP / SFTP の各パネルと同じ理由
+    # （終了処理は配送待ちのシグナルをその場で配るので、受信スレッドが出した
+    # エラーもそこで届く。答えるまで終了が止まり、そのとき受信は停止済み）。
+    _closing = False
+
     def __init__(self, parent=None, config_manager=None):
         super().__init__(parent)
         self.config_manager = config_manager
@@ -941,9 +947,36 @@ class SyslogPanel(QWidget):
             self.status_label.setText(f"メッセージ: {filtered} / {total}")
     
     def set_syslog_receiver(self, receiver):
-        """Syslogレシーバーを設定（親ウィンドウから呼ばれる）"""
+        """Syslogレシーバーを設定（親ウィンドウから呼ばれる）
+
+        error_occurred をここで繋ぐ。繋がないと bind 失敗の理由がどこへも
+        出ず、利用者からは「開始を押したが何も起こらず停止中のまま」に
+        見える（FTP / TFTP / SFTP の各パネルは同じ信号を _on_error へ
+        繋いでいる）。
+        """
+        old = getattr(self, "syslog_receiver", None)
+        if old is not None and old is not receiver:
+            try:
+                old.error_occurred.disconnect(self._on_receiver_error)
+            except (TypeError, RuntimeError):
+                pass   # 繋いでいない / 既に破棄済み
         self.syslog_receiver = receiver
-    
+        if receiver is not None and receiver is not old:
+            receiver.error_occurred.connect(self._on_receiver_error)
+
+    def _on_receiver_error(self, error_message):
+        """受信側の障害（ポート使用中・特権ポートなど）を利用者へ見せる
+
+        ここへ来るのは待ち受けそのものが始められなかった場合だけ。
+        受信したメッセージの不備は一覧に出るので、モーダルにはしない。
+        """
+        if self._closing:
+            # 終了処理の途中。開いても何もできない（_closing の説明を参照）
+            print("[Syslog] %s" % error_message)
+            return
+        QMessageBox.critical(self, "Syslog受信 エラー", error_message)
+
+
     def add_message(self, syslog_msg):
         """メッセージを追加（外部から呼び出される）"""
         if self.paused:
