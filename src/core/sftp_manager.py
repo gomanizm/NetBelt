@@ -132,7 +132,12 @@ class SFTPManager(QObject):
             self._disconnect_after_notice()
             return
         reason = str(e) or e.__class__.__name__
-        if _is_dropped_connection(e):
+        # 機器が SFTP のチャンネルだけを閉じると、paramiko は OSError
+        # ('Socket is closed') を上げるので型では見分けられない。接続中の
+        # ままチャンネルが閉じていれば同じく畳む（畳んだあとの失敗には
+        # 切断を重ねない）
+        if _is_dropped_connection(e) or (self.is_connected
+                                         and self._channel_closed()):
             # paramiko の 'Server connection dropped: ' のように、理由が
             # コロンで終わることがある。そのまま続けると「: 。」になる
             self.error_occurred.emit(
