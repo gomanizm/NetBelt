@@ -234,10 +234,14 @@ class TFTPServer:
             self._thread.join(timeout=3)   # 待受の1秒に対する余裕
         with self._workers_lock:
             workers = list(self._workers) + list(self._dallying)
+        # 転送側は _timeout 秒で必ず戻ってくるので、その少し先まで待つ。
+        # 期限は全転送で共通にする。1 本ずつ同じだけ待つと、共有フォルダの
+        # close() などで止まった転送が N 本あるとき、GUI スレッドから呼ぶ
+        # 停止が N 倍固まる（16 本で約 64 秒）
+        deadline = time.monotonic() + self._timeout + 2
         for worker in workers:
             if worker.is_alive():
-                # 転送側は _timeout 秒で必ず戻ってくるので、その少し先まで待つ
-                worker.join(timeout=self._timeout + 2)
+                worker.join(timeout=max(0.0, deadline - time.monotonic()))
         # 期限を過ぎても生きているスレッドは、保存先のファイルを握ったまま
         # （close() の中など）。捨てずに覚えておく
         for worker in workers:
