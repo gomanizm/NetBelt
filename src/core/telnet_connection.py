@@ -42,6 +42,10 @@ class TelnetConnection(QObject):
         self.is_connected = False
         self._read_thread: Optional[threading.Thread] = None
         self._stop_reading = False
+        # dispose() 済み（このオブジェクトは捨てられた）ことを覚えておく印。
+        # _stop_reading と違い connect() の入口で戻さないので、接続スレッドが
+        # 動き出す前に着地した dispose() でも消えない（SSH・シリアルと同じ）
+        self._disposed = False
         # 画面の描き待ちが多すぎる間、受信を止めておくための関所
         # （TerminalWidget.output_gate。set_read_gate で受け取る）
         self._read_gate = None
@@ -76,6 +80,13 @@ class TelnetConnection(QObject):
             bool: 接続成功時True
         """
         try:
+            if self._disposed:
+                # 接続スレッドが動き出す前にタブが閉じられ、dispose() が先に
+                # 走った。ここで印を無視して進むと、TCP は最後まで張られる
+                # のに参照しているものが誰もいない状態になり、閉じる経路が
+                # 無いまま機器の vty 枠を掴んだままになる
+                return False
+
             # ソケット作成
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.socket.settimeout(10)
@@ -117,7 +128,13 @@ class TelnetConnection(QObject):
 
         機器側都合の切断やエラーを受けたあとの後始末で使う。ここで
         disconnected を出すと、いま処理中の切断処理が再入する。
+
+        これを呼んだあとの connect() は、何もせず False を返す。呼び出し元
+        （MainWindow._close_connection / _dispose_connection）は dispose() の
+        前に接続辞書からこのオブジェクトを外しており、以後この接続を使う人は
+        いないため。同じオブジェクトで繋ぎ直す場合は disconnect() を使う。
         """
+        self._disposed = True
         self._stop_reading = True
         self.is_connected = False
 
@@ -132,8 +149,12 @@ class TelnetConnection(QObject):
             self.socket = None
 
     def disconnect(self):
-        """Telnet接続を切断"""
+        """Telnet接続を切断（同じオブジェクトで繋ぎ直せる）"""
         self.dispose()
+        # dispose() の印は「このオブジェクトは捨てた」意味なので、利用者が
+        # 明示的に切断しただけの場合は消す。残すと次の connect() が
+        # 取り消し扱いになり、繋ぎ直せなくなる
+        self._disposed = False
         self.disconnected.emit()
     
     def send_command(self, command: str):
