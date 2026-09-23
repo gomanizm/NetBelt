@@ -205,6 +205,76 @@ class InteractiveTerminal(QTextEdit):
             self.setTextCursor(cursor)
             bar.setValue(value)
     
+    def _wrapped_blocks(self) -> frozenset:
+        """画面領域のうち、折り返しで次の行へ続いているブロックの番号。
+
+        画面領域は「必ず行数ぶんの高さで描く」ので、折り返した 1 行も
+        文書の上では行ごとに切れている（履歴へ押し出された行は繋がる）。
+        画面の r 行目は、画面領域の先頭ブロックから r 個あとのブロック
+        （0 行目は領域の始まりが行の途中でも、そのブロックで終わる）。
+        """
+        screen = getattr(self, "_screen", None)
+        region = getattr(self, "_region", None)
+        if screen is None or region is None:
+            return frozenset()
+        marks = screen.wrapped
+        first = self.document().findBlock(region.position()).blockNumber()
+        # 最後の行の印は、続く行が文書に無いので使わない
+        return frozenset(first + row for row in range(len(marks) - 1)
+                         if marks[row])
+
+    def unwrapped_text(self, cursor=None) -> str:
+        """文書から文字列を取り出す（画面領域の自動折り返しは 1 行に戻す）。
+
+        cursor を省略すると文書全体。クリップボードと「全ログ保存」は
+        どちらもこれを通す。そのまま toPlainText() や selectedText() を
+        使うと、画面に出たままの公開鍵や長い設定行が折り返しの位置で
+        切れ、貼り付け先や保存先で壊れる。
+        """
+        document = self.document()
+        if cursor is None:
+            probe = QTextCursor(document)
+            probe.movePosition(QTextCursor.MoveOperation.End)
+            start, end = 0, probe.position()
+        elif cursor.hasSelection():
+            start, end = cursor.selectionStart(), cursor.selectionEnd()
+        else:
+            return ""
+        joined = self._wrapped_blocks()
+        probe = QTextCursor(document)
+        parts = []
+        block = document.findBlock(start)
+        while block.isValid() and block.position() < end:
+            # ブロックの長さには区切りの 1 文字が入っているので、その手前まで
+            probe.setPosition(max(start, block.position()))
+            probe.setPosition(min(end, block.position() + block.length() - 1),
+                              QTextCursor.MoveMode.KeepAnchor)
+            parts.append(probe.selectedText())
+            following = block.next()
+            if following.isValid() and following.position() <= end:
+                # 区切りまで選ばれている。折り返しならここでは切らない
+                parts.append("" if block.blockNumber() in joined else "\n")
+            block = following
+        # toPlainText() と同じ置き換え。区切り文字と改行なし空白を素の
+        # テキストへ直す（selectedText() は直さない）
+        return ("".join(parts).replace("\u2029", "\n")
+                .replace("\u2028", "\n").replace("\u00a0", " "))
+
+    def createMimeDataFromSelection(self):
+        """選んだ範囲をクリップボードへ渡す（折り返しは 1 行に戻す）。
+
+        copy()・マウスを離したときのコピー・Ctrl+C は、どれもここを通る。
+        """
+        data = super().createMimeDataFromSelection()
+        text = self.unwrapped_text(self.textCursor())
+        if text:
+            # Qt が返すのは遅延して中身を作る QMimeData で、最初に読まれた
+            # ときに選択範囲から text/plain と text/html を入れ直す。先に
+            # 読んで中身を確定させないと、こちらの差し替えが消される
+            data.text()
+            data.setText(text)
+        return data
+
     def send_text(self, text: str) -> bool:
         """テキストを機器へ送る（画面へは直接書かない）
 
@@ -1912,7 +1982,10 @@ class TerminalWidget(QWidget):
         
         # ターミナルのテキストを取得
         if isinstance(current_widget, (QTextEdit, InteractiveTerminal)):
-            log_text = current_widget.toPlainText()
+            # 画面に残っている折り返しは、コピーと同じく 1 行へ戻して保存する
+            log_text = (current_widget.unwrapped_text()
+                        if isinstance(current_widget, InteractiveTerminal)
+                        else current_widget.toPlainText())
             
             if not log_text.strip():
                 QMessageBox.information(
