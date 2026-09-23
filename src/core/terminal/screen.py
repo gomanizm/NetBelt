@@ -134,6 +134,10 @@ class Screen(object):
         self.scroll_top = 0
         self.scroll_bottom = self.rows - 1
         self._pending_wrap = False
+        # 直前の印字がいまのカーソル桁まで届いたか。折り返しが無効な
+        # ときだけ使う (右端で印字してもカーソルが動かないので、最終桁
+        # に居ることと「最終桁へ書いた」ことが区別できない)
+        self._printed_at_last_col = False
         # ESC 7 / ESC 8。位置・属性に加えて、VT100 と同じく
         # 文字集合の指示 (G0/G1) と SI/SO の状態、それに xterm と
         # 同じく右端の折り返し待ち (_pending_wrap) も持つ。最後の桁数は
@@ -433,6 +437,8 @@ class Screen(object):
                 entry_mark and end >= self.cols and self.autowrap
                 and not all(c == BLANK for c in line))
             self.dirty.add(self.cursor_row)
+            # 結合文字を繋ぐ先を選ぶための覚え (_join_previous)
+            self._printed_at_last_col = end >= self.cols
             if end < self.cols:
                 self.cursor_col = end
             else:
@@ -485,6 +491,7 @@ class Screen(object):
                 entry_mark and end >= cols and self.autowrap
                 and not all(c == BLANK for c in line))
             self.dirty.add(row)
+            self._printed_at_last_col = end >= cols     # _print_chars と同じ
             if end < cols:
                 self.cursor_col = end
             else:
@@ -498,16 +505,14 @@ class Screen(object):
 
         右端で折り返し待ちなら今のセル、そうでなければ 1 つ左のセル。
         折り返しが無効 (ESC[?7l) なら右端で印字してもカーソルが動かず
-        折り返し待ちも立たないので、最終桁にいるときは今のセルを選ぶ。
+        折り返し待ちも立たないので、直前の印字が最終桁へ届いていたとき
+        だけ今のセルを選ぶ。最終桁に居るだけ (手前まで印字して進んだ・
+        TAB で止まった・CUP で来た) なら、そこはまだ空白なので 1 つ左。
         そこが全角の継続セルなら、その全角本体へ繋げる。前に文字が無い
         (行頭) ときと、セルが MAX_CELL_TEXT まで伸びているときは捨てる。
-
-        残る制限: 折り返しが無効なとき、最終桁で印字した直後なのか、
-        最終桁へ CUP しただけなのかを区別していない。後者では 1 つ左の
-        文字へ付けるべきだが、ここでは最終桁のセルへ繋げる。
         """
         line = self.lines[self.cursor_row]
-        at_last_col = (not self.autowrap
+        at_last_col = (not self.autowrap and self._printed_at_last_col
                        and self.cursor_col == self.cols - 1)
         i = (self.cursor_col if self._pending_wrap or at_last_col
              else self.cursor_col - 1)
@@ -522,19 +527,24 @@ class Screen(object):
         self.dirty.add(self.cursor_row)
 
     def _ctrl(self, ch):
+        # カーソルを動かす C0 は、印字が届いた桁の覚えを落とす
+        # (_join_previous)。SO/SI・BEL は位置を変えないので落とさない
         if ch == "\r":
             self.cursor_col = 0
             self._pending_wrap = False
+            self._printed_at_last_col = False
         elif ch in "\n\x0b\x0c":
             self._linefeed()
         elif ch == "\b":
             if self.cursor_col:
                 self.cursor_col -= 1
             self._pending_wrap = False
+            self._printed_at_last_col = False
         elif ch == "\t":
             self.cursor_col = min(self.cols - 1,
                                   (self.cursor_col // 8 + 1) * 8)
             self._pending_wrap = False
+            self._printed_at_last_col = False
         elif ch == "\x0e":              # SO: G1 へ
             self._charset = ")"
         elif ch == "\x0f":              # SI: G0 へ
@@ -543,6 +553,7 @@ class Screen(object):
 
     def _linefeed(self, from_wrap=False):
         self._pending_wrap = False
+        self._printed_at_last_col = False       # 行が変わる (_join_previous)
         # 折り返しで送られたのか、機器が改行を送ったのかを覚える
         self.wrapped[self.cursor_row] = from_wrap
         if from_wrap:
@@ -620,6 +631,7 @@ class Screen(object):
         self.cursor_row = max(0, min(self.rows - 1, row))
         self.cursor_col = max(0, min(self.cols - 1, col))
         self._pending_wrap = False
+        self._printed_at_last_col = False       # 動いた先は空 (_join_previous)
         self.dirty.add(self.cursor_row)
 
     def _csi(self, seq):
