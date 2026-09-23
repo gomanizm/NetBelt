@@ -81,8 +81,8 @@ def _iter_known_hosts_lines(path):
     など）の行も、読めない行として扱う。from_line はそのまま通すが、
     paramiko の lookup はハッシュ化名の行ごとに hash_host を掛け直すので、
     同じ行の手前の名前で一致しない限り、接続先がどこであっても例外になる
-    （実測: 接続のたびに本文の空な『接続エラー: 』だけが出て、全機器が
-    繋がらなくなる）。
+    （実測: 接続のたびに『接続エラー: 』だけ（本文は空か
+    『Incorrect padding』）が出て、全機器が繋がらなくなる）。
     """
     from paramiko.hostkeys import HostKeyEntry
     raw = Path(str(path)).read_bytes()
@@ -510,7 +510,7 @@ class SSHConnection(QObject):
             "\r\n[NetBelt] 警告: known_hosts に読めない行があります"
             "（名前欄がこの機器の接続先と完全には一致しないので、"
             "接続は続けます）。ただしワイルドカード（* や ?）を含む行や、"
-            "ハッシュ化した名前（|1|…）が壊れている行は"
+            "ハッシュ化した名前（|1|…）が壊れている行は、"
             "この機器を指している可能性があり、その場合この機器は初回接続の"
             "扱いに戻り、鍵が変わっていても気づけません:\r\n"
             "%s\r\n%s\r\n"
