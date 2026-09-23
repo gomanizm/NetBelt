@@ -195,11 +195,28 @@ def take_known_hosts_import_warning():
 
 
 def _known_hosts_entry_id(line):
-    """known_hosts の 1 行を (ホスト, 鍵種別) で見分ける。読めない行は None。"""
+    """known_hosts の 1 行を (印, ホスト, 鍵種別) で見分ける。
+
+    引き継ぎで「新しい側に既にある行」を見分けるためだけに使う。
+    見分けようのない行（欄が 3 つに満たない行・コメント行）は None を返す。
+
+    OpenSSH の @cert-authority / @revoked は名前欄の前に置く印なので、
+    印があるときは 1 つ読み飛ばしてからホストと鍵種別を見る。剥がさないと
+    見分けが (印, ホスト) の 2 つになり、同じホストの @revoked 行が鍵種別
+    ごとに 2 行あっても 1 行しか引き継がれない（実測）。印そのものも
+    見分けに含める。印の有無で意味が変わる行なので、同じ行にはできない。
+    """
     fields = line.split()
+    if fields and fields[0].startswith("#"):
+        # コメント。中身は鍵ではないので、行の同一性を鍵の欄では測れない
+        return None
+    marker = ""
+    if fields and fields[0].startswith("@"):
+        marker = fields[0]
+        fields = fields[1:]
     if len(fields) < 3:
         return None
-    return (fields[0], fields[1])
+    return (marker, fields[0], fields[1])
 
 
 def _import_legacy_known_hosts(new_dir):
@@ -256,9 +273,20 @@ def _import_legacy_known_hosts_unlocked(new_dir):
         current = (new_kh.read_text(encoding="utf-8-sig", errors="replace")
                    .splitlines() if new_kh.exists() else [])
         known = set(filter(None, (_known_hosts_entry_id(l) for l in current)))
-        added = [l for l in old_lines
-                 if _known_hosts_entry_id(l)
-                 and _known_hosts_entry_id(l) not in known]
+        added = []
+        for line in old_lines:
+            if not line.strip():
+                continue       # 空行は情報を持たないので持ち越さない
+            entry_id = _known_hosts_entry_id(line)
+            if entry_id is None:
+                # 欄が 3 つに満たない行（鍵欄が書き込み途中で切れた等）と
+                # コメント行。捨てると「このファイルは壊れている」合図まで
+                # 消え、旧ファイルを見ていれば断っていた接続先が、引き継ぎを
+                # 境に黙って初回接続（TOFU）へ戻る（実測）。重複の見分けは
+                # できないので、判定の対象にはせず、そのまま書き出す
+                added.append(line)
+            elif entry_id not in known:
+                added.append(line)
         if added:
             # 本体を直接開くと、その瞬間に切り詰められる。同階層へ書いて
             # から os.replace で差し替える（差し替えは不可分）。
