@@ -1258,13 +1258,30 @@ class MainWindow(QMainWindow):
 
         self._show_terminal_size(device_name)
 
-    def _find_group_of_device(self, device_name: str):
-        """機器名から所属グループを返す(見つからなければNone)"""
-        for group in self.config_manager.get_groups():
-            for device in group.get("devices", []):
-                if device.get("name") == device_name:
-                    return group
-        return None
+    def _find_group_of_device(self, device_name: str, endpoint=None):
+        """機器名から所属グループを返す(見つからなければNone)
+
+        手編集・持ち込みの config では、別々のグループに同じ名前の機器が
+        並ぶ（読み込みは警告だけで残す）。名前だけで探すと必ず先頭の
+        グループに当たり、2 台目へ繋いでも 1 台目のグループの自動実行
+        コマンドがその機器へ流れていた（実測）。
+
+        その名前の機器が複数のグループにあるときは、endpoint（接続した
+        機器の device_endpoint() の戻り値）で 1 つに絞る。編集・削除・
+        移動で同名の機器を見分けるのと同じ読み方。それでも 1 つに
+        決まらなければ、どのグループの機器か分からないので None を返す。
+        1 つのグループにしか無い名前は、今までどおりそのグループを返す。
+        """
+        groups = [group for group in self.config_manager.get_groups()
+                  if any(device.get("name") == device_name
+                         for device in group.get("devices", []))]
+        if len(groups) <= 1:
+            return groups[0] if groups else None
+        matched = [group for group in groups
+                   if any(device.get("name") == device_name
+                          and self._endpoint_of(device) == endpoint
+                          for device in group.get("devices", []))]
+        return matched[0] if len(matched) == 1 else None
 
     def _is_autodetected_device(self, device_name: str) -> bool:
         """いま繋いでいるのが、自動検出したCOMポートかを返す
@@ -1399,7 +1416,10 @@ class MainWindow(QMainWindow):
         # シリアルコンソール（機器の素のCLI）へそのまま流れる
         if self._is_autodetected_device(device_name):
             return
-        group = self._find_group_of_device(device_name)
+        # 同名の機器が別のグループにもあるとき、繋いだ機器がどちらかは
+        # 接続したときの機器データの写しの接続先で見分ける
+        group = self._find_group_of_device(
+            device_name, self._endpoint_of(self.device_info.get(device_name)))
         if not group:
             return
         commands = group.get("auto_commands", [])
