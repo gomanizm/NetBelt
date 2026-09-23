@@ -138,6 +138,33 @@ def v3_password_error(auth_protocol: str, auth_password: str,
     return None
 
 
+# 「途中まで（… のため中断）」の理由に使う長さの上限。pysnmp の
+# dispatcher は poll error の本文へトレースバックを丸ごと入れるため
+# （実測 2097 バイト）、そのまま画面のステータスへ出すと読めない。
+PARTIAL_REASON_MAX_LENGTH = 120
+
+
+def short_failure_reason(error: BaseException) -> str:
+    """例外から、1 行の短い中断理由を作る
+
+    str(e) は複数行のことがあるので先頭行だけを使い、情報の無い
+    「Traceback (most recent call last):」は落とす。本文が空の例外
+    （OSError() など）もあるので、型名を必ず前に付ける。
+    """
+    text = str(error)
+    first_line = text.splitlines()[0].strip() if text else ""
+    header = "Traceback (most recent call last):"
+    if first_line.endswith(header):
+        first_line = first_line[:-len(header)].strip()
+    first_line = first_line.rstrip(":").strip()
+    name = type(error).__name__
+    if not first_line:
+        return name
+    if len(first_line) > PARTIAL_REASON_MAX_LENGTH:
+        first_line = first_line[:PARTIAL_REASON_MAX_LENGTH] + "…"
+    return f"{name}: {first_line}"
+
+
 class SNMPWorker(QThread):
     """SNMP操作を別スレッドで実行するワーカー"""
     
@@ -188,6 +215,15 @@ class SNMPWorker(QThread):
                 # 止めたあとの失敗（応答待ちのタイムアウト等）はエラーに
                 # しない。そこまでの行（GET なら空）を途中までとして渡す
                 self.cancelled.emit(list(self._collected))
+            elif self._collected:
+                # WALK の途中で例外（経路が落ちた、ソケットが閉じた）。
+                # errorIndication のときと同じく、取れた行は捨てずに
+                # 「途中まで」として渡す。ここで捨てると、直前までの
+                # 行は表にも書き出しにも出ないまま消える（実測）。
+                # 理由は 1 行に切り詰める（str(e) はトレースバックを
+                # 丸ごと抱えていることがある）
+                self.partial_result.emit(short_failure_reason(e))
+                self.result_ready.emit(True, list(self._collected))
             else:
                 self.result_ready.emit(False, str(e))
 
