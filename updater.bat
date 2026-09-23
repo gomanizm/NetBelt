@@ -803,18 +803,35 @@ exit /b 1
 
 :takeover_claimed
 set "TAKEOVER_HELD=1"
+REM 誰の目印かを中へ書く（:lock_claimed と同じ形。理由は :release_takeover）。
+REM holder.txt 入りのフォルダは :lock_is_foreign が更新の目印と見るので、
+REM 置き土産の回収の判定は変わらない。
+set "TAKEOVER_STAMPED="
+(echo !STAMP!)>"!TAKEOVER_DIR!\holder.txt" 2>nul
+if exist "!TAKEOVER_DIR!\holder.txt" set "TAKEOVER_STAMPED=1"
 exit /b 0
 
 REM ================================================================
 REM 取り直し用の目印を外す（call で呼ぶ）
 REM ================================================================
-REM 自分が確保したときだけ外す。持っている時間は powershell 数回ぶん
-REM なので、インストール先の目印のような holder.txt での確かめは置いて
-REM いない（10分の古さの境を越えるほど長くは持たない）。
+REM 自分が確保したときだけ外す。持っている時間はふだん powershell 数回
+REM ぶんだが、休止・スリープや遅い共有フォルダで 10 分を越えて止まると、
+REM その間に別の更新が古いとみなして回収し、同じ名前で自分のぶんを
+REM 作り直す。名前だけを見て消していた以前は、再開した側がそれを消して
+REM いた。実測（検査役 cx7c-release の t2_release_takeover_steals.py）:
+REM B が取り直しの最中なのに名前が空き、3 本目が :claim_takeover を
+REM 通れる状態になった。:release_lock と同じく中身の識別子で確かめ、
+REM 書けなかったときだけ以前と同じ無条件の削除にする。
 :release_takeover
 if not defined TAKEOVER_HELD exit /b 0
 set "TAKEOVER_HELD="
+if defined TAKEOVER_STAMPED goto :release_takeover_owned
 rd /s /q "!TAKEOVER_DIR!" 2>nul
+exit /b 0
+:release_takeover_owned
+set "LOCK_OWNER="
+set /p LOCK_OWNER=<"!TAKEOVER_DIR!\holder.txt" 2>nul
+if "!LOCK_OWNER!"=="!STAMP!" rd /s /q "!TAKEOVER_DIR!" 2>nul
 exit /b 0
 
 REM ================================================================
