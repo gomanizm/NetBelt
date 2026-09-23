@@ -301,10 +301,22 @@ REM ときと、切り分けのために手で叩いたときだけ。そのと�
 REM する（ZIP_SHA が未定義なら set は PS_SHA を消すので $env:PS_SHA は
 REM $null になる）。
 REM 終了コード: 0=展開まで成功 / 2=ハッシュ不一致 / 1=それ以外の失敗。
+REM
+REM 展開先は、Expand-Archive へ渡す直前に [ ] ` の前へ ` を付けてから渡す。
+REM Windows PowerShell 5.1 の Expand-Archive は、展開先があるかを中で
+REM Test-Path -Path（ワイルドカードとして読む）で確かめる。TEMP に角括弧が
+REM あると、上の mkdir で作った展開先を「無い」と判定し、同じフォルダを
+REM 作ろうとして止まっていた（実測 release-01: TEMP=...\Temp[lab] で
+REM 「An item with the specified name ... already exists.」、閉じない [ では
+REM 「wildcard character pattern is not valid」。TEMP を変えない限り毎回失敗）。
+REM [WildcardPattern]::Escape は 5.1 では ` をエスケープせず、TEMP が
+REM ...\a`] のとき展開先が a``] という別のフォルダになったので使わない。
+REM 置き換えは照合の後・Expand-Archive の直前で行う。ZIP を掴んだまま
+REM 展開まで進む形は変えていない。
 set "PS_ZIP=!ZIP_FILE!"
 set "PS_DEST=!TEMP_DIR!"
 set "PS_SHA=!ZIP_SHA!"
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$rc = 1; try { $fs = [IO.File]::Open($env:PS_ZIP, 'Open', 'Read', 'Read') } catch { Write-Host 'エラー:' $_.Exception.Message; exit 1 }; try { if ($env:PS_SHA) { if ((Get-FileHash -InputStream $fs -Algorithm SHA256 -ErrorAction Stop).Hash -ne $env:PS_SHA) { exit 2 } }; Expand-Archive -LiteralPath $env:PS_ZIP -DestinationPath $env:PS_DEST -Force; $rc = 0 } catch { Write-Host 'エラー:' $_.Exception.Message } finally { $fs.Close() }; exit $rc"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$rc = 1; try { $fs = [IO.File]::Open($env:PS_ZIP, 'Open', 'Read', 'Read') } catch { Write-Host 'エラー:' $_.Exception.Message; exit 1 }; try { if ($env:PS_SHA) { if ((Get-FileHash -InputStream $fs -Algorithm SHA256 -ErrorAction Stop).Hash -ne $env:PS_SHA) { exit 2 } }; $env:PS_DEST = $env:PS_DEST -replace '([\[\]`])', '`$1'; Expand-Archive -LiteralPath $env:PS_ZIP -DestinationPath $env:PS_DEST -Force; $rc = 0 } catch { Write-Host 'エラー:' $_.Exception.Message } finally { $fs.Close() }; exit $rc"
 if errorlevel 2 goto :zip_sha_mismatch
 if errorlevel 1 goto :zip_expand_failed
 goto :zip_expanded
