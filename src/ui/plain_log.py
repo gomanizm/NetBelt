@@ -20,7 +20,8 @@ QTextEdit.append() が平文を渡されたときに行う処理と同じで、�
 
 ただしそれだけでは、<br> の代わりに生の改行を入れれば同じ被害が出る
 （実測。chr(10) / chr(13) / CRLF / chr(11) / chr(12) / U+0085 / U+2028 /
-U+2029 のどれでも 2 行に割れた）。届いた文字列は insertText へ渡す前に
+U+2029 のどれでも 2 行に割れた。Qt が枠の区切りに使う U+FDD0 / U+FDD1 も
+同じで、toPlainText() では chr(10) になる）。届いた文字列は insertText へ渡す前に
 fold_to_one_line() で 1 行へ畳む。値は捨てずに見える表記へ置き換えるので、
 要求名はログにもエクスポートにも残る。
 
@@ -41,6 +42,10 @@ _LINE_BREAKS = (
     (chr(0x85), _BACKSLASH + "u0085"),
     (chr(0x2028), _BACKSLASH + "u2028"),
     (chr(0x2029), _BACKSLASH + "u2029"),
+    # insertText は QTextBeginningOfFrame / QTextEndOfFrame でもブロックを
+    # 作り、toPlainText() はそこを chr(10) にして返す（実測）
+    (chr(0xFDD0), _BACKSLASH + "ufdd0"),
+    (chr(0xFDD1), _BACKSLASH + "ufdd1"),
 )
 
 
