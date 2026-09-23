@@ -25,6 +25,37 @@ class _OpenWriters:
     def __init__(self):
         self._lock = threading.Lock()
         self._entries = {}   # ハンドル -> (スレッド, 実パス)
+        # 書き込みで開いている保存先の鍵 -> 開いたスレッド（reserve を参照）
+        self._reserved = {}
+
+    @staticmethod
+    def _key(real_path):
+        """保存先を比べるための鍵（TFTPServer._target_key と同じ考え方）。
+
+        実パスは realpath 済み。Windows は大文字小文字を区別しないので
+        normcase で揃える（区切り文字も '\\' へ揃う）
+        """
+        return os.path.normcase(real_path)
+
+    def reserve(self, real_path):
+        """保存先を 1 本の書き込みに予約する。先客がいれば False。
+
+        開く前に取る。同じ保存先を 2 本が同時に書くと、後から開いた側の
+        O_TRUNC と先の側の書き込みが交互に効いて、どちらも成功で終わるのに
+        中身だけが混ざる。閉じないまま終わったスレッドの予約は先客に数えない
+        """
+        key = self._key(real_path)
+        with self._lock:
+            holder = self._reserved.get(key)
+            if holder is not None and holder.is_alive():
+                return False
+            self._reserved[key] = threading.current_thread()
+            return True
+
+    def release(self, real_path):
+        """開けなかった保存先の予約を外す"""
+        with self._lock:
+            self._reserved.pop(self._key(real_path), None)
 
     def add(self, handle, real_path):
         with self._lock:
@@ -32,7 +63,11 @@ class _OpenWriters:
 
     def discard(self, handle):
         with self._lock:
-            self._entries.pop(handle, None)
+            entry = self._entries.pop(handle, None)
+            # 閉じ終えたので予約も外す（自分が取った予約だけ）
+            if entry is not None and \
+                    self._reserved.get(self._key(entry[1])) is entry[0]:
+                del self._reserved[self._key(entry[1])]
 
     def alive(self):
         """生きているスレッドが開いている分を (スレッド, 実パス) で返す。
@@ -67,11 +102,14 @@ class _WriteHandle(SFTPHandle):
 class SFTPServerHandler(SFTPServerInterface):
     """SFTP サーバーハンドラー"""
     
-    def __init__(self, server, root_dir, *args, open_writers=None, **kwargs):
+    def __init__(self, server, root_dir, *args, open_writers=None,
+                 notify=None, **kwargs):
         super().__init__(server, *args, **kwargs)
         self.root_dir = os.path.abspath(root_dir)
         # 書き込み用に開いたハンドルを登録する先（SFTPServerManager の一覧）
         self._open_writers = open_writers
+        # 利用者へ見せる出来事をパネルのログへ渡す口（1 行の文字列を受け取る）
+        self._notify = notify
         
     def _get_real_path(self, path):
         """SFTP のパスを実際のファイルシステムパスに変換する（chroot を模擬）。
@@ -204,7 +242,11 @@ class SFTPServerHandler(SFTPServerInterface):
         書き込み系を一律 'wb' で開くと、読み書き両用で開いた瞬間に既存ファイルが
         truncate され、部分書き換えを行うクライアントがデータを失う。
         O_EXCL（新規作成、存在したら失敗）も黙って上書きしてしまう。
+
+        同じ保存先を別の要求が書き込みで開いている間は、書き込みの open を
+        断る（_OpenWriters.reserve を参照）。読み取りの open は妨げない。
         """
+        reserved = False
         try:
             real_path = self._get_real_path(path)
 
@@ -217,6 +259,16 @@ class SFTPServerHandler(SFTPServerInterface):
                 if dir_path and not os.path.exists(dir_path):
                     os.makedirs(dir_path)
 
+            tracked = writing and self._open_writers is not None
+            if tracked and not self._open_writers.reserve(real_path):
+                # 開くと O_TRUNC が相手の書きかけを切り詰め、双方が成功で
+                # 終わるのに中身が混ざる。TFTP の同名 WRQ と同じく断る
+                print(f"[SFTP Server] open refused, already open for writing: {real_path}")
+                if self._notify is not None:
+                    self._notify("他の転送が書き込み中のため断りました: %s" % path)
+                return SFTP_FAILURE
+            reserved = tracked
+
             fd = os.open(real_path, flags | getattr(os, "O_BINARY", 0))
             if flags & os.O_RDWR:
                 mode = 'a+b' if (flags & os.O_APPEND) else 'r+b'
@@ -226,7 +278,6 @@ class SFTPServerHandler(SFTPServerInterface):
                 mode = 'rb'
             f = os.fdopen(fd, mode)
 
-            tracked = writing and self._open_writers is not None
             fobj = (_WriteHandle(flags, self._open_writers) if tracked
                     else SFTPHandle(flags))
             # モードに応じて片方だけ設定する。両方入れると、読み取り専用の
@@ -245,6 +296,9 @@ class SFTPServerHandler(SFTPServerInterface):
 
             return fobj
         except Exception as e:
+            if reserved:
+                # 開けなかった。予約を残すと、その保存先へ二度と書けなくなる
+                self._open_writers.release(real_path)
             print(f"[SFTP Server] open error: {e}")
             return SFTP_FAILURE
 
@@ -802,9 +856,12 @@ class SFTPServerManager(QObject):
             # paramiko の既定の ServerInterface.check_channel_subsystem_request は
             # ここで登録したハンドラを引いて起動する実装なので、登録しないと
             # クライアントの subsystem('sftp') 要求が拒否され、チャネルが閉じる。
+            # 断った書き込みなどは、相手の IP を添えてパネルのログへ出す
             transport.set_subsystem_handler(
                 'sftp', SFTPServer, SFTPServerHandler, root_dir=self.root_dir,
-                open_writers=self._open_writers)
+                open_writers=self._open_writers,
+                notify=lambda message, ip=client_addr[0]:
+                    self.client_activity.emit(ip, message))
             
             # SSHサーバーインターフェースを作成
             server = SSHServerInterface(self.username, self.password)
