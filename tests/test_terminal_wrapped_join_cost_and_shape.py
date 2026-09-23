@@ -68,6 +68,11 @@ class WrappedJoinCostAndShapeTest(unittest.TestCase):
     def _terminal(self, rows=5, cols=20):
         from ui.terminal_widget import TerminalWidget
         w = TerminalWidget()
+        # 窓合わせ（200ms 後に _apply_grid_size）が、ここで決めた画面の
+        # 大きさを窓の大きさへ縮めないよう、格子をこの大きさに固定する。
+        # 負荷で描画が 200ms を超えると、縮めた分の行が履歴へ押し出され、
+        # 履歴側の規則（MAX_BLOCK_CHARS ごとに切る）で繋がらなくなる
+        w._grid_size = lambda t, r=rows, c=cols: (r, c)
         self.addCleanup(w.close)
         self.addCleanup(w._pending_output.clear)
         self.addCleanup(w._output_timer.stop)
