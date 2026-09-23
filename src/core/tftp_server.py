@@ -36,6 +36,23 @@ def _safe_join(root, filename):
     return target
 
 
+# WRQ の tsize として使う値の上限（これ以上は大きさ不明として扱う）
+_MAX_DECLARED_SIZE = 2 ** 63
+
+
+def _declared_size(value):
+    """WRQ の tsize（クライアントの申告）を解釈する。使えない値は 0（大きさ不明）。
+
+    認証の無い相手が決める値なので、範囲を見ずに使うと 400 桁の数字が
+    そのまま表示まで届き、float へ直すところで例外になる（負の値も通る）
+    """
+    try:
+        size = int(value or 0)
+    except ValueError:
+        return 0
+    return size if 0 <= size < _MAX_DECLARED_SIZE else 0
+
+
 def _err(sock, addr, code, msg):
     sock.sendto(struct.pack("!HH", OP_ERROR, code) + msg.encode() + b"\x00", addr)
 
@@ -362,10 +379,8 @@ class TFTPServer:
             xs.close()
             return
         neg = self._neg_options(opts)
-        try:
-            total = int(opts.get("tsize", "0") or 0)  # tsize はクライアント宣言。pop 前の opts から読む
-        except ValueError:
-            total = 0  # 不正な tsize はハンドラスレッドを落とさず 0 扱い
+        # tsize はクライアント宣言。pop 前の opts から読む。不正・範囲外は 0 扱い
+        total = _declared_size(opts.get("tsize"))
         neg.pop("tsize", None)  # WRQ の tsize はクライアント宣言。ここでは echo せず簡略化
         blksize = int(neg.get("blksize", "512"))
         timeout = self._transfer_timeout(xs, neg)

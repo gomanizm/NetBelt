@@ -235,7 +235,15 @@ class TFTPServerPanel(QWidget):
         self._add_log("[%s] %s" % (ip, msg))
 
     def _fmt_bytes(self, n):
-        """バイト数を読みやすい単位文字列に変換"""
+        """バイト数を読みやすい単位文字列に変換。
+
+        float へ直せないほど大きい値（相手が申告した tsize など）は「—」にする。
+        そのまま割ると OverflowError になり、履歴に空の行が残る
+        """
+        try:
+            n = float(n)
+        except (OverflowError, TypeError, ValueError):
+            return "—"
         for u in ("B", "KB", "MB", "GB"):
             if n < 1024 or u == "GB": return "%.1f%s" % (n, u)
             n /= 1024.0
