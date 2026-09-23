@@ -74,10 +74,21 @@ def export_log_text(panel, text: str, stem: str,
     # config_manager を持たない相手（素のウィジェットを渡すテスト等）でも
     # 保存自体は通す。save_defaults は None を「覚えていない」として扱う
     config_manager = getattr(panel, "config_manager", None)
-    file_path, _ = QFileDialog.getSaveFileName(
+    # 既定名は 1 回だけ作る。2 回作ると秒がずれ、利用者が名前に触れていない
+    # のに「触った」と判定されて拡張子の付け替えが効かない
+    default_name = default_file_name(stem)
+    file_path, selected_filter = QFileDialog.getSaveFileName(
         panel, title,
-        save_defaults.initial_path(config_manager, default_file_name(stem)),
+        save_defaults.initial_path(config_manager, default_name),
         FILE_FILTER)
+    if not file_path:
+        return None
+    # 選んだ種類に合わせて拡張子を付け替える（SNMP・Syslog・端末と同じ作法）。
+    # 捨てていたため、既定名のまま種類だけ「ログファイル (*.log)」へ変えても
+    # .txt で保存されていた。付け替えた先が既にあれば、ダイアログが訊いて
+    # いない上書きなのでここで確認する（断られたら空が返る）
+    file_path = save_defaults.apply_filter_suffix_confirmed(
+        panel, title, file_path, selected_filter, default_name)
     if not file_path:
         return None
 
