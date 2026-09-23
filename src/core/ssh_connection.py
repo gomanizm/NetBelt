@@ -31,6 +31,28 @@ def known_hosts_server_name(host, port):
     return host if port == 22 else "[%s]:%d" % (host, port)
 
 
+def ssh_port_number(port):
+    """設定のポート番号を、接続に使う整数（1〜65535）にする。使えなければ None。
+
+    paramiko 4.0.0 は known_hosts を引く名前を `port == 22`（整数との比較）で
+    決める。手編集の config.json などで "22" と文字列になっていると、同じ
+    22 番へ繋ぐのに "[host]:22" という別名で引き、保存済みの鍵が見つからず
+    TOFU が黙って受け入れて認証へ進む（実測）。点検側の
+    known_hosts_server_name と paramiko に同じ整数を渡すため、ここでそろえる。
+    bool（JSON の true）と端数のある数は、ポート番号として読まない。
+    """
+    if isinstance(port, str):
+        try:
+            port = int(port)
+        except ValueError:
+            return None
+    elif isinstance(port, float) and port.is_integer():
+        port = int(port)
+    if isinstance(port, bool) or not isinstance(port, int):
+        return None
+    return port if 1 <= port <= 65535 else None
+
+
 def known_hosts_names(text):
     """known_hosts の 1 行が指す接続先名を返す（カンマ区切りは分解する）。
 
@@ -668,6 +690,17 @@ class SSHConnection(QObject):
                 # のに参照しているものが誰もいない状態になり、閉じる経路が
                 # 無いまま機器の vty 枠を掴んだままになる
                 return False
+
+            # ポートは整数にそろえてから、known_hosts の点検と paramiko の
+            # 両方に同じ値を渡す（ssh_port_number 参照）。使えない値で
+            # 22 番などへ黙って繋がず、機器へは何も送らずに止める
+            port = ssh_port_number(self.port)
+            if port is None:
+                return self._fail(
+                    "ポート番号 %r は使えないため、接続しませんでした。"
+                    "機器の編集で 1〜65535 の整数を設定してください。"
+                    % (self.port,))
+            self.port = port
 
             # 待っている間に dispose() が走ると self.client は None になる。
             # 後始末は必ずこのローカル参照に対して行う
