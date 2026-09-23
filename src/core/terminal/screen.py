@@ -836,6 +836,24 @@ class Screen(object):
                     self.wrapped[r] = False
                 self.dirty.update(range(self.rows))
                 self._pending_wrap = False
+            elif not to_alt and with_cursor and self._saved_main:
+                # 47l / 1047l で先にメイン画面へ戻ったあとの 1049l。
+                # 画面の入れ替えは済んでいるが、1049h の保存はまだ
+                # 残っている (捨てるのは 47h / 1047h の入場だけ)。
+                # xterm の 1049l は CursorRestore なので、そこから
+                # 位置・属性・文字集合を戻す。戻さないと代替画面の
+                # ESC(0 が居座り、以降のメイン画面の出力と記録が
+                # 罫線文字へ化け続ける。使った保存は捨てる
+                # (同じ保存を次の 1049l が使い回さない)。1049h を
+                # 一度も受けていない迷子の 1049l (tput rmcup など)
+                # は保存が無いので、これまでどおり何もしない
+                row, col, attr, g, charset = self._saved_main[:5]
+                self.attr = attr
+                self._g = dict(g)
+                self._charset = charset
+                self._move(row, col)
+                self._saved_main = None
+                self.dirty.update(range(self.rows))
             return
         # self.lines が別の画面に差し替わる。空だという覚えは持ち越せない。
         # 入れ替えない呼び出し (上の早期 return) は白紙にするだけで中身を
