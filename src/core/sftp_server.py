@@ -2,6 +2,7 @@
 import os
 import socket
 import threading
+import time
 import paramiko
 from paramiko import ServerInterface, SFTPServerInterface, SFTPServer, SFTPAttributes, SFTPHandle, SFTP_OK, SFTP_FAILURE
 from PyQt6.QtCore import QObject, pyqtSignal
@@ -9,14 +10,68 @@ import stat as stat_module
 from .sockets import set_exclusive_bind
 from .crypto import PasswordCrypto
 from .ftp_server import UNDECRYPTABLE_PASSWORD_MESSAGE
+# 停止のあとも書き込みが生き残っている間に、次の起動を断る理由の文言。
+# 生き残りは保存先のファイルを握ったままなので、TFTP と同じ扱いにする
+from .tftp_server import PREVIOUS_STOP_INCOMPLETE_MESSAGE
+
+
+class _OpenWriters:
+    """書き込み用に開いているハンドルと、それを扱う SFTP のスレッドの一覧。
+
+    停止のあとも保存先を握ったまま生き残ったスレッドを見分けるのに使う。
+    ハンドルは SFTP のスレッドが登録・解除し、マネージャが読む
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._entries = {}   # ハンドル -> (スレッド, 実パス)
+
+    def add(self, handle, real_path):
+        with self._lock:
+            self._entries[handle] = (threading.current_thread(), real_path)
+
+    def discard(self, handle):
+        with self._lock:
+            self._entries.pop(handle, None)
+
+    def alive(self):
+        """生きているスレッドが開いている分を (スレッド, 実パス) で返す。
+
+        閉じないまま終わったスレッドの分はここで落とす
+        """
+        with self._lock:
+            for handle, (thread, _path) in list(self._entries.items()):
+                if not thread.is_alive():
+                    del self._entries[handle]
+            return list(self._entries.values())
+
+
+class _WriteHandle(SFTPHandle):
+    """書き込み用のハンドル。閉じ終えたら _OpenWriters から外れる。
+
+    close() の中で止まっている間（共有フォルダへの書き出しなど）は
+    一覧に残るので、まだ保存先を握っていると分かる
+    """
+
+    def __init__(self, flags, open_writers):
+        super().__init__(flags)
+        self._open_writers = open_writers
+
+    def close(self):
+        try:
+            super().close()
+        finally:
+            self._open_writers.discard(self)
 
 
 class SFTPServerHandler(SFTPServerInterface):
     """SFTP サーバーハンドラー"""
     
-    def __init__(self, server, root_dir, *args, **kwargs):
+    def __init__(self, server, root_dir, *args, open_writers=None, **kwargs):
         super().__init__(server, *args, **kwargs)
         self.root_dir = os.path.abspath(root_dir)
+        # 書き込み用に開いたハンドルを登録する先（SFTPServerManager の一覧）
+        self._open_writers = open_writers
         
     def _get_real_path(self, path):
         """SFTP のパスを実際のファイルシステムパスに変換する（chroot を模擬）。
@@ -171,7 +226,9 @@ class SFTPServerHandler(SFTPServerInterface):
                 mode = 'rb'
             f = os.fdopen(fd, mode)
 
-            fobj = SFTPHandle(flags)
+            tracked = writing and self._open_writers is not None
+            fobj = (_WriteHandle(flags, self._open_writers) if tracked
+                    else SFTPHandle(flags))
             # モードに応じて片方だけ設定する。両方入れると、読み取り専用の
             # ハンドルが書き込み可能として応答してしまう。
             if flags & os.O_RDWR:
@@ -182,6 +239,9 @@ class SFTPServerHandler(SFTPServerInterface):
             else:
                 fobj.readfile = f
             fobj._real_path = real_path
+            if tracked:
+                # 閉じ終えるまで、このスレッドが保存先を握っていると覚える
+                self._open_writers.add(fobj, real_path)
 
             return fobj
         except Exception as e:
@@ -310,6 +370,10 @@ class SFTPServerManager(QObject):
         self._client_sockets = set()
         self._client_lock = threading.Lock()
         self._stop_event = threading.Event()
+        # 書き込み用に開いているハンドルの一覧（SFTP のスレッドが登録する）と、
+        # 停止のあとも書き込みを抱えたまま生き残ったスレッド
+        self._open_writers = _OpenWriters()
+        self._unfinished = []
 
         # 同時に受け付けるクライアント接続の上限。認証前の接続でも
         # スレッドと Transport を 1 つずつ消費するので、上限が無いと
@@ -418,6 +482,13 @@ class SFTPServerManager(QObject):
         if self.is_running:
             self.error_occurred.emit("サーバーは既に実行中です")
             return False
+        # 前回の停止のあとも書き込みを抱えたスレッドが残っている間は起動しない。
+        # 生き残りは保存先のファイルを握ったままなので、新しい起動で同名の
+        # アップロードを受けると、後から戻った旧 write()/close() が中身を混ぜる。
+        # ここでは待たない（画面を固めない）。消えていれば通す（TFTP と同じ）
+        if not self._previous_stop_finished():
+            self.error_occurred.emit(PREVIOUS_STOP_INCOMPLETE_MESSAGE)
+            return False
 
         # 空の資格情報でネットワークに晒さない。UI 側でも検証しているが、
         # ここでも拒否して弱い既定値のまま起動する経路を残さない。
@@ -504,15 +575,22 @@ class SFTPServerManager(QObject):
     # 待受スレッドの終了を待つ上限。accept は 1 秒でタイムアウトするので
     # 通常はそれ以内に抜ける
     STOP_TIMEOUT_SECONDS = 3.0
+    # 停止のとき、書き込み中のスレッドが抜けるのを待つ上限（全体で）。
+    # 切断に気づけば数ミリ秒で抜けるので、残るのは止まっている分だけ
+    WRITER_STOP_TIMEOUT_SECONDS = 1.0
 
     def stop(self):
-        """SFTPサーバーを停止"""
+        """SFTPサーバーを停止する。
+
+        書き込みを抱えたスレッドが残らず終われたかを返す（残っている間は
+        次の start() を断る。_previous_stop_finished を参照）
+        """
         thread = self.server_thread
         # is_running で判定しない。あのフラグを立てるのはワーカーの先頭で、
         # start() はスレッドを起こした直後に戻るため、start() の直後に
         # 呼ばれると「まだ立っていない」窓で空振りし、待受が生き残る
         if thread is None or not thread.is_alive():
-            return
+            return self._previous_stop_finished()
 
         print("[SFTP Server] Stopping server...")
         # 停止フラグは接続一覧と同じロックの下で立てる。待受ループは
@@ -561,8 +639,29 @@ class SFTPServerManager(QObject):
         # 解放済みオブジェクトへ届く（FTP と同じ構造）
         if thread is not threading.current_thread():
             thread.join(timeout=self.STOP_TIMEOUT_SECONDS)
+        # 接続はすべて閉じた。書き込み用のハンドルを開いたまま生きている
+        # スレッドは、切断に気づいて抜ける途中か、保存先への write()/close()
+        # の中で止まっている（共有フォルダの遅延・切断など）。前者を取り
+        # 違えないよう少しだけ待ち、それでも残った分を覚えて、消えるまで
+        # 次の start() を断る
+        deadline = time.monotonic() + self.WRITER_STOP_TIMEOUT_SECONDS
+        for writer, _path in self._open_writers.alive():
+            writer.join(timeout=max(0.0, deadline - time.monotonic()))
+        for writer, path in self._open_writers.alive():
+            print(f"[SFTP Server] Write still in progress after stop: {path}")
+            if writer not in self._unfinished:
+                self._unfinished.append(writer)
         self.stopped.emit()
         print("[SFTP Server] Server stopped")
+        return self._previous_stop_finished()
+
+    def _previous_stop_finished(self):
+        """前回の停止が終わっているか。今の状態だけを見て、待たない。
+
+        書き込みを抱えて生き残ったスレッドのうち、終わった分は落とす
+        """
+        self._unfinished = [t for t in self._unfinished if t.is_alive()]
+        return not self._unfinished
     
     def _run_server(self, sock, stop_event):
         """サーバーのメインループ
@@ -704,7 +803,8 @@ class SFTPServerManager(QObject):
             # ここで登録したハンドラを引いて起動する実装なので、登録しないと
             # クライアントの subsystem('sftp') 要求が拒否され、チャネルが閉じる。
             transport.set_subsystem_handler(
-                'sftp', SFTPServer, SFTPServerHandler, root_dir=self.root_dir)
+                'sftp', SFTPServer, SFTPServerHandler, root_dir=self.root_dir,
+                open_writers=self._open_writers)
             
             # SSHサーバーインターフェースを作成
             server = SSHServerInterface(self.username, self.password)
