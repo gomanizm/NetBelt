@@ -11,7 +11,7 @@ from typing import Dict, Optional
 # MIB 解析器の版。抽出・解決の規則を変えたら上げる。mib_cache.json は
 # この値も鍵にするので、古い解析器が作ったキャッシュがアプリの更新後に
 # そのまま使われることがなくなる。
-MIB_PARSER_VERSION = '2026-09-23.1'
+MIB_PARSER_VERSION = '2026-09-23.2'
 
 
 def app_dir() -> str:
@@ -806,6 +806,17 @@ class MIBResolver:
         1.3.6.1.4.1.65001.1.99 ではなく標準 system 配下の
         1.3.6.1.2.1.1.99 に入り、mib_cache.json にも残った）。
 
+        借用を許した回の中でも、その回に残っている定義が親になる名前は
+        借りない。1 回の回は残りをリストの順に 1 パスするだけなので、
+        これが無いと同じ誤確定がその 1 回の中で起きる（実測: 深さ 2 の鎖
+        mib-2 → vendorRoot → system → alarm で、根の vendorRoot が借用
+        待ちのあいだに alarm が内蔵の system を借り、
+        1.3.6.1.2.1.9999.1.99 ではなく 1.3.6.1.2.1.1.99 になった）。
+        借りるのは鎖の根——残りのどれも親にならない側——だけで、進んだら
+        借用をまた禁じるので、残りは次の回に自分のモジュールの親で決まる。
+        同じパスの中で先に親が決まった子はそのまま解決するので、回数は
+        増えない。
+
         「同じモジュールにあるか」は、抽出できた定義だけでなく
         _MIB_LOCAL_NAME で集めた宣言も見る。そのモジュールの宣言が抽出から
         落ちていると（複数添字の右辺など）、よその同名が親になって子が別
@@ -876,12 +887,25 @@ class MIBResolver:
         while pending:
             still_pending = []
             progressed = False
+            # 借用を許す回でも、この回に残っている定義が親になる名前は
+            # 借りない。1 回の回は pending をリストの順に 1 パスするだけ
+            # なので、これが無いと、パスの後ろで決まる自モジュールの親を
+            # 待たずに、前の方の子が内蔵の同名で確定する（実測: 深さ 2 の
+            # 鎖の根が借用待ちのとき、alarm が 1.3.6.1.2.1.9999.1.99 では
+            # なく標準 system 配下の 1.3.6.1.2.1.1.99 に入った）。鎖の根
+            # ——残りのどれも親にならない側——だけが借り、進んだら borrow を
+            # また禁じるので、残りは次の回に自分のモジュールの親で決まる
+            awaiting = set()
+            if borrow:
+                for _pending_name, _, _, _pending_module in pending:
+                    awaiting.add((_pending_module, _pending_name))
             for name, parent, index, module in pending:
                 if parent == 'enterprises':
                     parent_oid = '1.3.6.1.4.1'
                 elif parent in declared[module]:
                     parent_oid = in_module.get(module, {}).get(parent)
                     if (parent_oid is None and borrow
+                            and (module, parent) not in awaiting
                             and declaring.get(parent, 0) < 2):
                         # よそのモジュールに同名が無い＝曖昧ではない。
                         # 標準表 / custom_mibs.json / IMPORTS の値を
