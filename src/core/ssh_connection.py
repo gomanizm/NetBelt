@@ -134,14 +134,23 @@ def load_known_hosts(hostkeys, path):
     入れ替わって次から BadHostKeyException で拒否される）。
     paramiko の検証（lookup → SubDict.__getitem__）は先頭の行を使うので、
     こちらも先に読んだ行を優先し、食い違う行は潰さずに並べる。
-    同じ鍵がもうある行（同一行の重複）は、これまでどおり畳む。
+    同じ名前・同じ鍵種別・同じ鍵の行（同一行の重複）だけは畳む。
+
+    畳むかどうかは名前を文字列のまま比べて決める。HostKeys.check は
+    lookup 経由でハッシュ化名（|1|salt|hash）とも照合するので、それを
+    使うと「ハッシュ行＋同じ鍵の平文行」の平文行が畳まれ、別の機器の
+    保存で利用者の書いた行が黙って消える（実測）。
     """
     from paramiko.hostkeys import HostKeyEntry
     for _lineno, _text, _raw, entry in _iter_known_hosts_lines(path):
         if entry is None:
             continue
+        keytype = entry.key.get_name()
+        blob = entry.key.asbytes()
         for name in entry.hostnames:
-            if hostkeys.check(name, entry.key):
+            if any(name in e.hostnames and e.key.get_name() == keytype
+                   and e.key.asbytes() == blob
+                   for e in hostkeys._entries):
                 continue
             # HostKeys.load 自身も _entries へ append する（paramiko 4.0.0）
             hostkeys._entries.append(HostKeyEntry([name], entry.key))
