@@ -358,7 +358,15 @@ class ConfigManager:
             return config
         
         try:
-            with open(self.config_path, 'r', encoding='utf-8') as f:
+            # utf-8-sig で読む。メモ帳の「UTF-8 (BOM)」や PowerShell 5.1 の
+            # Out-File -Encoding utf8 で手編集すると先頭に BOM が付くが、
+            # utf-8 のままだと BOM が文字として json.load へ渡り
+            # 「Unexpected UTF-8 BOM」で設定全体が破損扱いになる（実測）。
+            # その結果、機器もグループも消えた既定設定で起動し、次の保存で
+            # config.json が既定設定へ置き換わっていた。BOM が無ければ
+            # utf-8 と同じ。書き出しは今までどおり BOM 無しなので、一度
+            # 読み直して保存すれば BOM は落ちる
+            with open(self.config_path, 'r', encoding='utf-8-sig') as f:
                 config = json.load(f)
                 # name/host の無い機器とグループは先に整える（UI が KeyError で
                 # 落ちる）。復号も機器が dict であることを前提にしているので、
