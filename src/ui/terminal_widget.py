@@ -223,6 +223,26 @@ class InteractiveTerminal(QTextEdit):
         return frozenset(first + row for row in range(len(marks) - 1)
                          if marks[row])
 
+    def _join_wrapped_blocks(self) -> None:
+        """いまの画面の折り返し行を、文書の上で 1 ブロックへ繋ぐ。
+
+        画面を作り直す前（再接続）に呼ぶ。据え置かれた行はもう
+        _wrapped_blocks() の範囲外になるので、ここで繋いでおかないと
+        折り返しの位置で割れたまま永久に残り、コピーも全ログ保存も
+        割れた行を返す（押し出された履歴は初めから繋がっている）。
+        区切り文字を消すと後ろのブロック番号がずれるので、番号の大きい
+        方から消す。
+        """
+        document = self.document()
+        for number in sorted(self._wrapped_blocks(), reverse=True):
+            block = document.findBlockByNumber(number)
+            if not block.isValid() or not block.next().isValid():
+                continue
+            cut = QTextCursor(document)
+            # ブロックの長さには区切りの 1 文字が入っている。その 1 文字を消す
+            cut.setPosition(block.position() + block.length() - 1)
+            cut.deleteChar()
+
     def unwrapped_text(self, cursor=None) -> str:
         """文書から文字列を取り出す（画面領域の自動折り返しは 1 行に戻す）。
 
@@ -264,6 +284,13 @@ class InteractiveTerminal(QTextEdit):
         """選んだ範囲をクリップボードへ渡す（折り返しは 1 行に戻す）。
 
         copy()・マウスを離したときのコピー・Ctrl+C は、どれもここを通る。
+
+        折り返しを戻したときは、text/plain 以外（text/html など）を落とす。
+        Qt が入れる書式付きの形式は画面の行ごとに段落を作るので、そのままだと
+        折り返しの位置で割れたまま残る。Word・Outlook・Excel は貼り付けで
+        text/html を先に取るため、公開鍵や長い設定行が割れて入る（実測）。
+        色は失うが行は壊れない方を採る。折り返しが無いときは何も落とさない
+        ので、これまでどおり色付きで貼れる。
         """
         data = super().createMimeDataFromSelection()
         text = self.unwrapped_text(self.textCursor())
@@ -271,7 +298,10 @@ class InteractiveTerminal(QTextEdit):
             # Qt が返すのは遅延して中身を作る QMimeData で、最初に読まれた
             # ときに選択範囲から text/plain と text/html を入れ直す。先に
             # 読んで中身を確定させないと、こちらの差し替えが消される
-            data.text()
+            if data.text() != text:
+                for fmt in list(data.formats()):
+                    if fmt != "text/plain":
+                        data.removeFormat(fmt)
             data.setText(text)
         return data
 
@@ -985,6 +1015,9 @@ class TerminalWidget(QWidget):
         前は確定した記録で、二度と書き換えない。
         """
         rows, cols = self._grid_size(terminal)
+        # 出ていく画面の折り返し行は、ここで押し出された履歴と同じ形
+        # （1 ブロック）にしてから置き去りにする
+        terminal._join_wrapped_blocks()
         terminal._parser = vt.Parser()
         terminal._screen = Screen(rows, cols)
         region = QTextCursor(terminal.document())
