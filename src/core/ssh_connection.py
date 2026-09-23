@@ -76,6 +76,12 @@ def _iter_known_hosts_lines(path):
     なる。@cert-authority / @revoked で始まる行も、印を剥がさないために
     3 つ目の欄が鍵種別の文字列になり、同じく InvalidHostKey になる。
     ここでは種類を問わず握りつぶし、読めない行として扱う。
+
+    形の崩れたハッシュ化名（塩が 20 バイトに復号できない |1|AAAA|AAAA
+    など）の行も、読めない行として扱う。from_line はそのまま通すが、
+    paramiko の lookup はハッシュ化名の行ごとに hash_host を掛け直すので、
+    接続先がどこであっても例外になる（実測: 接続のたびに本文の空な
+    『接続エラー: 』だけが出て、全機器が繋がらなくなる）。
     """
     from paramiko.hostkeys import HostKeyEntry
     raw = Path(str(path)).read_bytes()
@@ -92,6 +98,10 @@ def _iter_known_hosts_lines(path):
             continue
         try:
             entry = HostKeyEntry.from_line(text, lineno)
+            if entry is not None:
+                for name in entry.hostnames:
+                    if name.startswith("|1|"):
+                        paramiko.hostkeys.HostKeys.hash_host("x", name)
         except Exception:
             entry = None
         yield lineno, text, raw_line, entry
