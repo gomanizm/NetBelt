@@ -120,14 +120,31 @@ def load_known_hosts(hostkeys, path):
     行や @cert-authority / @revoked の行があると例外になり、読める行まで
     失われる（実測: 1 行壊れているだけで全機器が繋がらなくなる）。
     読めない行は unreadable_known_hosts_lines() が名指しで知らせるので、
-    ここでは読める行だけを取り込む。名前ごとに add するのは
+    ここでは読める行だけを取り込む。名前ごとに入れるのは
     HostKeys.load と同じ（複数名の行は名前の数だけ登録される）。
+
+    行の入れ方も HostKeys.load にそろえる。HostKeys.add は
+    (接続先, 鍵種別) が同じ既存エントリを置き換えるので、それを使うと
+    同じ接続先・同じ鍵種別で食い違う 2 行のうち先の行が消える。
+    OpenSSH は鍵の入れ替え期間に同じホストの行を並べることを許すので、
+    利用者が新しい鍵の行を手で足した状態は普通に起きる。そこを潰すと、
+    保存のたびにディスクを読み直す _save_known_hosts が、触っていない
+    接続先の行を 1 本消してしまう（実測: A に食い違う 2 行がある状態で
+    B の初回接続を保存すると、A は後の行だけになり、検証に使う鍵が
+    入れ替わって次から BadHostKeyException で拒否される）。
+    paramiko の検証（lookup → SubDict.__getitem__）は先頭の行を使うので、
+    こちらも先に読んだ行を優先し、食い違う行は潰さずに並べる。
+    同じ鍵がもうある行（同一行の重複）は、これまでどおり畳む。
     """
+    from paramiko.hostkeys import HostKeyEntry
     for _lineno, _text, _raw, entry in _iter_known_hosts_lines(path):
         if entry is None:
             continue
         for name in entry.hostnames:
-            hostkeys.add(name, entry.key.get_name(), entry.key)
+            if hostkeys.check(name, entry.key):
+                continue
+            # HostKeys.load 自身も _entries へ append する（paramiko 4.0.0）
+            hostkeys._entries.append(HostKeyEntry([name], entry.key))
 
 
 def _has_utf8_bom(path):

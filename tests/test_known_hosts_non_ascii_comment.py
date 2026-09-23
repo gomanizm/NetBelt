@@ -26,9 +26,10 @@ HostKeyStoreError に包み直して、関係のない機器まで全部中止�
 直し方: _load_known_hosts_into_client() で paramiko の読み込みを主経路の
 まま残しつつ、UnicodeDecodeError だけを受け止めて、読める行を自前の
 ローダ（load_known_hosts）で取り込む。paramiko の load_host_keys は
-読む前に _host_keys_filename を覚えるので、save_host_keys の読み直しが
-同じ例外を踏まないよう None に戻す（保存前の取り込みは
-_save_known_hosts が自分で行うので、失われるものは無い）。
+読む前に _host_keys_filename を覚えるので、この client が持っているのは
+ファイルの一部だけだと分かるよう None に戻す（2d9394a 以降、保存は
+_save_known_hosts が錠の中でディスクから作り直して行い、paramiko の
+save_host_keys は保存経路から外れている）。
 例外を Exception まで広げないのは、権限エラー（PermissionError）で
 中止する既存の動きを残すため。
 """
