@@ -280,13 +280,35 @@ REM 相手はフォルダを列挙すれば写しの名前も知れる。実測�
 REM cx5j-check-release の p5_staged_swap.py）: 写しだけを別の有効な ZIP へ
 REM 置き換えると、渡されたパスを Expand-Archive で開くだけだったため、
 REM 控えと食い違う中身がそのまま据わり「更新が完了しました」まで出た。
-REM 期待値が無いのは、この引数を知らない古い NetBelt から呼ばれたときと、
-REM 切り分けのために手で叩いたときだけ。そのときは従来どおり展開する。
-if not defined ZIP_SHA goto :zip_sha_ok
+REM
+REM 照合と展開は 1 つの powershell で、ZIP を掴んだまま済ませる。以前は
+REM 照合と展開で powershell を 2 回に分けていたので、照合したのはバイト列、
+REM 開き直すのは名前、という窓が空いていた。実測（検査役
+REM cx7a-verify-release の p01_zip_swap_after_hash.py と
+REM p01b_window_size.py、f4cad23）: 窓は平均 1571 ms（最小 841 / 最大
+REM 1986、powershell の起動 1 回ぶん）あり、そこで別の有効な ZIP へ
+REM 置き換えると rc=0・『更新が完了しました！』で EXE_FROM_EVIL が据わった。
+REM 書き込みを拒む共有モード（FileShare::Read）で開いたまま
+REM Get-FileHash -InputStream で照合し、同じハンドルのまま Expand-Archive
+REM まで進めれば、その間の差し替えは拒まれる（実測 e1_hold_share.py:
+REM copyfile / os.replace / rename / 書き込み open のすべてが
+REM PermissionError、Expand-Archive は成功）。
+REM
+REM PowerShell の '...' に生のパスを埋めると、パスに ' が入っただけで
+REM 文字列が閉じて壊れる。環境変数で渡せば引用符の問題が起きない。
+REM 期待値が空になるのは、この引数を知らない古い NetBelt から呼ばれた
+REM ときと、切り分けのために手で叩いたときだけ。そのときは照合せず展開
+REM する（ZIP_SHA が未定義なら set は PS_SHA を消すので $env:PS_SHA は
+REM $null になる）。
+REM 終了コード: 0=展開まで成功 / 2=ハッシュ不一致 / 1=それ以外の失敗。
 set "PS_ZIP=!ZIP_FILE!"
+set "PS_DEST=!TEMP_DIR!"
 set "PS_SHA=!ZIP_SHA!"
-powershell -NoProfile -ExecutionPolicy Bypass -Command "try { if ((Get-FileHash -LiteralPath $env:PS_ZIP -Algorithm SHA256 -ErrorAction Stop).Hash -eq $env:PS_SHA) { exit 0 } } catch { }; exit 1"
-if not errorlevel 1 goto :zip_sha_ok
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$rc = 1; try { $fs = [IO.File]::Open($env:PS_ZIP, 'Open', 'Read', 'Read') } catch { Write-Host 'エラー:' $_.Exception.Message; exit 1 }; try { if ($env:PS_SHA) { if ((Get-FileHash -InputStream $fs -Algorithm SHA256 -ErrorAction Stop).Hash -ne $env:PS_SHA) { exit 2 } }; Expand-Archive -LiteralPath $env:PS_ZIP -DestinationPath $env:PS_DEST -Force; $rc = 0 } catch { Write-Host 'エラー:' $_.Exception.Message } finally { $fs.Close() }; exit $rc"
+if errorlevel 2 goto :zip_sha_mismatch
+if errorlevel 1 goto :zip_expand_failed
+goto :zip_expanded
+:zip_sha_mismatch
 echo エラー: 更新ファイルの中身が、確認した時点から変わっています
 echo   展開の直前に計算した SHA-256 が、NetBelt が確かめた値と違いました。
 echo   インストール先のファイルは何も変えていません。
@@ -295,19 +317,13 @@ rd /s /q "!TEMP_DIR!" 2>nul
 call :drop_apply_copy
 pause
 exit /b 1
-:zip_sha_ok
-REM PowerShell の '...' に生のパスを埋めると、パスに ' が入っただけで
-REM 文字列が閉じて壊れる。環境変数で渡せば引用符の問題が起きない。
-set "PS_ZIP=!ZIP_FILE!"
-set "PS_DEST=!TEMP_DIR!"
-powershell -NoProfile -ExecutionPolicy Bypass -Command "try { Expand-Archive -LiteralPath $env:PS_ZIP -DestinationPath $env:PS_DEST -Force; exit 0 } catch { Write-Host 'エラー:' $_.Exception.Message; exit 1 }"
-if errorlevel 1 (
-    echo エラー: ZIPファイルの展開に失敗しました
-    rd /s /q "!TEMP_DIR!" 2>nul
-    call :drop_apply_copy
-    pause
-    exit /b 1
-)
+:zip_expand_failed
+echo エラー: ZIPファイルの展開に失敗しました
+rd /s /q "!TEMP_DIR!" 2>nul
+call :drop_apply_copy
+pause
+exit /b 1
+:zip_expanded
 echo   展開完了
 echo.
 
