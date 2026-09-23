@@ -11,6 +11,7 @@ NetBelt の受信サーバ（FTP / TFTP / Syslog / SFTP サーバ / SNMP Trap）
 - ルールは "NetBelt - <サービス> (<PROTO>/<port>)" という名前で作成する。
 - Windows 以外では何もしない（常に成功扱い）。
 """
+import os
 import sys
 import subprocess
 
@@ -52,6 +53,7 @@ def _netsh(args):
 # netsh show rule の出力はロケール依存。日本語と英語のキー/値を受け付ける
 _KEY_ENABLED = ("enabled", "有効")
 _KEY_ACTION = ("action", "操作")
+_KEY_PROGRAM = ("program", "プログラム")
 _VAL_YES = ("yes", "はい")
 _VAL_NO = ("no", "いいえ")
 _VAL_ALLOW = ("allow", "許可")
@@ -77,8 +79,32 @@ def _decode_netsh(data):
     return data.decode("latin-1")
 
 
-def _rule_state(name):
+def _same_program(rule_program, program):
+    """ルールの Program 値が指定の実行体と同じものを指すか
+
+    大小・区切り（/ と \\）・冗長な . の違いは同じものとして扱う。
+    """
+    if not rule_program:
+        return False
+    try:
+        return (os.path.normcase(os.path.normpath(rule_program))
+                == os.path.normcase(os.path.normpath(program)))
+    except (TypeError, ValueError, OSError):
+        return False
+
+
+def _rule_state(name, program=None):
     """指定名の受信ルールの状態を返す。
+
+    Args:
+        name: ルール名
+        program: 指定すると、この実行体を対象にしたルールだけを判断材料に
+            する。ルール名は配置先に依存しない固定値なので、ポータブル版を
+            別フォルダへ移すと、旧配置先向けの同名ルールが残っているだけで
+            「許可済み」と読めてしまう（実測: 新しい exe 向けの追加が
+            失敗していても ensure_self_program_allow が「完了」を返した）。
+            Program 行を値まで読めなかった出力（未知のロケール、プログラム
+            指定の無いルール）では、従来どおり名前一致で判断する。
 
     Returns:
         "ok"      … 有効かつ許可の受信ルールがある
@@ -99,52 +125,67 @@ def _rule_state(name):
     ルール名にプロトコルとポートを含めているため実運用では一致するが、
     利用者が手で同名ルールを作り替えた場合は取りこぼす。
     """
-    r = _netsh(["advfirewall", "firewall", "show", "rule", "name=" + name, "dir=in"])
+    args = ["advfirewall", "firewall", "show", "rule", "name=" + name, "dir=in"]
+    if program is not None:
+        # Program 行は verbose を付けないと出ない（実測）
+        args.append("verbose")
+    r = _netsh(args)
     # 存在しない場合 netsh は returncode!=0 で "No rules match..." を返す
     if r.returncode != 0:
         return "absent"
     text = _decode_netsh(r.stdout or b"")
-    # ルールごとに 有効/操作 を集める。区切り線（----）で次のルールへ移る
-    rules = []  # 両方を値まで読めた (有効, 許可) の組
-    enabled = allow = None
+    # ルールごとに 有効/操作/プログラム を集める。区切り線（----）で次のルールへ
+    rules = []  # 有効と操作を値まで読めた (有効, 許可, プログラム) の組
+    enabled = allow = prog = None
     for line in text.splitlines():
         if line.startswith("----"):
             if enabled is not None and allow is not None:
-                rules.append((enabled, allow))
-            enabled = allow = None
+                rules.append((enabled, allow, prog))
+            enabled = allow = prog = None
             continue
         key, sep, val = line.partition(":")
         if not sep:
             continue
         key = key.strip().lower()
-        val = val.strip().lower()
+        raw = val.strip()
+        val = raw.lower()
         if key in _KEY_ENABLED:
             enabled = _tri(val, _VAL_YES, _VAL_NO)
         elif key in _KEY_ACTION:
             allow = _tri(val, _VAL_ALLOW, _VAL_BLOCK)
+        elif key in _KEY_PROGRAM:
+            prog = raw
     if enabled is not None and allow is not None:
-        rules.append((enabled, allow))
+        rules.append((enabled, allow, prog))
     if not rules:
         return "unknown"
+    if program is not None and any(p for _, _, p in rules):
+        # Program を値まで読めたときだけ、その実行体のルールへ絞る。
+        # 1 件も読めない出力（未知のロケール、プログラム指定の無い＝
+        # すべての実行体を通すルール）は、これまでどおり名前で判断する
+        rules = [r for r in rules if _same_program(r[2], program)]
+        if not rules:
+            return "absent"
     # 有効なブロックは有効な許可に優先する（修復対象）
-    if any(en and not al for en, al in rules):
+    if any(en and not al for en, al, _ in rules):
         return "present"
-    if any(en and al for en, al in rules):
+    if any(en and al for en, al, _ in rules):
         return "ok"
     return "present"
 
 
-def rule_exists(name):
+def rule_exists(name, program=None):
     """指定名の「有効な許可」受信ルールが存在するか（読み取りのみ・管理者権限不要）
 
     名前が一致するだけでは真にしない。無効化・ブロック化された同名ルールは
     受信を通さないので、それを「許可済み」と報告すると通らないのに完了と出る。
     出力を解釈できないロケールでは従来どおり名前一致で真とする。
+    program を渡すと、その実行体を対象にしたルールだけを見る（_rule_state）。
     """
     if not is_windows():
         return False
     try:
-        return _rule_state(name) in ("ok", "unknown")
+        return _rule_state(name, program=program) in ("ok", "unknown")
     except Exception:
         return False
 
@@ -273,7 +314,9 @@ def ensure_self_program_allow():
         import time
         for _ in range(6):
             time.sleep(0.25)
-            if rule_exists(name):
+            # 名前だけで確かめると、旧配置先向けの同名ルールが残っている
+            # 環境で、新しい exe への add が失敗していても「完了」と出る
+            if rule_exists(name, program=prog):
                 return True, "自exe受信許可を追加(昇格): " + name
         # 反映を確認できないものを成功にすると「通らないのに完了」と出る
         return False, "自exe受信許可を要求したが反映を確認できず: " + name
