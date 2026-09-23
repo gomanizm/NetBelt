@@ -163,6 +163,45 @@ class SFTPManager(QObject):
             # 既に捨てられている。切断を知らせる相手も一緒に外れている
             print("[SFTP] 通知の間に破棄されたため、切断の通知は省きました")
 
+    def _channel_closed(self) -> bool:
+        """SFTP のチャンネルが既に閉じられているかを返す
+
+        機器が SFTP サブシステムだけを閉じると（SSH のトランスポートは
+        生きている）、paramiko は以後の操作で OSError('Socket is closed')
+        を上げる。型では切断と見分けられないので、チャンネルの状態を見る。
+        .closed が True そのもののときだけ閉じたと見なす（差し替えの Mock
+        のように、真と評価されるだけの値を取り違えない）。
+        """
+        client = self.sftp_client
+        if client is None:
+            return False
+        try:
+            return client.get_channel().closed is True
+        except Exception:
+            return False
+
+    def _abort_connect(self, e: Exception) -> bool:
+        """connect() のホーム取得でチャンネルが使えないと分かったら畳み、False を返す
+
+        connected をまだ出していないので、disconnect ではなく直接閉じる。
+        SSH の接続は端末側のものなので閉じない。
+        """
+        if isinstance(e, TimeoutError):
+            reason = f"機器が{self.CHANNEL_TIMEOUT_SECONDS:g}秒応答しません"
+        else:
+            # 'Server connection dropped: ' のように理由がコロンで
+            # 終わることがある。理由を持たない例外は型名で出す
+            reason = (str(e) or e.__class__.__name__).strip()
+            reason = reason.rstrip(':').rstrip()
+        try:
+            self.sftp_client.close()
+        except Exception:
+            pass
+        self.sftp_client = None
+        self.ssh_client = None
+        self.error_occurred.emit(f"SFTP接続エラー: {reason}")
+        return False
+
     def connect(self, ssh_client: paramiko.SSHClient) -> bool:
         """
         SFTP接続を開始（既存のSSHクライアントを使用）
@@ -198,22 +237,15 @@ class SFTPManager(QObject):
                 # disconnect ではなく直接閉じる）。切断・壊れた応答を
                 # 期限切れと同じに扱うのは他の操作と揃える
                 # （利用者の決定 2026-09-20。_fail を参照）
-                if isinstance(e, TimeoutError):
-                    reason = f"機器が{self.CHANNEL_TIMEOUT_SECONDS:g}秒応答しません"
-                else:
-                    # 'Server connection dropped: ' のように理由がコロンで
-                    # 終わることがある。理由を持たない例外は型名で出す
-                    reason = (str(e) or e.__class__.__name__).strip()
-                    reason = reason.rstrip(':').rstrip()
-                try:
-                    self.sftp_client.close()
-                except Exception:
-                    pass
-                self.sftp_client = None
-                self.ssh_client = None
-                self.error_occurred.emit(f"SFTP接続エラー: {reason}")
-                return False
-            except Exception:
+                return self._abort_connect(e)
+            except Exception as e:
+                # 型では切断と分からなくても、機器が SFTP のチャンネルを
+                # 既に閉じていれば同じく使えない印（paramiko は
+                # OSError('Socket is closed') を上げる）。開いている
+                # チャンネルでの失敗はホームが分からないだけなので、
+                # これまでどおり '/' から始める
+                if self._channel_closed():
+                    return self._abort_connect(e)
                 self.current_path = "/"
             
             self.is_connected = True
