@@ -123,6 +123,20 @@ class DeviceDialog(QDialog):
         
         layout.addLayout(button_layout)
     
+    @staticmethod
+    def _as_text(value, default=""):
+        """設定の値を、入力欄へ入れられる文字列にする。
+
+        読み込み時にそろえてはいるが（ConfigManager の
+        _quarantine_invalid_devices）、ConfigManager を通らない device_data
+        もある。ここで QLineEdit.setText / QComboBox.findText が TypeError に
+        なると、その機器は編集で直せなくなる（パスワードの入れ直しも
+        できない）ので、読み手側でも文字列にしてから渡す。
+        """
+        if value is None:
+            return default
+        return value if isinstance(value, str) else str(value)
+
     def _load_data(self):
         """データを読み込み（編集モード時）"""
         if not self.is_edit_mode:
@@ -135,16 +149,16 @@ class DeviceDialog(QDialog):
         self.name_edit.setText(self.device_data.get("name", ""))
         self.host_edit.setText(self.device_data.get("host", ""))
         self.port_edit.setText(str(self.device_data.get("port", 22)))
-        self.username_edit.setText(self.device_data.get("username", ""))
-        self.password_edit.setText(self.device_data.get("password", ""))
-        self.ssh_key_edit.setText(self.device_data.get("ssh_key", ""))
+        self.username_edit.setText(self._as_text(self.device_data.get("username")))
+        self.password_edit.setText(self._as_text(self.device_data.get("password")))
+        self.ssh_key_edit.setText(self._as_text(self.device_data.get("ssh_key")))
         
         # プロトコル設定。コンボの初期選択は index 0 の "ssh" なので、
         # 保存値が telnet / console のときだけ currentTextChanged が発火し、
         # 既定ポートで上書きされていた（telnet 2323 が 23 に戻る）。
         # 信号を止めるだけでは秘密鍵欄の有効/無効まで飛ぶので、
         # UI の同期は明示的に呼ぶ。
-        protocol = self.device_data.get("protocol", "ssh")
+        protocol = self._as_text(self.device_data.get("protocol"), "ssh")
         index = self.protocol_combo.findText(protocol)
         if index >= 0:
             self.protocol_combo.blockSignals(True)

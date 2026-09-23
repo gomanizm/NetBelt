@@ -796,6 +796,41 @@ class ConfigManager:
         device["password"] = ""
         return "emptied"
 
+    # 機器の任意文字列項目と、読めないときに戻す既定値・画面へ出す名前。
+    # 読み手（DeviceDialog）は QLineEdit.setText / QComboBox.findText へ
+    # そのまま渡すので、文字列でないと編集ダイアログが TypeError で開けず、
+    # その機器は GUI から二度と直せなくなる（パスワードの入れ直しも不可）。
+    # password は暗号化の都合があるので _normalize_password が別に見る
+    _DEVICE_TEXT_FIELDS = (
+        ("username", "", "ユーザー名"),
+        ("ssh_key", "", "秘密鍵"),
+        ("protocol", "ssh", "プロトコル"),
+    )
+
+    @staticmethod
+    def _normalize_text_field(device, key, default):
+        """機器の任意文字列項目を文字列にそろえる。直したら種別を返す。
+
+        パスワードと同じ流儀にそろえる。数値は入力された値として読める
+        ので str() で文字列にし、それ以外の型（list / dict / bool）は
+        中身を失う直し方なので既定値へ戻して知らせる。null は「無し」と
+        同じ意味なので、黙ってそろえるだけで警告しない。
+        キーごと無いのは「未設定」なので足さない。
+        """
+        if key not in device:
+            return None
+        value = device[key]
+        if isinstance(value, str):
+            return None
+        if value is None:
+            device[key] = default
+            return None
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            device[key] = str(value)
+            return "numeric"
+        device[key] = default
+        return "emptied"
+
     # name の無いグループに与える表示名。グループごと捨てると中の正常な
     # 機器まで消えるので、名前だけ補って中身は残す
     UNNAMED_GROUP_NAME = "(名前なし)"
@@ -842,6 +877,8 @@ class ConfigManager:
         emptied_groups = 0
         numeric_passwords = []   # 文字列に直した機器名
         emptied_passwords = []   # パスワードを空にした機器名
+        numeric_texts = []       # 文字列に直した「機器名 の 項目名」
+        emptied_texts = []       # 既定値へ戻した「機器名 の 項目名」
         broken_macros = []       # 読めないマクロを外した機器名
         broken_auto_commands = []  # 自動実行コマンドを無効にしたグループ名
         kept_groups = []
@@ -883,6 +920,14 @@ class ConfigManager:
                             numeric_passwords.append(d["name"])
                         elif fixed == "emptied":
                             emptied_passwords.append(d["name"])
+                        # ユーザー名・秘密鍵・プロトコルも、読み手が文字列を
+                        # 前提にしている（setText / findText）
+                        for key, default, label in self._DEVICE_TEXT_FIELDS:
+                            fixed = self._normalize_text_field(d, key, default)
+                            if fixed == "numeric":
+                                numeric_texts.append(f"{d['name']} の{label}")
+                            elif fixed == "emptied":
+                                emptied_texts.append(f"{d['name']} の{label}")
                         # 機器別マクロも、機器の編集ダイアログが for で回すので
                         # list であることが前提（要素は名前を持つ辞書）
                         if self._normalize_optional_list(
@@ -907,6 +952,7 @@ class ConfigManager:
             config["groups"] = kept_groups
         if not (removed or reserved or renamed_groups or dropped_groups
                 or emptied_groups or numeric_passwords or emptied_passwords
+                or numeric_texts or emptied_texts
                 or broken_macros or broken_auto_commands
                 or broken_global_macros):
             return
@@ -940,6 +986,14 @@ class ConfigManager:
                          "機器があり、パスワードを空にしました。"
                          "機器の編集で入れ直してください: "
                          + "、".join(emptied_passwords))
+        if numeric_texts:
+            parts.append("設定ファイル (config.json) で数値になっていた項目があり、"
+                         "そのまま文字列として扱います: "
+                         + "、".join(numeric_texts))
+        if emptied_texts:
+            parts.append("設定ファイル (config.json) で文字列でない項目があり、"
+                         "既定値に戻しました。機器の編集で入れ直してください: "
+                         + "、".join(emptied_texts))
         if broken_macros:
             parts.append("設定ファイル (config.json) でマクロの一覧が読めない機器が"
                          "あり、そのマクロを外しました。機器の編集で入れ直して"
@@ -965,6 +1019,8 @@ class ConfigManager:
               f"(パスワードを文字列化={len(numeric_passwords)}, "
               f"空にした={len(emptied_passwords)}, "
               f"マクロを外した={len(broken_macros)}, "
+              f"項目を文字列化={len(numeric_texts)}, "
+              f"項目を既定値に戻した={len(emptied_texts)}, "
               f"自動実行を無効にしたグループ={len(broken_auto_commands)})")
 
     def _backup_corrupted_config(self) -> None:
