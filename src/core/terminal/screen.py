@@ -627,6 +627,15 @@ class Screen(object):
         self.wrapped[self.scroll_bottom] = False
         self.dirty.update(range(self.scroll_top, self.scroll_bottom + 1))
 
+    def _forget_scrolled_cell(self):
+        """SU / SD のあと、最終桁へ印字した覚えを落とす (_join_previous)。
+
+        カーソルは動かないが、範囲の中ならその桁のセルは別の行のものに
+        入れ替わった。範囲の外の行は動かないので、覚えはそのまま正しい
+        """
+        if self.scroll_top <= self.cursor_row <= self.scroll_bottom:
+            self._printed_at_last_col = False
+
     # ---- CSI -------------------------------------------------------
 
     def _move(self, row, col):
@@ -704,8 +713,10 @@ class Screen(object):
             # 履歴へ入れる (xterm も範囲の高さで頭打ちにする)
             self._scroll_up(min(rows_n,
                                 self.scroll_bottom - self.scroll_top + 1))
+            self._forget_scrolled_cell()
         elif f == "T":
             self._scroll_down(rows_n)
+            self._forget_scrolled_cell()
         elif f == "r":
             self._set_margins(p)
         elif f in "hl":                 # SM / RM。表示に効くのは IRM だけ
