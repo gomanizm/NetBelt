@@ -10,6 +10,16 @@ from .sockets import set_exclusive_bind
 
 OP_RRQ, OP_WRQ, OP_DATA, OP_ACK, OP_ERROR, OP_OACK = 1, 2, 3, 4, 5, 6
 
+# 停止の期限を過ぎても転送スレッドが生き残っているときに、次の起動を断る
+# 理由の文言。生き残りは保存先のファイルをまだ握っており（共有フォルダ相手の
+# close() など）、そのまま起動すると新しいサーバが同名の WRQ を受理して、
+# 後から復帰した旧 close() が中身を混ぜてしまう。FTP 側の
+# ftp_server.PREVIOUS_STOP_INCOMPLETE_MESSAGE と同じ扱い
+PREVIOUS_STOP_INCOMPLETE_MESSAGE = (
+    "前回の停止が完了していません（進行中だった転送が終わっておらず、"
+    "保存先のファイルを掴んだままの可能性があります）。"
+    "しばらく待ってからもう一度お試しください")
+
 
 def _safe_join(root, filename):
     """root 配下の実パスを返す。root 外はエラー（パストラバーサル防止）。
@@ -126,6 +136,9 @@ class TFTPServer:
         # 進行中の転送スレッド。覚えないと stop() で止められない。
         self._workers = []
         self._workers_lock = threading.Lock()
+        # stop() の待ち時間を過ぎても終わらなかった転送スレッド。保存先の
+        # ファイルをまだ握っているので、次の起動の可否を決めるのに使う
+        self._unfinished = []
         self._retries = 5      # タイムアウト時の再送回数
         self._timeout = 2.0    # 送受信タイムアウト秒
         # 同時に走らせる転送の上限。TFTP は無認証で 0.0.0.0 で待ち受け、
@@ -194,6 +207,9 @@ class TFTPServer:
 
         転送スレッドも待つ。待たないと、停止したはずの後にファイルが
         作られたり、終了時に書きかけのファイルが黙って切り詰められる。
+
+        待ちきれずに残った転送スレッドは覚えておき、全部終えられたかを
+        返す（unfinished_workers を参照）。
         """
         self._stopping = True
         self._running = False
@@ -205,6 +221,11 @@ class TFTPServer:
             if worker.is_alive():
                 # 転送側は _timeout 秒で必ず戻ってくるので、その少し先まで待つ
                 worker.join(timeout=self._timeout + 2)
+        # 期限を過ぎても生きているスレッドは、保存先のファイルを握ったまま
+        # （close() の中など）。捨てずに覚えておく
+        for worker in workers:
+            if worker.is_alive() and worker not in self._unfinished:
+                self._unfinished.append(worker)
         # 抜けきったと確認できたときだけ閉じる。まだ recvfrom の中に
         # いるなら、閉じるより開いたままにしておく方が安全。
         if self._sock and not (self._thread and self._thread.is_alive()):
@@ -212,6 +233,15 @@ class TFTPServer:
                 self._sock.close()
             except Exception:
                 pass
+        return not self.unfinished_workers()
+
+    def unfinished_workers(self):
+        """停止しきれずに生き残っている転送スレッドを返す（待たない）。
+
+        終わった分は落とすので、生き残りが消えれば空になる。
+        """
+        self._unfinished = [w for w in self._unfinished if w.is_alive()]
+        return list(self._unfinished)
 
     def _serve(self):
         while self._running:
@@ -754,6 +784,8 @@ class TFTPServerManager(QObject):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._srv = None
+        # 停止しきれなかった旧サーバ。生き残りの転送が消えるまで捨てない
+        self._stopped_srv = None
         self.is_running = False
         # (ip, filename) 単位の表示コアレス状態。機器は RRQ/WRQ を送信元ポートを変えて
         # 複数回再送し、当サーバは各要求にスレッドを起こす（機器仕様で不可避）。敗者スレッドの
@@ -835,6 +867,13 @@ class TFTPServerManager(QObject):
         if self.is_running:
             self.error_occurred.emit("サーバーは既に実行中です")
             return False
+        # 前回の停止で終わりきらなかった転送が残っている間は起動しない。
+        # 生き残りは保存先のファイルを握ったままなので、新しいサーバで
+        # 同名の WRQ を受けると、後から復帰した旧 close() が中身を混ぜる。
+        # ここでは待たない（画面を固めない）。消えていれば通す
+        if not self._previous_stop_finished():
+            self.error_occurred.emit(PREVIOUS_STOP_INCOMPLETE_MESSAGE)
+            return False
         # ファイアウォールは自動設定しない（3CDaemon 方式）。管理者昇格(UAC)を避けるため、
         # 受信許可は Windows 標準の初回プロンプト／既存の許可ルールに委ねる。過去にプロンプトを
         # 拒否してブロックが残っている場合のみ手動修正が要る（firewall.ensure_* は手動用に残置）。
@@ -852,9 +891,22 @@ class TFTPServerManager(QObject):
         self.started.emit()
         return True
 
+    def _previous_stop_finished(self):
+        """前回の停止が終わっているか。今の状態だけを見て、待たない。"""
+        if self._stopped_srv is None:
+            return True
+        if self._stopped_srv.unfinished_workers():
+            return False
+        self._stopped_srv = None
+        return True
+
     def stop(self):
         if self._srv:
-            self._srv.stop()
+            # 待ちきれなかった転送が残っているなら、その旧サーバは捨てない。
+            # 捨てると生き残りの有無が分からなくなり、次の start() が
+            # 同じ保存先への新しい WRQ を通してしまう
+            finished = self._srv.stop()
+            self._stopped_srv = None if finished else self._srv
             self._srv = None
         self.is_running = False
         self.stopped.emit()
