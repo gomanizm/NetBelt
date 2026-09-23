@@ -1674,6 +1674,13 @@ class TerminalWidget(QWidget):
         受信は同じ溜まりの後ろへ並び、普段どおりタイマーが描く（順番は
         変わらない）。溜まりを辞書から外さずに取り出すのは、後から届いた分を
         追い越して描かないため。
+
+        描画が失敗しても、関所の開け直しと次の排出だけは続ける
+        （_flush_pending_output と同じ）。飛ばすと関所が閉じたまま受信
+        スレッドが読まなくなり、_output_gates は機器名で持ち回されるので
+        次の接続にも同じ閉じた関所が渡って、その機器は受信できないまま
+        止まる（実測: 残り 16,376 文字が永久に描かれなかった）。例外
+        そのものは握り潰さず、呼び出し元へそのまま返す。
         """
         from PyQt6.QtCore import QEventLoop
         from PyQt6.QtWidgets import QApplication
@@ -1699,12 +1706,14 @@ class TerminalWidget(QWidget):
                     self.append_output(device_name, text)
                 finally:
                     self._flushing_device = None
-                self._update_output_gate(device_name)
+                    self._update_output_gate(device_name)
                 if remaining > 0:
                     QApplication.processEvents(
                         QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
         finally:
             self._drawing_pending_now = False
+            if self._pending_output:
+                self._output_timer.start()
 
     def _discard_log_dialog(self, dialog) -> None:
         """記録中ダイアログを閉じて、捨てる。
