@@ -28,6 +28,11 @@ _DROPPED_CONNECTION_ERRORS = (EOFError, paramiko.SSHException,
 # except 節へそのまま渡す
 _UNUSABLE_CHANNEL_ERRORS = (TimeoutError,) + _DROPPED_CONNECTION_ERRORS
 
+# connect() のホーム取得で接続ごと畳む失敗。SFTPError は含めない。
+# REALPATH の応答を 1 件で返さない機器でもそれは起きるので、ここまで
+# 広げると繋がる機器の SFTP を断ることになる（保守的な側を採る）
+_UNUSABLE_CONNECT_ERRORS = (TimeoutError, EOFError, paramiko.SSHException)
+
 
 def _is_dropped_connection(e: Exception) -> bool:
     """接続が切れた・応答が壊れたと分かる失敗か"""
@@ -184,20 +189,29 @@ class SFTPManager(QObject):
             # ホームディレクトリを取得
             try:
                 self.current_path = self.sftp_client.normalize('.')
-            except TimeoutError:   # socket.timeout の別名
-                # 期限切れは「ホームが分からない」ではなく、チャンネルが
-                # 使えないという印。要求と応答はずれたままなので、'/' から
-                # 始めても以後の操作は失敗し続ける。掴んだまま接続成功を
-                # 返さず、ここで畳んで失敗にする（connected をまだ出して
-                # いないので、disconnect ではなく直接閉じる）
+            except _UNUSABLE_CONNECT_ERRORS as e:
+                # 期限切れ（socket.timeout の別名）も切断も「ホームが
+                # 分からない」ではなく、チャンネルが使えないという印。
+                # 要求と応答はずれたままなので、'/' から始めても以後の
+                # 操作は失敗し続ける。掴んだまま接続成功を返さず、ここで
+                # 畳んで失敗にする（connected をまだ出していないので、
+                # disconnect ではなく直接閉じる）。切断・壊れた応答を
+                # 期限切れと同じに扱うのは他の操作と揃える
+                # （利用者の決定 2026-09-20。_fail を参照）
+                if isinstance(e, TimeoutError):
+                    reason = f"機器が{self.CHANNEL_TIMEOUT_SECONDS:g}秒応答しません"
+                else:
+                    # 'Server connection dropped: ' のように理由がコロンで
+                    # 終わることがある。理由を持たない例外は型名で出す
+                    reason = (str(e) or e.__class__.__name__).strip()
+                    reason = reason.rstrip(':').rstrip()
                 try:
                     self.sftp_client.close()
                 except Exception:
                     pass
                 self.sftp_client = None
                 self.ssh_client = None
-                self.error_occurred.emit(
-                    f"SFTP接続エラー: 機器が{self.CHANNEL_TIMEOUT_SECONDS:g}秒応答しません")
+                self.error_occurred.emit(f"SFTP接続エラー: {reason}")
                 return False
             except Exception:
                 self.current_path = "/"
