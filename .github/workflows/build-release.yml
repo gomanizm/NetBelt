@@ -127,6 +127,11 @@ jobs:
           if ($null -ne $start -and $lines[$i].StartsWith('## [')) { $end = $i; break }
         }
         if ($null -eq $start) { throw "CHANGELOG.md に [$version] の節がありません" }
+        # 範囲を作る前に弾く。$end は次の見出しの位置か $lines.Count なので、
+        # $start -ge $end は「本文が 1 行も無い」と同値。PowerShell の
+        # $lines[3..2] は空配列ではなく逆順の 2 要素を返すので、先に見ないと
+        # 下の空チェックを素通りし、見出し 2 本が逆順で本文として載る
+        if ($start -ge $end) { throw "[$version] の節が空です" }
         $section = ($lines[$start..($end - 1)] -join "`n").Trim()
         if (-not $section) { throw "[$version] の節が空です" }
 
