@@ -646,6 +646,14 @@ class SFTPServerManager(QObject):
                                 notice = self._take_notice()
                                 self._notice_shown[client_socket] = notice
                                 accepted = True
+                                if notice:
+                                    # 接続の知らせもこのロックの下で出す。
+                                    # 離してから出すと、その隙間に切れた相手の
+                                    # 切断の知らせ（ハンドラの finally も同じ
+                                    # ロックを取る）に追い越され、パネルの
+                                    # 「接続クライアント: N」が 1 件ずれたまま
+                                    # サーバを止めるまで戻らない
+                                    self.client_connected.emit(client_addr[0])
 
                     if not accepted:
                         try:
@@ -657,8 +665,6 @@ class SFTPServerManager(QObject):
                         continue
 
                     print(f"[SFTP Server] Client connected from {client_addr[0]}:{client_addr[1]}")
-                    if notice:
-                        self.client_connected.emit(client_addr[0])
 
                 except socket.timeout:
                     # タイムアウトは正常（停止チェックのため）
