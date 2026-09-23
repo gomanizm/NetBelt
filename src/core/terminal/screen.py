@@ -847,20 +847,24 @@ class Screen(object):
             elif not to_alt and with_cursor and self._saved_main:
                 # 47l / 1047l で先にメイン画面へ戻ったあとの 1049l。
                 # 画面の入れ替えは済んでいるが、1049h の保存はまだ
-                # 残っている (捨てるのは 47h / 1047h の入場だけ)。
-                # xterm の 1049l は CursorRestore なので、そこから
-                # 位置・属性・文字集合を戻す。戻さないと代替画面の
-                # ESC(0 が居座り、以降のメイン画面の出力と記録が
-                # 罫線文字へ化け続ける。使った保存は捨てる
+                # 残っている (捨てるのは 47h / 1047h の入場と 1049l の
+                # 退場)。xterm の 1049l は CursorRestore なので、そこから
+                # 位置・属性・文字集合・折り返し待ちを戻す。戻さないと
+                # 代替画面の ESC(0 が居座り、以降のメイン画面の出力と
+                # 記録が罫線文字へ化け続ける。使った保存は捨てる
                 # (同じ保存を次の 1049l が使い回さない)。1049h を
-                # 一度も受けていない迷子の 1049l (tput rmcup など)
-                # は保存が無いので、これまでどおり何もしない
-                row, col, attr, g, charset = self._saved_main[:5]
-                printed = self._saved_main[-1]
+                # 一度も受けていない迷子の 1049l (tput rmcup など) と、
+                # 往復を終えたあとの 1049l は保存が無いので何もしない
+                (row, col, attr, g, charset, pending, saved_cols,
+                 printed) = self._saved_main
                 self.attr = attr
                 self._g = dict(g)
                 self._charset = charset
                 self._move(row, col)
+                # 解く条件と代入の順は下の通常の経路と同じ
+                if pending and self.cols < saved_cols:
+                    pending = False
+                self._pending_wrap = pending
                 self._printed_at_last_col = printed
                 self._saved_main = None
                 self.dirty.update(range(self.rows))
@@ -914,6 +918,10 @@ class Screen(object):
                 # 保存領域 (入れ替えたあとの _saved、DECSC) から戻す
                 (row, col, attr, g, charset, pending, saved_cols,
                  printed) = (self._saved_main or self._saved)
+                # 使った 1049 の保存は捨てる。残すと、往復のあとに来た
+                # 1049l (trap 'tput rmcup' EXIT など) が上の早期 return
+                # でこの古い位置へ戻り、続く出力が前の行を潰す
+                self._saved_main = None
                 self.attr = attr
                 self._g = dict(g)
                 self._charset = charset

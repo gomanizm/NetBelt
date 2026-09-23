@@ -13,9 +13,10 @@ _saved_main は 47l では捨てられない (捨てるのは 47h / 1047h の入
     HEAD : ['MAIN', '', ' ─']  cursor (2, 2)  G0='0' のまま
     正   : ['MAINq', '', '']   cursor (0, 5)  G0='B'
   ESC[?1047l 版も同じ。47l を挟まない素の 1049h / 1049l は正しい。
-  2 回目の 1049l も同じ穴で、
-  'MAIN' ESC[?1049h ESC[3;2H ESC[?1049l ESC[3;5H ESC[?1049l 'q' は
-  ['MAIN', '', '    q'] になる (xterm は CursorRestore するので 'MAINq')。
+  2 回目の 1049l ('MAIN' ESC[?1049h ESC[3;2H ESC[?1049l ESC[3;5H
+  ESC[?1049l 'q') は、xterm なら CursorRestore で 'MAINq' になるが、
+  利用者の決定 (下) で同じ保存を使い回さないので何もしない
+  (tests/test_terminal_1049_save_used_once.py)。
   実害は文字集合の居座りで、以降のメイン画面の出力とログが罫線文字へ
   化け続ける。位置のずれのほうは次の出力がプロンプト行を潰す。
 
@@ -73,11 +74,12 @@ class Leave1049AfterLeavingTheAlternateScreenTest(unittest.TestCase):
                  + DEC_GRAPHICS + LEAVE_1047 + LEAVE_1049 + "q")
         self.assertEqual(s.text(), ["MAINq", "", ""])
 
-    def test_a_second_1049l_restores_from_the_same_save(self):
-        """切り替えの済んだ 2 回目の 1049l も、保存から戻すこと。"""
+    def test_a_second_1049l_does_nothing(self):
+        """往復を終えたあとの 2 回目の 1049l は、使い終えた保存へ戻らないこと。"""
         s = feed(Screen(3, 10), "MAIN" + ENTER_1049 + ESC + "[3;2H"
                  + LEAVE_1049 + ESC + "[3;5H" + LEAVE_1049 + "q")
-        self.assertEqual(s.text(), ["MAINq", "", ""])
+        self.assertEqual(s.text(), ["MAIN", "", "    q"])
+        self.assertIsNone(s._saved_main)
 
     def test_the_used_save_is_not_reused(self):
         """使った保存は捨てて、次の 1049l では何もしないこと。"""
