@@ -243,12 +243,22 @@ def _take_over_abandoned_finalize(marker: str) -> None:
     os.rename で名前を戻す。戻せない＝その間に誰かが新しい目印を作った
     ときは、名前から外れた以上どの排他にもならないので捨てる
     （updater.bat の :lock_put_back と同じ判断）。
+
+    中身を読むのは、古いと分かった後だけにする。待っている側はこの関数を
+    50 ms ごとに呼ぶので、先に読むと持ち主の生きている目印を開き続ける
+    ことになる。Windows の open() は FILE_SHARE_DELETE を含まないため、
+    その一瞬に持ち主の _drop_finalize_marker が走ると os.replace が
+    [WinError 32] で失敗し、目印が置き去りになる（実測: 検査役
+    cx7a-verify-release2 の r03_regression_read_handle.py /
+    p03_multiproc_stress.py、5 本 × 60 回 で 4/297・3/298 件）。置き去りの
+    目印は FINALIZE_STALE_SEC のあいだ、誰も保存していないのに
+    FINALIZE_BUSY_MESSAGE を出させる。
     """
     try:
-        with open(marker, 'rb') as f:
-            seen = f.read(_FINALIZE_TOKEN_MAX)
         if time.time() - os.path.getmtime(marker) < FINALIZE_STALE_SEC:
             return
+        with open(marker, 'rb') as f:
+            seen = f.read(_FINALIZE_TOKEN_MAX)
     except OSError:
         return
     grabbed = '%s.%d.stale' % (marker, os.getpid())
