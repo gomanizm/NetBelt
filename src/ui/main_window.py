@@ -156,6 +156,12 @@ class MainWindow(QMainWindow):
         
         # SFTP管理用辞書
         self.sftp_managers: Dict[str, SFTPManager] = {}  # 機器名 -> SFTPManager
+        # 知らせ（受信・接続・切断・エラー）を lambda で結んだ接続と SFTP
+        # マネージャ。辞書から外したあとも、閉じるときに結び付きを外すため
+        # に控える（_detach_notifications）。弱参照なので、破棄されたものは
+        # 自然に消える
+        import weakref
+        self._notice_sources = weakref.WeakSet()
         
         # Syslogレシーバー初期化
         self.syslog_receiver = SyslogReceiver(self)
@@ -861,6 +867,7 @@ class MainWindow(QMainWindow):
             lambda c=ssh: self._on_connection_closed(device_name, c))
         ssh.error_occurred.connect(
             lambda error, c=ssh: self._on_connection_error(device_name, error, c))
+        self._notice_sources.add(ssh)
         
         # ターミナルのキー入力をSSHに送信（再接続時の蓄積を防ぐため既存接続を切断）
         try:
@@ -946,6 +953,7 @@ class MainWindow(QMainWindow):
             lambda c=serial_conn: self._on_connection_closed(device_name, c))
         serial_conn.error_occurred.connect(
             lambda error, c=serial_conn: self._on_connection_error(device_name, error, c))
+        self._notice_sources.add(serial_conn)
         
         # ターミナルのキー入力をシリアルに送信（再接続時の蓄積を防ぐため既存接続を切断）
         try:
@@ -1033,6 +1041,7 @@ class MainWindow(QMainWindow):
             lambda c=telnet: self._on_connection_closed(device_name, c))
         telnet.error_occurred.connect(
             lambda error, c=telnet: self._on_connection_error(device_name, error, c))
+        self._notice_sources.add(telnet)
         
         # ターミナルのキー入力をTelnetに送信（再接続時の蓄積を防ぐため既存接続を切断）
         try:
@@ -1198,6 +1207,7 @@ class MainWindow(QMainWindow):
         sftp_manager.error_occurred.connect(
             lambda err, c=conn: self._on_sftp_error(device_name, err, c)
         )
+        self._notice_sources.add(sftp_manager)
 
         client = conn.client
 
@@ -2938,14 +2948,12 @@ for details.
         self.terminal_widget.finish_log_recordings()
         # 配り切ったので、以後の知らせはこの窓へ届かないようにする。閉じる
         # 前に辞書から外した接続・SFTP マネージャ（タブを閉じた・置き換えた）
-        # も、deleteLater はイベントループへ戻るまで処理されないので、窓の子
-        # として残り、遅れた知らせを出しうる。それらも拾う
-        from PyQt6.QtCore import QObject, pyqtBoundSignal
-        leftovers = [child for child in self.findChildren(QObject)
-                     if any(isinstance(getattr(child, name, None), pyqtBoundSignal)
-                            for name in self._NOTICE_SIGNALS)]
+        # も、deleteLater はイベントループへ戻るまで処理されないので残り、
+        # 遅れた知らせを出しうる。控えておいたそれらも外す。窓の子を名前で
+        # 一律に拾うと、SNMP・Syslog の管理役まで外し、終了処理の最中に
+        # 届いたエラーがパネルの記録に残らなくなる
         seen = set()
-        for obj in closed + leftovers:
+        for obj in closed + list(self._notice_sources):
             if id(obj) not in seen:
                 seen.add(id(obj))
                 self._detach_notifications(obj)

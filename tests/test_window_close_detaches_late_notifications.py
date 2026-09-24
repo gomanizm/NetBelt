@@ -168,6 +168,26 @@ class WindowCloseDetachesLateNotificationsTest(unittest.TestCase):
         self.assertEqual(sftp.receivers(sftp.error_occurred), 0,
                          "閉じた窓へ、SFTP のエラーがまだ結ばれている")
 
+    def test_closing_keeps_other_panels_error_notices(self):
+        """接続・SFTP 以外（SNMP・Syslog の管理役）のエラーの受け手は外さないこと（対照）。
+
+        これらは終了処理の最中に届いたエラーもパネルが記録へ残す（SNMPPanel の
+        _on_error_occurred は「黙って捨てずに記録だけ残す」）。窓の子を名前で
+        一律に拾って外すと、それが消える（69af9ba を検査役が実測）。
+        """
+        snmp = self.window.snmp_panel.snmp_manager
+        syslog = self.window.syslog_receiver
+        before = (snmp.receivers(snmp.error_occurred),
+                  syslog.receivers(syslog.error_occurred))
+        self.assertTrue(all(before), "前提: エラーの受け手が無い: %r" % (before,))
+
+        self.window.close()
+
+        after = (snmp.receivers(snmp.error_occurred),
+                 syslog.receivers(syslog.error_occurred))
+        self.assertEqual(after, before,
+                         "SNMP・Syslog のエラーの受け手まで外した")
+
     def test_output_received_before_close_is_still_delivered(self):
         """記録中なら、閉じる直前に届いた受信を配り切ってから外すこと（対照）。
 
