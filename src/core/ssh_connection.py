@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Callable, Optional
 from PyQt6.QtCore import QObject, pyqtSignal
 
+from .send_backpressure import DrainWatcher, MIN_SEND_ROOM, socket_writable
+
 # known_hosts の読み書きを直列化する。同時に保存すると、あとから
 # os.replace した側が先の結果を丸ごと差し替えてしまう。旧 known_hosts の
 # 引き継ぎと接続前の読み込みも同じ錠を使うので、config_manager 側に置く。
@@ -381,6 +383,9 @@ class SSHConnection(QObject):
     connected = pyqtSignal()  # 接続成功
     disconnected = pyqtSignal()  # 切断
     error_occurred = pyqtSignal(str)  # エラー発生
+    # 待たずに書けなかったチャネルが、また書けるようになった（端末の
+    # resume_send_queue へ繋ぐ）。見張りのスレッドから出すのでキュー接続で届く
+    send_drained = pyqtSignal()
     
     def __init__(self, host: str, port: int, username: str, password: str = "", 
                  ssh_key: str = "", parent=None):
@@ -419,6 +424,10 @@ class SSHConnection(QObject):
         # 画面の描き待ちが多すぎる間、受信を止めておくための関所
         # （TerminalWidget.output_gate。set_read_gate で受け取る）
         self._read_gate = None
+        # 送信の背圧（has_pending_sends）。接続が成立したときに、その
+        # チャネルに束縛して作る
+        self._drain_watcher: Optional[DrainWatcher] = None
+        self._window_peak = 0
 
     def set_read_gate(self, gate) -> None:
         """受信を止める合図（threading.Event）を受け取る
@@ -820,6 +829,10 @@ class SSHConnection(QObject):
                 return self._abandon(client, channel, transports)
 
             self.channel = channel
+            # 背圧の見張りは、このチャネルに束縛する（後の接続のチャネルを見ない）
+            self._window_peak = 0
+            self._drain_watcher = DrainWatcher(
+                lambda: self._send_backlogged(channel), self._announce_drained)
             self.is_connected = True
             self.connected.emit()
             
@@ -867,6 +880,12 @@ class SSHConnection(QObject):
         self._stop_reading = True
         self.is_connected = False
 
+        # 送信の背圧の見張りを止める。相手が読まないまま詰まっていても、
+        # ここで終わる（以後は send_drained を出さない）
+        watcher, self._drain_watcher = self._drain_watcher, None
+        if watcher is not None:
+            watcher.stop()
+
         if self._read_thread and self._read_thread.is_alive():
             self._read_thread.join(timeout=2)
 
@@ -903,9 +922,53 @@ class SSHConnection(QObject):
             # send は送れたバイト数を返すだけで、渡した全部を送ったとは
             # 限らない。1文字ずつ送っていた頃はまず起きなかったが、
             # 貼り付けをまとめて渡すようになったので取りこぼしうる。
+            # 端末は has_pending_sends が False のとき（受信ウィンドウに
+            # 区切り 1 つ分の空きがあるとき）だけ渡すので、ここは待たずに
+            # 終わる。待つと 0.1 秒の時間切れで途中までしか送れずに終わる
             self.channel.sendall(command.encode('utf-8'))
         except Exception as e:
             self.error_occurred.emit(f"送信エラー: {str(e)}")
+
+    def has_pending_sends(self) -> bool:
+        """いま区切りを渡されても、待たずには書けないか（端末の set_send_backlog 用）
+
+        相手の読むのが遅いと受信ウィンドウが 0 のまま空かず、sendall は
+        チャネルの時間切れ（0.1 秒）で途中までしか送れずに失敗する。どこまで
+        送れたかは分からないので、切断として扱うしかなかった（実機の IOSv で
+        16KB の貼り付けが途中で切れた）。空きが無い間は端末に次を渡させず、
+        未送信の分を端末の列に残す。空いたら send_drained で知らせる。
+        """
+        watcher = self._drain_watcher
+        return watcher is not None and watcher.check()
+
+    def _send_backlogged(self, channel) -> bool:
+        """channel へ区切り 1 つを待たずに書けないなら True
+
+        判定できないとき・閉じたときは False（送らせれば送信エラーとして知らせる）。
+        受信ウィンドウの空き（最大でも、これまでに見た最大の窓まで）と、
+        鍵交換中でないこと（その間 paramiko は送信を待たせる）と、TCP へ
+        書けることを見る。
+        """
+        try:
+            if channel.closed or not self.is_connected:
+                return False
+            transport = channel.get_transport()
+            if not transport.clear_to_send.is_set():
+                return True
+            window = channel.out_window_size
+            self._window_peak = max(self._window_peak, window)
+            if window < min(MIN_SEND_ROOM, self._window_peak):
+                return True
+            return not socket_writable(transport.sock)
+        except Exception:
+            return False
+
+    def _announce_drained(self):
+        """見張りのスレッドから、また書けるようになったことを知らせる"""
+        try:
+            self.send_drained.emit()
+        except RuntimeError:
+            pass   # 捨てられた接続（C++ 側が消えている）
 
     def set_terminal_size(self, cols: int, rows: int):
         """端末の大きさを機器へ伝える (RFC 4254 6.7 window-change)。
