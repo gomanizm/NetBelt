@@ -39,6 +39,11 @@ _LINE_BREAKS = (
     (chr(0x0D), _BACKSLASH + "r"),
     (chr(0x0B), _BACKSLASH + "v"),
     (chr(0x0C), _BACKSLASH + "f"),
+    # Qt の画面では割れないが、保存したログを str.splitlines() などで読むと
+    # 行が割れる（Syslog のテキスト保存と同じ基準・同じ表記にそろえる）
+    (chr(0x1C), _BACKSLASH + "x1c"),
+    (chr(0x1D), _BACKSLASH + "x1d"),
+    (chr(0x1E), _BACKSLASH + "x1e"),
     (chr(0x85), _BACKSLASH + "u0085"),
     (chr(0x2028), _BACKSLASH + "u2028"),
     (chr(0x2029), _BACKSLASH + "u2029"),
