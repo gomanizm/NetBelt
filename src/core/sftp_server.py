@@ -463,6 +463,13 @@ class SFTPServerManager(QObject):
         # 既定に頼らず明示して、枠が返る時間を上限側で決められるようにする
         self.banner_timeout_seconds = 15.0
         self.auth_timeout_seconds = 30.0
+        # 接続がこの秒数黙ったら keepalive を送る。回線断などで相手が黙って
+        # 消えると、TCP は送るものが無い限り気づけず、書き込みの予約
+        # （_OpenWriters）がサーバーを止めるまで残って同じ名前へのアップロードを
+        # 断り続ける。送れば TCP の再送が尽きたところで接続が切れ、予約が外れる。
+        # 生きている相手は読み捨てるだけなので、黙っている書き手の予約は外さない。
+        # 認証の期限と同じ桁にし、FTP のデータ接続の無通信期限（300 秒）より短くする
+        self.keepalive_seconds = 30.0
 
         # GUI へ渡したまま、まだ処理されていない通知の件数の上限。
         # 認証を通さない TCP 接続→即切断だけで接続と切断の両方が出るので、
@@ -875,6 +882,8 @@ class SFTPServerManager(QObject):
             # 続けると、上限を入れても正規の接続が入れなくなる
             transport.banner_timeout = self.banner_timeout_seconds
             transport.auth_timeout = self.auth_timeout_seconds
+            # 黙って消えた相手のセッションを終わらせる（keepalive_seconds を参照）
+            transport.set_keepalive(self.keepalive_seconds)
             transport.add_server_key(self.host_key)
             
             # SFTP サブシステムを登録する。
