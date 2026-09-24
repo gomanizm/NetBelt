@@ -53,20 +53,34 @@ class _OpenWriters:
             return True
 
     def release(self, real_path):
-        """開けなかった保存先の予約を外す"""
+        """開けなかった保存先・切り詰め終えた保存先の予約を外す"""
         with self._lock:
             self._reserved.pop(self._key(real_path), None)
 
-    def held_by_other(self, real_path):
-        """別の生きているスレッド（別の接続）が保存先を予約しているか。
+    def reserve_for_truncate(self, real_path):
+        """SETSTAT の切り詰めのために保存先を予約する。
 
-        予約はしない。SETSTAT の切り詰めを断るかの判定に使う（書いている
-        本人の切り詰めは通す）
+        確かめるだけで予約を取らないと、確かめてから切り詰めるまでの間に
+        別の接続の OPEN が予約を取って書き始め、その書きかけの先頭を
+        切り詰めてしまう（どちらも成功で終わる）。確認と予約を同じ錠の中で
+        済ませ、呼び出し側は切り詰め終えたら release で外す。
+
+        Returns:
+            None: 別の生きているスレッド（別の接続）が予約している（断る）
+            True: 新しく予約した（切り詰めのあとで外す）
+            False: このスレッドが書き込みで開いている（書いている本人の
+                切り詰めは通す。予約はハンドルのものなので外さない）
         """
+        key = self._key(real_path)
+        me = threading.current_thread()
         with self._lock:
-            holder = self._reserved.get(self._key(real_path))
-            return (holder is not None and holder.is_alive()
-                    and holder is not threading.current_thread())
+            holder = self._reserved.get(key)
+            if holder is me:
+                return False
+            if holder is not None and holder.is_alive():
+                return None
+            self._reserved[key] = me
+            return True
 
     def add(self, handle, real_path):
         with self._lock:
@@ -374,14 +388,23 @@ class SFTPServerHandler(SFTPServerInterface):
             real_path = self._get_real_path(path)
             if attr.st_size is not None:
                 # 別の接続が書き込み中の保存先は切り詰めない。相手は成功で
-                # 終わるのに、切り詰めた先頭が 0 で埋まって中身が壊れる
-                if self._open_writers is not None and \
-                        self._open_writers.held_by_other(real_path):
-                    print(f"[SFTP Server] truncate refused, open for writing: {real_path}")
-                    if self._notify is not None:
-                        self._notify("他の転送が書き込み中のため断りました: %s" % path)
-                    return SFTP_FAILURE
-                os.truncate(real_path, attr.st_size)
+                # 終わるのに、切り詰めた先頭が 0 で埋まって中身が壊れる。
+                # 切り詰め終えるまで予約を持つ（reserve_for_truncate を参照）
+                reserved = False
+                if self._open_writers is not None:
+                    reserved = self._open_writers.reserve_for_truncate(real_path)
+                    if reserved is None:
+                        print(f"[SFTP Server] truncate refused, open for writing: {real_path}")
+                        if self._notify is not None:
+                            self._notify("他の転送が書き込み中のため断りました: %s" % path)
+                        return SFTP_FAILURE
+                try:
+                    os.truncate(real_path, attr.st_size)
+                finally:
+                    if reserved:
+                        # 失敗しても外す。残すと、この接続が切れるまで
+                        # その保存先へ誰も書けなくなる
+                        self._open_writers.release(real_path)
             atime = attr.st_atime
             mtime = attr.st_mtime
             if atime is not None or mtime is not None:
