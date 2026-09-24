@@ -1503,6 +1503,10 @@ class MainWindow(QMainWindow):
             print(f"[Connection] {device_name} の後始末に失敗: {e}")
         self._release_object(conn)
 
+    # 接続・SFTP マネージャの知らせのうち、窓が lambda で受けているもの
+    _NOTICE_SIGNALS = ("output_received", "connected", "disconnected",
+                       "error_occurred")
+
     @staticmethod
     def _detach_notifications(obj) -> None:
         """閉じた窓へ、接続・SFTP の知らせ（受信・接続・切断・エラー）が届かないようにする
@@ -1517,8 +1521,7 @@ class MainWindow(QMainWindow):
         （削除より先に配送待ちが届く）。結び付きを外せば、残った知らせは
         誰も呼ばない。
         """
-        for name in ("output_received", "connected", "disconnected",
-                     "error_occurred"):
+        for name in MainWindow._NOTICE_SIGNALS:
             signal = getattr(obj, name, None)
             if signal is None:
                 continue
@@ -2933,9 +2936,19 @@ for details.
         # 画面が流れている最中に閉じた分が記録から欠ける
         self._drain_output_before_log_finish()
         self.terminal_widget.finish_log_recordings()
-        # 配り切ったので、以後の知らせはこの窓へ届かないようにする
-        for obj in closed:
-            self._detach_notifications(obj)
+        # 配り切ったので、以後の知らせはこの窓へ届かないようにする。閉じる
+        # 前に辞書から外した接続・SFTP マネージャ（タブを閉じた・置き換えた）
+        # も、deleteLater はイベントループへ戻るまで処理されないので、窓の子
+        # として残り、遅れた知らせを出しうる。それらも拾う
+        from PyQt6.QtCore import QObject, pyqtBoundSignal
+        leftovers = [child for child in self.findChildren(QObject)
+                     if any(isinstance(getattr(child, name, None), pyqtBoundSignal)
+                            for name in self._NOTICE_SIGNALS)]
+        seen = set()
+        for obj in closed + leftovers:
+            if id(obj) not in seen:
+                seen.add(id(obj))
+                self._detach_notifications(obj)
         
         # 別ウィンドウにしたツールを閉じる。開いたままだと可視のトップ
         # レベルが残り、quitOnLastWindowClosed が既定 True のためイベント

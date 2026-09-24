@@ -139,6 +139,23 @@ class WindowCloseDetachesLateNotificationsTest(unittest.TestCase):
         self.assertEqual(after, {name: 0 for name in NOTIFICATIONS},
                          "閉じた窓へ、接続の知らせがまだ結ばれている")
 
+    def test_closing_detaches_a_connection_already_taken_off_the_list(self):
+        """閉じる前にタブを閉じて辞書から外れた接続も、閉じたあと受け手が残らないこと。
+
+        外した接続は deleteLater に渡すが、イベントループへ戻るまで破棄されず
+        窓の子として残る（テストのように外から直接呼ぶと processEvents では
+        処理されない）。その接続の遅れた知らせも、閉じた窓へ届けない。
+        """
+        conn = self._connect()
+        self.window._on_tab_closed("dev")
+        self.assertNotIn("dev", self.window.connections, "前提: 辞書から外れていない")
+
+        self.window.close()
+
+        after = self._receivers(conn, NOTIFICATIONS)
+        self.assertEqual(after, {name: 0 for name in NOTIFICATIONS},
+                         "辞書から外れた接続の知らせが、閉じた窓へまだ結ばれている")
+
     def test_closing_detaches_the_sftp_error_notice(self):
         """閉じたあと、SFTP マネージャのエラーの受け手が残っていないこと。"""
         sftp = _FakeSFTP()
