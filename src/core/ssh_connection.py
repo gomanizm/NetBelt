@@ -16,6 +16,7 @@ from PyQt6.QtCore import QObject, pyqtSignal
 # 引き継ぎと接続前の読み込みも同じ錠を使うので、config_manager 側に置く。
 # NetBelt を 2 つ起動した場合に備えて、プロセスをまたぐ錠も兼ねる
 from .config_manager import known_hosts_guard as _known_hosts_guard
+from .sockets import tcp_port_number
 
 
 def known_hosts_server_name(host, port):
@@ -39,18 +40,9 @@ def ssh_port_number(port):
     22 番へ繋ぐのに "[host]:22" という別名で引き、保存済みの鍵が見つからず
     TOFU が黙って受け入れて認証へ進む（実測）。点検側の
     known_hosts_server_name と paramiko に同じ整数を渡すため、ここでそろえる。
-    bool（JSON の true）と端数のある数は、ポート番号として読まない。
+    読み方は Telnet と共通（core.sockets.tcp_port_number）。
     """
-    if isinstance(port, str):
-        try:
-            port = int(port)
-        except ValueError:
-            return None
-    elif isinstance(port, float) and port.is_integer():
-        port = int(port)
-    if isinstance(port, bool) or not isinstance(port, int):
-        return None
-    return port if 1 <= port <= 65535 else None
+    return tcp_port_number(port)
 
 
 def known_hosts_names(text):

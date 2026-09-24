@@ -1,4 +1,4 @@
-"""待ち受けソケットの共通設定。"""
+"""ソケットの共通設定（待ち受けの排他と、接続先ポート番号の読み方）。"""
 import socket
 import sys
 
@@ -44,3 +44,24 @@ def set_exclusive_bind(sock) -> None:
         # なるため黙って通さない。まず起きないが、起きたら追えるようにする。
         print(f"[Socket] SO_EXCLUSIVEADDRUSE を設定できませんでした: {e}"
               " (このポートは他プロセスに奪われる可能性があります)")
+
+
+def tcp_port_number(port):
+    """設定のポート番号を、接続に使う整数（1〜65535）にする。使えなければ None。
+
+    手編集の config.json などでは "23" のように文字列になっていることがある。
+    前後の空白を許す整数の文字列と、端数の無い数は整数へそろえる。
+    bool（JSON の true）と端数のある数は、ポート番号として読まない
+    （True は 1 番として通ってしまう）。SSH と Telnet の接続が同じ読み方を
+    使う。
+    """
+    if isinstance(port, str):
+        try:
+            port = int(port)
+        except ValueError:
+            return None
+    elif isinstance(port, float) and port.is_integer():
+        port = int(port)
+    if isinstance(port, bool) or not isinstance(port, int):
+        return None
+    return port if 1 <= port <= 65535 else None

@@ -6,6 +6,8 @@ import time
 from typing import Optional
 from PyQt6.QtCore import QObject, pyqtSignal
 
+from .sockets import tcp_port_number
+
 
 class TelnetConnection(QObject):
     """Telnet接続を管理するクラス"""
@@ -86,6 +88,19 @@ class TelnetConnection(QObject):
                 # のに参照しているものが誰もいない状態になり、閉じる経路が
                 # 無いまま機器の vty 枠を掴んだままになる
                 return False
+
+            # 手編集の config.json などで "23" と文字列になっていると、
+            # socket.connect は原因の分からない英語の例外で失敗し、true は
+            # 1 番へ繋ぎに行く。SSH と同じ読み方で整数へそろえ、使えない値
+            # なら機器へは何も繋がずに止める
+            port = tcp_port_number(self.port)
+            if port is None:
+                self.error_occurred.emit(
+                    "ポート番号 %r は使えないため、接続しませんでした。"
+                    "機器の編集で 1〜65535 の整数を設定してください。"
+                    % (self.port,))
+                return False
+            self.port = port
 
             # ソケット作成
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
