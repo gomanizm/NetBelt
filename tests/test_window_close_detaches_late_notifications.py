@@ -47,6 +47,11 @@ sys.path.insert(0, "src")
 
 NOTIFICATIONS = ("output_received", "connected", "disconnected", "error_occurred")
 
+from ui.main_window import MainWindow as _MainWindow    # noqa: E402
+
+# setUp で差し替える前の本物（SFTP マネージャの登録を確かめるテストで使う）
+_REAL_START_SFTP = _MainWindow._start_sftp_session
+
 
 class _FakeSSH(QObject):
     """接続の見た目だけを持つ偽物。connect() は成功を知らせるだけ。"""
@@ -88,6 +93,54 @@ class _FakeTelnet(_FakeSSH):
         type(self).instances.append(self)
 
 
+class _FakeSerial(QObject):
+    """シリアル接続の見た目だけを持つ偽物（送信の背圧の口も持つ）。"""
+    output_received = pyqtSignal(str)
+    connected = pyqtSignal()
+    disconnected = pyqtSignal()
+    error_occurred = pyqtSignal(str)
+    send_drained = pyqtSignal()
+    instances = []
+
+    def __init__(self, port, baudrate, parent=None):
+        super().__init__(parent)
+        type(self).instances.append(self)
+
+    def connect(self):
+        self.connected.emit()
+        return True
+
+    def has_pending_sends(self):
+        return False
+
+    def send_command(self, command):
+        pass
+
+    def dispose(self):
+        pass
+
+    def disconnect(self):
+        pass
+
+
+class _PendingSFTP(QObject):
+    """確立を合図まで待たせる SFTP マネージャの偽物（辞書へ入る前の状態を作る）。"""
+    error_occurred = pyqtSignal(str)
+    release = None
+    instances = []
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        type(self).instances.append(self)
+
+    def connect(self, client):
+        type(self).release.wait(5)
+        return False
+
+    def disconnect(self):
+        pass
+
+
 class _FakeSFTP(QObject):
     """SFTP マネージャの見た目だけを持つ偽物。"""
     error_occurred = pyqtSignal(str)
@@ -113,13 +166,22 @@ class WindowCloseDetachesLateNotificationsTest(unittest.TestCase):
                            lambda *a, **k: ConfigManager(str(d / "config.json"))),
                 mock.patch("ui.main_window.SSHConnection", _FakeSSH),
                 mock.patch("ui.main_window.TelnetConnection", _FakeTelnet),
+                mock.patch("ui.main_window.SerialConnection", _FakeSerial),
                 mock.patch.object(MainWindow, "_start_sftp_session")):
             patcher.start()
             self.addCleanup(patcher.stop)
         _FakeSSH.instances = []
         _FakeTelnet.instances = []
+        _FakeSerial.instances = []
         self.window = MainWindow()
-        self.addCleanup(self.window.close)
+        self.addCleanup(self._close_quietly)
+
+    def _close_quietly(self):
+        """後始末の close。回帰で closeEvent が例外を出しても、テストの失敗で
+        止まるようにする（既定の excepthook のままだと PyQt が qFatal で
+        プロセスごと落とし、全体の結果が失われる）"""
+        with mock.patch("sys.excepthook", lambda *args: None):
+            self.window.close()
 
     def _pump(self, seconds=0.3):
         end = time.time() + seconds
@@ -182,6 +244,41 @@ class WindowCloseDetachesLateNotificationsTest(unittest.TestCase):
         after = self._receivers(conn, NOTIFICATIONS)
         self.assertEqual(after, {name: 0 for name in NOTIFICATIONS},
                          "辞書から外れた Telnet 接続の知らせが、閉じた窓へまだ結ばれている")
+
+    def test_closing_detaches_a_serial_connection_taken_off_the_list(self):
+        """シリアルでも、辞書から外れた接続の知らせを閉じたあと残さないこと。"""
+        self.window._connect_serial({
+            "name": "con", "protocol": "console", "host": "COM9",
+            "baudrate": 9600})
+        self._pump()
+        conn = _FakeSerial.instances[-1]
+        self.window._on_tab_closed("con")
+
+        self.window.close()
+
+        after = self._receivers(conn, NOTIFICATIONS)
+        self.assertEqual(after, {name: 0 for name in NOTIFICATIONS},
+                         "辞書から外れたシリアル接続の知らせが、閉じた窓へまだ結ばれている")
+
+    def test_closing_detaches_an_sftp_manager_still_being_established(self):
+        """確立の途中（辞書へ入る前）の SFTP マネージャも、閉じたあと受け手を残さないこと。"""
+        import threading
+        conn = self._connect()
+        _PendingSFTP.release = threading.Event()
+        _PendingSFTP.instances = []
+        self.addCleanup(_PendingSFTP.release.set)
+        with mock.patch("ui.main_window.SFTPManager", _PendingSFTP):
+            _REAL_START_SFTP(self.window, "dev", conn)
+        manager = _PendingSFTP.instances[-1]
+        self.assertNotIn(manager, self.window.sftp_managers.values(),
+                         "前提: 確立の途中なのに辞書へ入っている")
+        self.assertGreater(manager.receivers(manager.error_occurred), 0,
+                           "前提: SFTP のエラーが窓へ結ばれていない")
+
+        self.window.close()
+
+        self.assertEqual(manager.receivers(manager.error_occurred), 0,
+                         "確立途中の SFTP マネージャのエラーが、閉じた窓へまだ結ばれている")
 
     def _close_after_the_connection_was_deleted(self, notice):
         """接続が失敗・切断して破棄されたあと（ラッパーだけが残る）に窓を閉じる。
