@@ -181,8 +181,11 @@ class SftpConcurrentWriteRefusedTest(unittest.TestCase):
         with open(self.real("exists.cfg"), "wb") as seed:
             seed.write(b"OLD")
         a = self.sftp()
+        # 'x' だけだと paramiko は CREATE|EXCL しか立てず（WRITE なし）、
+        # サーバーは読み取りの open として扱うので予約そのものが起きない。
+        # 'wx' にして、予約を取ってから os.open() が失敗する経路を通す
         with self.assertRaises(IOError):
-            a.open("exists.cfg", "x")
+            a.open("exists.cfg", "wx")
         with a.open("exists.cfg", "w") as handle:
             handle.write(b"NEW")
         self.assertEqual(self.read("exists.cfg"), b"NEW")
