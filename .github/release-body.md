@@ -16,6 +16,7 @@ ZIP 内の `THIRD-PARTY-NOTICES.txt` を参照してください。
 
 ### 📦 パッケージ内容
 - `NetBelt.exe` - アプリケーション本体
+- `updater.bat` - 自動更新が使うスクリプト（削除しないでください）
 - `README.txt` - 使い方ガイド
 - `LICENSE.txt` - NetBelt のライセンス（GPL-3.0）
 - `THIRD-PARTY-NOTICES.txt` - 同梱した第三者パッケージのライセンス表示
