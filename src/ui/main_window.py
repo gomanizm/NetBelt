@@ -1504,6 +1504,30 @@ class MainWindow(QMainWindow):
         self._release_object(conn)
 
     @staticmethod
+    def _detach_notifications(obj) -> None:
+        """閉じた窓へ、接続・SFTP の知らせ（受信・接続・切断・エラー）が届かないようにする
+
+        これらは接続オブジェクトを既定値に束縛した lambda で受けている。窓を
+        閉じたあとも接続スレッドは知らせを出しうる（Enter で始めた再接続の
+        失敗など）。キュー接続なので配送待ちに残り、そのあと窓ごと GC に
+        回収されると、CPython は lambda の既定値と名前を空にする。それでも
+        PyQt の中継は配送待ちの知らせで空の lambda を呼ぶ（実測:
+        TypeError: () missing 1 required positional argument: 'c'。excepthook が
+        既定のままなら qFatal でプロセスが落ちる）。deleteLater では防げない
+        （削除より先に配送待ちが届く）。結び付きを外せば、残った知らせは
+        誰も呼ばない。
+        """
+        for name in ("output_received", "connected", "disconnected",
+                     "error_occurred"):
+            signal = getattr(obj, name, None)
+            if signal is None:
+                continue
+            try:
+                signal.disconnect()
+            except (TypeError, RuntimeError, AttributeError):
+                pass  # 結び付きが無い / 既に破棄済み / シグナルでない
+
+    @staticmethod
     def _release_object(obj) -> None:
         """用済みの QObject を MainWindow の子から外す
 
@@ -2883,7 +2907,8 @@ for details.
         for device_name in list(self.connections.keys()):
             self.macro_manager.cleanup_device(device_name)
         
-        # すべてのSFTP接続を切断
+        # すべてのSFTP接続を切断。知らせを外すのは、配送待ちを配り切った後
+        closed = list(self.sftp_managers.values())
         for device_name, sftp_mgr in list(self.sftp_managers.items()):
             try:
                 sftp_mgr.disconnect()
@@ -2897,9 +2922,10 @@ for details.
         # _dispose_connection() を使う。disconnect() は disconnected を出し、
         # その先の _on_connection_closed が切断バナーを端末へ書くので、
         # まだ開いている記録へ終了時の案内が混ざる
+        closed.extend(self.connections.values())
         for device_name in list(self.connections.keys()):
             self._dispose_connection(device_name)
-        
+
         self.connections.clear()
 
         # 受信済みでまだ描いていない出力を記録し切ってから、記録を止めて
@@ -2907,6 +2933,9 @@ for details.
         # 画面が流れている最中に閉じた分が記録から欠ける
         self._drain_output_before_log_finish()
         self.terminal_widget.finish_log_recordings()
+        # 配り切ったので、以後の知らせはこの窓へ届かないようにする
+        for obj in closed:
+            self._detach_notifications(obj)
         
         # 別ウィンドウにしたツールを閉じる。開いたままだと可視のトップ
         # レベルが残り、quitOnLastWindowClosed が既定 True のためイベント
