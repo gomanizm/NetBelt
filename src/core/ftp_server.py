@@ -1,4 +1,5 @@
 """FTP サーバー（pyftpdlib ラッパ）。UI 通知は Qt シグナル。"""
+import os
 import threading
 import time
 
@@ -73,6 +74,42 @@ class FTPServerManager(QObject):
                        self.transfer_progress, self.transfer_complete,
                        self.transfer_interrupted):
             signal.connect(self._on_notice_delivered)
+        # 書き込み中の保存先の鍵（_upload_key）→ STOR を受けた制御接続。
+        # 同じ保存先へ 2 本の STOR が同時に走ると、どちらも 226 で終わるのに
+        # 中身が混ざる・片方が黙って消える（SFTP・TFTP と同じく後の方を断る）。
+        # 読み書きするのは待受スレッド（ioloop）だけ
+        self._uploads = {}
+
+    @staticmethod
+    def _upload_key(path):
+        """保存先を比べるための鍵（SFTP・TFTP と同じく realpath → normcase）"""
+        return os.path.normcase(os.path.realpath(path))
+
+    def _reserve_upload(self, handler, path):
+        """保存先を handler（制御接続）の STOR に予約する。
+
+        Returns:
+            None: 別の接続が書き込み中（断る）
+            True: 新しく予約した（STOR が失敗したら外す）
+            False: この接続が既に予約していた（外さない）
+        """
+        key = self._upload_key(path)
+        holder = self._uploads.get(key)
+        if holder is None:
+            self._uploads[key] = handler
+            return True
+        return False if holder is handler else None
+
+    def _release_uploads(self, handler, path=None):
+        """handler の予約を外す。path を渡したらその保存先の分だけ。
+
+        受信の完了・未完了では全部外す。データ接続は 1 本なので、その時点で
+        まだ持っている他の予約は、後の STOR で pyftpdlib が手放した分だけ
+        """
+        key = None if path is None else self._upload_key(path)
+        for k in [k for k, h in self._uploads.items()
+                  if h is handler and (key is None or k == key)]:
+            del self._uploads[k]
 
     def _take_notice(self, force=False, count_drop=True):
         """配送待ちを 1 件ぶん確保する。確保できたら True（呼び出し側が emit する）。
@@ -271,7 +308,24 @@ class FTPServerManager(QObject):
                 return result
 
             def ftp_STOR(self, file, mode="w"):
-                result = super().ftp_STOR(file, mode)
+                # APPE と REST 付きの STOR もここを通る。開く前に保存先を予約し、
+                # 別の接続が書き込み中なら断る（開くと 'wb' が相手の書きかけを
+                # 切り詰め、どちらも 226 で終わるのに中身が混ざる）
+                fresh = mgr._reserve_upload(self, file)
+                if fresh is None:
+                    self.respond("450 File busy: another upload is writing it.")
+                    mgr._emit_activity(self.remote_ip,
+                                       "他の転送が書き込み中のため断りました: %s"
+                                       % self.fs.fs2ftp(file))
+                    return None
+                result = None
+                try:
+                    result = super().ftp_STOR(file, mode)
+                finally:
+                    if result is None and fresh:
+                        # 開けなかった（550 / 554）。残すと、この接続を閉じるまで
+                        # 同じ保存先へ誰も書けない
+                        mgr._release_uploads(self, file)
                 if result is not None:
                     self._tx_name = os.path.basename(file); self._tx_total = 0  # アップロードは総サイズ不明
                     self._tx_dir = "upload"; self._tx_last = 0.0; self._tx_path = file
@@ -314,6 +368,7 @@ class FTPServerManager(QObject):
                                    file, self._display_for(file))
                 self._forget_tx()
             def on_file_received(self, file):
+                mgr._release_uploads(self)   # 閉じ終えた（pyftpdlib は閉じてから呼ぶ）
                 try: total = os.path.getsize(file)
                 except OSError: total = 0
                 mgr._emit_complete(self.remote_ip, os.path.basename(file), total, total, "upload",
@@ -326,9 +381,18 @@ class FTPServerManager(QObject):
                                       file, self._display_for(file))
                 self._forget_tx()
             def on_incomplete_file_received(self, file):
+                mgr._release_uploads(self)
                 mgr._emit_interrupted(self.remote_ip, os.path.basename(file), "upload",
                                       file, self._display_for(file))
                 self._forget_tx()
+            def close(self):
+                # STOR を受けたがデータ接続が来ないまま相手が去ると（受動ポートが
+                # 塞がれているなど）、pyftpdlib はファイルを閉じるだけで上の
+                # コールバックを呼ばない。予約が残ると同じ名前へ書けなくなる
+                try:
+                    super().close()
+                finally:
+                    mgr._release_uploads(self)
             def on_connect(self):
                 mgr._emit_activity(self.remote_ip, "接続")
             def on_disconnect(self):
@@ -361,6 +425,9 @@ class FTPServerManager(QObject):
             self._server = None
             return False
         self._stop_event = threading.Event()
+        # 前回の待受スレッドは終わっている（_await_previous_thread）ので、
+        # 閉じ損ねた接続の予約が残っていても持ち越さない
+        self._uploads = {}
         self._thread = threading.Thread(
             target=self._serve, args=(self._server, self._stop_event),
             daemon=True)
