@@ -868,6 +868,7 @@ class MainWindow(QMainWindow):
         except TypeError:
             pass
         terminal.key_pressed.connect(ssh.send_command)
+        self._attach_send_backpressure(terminal, ssh)
         
         # 接続と機器情報を保存
         self.connections[device_name] = ssh
@@ -1039,6 +1040,7 @@ class MainWindow(QMainWindow):
         except TypeError:
             pass
         terminal.key_pressed.connect(telnet.send_command)
+        self._attach_send_backpressure(terminal, telnet)
         
         # 接続と機器情報を保存
         self.connections[device_name] = telnet
@@ -1110,6 +1112,25 @@ class MainWindow(QMainWindow):
         setter = getattr(conn, "set_read_gate", None)
         if setter is not None:
             setter(self.terminal_widget.output_gate(device_name))
+
+    @staticmethod
+    def _attach_send_backpressure(terminal, conn) -> None:
+        """接続が待たずに書けるときだけ、端末が次の区切りを渡すようにする
+
+        SSH / Telnet は渡された区切りをその場で書く。読むのが遅い機器へ
+        大きく貼り付けると、受信ウィンドウや送信バッファが空かないまま
+        時間切れになり、送信エラーとして切断していた（実機の IOSv で 16KB が
+        途中で切れた）。接続の has_pending_sends を端末へ渡し、書けるように
+        なった知らせ（send_drained）で続きを渡させる。未送信の分は端末の列に
+        残るので、マクロの停止で取り消せ、再接続待ちでは捨てられる。
+        背圧の口を持たない接続（テストの偽物など）では、これまでどおり。
+        """
+        backlog = getattr(conn, "has_pending_sends", None)
+        drained = getattr(conn, "send_drained", None)
+        if backlog is None or drained is None:
+            return
+        terminal.set_send_backlog(backlog)
+        drained.connect(terminal.resume_send_queue)
 
     def _on_connection_output(self, device_name: str, text: str, conn=None):
         """受信出力をターミナルへ流す（置き換え済みの接続からは流さない）
