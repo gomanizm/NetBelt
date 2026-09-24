@@ -500,7 +500,11 @@ class SFTPServerManager(QObject):
         # （実測: 20 秒で 13130 件・約 11MB）。32 接続の上限は切断ごとに枠が
         # 戻るので累積を止めない。パネルのログの行数上限が効くのは配送の後。
         # FTP の max_pending_notices・TFTP の同名の仕掛けと同じく、超過中は
-        # 数えるだけにして、はけた時点で省略した件数を 1 行だけ出す
+        # 数えるだけにして、はけた時点で省略した件数を 1 行だけ出す。
+        # 書き込みを断った通知（client_activity）も同じカウンタに数える。
+        # 認証済みの相手が同じ名前への要求を繰り返すだけで、要求ごとに 1 件
+        # 出る（実測: 5 秒で 10642 件）。数え違えないよう、この信号はすべて
+        # _emit_activity から出す
         self.max_pending_notices = 1000
         self._notice_lock = threading.Lock()
         self._pending_notices = 0
@@ -511,7 +515,8 @@ class SFTPServerManager(QObject):
         # 自分の信号を自分でも受ける。待受スレッド・ハンドラから emit した分は
         # キュー経由で GUI スレッドへ届くので、呼ばれたことが
         # 「GUI が 1 件処理した」の合図
-        for signal in (self.client_connected, self.client_disconnected):
+        for signal in (self.client_connected, self.client_disconnected,
+                       self.client_activity):
             signal.connect(self._on_notice_delivered)
 
         # サーバー設定
@@ -551,6 +556,11 @@ class SFTPServerManager(QObject):
             return False
         return self._take_notice()
 
+    def _emit_activity(self, ip, message):
+        """client_activity を 1 件渡す。配送待ちが上限に達している間は数えるだけ。"""
+        if self._take_notice():
+            self.client_activity.emit(ip, message)
+
     def _on_notice_delivered(self, *_args):
         """GUI が通知を 1 件処理したので配送待ちを戻す（GUI スレッドで動く）"""
         with self._notice_lock:
@@ -560,8 +570,9 @@ class SFTPServerManager(QObject):
             if self._pending_notices == 0:
                 dropped, self._dropped_notices = self._dropped_notices, 0
         if dropped:
-            # この 1 行は数えない（GUI が追いついた時点でしか出ない）
-            self.client_activity.emit(
+            # この 1 行も client_activity なので同じく数える（FTP と同じ）。
+            # 数えずに出すと、届いたときに他の通知の分まで戻してしまう
+            self._emit_activity(
                 "", "表示が追いつかず %d 件の通知を省略しました" % dropped)
 
     def _load_or_create_host_key(self):
@@ -918,7 +929,7 @@ class SFTPServerManager(QObject):
                 'sftp', SFTPServer, SFTPServerHandler, root_dir=self.root_dir,
                 open_writers=self._open_writers,
                 notify=lambda message, ip=client_addr[0]:
-                    self.client_activity.emit(ip, message))
+                    self._emit_activity(ip, message))
             
             # SSHサーバーインターフェースを作成
             server = SSHServerInterface(self.username, self.password)
