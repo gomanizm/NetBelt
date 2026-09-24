@@ -1532,10 +1532,15 @@ class MainWindow(QMainWindow):
         誰も呼ばない。
         """
         for name in MainWindow._NOTICE_SIGNALS:
-            signal = getattr(obj, name, None)
-            if signal is None:
-                continue
+            # シグナルを引くところから守る。接続が失敗・切断して C++ 側が
+            # 破棄されても、再接続待ちの端末が has_pending_sends を握るので
+            # ラッパーは登録簿に残り、引くと RuntimeError になる（実測:
+            # closeEvent が途中で止まり、別ウィンドウのツールが閉じなかった）。
+            # C++ 側が消えていれば結び付きも一緒に消えているので、飛ばしてよい
             try:
+                signal = getattr(obj, name, None)
+                if signal is None:
+                    continue
                 signal.disconnect()
             except (TypeError, RuntimeError, AttributeError):
                 pass  # 結び付きが無い / 既に破棄済み / シグナルでない

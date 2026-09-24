@@ -41,7 +41,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from PyQt6.QtCore import QObject, pyqtSignal
+from PyQt6.QtCore import QCoreApplication, QEvent, QObject, pyqtSignal
 
 sys.path.insert(0, "src")
 
@@ -78,6 +78,16 @@ class _FakeSSH(QObject):
         pass
 
 
+class _FakeTelnet(_FakeSSH):
+    """Telnet 接続の見た目だけを持つ偽物（引数の形だけ Telnet に合わせる）。"""
+    instances = []
+
+    def __init__(self, host, port, username, password, parent=None):
+        QObject.__init__(self, parent)
+        self.client = None
+        type(self).instances.append(self)
+
+
 class _FakeSFTP(QObject):
     """SFTP マネージャの見た目だけを持つ偽物。"""
     error_occurred = pyqtSignal(str)
@@ -102,10 +112,12 @@ class WindowCloseDetachesLateNotificationsTest(unittest.TestCase):
                 mock.patch("ui.main_window.ConfigManager",
                            lambda *a, **k: ConfigManager(str(d / "config.json"))),
                 mock.patch("ui.main_window.SSHConnection", _FakeSSH),
+                mock.patch("ui.main_window.TelnetConnection", _FakeTelnet),
                 mock.patch.object(MainWindow, "_start_sftp_session")):
             patcher.start()
             self.addCleanup(patcher.stop)
         _FakeSSH.instances = []
+        _FakeTelnet.instances = []
         self.window = MainWindow()
         self.addCleanup(self.window.close)
 
@@ -155,6 +167,56 @@ class WindowCloseDetachesLateNotificationsTest(unittest.TestCase):
         after = self._receivers(conn, NOTIFICATIONS)
         self.assertEqual(after, {name: 0 for name in NOTIFICATIONS},
                          "辞書から外れた接続の知らせが、閉じた窓へまだ結ばれている")
+
+    def test_closing_detaches_a_telnet_connection_taken_off_the_list(self):
+        """Telnet でも、辞書から外れた接続の知らせを閉じたあと残さないこと。"""
+        self.window._on_connect_requested({
+            "name": "tel", "host": "192.0.2.11", "port": 23,
+            "username": "u", "password": "", "protocol": "telnet"})
+        self._pump()
+        conn = _FakeTelnet.instances[-1]
+        self.window._on_tab_closed("tel")
+
+        self.window.close()
+
+        after = self._receivers(conn, NOTIFICATIONS)
+        self.assertEqual(after, {name: 0 for name in NOTIFICATIONS},
+                         "辞書から外れた Telnet 接続の知らせが、閉じた窓へまだ結ばれている")
+
+    def _close_after_the_connection_was_deleted(self, notice):
+        """接続が失敗・切断して破棄されたあと（ラッパーだけが残る）に窓を閉じる。
+
+        再接続待ちの端末は接続の has_pending_sends（bound method）を握り続ける
+        ので、C++ 側が破棄されてもラッパーは登録簿に残る。そのラッパーの
+        シグナルを引くと RuntimeError になる（検査役の実測: closeEvent が途中で
+        止まり、アプリでは「予期しないエラー」のダイアログが出て、別ウィンドウに
+        したツールが閉じられずに残った。テストでは qFatal でプロセスが落ちた）。
+        """
+        from PyQt6 import sip
+        conn = self._connect()
+        notice(conn)
+        self.assertNotIn("dev", self.window.connections, "前提: 辞書から外れていない")
+        # イベントループへ戻ったのと同じく、deleteLater を処理させる
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete.value)
+        self.assertTrue(sip.isdeleted(conn), "前提: C++ 側が破棄されていない")
+        self.window._detach_tool("sftp")
+        detached = self.window._detached["sftp"]
+        errors = []
+        with mock.patch("sys.excepthook",
+                        lambda t, v, tb: errors.append("%s: %s" % (t.__name__, v))):
+            self.window.close()
+        self.assertEqual(errors, [], "closeEvent が例外で止まった")
+        self.assertFalse(detached.isVisible(), "別ウィンドウのツールが閉じられていない")
+
+    def test_close_runs_to_the_end_after_a_failed_connection_was_deleted(self):
+        """接続失敗で破棄された接続が残っていても、閉じる処理が最後まで走ること。"""
+        self._close_after_the_connection_was_deleted(
+            lambda conn: conn.error_occurred.emit("connection refused"))
+
+    def test_close_runs_to_the_end_after_a_dropped_connection_was_deleted(self):
+        """機器側の切断で破棄された接続が残っていても、閉じる処理が最後まで走ること。"""
+        self._close_after_the_connection_was_deleted(
+            lambda conn: conn.disconnected.emit())
 
     def test_closing_detaches_the_sftp_error_notice(self):
         """閉じたあと、SFTP マネージャのエラーの受け手が残っていないこと。"""
