@@ -524,8 +524,16 @@ class SSHConnection(QObject):
             known_hosts_path: known_hosts のパス（案内に載せる）
         """
         server_name = known_hosts_server_name(self.host, self.port)
+        names = [server_name]
+        if server_name == self.host:
+            # 22 番は、旧版が "[host]:22" の名前で残した行も照合に使う
+            # （_use_legacy_port22_keys）。その行が壊れていたときも、この
+            # 機器の行として中止する。警告だけで進むと TOFU が別の鍵を
+            # 受け入れ、パスワードが相手へ届く（実測）
+            names.append("[%s]:22" % self.host)
         mine = [(no, text) for no, text, _ in broken
-                if _hostnames_match(known_hosts_names(text), server_name)]
+                if any(_hostnames_match(known_hosts_names(text), name)
+                       for name in names)]
         if mine:
             raise HostKeyStoreError(
                 "known_hosts に読めない行があり、%s の鍵を検証できないため"
