@@ -9,9 +9,9 @@ import threading
 import time
 from pathlib import Path
 from typing import Callable, Optional
-from PyQt6.QtCore import QObject, pyqtSignal
+from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
 
-from .send_backpressure import DrainWatcher, MIN_SEND_ROOM, socket_writable
+from .send_backpressure import DrainWatcher, socket_writable
 
 # known_hosts の読み書きを直列化する。同時に保存すると、あとから
 # os.replace した側が先の結果を丸ごと差し替えてしまう。旧 known_hosts の
@@ -384,7 +384,8 @@ class SSHConnection(QObject):
     disconnected = pyqtSignal()  # 切断
     error_occurred = pyqtSignal(str)  # エラー発生
     # 待たずに書けなかったチャネルが、また書けるようになった（端末の
-    # resume_send_queue へ繋ぐ）。見張りのスレッドから出すのでキュー接続で届く
+    # resume_send_queue へ繋ぐ。接続自身も持ち越しを書くのに使う）。
+    # 見張りのスレッドから出すのでキュー接続で届く
     send_drained = pyqtSignal()
     
     def __init__(self, host: str, port: int, username: str, password: str = "", 
@@ -427,7 +428,10 @@ class SSHConnection(QObject):
         # 送信の背圧（has_pending_sends）。接続が成立したときに、その
         # チャネルに束縛して作る
         self._drain_watcher: Optional[DrainWatcher] = None
-        self._window_peak = 0
+        # 送信ウィンドウに入り切らず、まだ書いていない分（_write_carry）。
+        # 端末に渡す物が無くても、書けるようになったらここで書き出す
+        self._carry = b""
+        self.send_drained.connect(self._write_carry_when_drained)
 
     def set_read_gate(self, gate) -> None:
         """受信を止める合図（threading.Event）を受け取る
@@ -830,7 +834,7 @@ class SSHConnection(QObject):
 
             self.channel = channel
             # 背圧の見張りは、このチャネルに束縛する（後の接続のチャネルを見ない）
-            self._window_peak = 0
+            self._carry = b""
             self._drain_watcher = DrainWatcher(
                 lambda: self._send_backlogged(channel), self._announce_drained)
             self.is_connected = True
@@ -885,6 +889,8 @@ class SSHConnection(QObject):
         watcher, self._drain_watcher = self._drain_watcher, None
         if watcher is not None:
             watcher.stop()
+        # 書き残しは捨てる（繋ぎ直した先へ古い残りを書かない）
+        self._carry = b""
 
         if self._read_thread and self._read_thread.is_alive():
             self._read_thread.join(timeout=2)
@@ -919,15 +925,52 @@ class SSHConnection(QObject):
         try:
             # キー入力をそのまま送信（改行は追加しない）
             # InteractiveTerminalからEnterキーは'\r'として送られてくる
-            # send は送れたバイト数を返すだけで、渡した全部を送ったとは
-            # 限らない。1文字ずつ送っていた頃はまず起きなかったが、
-            # 貼り付けをまとめて渡すようになったので取りこぼしうる。
-            # 端末は has_pending_sends が False のとき（受信ウィンドウに
-            # 区切り 1 つ分の空きがあるとき）だけ渡すので、ここは待たずに
-            # 終わる。待つと 0.1 秒の時間切れで途中までしか送れずに終わる
-            self.channel.sendall(command.encode('utf-8'))
+            # 書き残しがあれば、その後ろへ足す（後から来た打鍵が追い越さない）
+            self._carry += command.encode('utf-8')
         except Exception as e:
             self.error_occurred.emit(f"送信エラー: {str(e)}")
+            return
+        self._write_carry()
+
+    def _write_carry(self) -> bool:
+        """書き残しを、待たずに書ける分だけ書く（GUI スレッドから呼ぶ）
+
+        送信ウィンドウに 1 バイトでも空きがあれば、入る分だけを書く。入る分は
+        ウィンドウを待たないので、0.1 秒の時間切れにならない。最低量を
+        待つと、補充を遅らせる機器では補充が永遠に来ず、送信が止まっていた。
+        書き切れずに残ったら見張りを始めて True を返す（続きは send_drained で）。
+        send は送れたバイト数を返すだけなので、書くのは sendall にする。
+        """
+        watcher = self._drain_watcher
+        while self._carry:
+            channel = self.channel
+            if not self.is_connected or channel is None:
+                self._carry = b""   # 切れた接続の残りは捨てる
+                return False
+            if watcher is not None and watcher.check():
+                return True   # ウィンドウが 0・鍵交換中・TCP へ書けない
+            room = channel.out_window_size
+            if watcher is None or not isinstance(room, int) or room <= 0:
+                # 待てない（見張りが無い・窓が分からない・閉じた）: 全部を送り、
+                # 失敗は送信エラーとして知らせる（これまでどおり）
+                room = len(self._carry)
+            head, self._carry = self._carry[:room], self._carry[room:]
+            try:
+                channel.sendall(head)
+            except Exception as e:
+                self._carry = b""   # どこまで送れたか分からない
+                self.error_occurred.emit(f"送信エラー: {str(e)}")
+                return False
+        return False
+
+    @pyqtSlot()
+    def _write_carry_when_drained(self):
+        """見張りが書けるようになったと知らせた（GUI スレッドで受ける）
+
+        最後の区切りが入り切らず、端末に渡す物が無くなっていると、端末は
+        続きを呼ばない。書き残しはここで書く。
+        """
+        self._write_carry()
 
     def has_pending_sends(self) -> bool:
         """いま区切りを渡されても、待たずには書けないか（端末の set_send_backlog 用）
@@ -935,19 +978,21 @@ class SSHConnection(QObject):
         相手の読むのが遅いと受信ウィンドウが 0 のまま空かず、sendall は
         チャネルの時間切れ（0.1 秒）で途中までしか送れずに失敗する。どこまで
         送れたかは分からないので、切断として扱うしかなかった（実機の IOSv で
-        16KB の貼り付けが途中で切れた）。空きが無い間は端末に次を渡させず、
+        16KB の貼り付けが途中で切れた）。先に書き残しを書き、それが残るか、
+        ウィンドウが 0・鍵交換中・TCP へ書けない間は端末に次を渡させず、
         未送信の分を端末の列に残す。空いたら send_drained で知らせる。
         """
         watcher = self._drain_watcher
-        return watcher is not None and watcher.check()
+        if watcher is None:
+            return False
+        return self._write_carry() or watcher.check()
 
     def _send_backlogged(self, channel) -> bool:
-        """channel へ区切り 1 つを待たずに書けないなら True
+        """channel へ待たずに 1 バイトも書けないなら True（見張りのスレッドからも呼ぶ）
 
         判定できないとき・閉じたときは False（送らせれば送信エラーとして知らせる）。
-        受信ウィンドウの空き（最大でも、これまでに見た最大の窓まで）と、
-        鍵交換中でないこと（その間 paramiko は送信を待たせる）と、TCP へ
-        書けることを見る。
+        送信ウィンドウが 0 でないことと、鍵交換中でないこと（その間 paramiko は
+        送信を待たせる）と、TCP へ書けることを見る。状態を読むだけで書かない。
         """
         try:
             if channel.closed or not self.is_connected:
@@ -955,9 +1000,7 @@ class SSHConnection(QObject):
             transport = channel.get_transport()
             if not transport.clear_to_send.is_set():
                 return True
-            window = channel.out_window_size
-            self._window_peak = max(self._window_peak, window)
-            if window < min(MIN_SEND_ROOM, self._window_peak):
+            if channel.out_window_size <= 0:
                 return True
             return not socket_writable(transport.sock)
         except Exception:
