@@ -313,6 +313,11 @@ class FTPServerManager(QObject):
                 # 切り詰め、どちらも 226 で終わるのに中身が混ざる）
                 fresh = mgr._reserve_upload(self, file)
                 if fresh is None:
+                    # pyftpdlib は STOR / RETR のたびに REST の位置を読んで
+                    # 0 に戻す。ここで断ると super() を通らないので、戻さないと
+                    # 次の REST 無しの STOR / RETR が残った位置から始まる
+                    # （実測: 上書きが途中から書かれ、取得が先頭を欠く）
+                    self._restart_position = 0
                     self.respond("450 File busy: another upload is writing it.")
                     mgr._emit_activity(self.remote_ip,
                                        "他の転送が書き込み中のため断りました: %s"
