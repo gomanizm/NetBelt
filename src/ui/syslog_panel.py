@@ -8,6 +8,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QAbstractTableModel, QModelIndex, QSortFilterProxyModel, pyqtSignal, QEvent
 from PyQt6.QtGui import QColor, QBrush, QAction, QStandardItemModel, QStandardItem
+from PyQt6 import sip
 from datetime import datetime
 import json
 import os
@@ -137,6 +138,12 @@ class CheckableComboBox(QComboBox):
         self.lineEdit().setText(t)
 
     def eventFilter(self, obj, event):
+        # 自分の入力欄と一覧に掛けたフィルタなので、窓が GC で片付けられる
+        # 途中、ラッパーが破棄済みになったあとも呼ばれることがある。self を
+        # 引くと RuntimeError になり、excepthook が既定のテストでは PyQt が
+        # qFatal でプロセスを落とした（実測）。破棄済みなら素通しにする
+        if sip.isdeleted(self):
+            return False
         if obj is self.lineEdit() and event.type() == QEvent.Type.MouseButtonRelease:
             if self.view().isVisible():
                 self.hidePopup()
