@@ -56,6 +56,8 @@ class _FtpServerCase(unittest.TestCase):
         self.activity = []
         self.m.client_activity.connect(
             lambda ip, message: self.activity.append((ip, message)))
+        # テストのあとに届く知らせが、GC で空にされた lambda を呼ばないよう外す
+        self.addCleanup(self.m.client_activity.disconnect)
         if self.anonymous:
             started = self.m.start(port=0, root_dir=self.root,
                                    anonymous=True, anonymous_write=True)

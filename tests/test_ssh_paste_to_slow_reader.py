@@ -184,6 +184,8 @@ class SSHPasteToSlowReaderTest(unittest.TestCase):
         self.closed = []
         conn.error_occurred.connect(self.errors.append)
         conn.disconnected.connect(lambda: self.closed.append(True))
+        # テストのあとに届く知らせが、GC で空にされた lambda を呼ばないよう外す
+        self.addCleanup(conn.disconnected.disconnect)
         self.assertTrue(conn.connect(), "前提: localhost の SSH に繋がる")
         deadline = time.time() + 5
         while server.channel is None and time.time() < deadline:

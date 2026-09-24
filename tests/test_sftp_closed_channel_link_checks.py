@@ -176,6 +176,8 @@ class _Base(unittest.TestCase):
         self.errors, self.gone, self.lists = [], [], []
         m.error_occurred.connect(self.errors.append)
         m.disconnected.connect(lambda: self.gone.append(True))
+        # テストのあとに届く知らせが、GC で空にされた lambda を呼ばないよう外す
+        self.addCleanup(m.disconnected.disconnect)
         m.file_list_ready.connect(self.lists.append)
 
     def _assert_folded_once(self, m, prefix):
