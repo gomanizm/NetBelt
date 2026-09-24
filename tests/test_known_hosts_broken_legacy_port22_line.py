@@ -19,6 +19,7 @@ TOFU が別の鍵を受け入れ、パスワードが相手へ届く。
 対象にする。22 番以外のポートの扱いは変えない。
 """
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -43,6 +44,7 @@ class BrokenLegacyPort22LineTest(unittest.TestCase):
 
     def setUp(self):
         self.dir = Path(tempfile.mkdtemp(prefix="netbelt-khlegacybroken-"))
+        self.addCleanup(shutil.rmtree, str(self.dir), True)
         patcher = mock.patch("core.config_manager.app_data_dir",
                              return_value=self.dir)
         patcher.start()
