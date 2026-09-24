@@ -16,7 +16,8 @@ from .dialogs.device_dialog import DeviceDialog
 from .dialogs.group_dialog import GroupDialog
 from .dialogs.macro_dialog import MacroDialog
 from .dialogs.settings_dialog import SettingsDialog
-from core.config_manager import ConfigManager, device_endpoint
+from core.config_manager import (ConfigManager, count_macros_named,
+                                 device_endpoint)
 from core.ssh_connection import SSHConnection
 from core.serial_connection import SerialConnection
 from core.telnet_connection import TelnetConnection
@@ -1996,6 +1997,20 @@ class MainWindow(QMainWindow):
             device_name: 機器名
             macro_name: マクロ名
         """
+        # 同じ名前が複数あると、名前で引く get_macro_by_name は先頭の 1 件を
+        # 返すので、メニューで 2 件目を選んでも 1 件目のコマンドが機器へ
+        # 送られる（実測）。どれを送るか決められないので、何も送らずに断る
+        if count_macros_named(self.config_manager.get_global_macros(),
+                              macro_name) > 1:
+            QMessageBox.warning(
+                self,
+                "マクロ実行エラー",
+                f"同じ名前のマクロ '{macro_name}' が複数あるため、"
+                "どれを実行するか決められません。機器へは何も送っていません。\n"
+                "設定ファイル (config.json) で名前を変えてから実行してください。"
+            )
+            return
+
         # マクロ情報を取得
         macro = self.config_manager.get_macro_by_name(macro_name)
         if not macro:

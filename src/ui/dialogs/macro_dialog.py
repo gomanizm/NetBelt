@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, pyqtSignal
 from typing import List, Optional
 
-from core.config_manager import is_readable_macro
+from core.config_manager import count_macros_named, is_readable_macro
 
 
 class MacroDialog(QDialog):
@@ -239,6 +239,11 @@ class MacroDialog(QDialog):
         preset_name = current_item.text()
         if not self.config_manager:
             return
+
+        # 同じ名前が複数あると、名前で引くので開くのは先頭の 1 件になる
+        # （2 行目を選んでも 1 件目の中身が開き、保存も 1 件目へ入る）
+        if self._refuse_duplicate_name(preset_name, "編集"):
+            return
         
         macro = self.config_manager.get_macro_by_name(preset_name)
         if not macro:
@@ -264,6 +269,10 @@ class MacroDialog(QDialog):
             return
         
         preset_name = current_item.text()
+
+        # 同じ名前が複数あると、削除は名前で消すので同じ名前が全部消える
+        if self._refuse_duplicate_name(preset_name, "削除"):
+            return
         
         reply = QMessageBox.question(
             self,
@@ -283,6 +292,23 @@ class MacroDialog(QDialog):
                 self._load_presets()
                 QMessageBox.warning(self, "エラー", "プリセットの削除に失敗しました。")
     
+    def _refuse_duplicate_name(self, preset_name: str, action: str) -> bool:
+        """同じ名前のプリセットが複数あれば理由を出して True を返す（操作は断る）
+
+        Args:
+            preset_name: 選ばれたプリセットの名前
+            action: 断る操作の名前（「編集」「削除」）
+        """
+        if not self.config_manager or count_macros_named(
+                self.config_manager.get_global_macros(), preset_name) < 2:
+            return False
+        QMessageBox.warning(
+            self, "エラー",
+            f"同じ名前のプリセット '{preset_name}' が複数あるため、"
+            f"どれを{action}するか決められません。\n"
+            f"設定ファイル (config.json) で名前を変えてから{action}してください。")
+        return True
+
     def _on_keepalive_start(self):
         """キープアライブ開始を要求する（表示は進めない）
 

@@ -57,6 +57,21 @@ def is_readable_macro(macro) -> bool:
             and all(isinstance(c, str) for c in macro.get("commands", [])))
 
 
+def count_macros_named(macros, name) -> int:
+    """共通マクロの一覧で、その名前を持つものの数（一覧が list でなければ 0）
+
+    マクロの実行・編集・削除は名前で相手を引く（get_macro_by_name は先頭の
+    1 件、remove_global_macro は同じ名前の全件）。手編集や持ち込みの
+    config.json で同じ名前が並ぶと、2 件目を選んでも 1 件目のコマンドが
+    機器へ送られ、削除では両方が消えていた（実測）。名前で引く操作は、
+    これが 2 以上なら断る。
+    """
+    if not isinstance(macros, list):
+        return 0
+    return sum(1 for m in macros
+               if isinstance(m, dict) and m.get("name") == name)
+
+
 def device_endpoint(device_data):
     """機器データが指す接続先を、比べられる形で返す（辞書でなければ None）
 
@@ -405,6 +420,7 @@ class ConfigManager:
                 # よう、隔離のあとで見る）
                 self._notify_duplicate_group_names(config)
                 self._notify_duplicate_device_names(config)
+                self._notify_duplicate_global_macro_names(config)
                 # パスワードを復号化
                 self._decrypt_passwords(config)
                 self._notify_undecryptable()
@@ -713,6 +729,36 @@ class ConfigManager:
             + "、".join(duplicates)
             + "\n接続も設定の操作も機器名で相手を探すため、どちらが選ばれるかは"
               "決まりません。機器の編集で名前を分けてください。")
+
+    def _notify_duplicate_global_macro_names(self, config: Dict) -> None:
+        """同じ名前の共通マクロが複数ある設定を読んだら、その名前を挙げて知らせる。
+
+        GUI の新規作成は同名を断るが、読み込みは重複を弾かない。実行・編集・
+        削除は名前で相手を引くので、どれを指すかが決まらない（count_macros_named
+        を参照）。その名前の操作は断ることにしたので、ここで理由と直し方を
+        先に伝える。名前は画面から変えられない（編集では名前欄が読み取り
+        専用）ので、config.json を直すよう案内する。黙って除外・改名は
+        しない（利用者のコマンド列が消える）。
+        """
+        seen = set()
+        duplicates = []
+        macros = config.get("global_macros")
+        for macro in macros if isinstance(macros, list) else []:
+            if not is_readable_macro(macro):
+                continue
+            name = macro["name"]
+            if name not in seen:
+                seen.add(name)
+            elif name not in duplicates:
+                duplicates.append(name)
+        if not duplicates:
+            return
+        self._append_load_warning(
+            "設定ファイル (config.json) に同じ名前の全体共通マクロ（プリセット）が"
+            "複数あります: " + "、".join(duplicates)
+            + "\nマクロは名前で探すため、どれを指すかが決まりません。機器へ"
+              "別のマクロを送らないよう、この名前のマクロは実行・編集・削除を"
+              "断ります。config.json を直接編集して名前を分けてください。")
 
     def has_undecryptable_password(self, device_name, password) -> bool:
         """その機器のパスワードが、読み込み時に復号できなかった暗号文のままか。
