@@ -495,6 +495,29 @@ class SSHConnection(QObject):
             "\r\n[NetBelt] 警告: %s\r\n" % message)
         client.set_missing_host_key_policy(policy)
 
+    def _use_legacy_port22_keys(self, client):
+        """旧版が "[host]:22" の名前で保存した鍵を、22 番の照合に使う。
+
+        paramiko 4.0.0 は known_hosts を引く名前を `port == 22`（整数との
+        比較）で決める。ポートを整数へそろえる前の版は、config.json の
+        文字列 "22" をそのまま渡していたので、その機器の鍵は "[host]:22" の
+        名前で保存されている。いまは "host" で引くためこの行が使われず、
+        更新後の最初の接続で TOFU が黙って別の鍵を受け入れ、パスワードが
+        相手へ届いていた（実測）。"host" の鍵が無いときだけ、"[host]:22" の
+        鍵を "host" の鍵として読み替える。読み替えはメモリ上だけで、
+        known_hosts には書かない。
+        """
+        if self.port != 22:
+            return
+        keys = client.get_host_keys()
+        if keys.lookup(self.host) is not None:
+            return
+        legacy = keys.lookup("[%s]:22" % self.host)
+        if legacy is None:
+            return
+        for keytype in legacy.keys():
+            keys.add(self.host, keytype, legacy[keytype])
+
     def _refuse_or_warn_broken_lines(self, broken, known_hosts_path):
         """読めない行を名指しで知らせ、その行が指す接続先なら接続を中止する。
 
@@ -711,6 +734,7 @@ class SSHConnection(QObject):
                 self._setup_host_keys(client)
             except HostKeyStoreError as e:
                 return self._fail(str(e))
+            self._use_legacy_port22_keys(client)
             
             # 接続パラメータの準備
             connect_kwargs = {
