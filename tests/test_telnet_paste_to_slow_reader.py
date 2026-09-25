@@ -179,6 +179,9 @@ class TelnetPasteToSlowReaderTest(unittest.TestCase):
 
     def test_a_large_paste_reaches_a_slow_reader_whole_and_in_order(self):
         server, conn, _, term = self._session()
+        # 送信バッファの大きさを OS に任せない（Windows は自動で大きくし、そうなると
+        # 詰まらずに素通りする。GitHub のランナーで前提が崩れた）
+        conn.socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
         body = _paste_body(160 * 1024)
         expected = _wire_bytes(body)
         stamps = self._ticker()
@@ -200,12 +203,32 @@ class TelnetPasteToSlowReaderTest(unittest.TestCase):
         self.assertLess(max(gaps), 1.0,
                         "送信中に GUI が %.2f 秒止まった" % max(gaps))
 
+    def _stall(self, conn, term):
+        """貼り付けを渡し、送信が詰まって見張りが動き出すまで回す
+
+        詰まるかを OS の送信バッファの大きさに任せない。Windows は SO_SNDBUF を
+        明示しないソケットの送信バッファを自動で大きくする（動的な送信
+        バッファ）ので、環境によっては 192KB を渡しても埋まらない。NetBelt の
+        ソケットの SO_SNDBUF を 4096 に明示する（相手の受信バッファは
+        SlowTCPServer が 4096 に絞っている）。
+        """
+        conn.socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+        term.send_text(_paste_body(192 * 1024))
+        self._pump_until(lambda: self.errors or self.closed
+                         or self._watcher_thread(conn) is not None, 10)
+
+    @staticmethod
+    def _watcher_thread(conn):
+        """接続の見張りのスレッド（動いていなければ None）"""
+        watcher = getattr(conn, "_drain_watcher", None)
+        return watcher._thread if watcher is not None else None
+
     def test_a_stalled_reader_keeps_the_session_and_the_rest_stays_queued(self):
         """相手が読まなくなっても切らず、渡していない分は端末の列に残ること。"""
         server, conn, _, term = self._session()
         server.reading.clear()
 
-        term.send_text(_paste_body(192 * 1024))
+        self._stall(conn, term)
         self._pump_until(lambda: self.errors or self.closed, 0.8)
 
         self.assertEqual([], self.errors, "相手が詰まっただけで送信エラーになった")
@@ -215,14 +238,13 @@ class TelnetPasteToSlowReaderTest(unittest.TestCase):
                         "渡していない分が端末の列に残っていない（取り消せない）")
 
         # 詰まったままでも、後始末で見張りが止まり、固まらない
-        watcher = conn._drain_watcher
-        thread = watcher._thread if watcher is not None else None
+        thread = self._watcher_thread(conn)
+        self.assertIsNotNone(thread, "前提: 送信が詰まり、見張りが動いている")
         started = time.perf_counter()
         conn.dispose()
         self.assertLess(time.perf_counter() - started, 2.5, "後始末が固まった")
-        if thread is not None:
-            thread.join(1.0)
-            self.assertFalse(thread.is_alive(), "見張りのスレッドが残った")
+        thread.join(1.0)
+        self.assertFalse(thread.is_alive(), "見張りのスレッドが残った")
         self._pump_until(lambda: False, 0.2)
         self.assertEqual([], self.errors, "後始末のあとにエラーが出た")
 
@@ -230,6 +252,9 @@ class TelnetPasteToSlowReaderTest(unittest.TestCase):
         """送信バッファが埋まっていても、交渉の応答は待って送り切り、切断にしないこと。"""
         server, conn, _, term = self._session()
         server.reading.clear()
+        # 送信バッファの大きさを OS に任せない（Windows は自動で大きくし、そうなると
+        # 詰まらずに素通りする。GitHub のランナーで前提が崩れた）
+        conn.socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
         # 相手が読まない間に、送信バッファと相手の受信バッファを埋める
         filled = bytearray()
         piece = b"F" * 4096
@@ -277,10 +302,10 @@ class TelnetPasteToSlowReaderTest(unittest.TestCase):
         """待っている間に相手が閉じたら、切断として知らせて見張りも終わること。"""
         server, conn, _, term = self._session()
         server.reading.clear()
-        term.send_text(_paste_body(192 * 1024))
+        self._stall(conn, term)
         self._pump_until(lambda: self.errors or self.closed, 0.5)
-        watcher = conn._drain_watcher
-        thread = watcher._thread if watcher is not None else None
+        thread = self._watcher_thread(conn)
+        self.assertIsNotNone(thread, "前提: 送信が詰まり、見張りが動いている")
 
         server.close_peer()
         self._pump_until(
@@ -289,9 +314,8 @@ class TelnetPasteToSlowReaderTest(unittest.TestCase):
         self.assertTrue(
             self.closed or any("送信エラー" in e for e in self.errors),
             "相手が閉じたのに知らせが無い: %r" % (self.errors,))
-        if thread is not None:
-            thread.join(2.0)
-            self.assertFalse(thread.is_alive(), "見張りのスレッドが残った")
+        thread.join(2.0)
+        self.assertFalse(thread.is_alive(), "見張りのスレッドが残った")
 
 
 if __name__ == "__main__":

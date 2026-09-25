@@ -122,6 +122,11 @@ class TelnetSendNeverWaitsForReplyWriterTest(unittest.TestCase):
         conn.disconnected.connect(lambda: closed.append(True))
         self.addCleanup(conn.disconnected.disconnect)
         self.assertTrue(conn.connect(), "前提: localhost の TCP に繋がる")
+        # 送信バッファの大きさを OS に任せない。Windows は SO_SNDBUF を明示
+        # しないソケットの送信バッファを自動で大きくする（動的な送信バッファ）
+        # ので、CI（windows-latest）では 90KB の応答を丸ごと受け取り、埋まら
+        # なかった。4096 に明示すると、待たずに書ける量は数十 KB で止まる
+        conn.socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
         peer.accept()
 
         # GUI の背圧の判定。まだ何も書いていないので、待たずに書けると答える
@@ -129,8 +134,9 @@ class TelnetSendNeverWaitsForReplyWriterTest(unittest.TestCase):
 
         # ---- GUI はここ（判定のあと、send_command の前）で止まっていた ----
         # その間に相手が読まないまま交渉を連発し、NetBelt の応答が送信
-        # バッファを埋める（応答 90KB > 送信バッファと相手の受信バッファ）
-        count = 30000
+        # バッファを埋める（応答 300KB > 送信バッファと相手の受信バッファ。
+        # 直す前の実測は 90KB で、埋まるまでの量との差が小さかった）
+        count = 100000
         threading.Thread(
             target=peer.send_all, args=(bytes([IAC, DO, ECHO]) * count,),
             daemon=True).start()

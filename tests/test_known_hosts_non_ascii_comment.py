@@ -32,7 +32,18 @@ _save_known_hosts が錠の中でディスクから作り直して行い、param
 save_host_keys は保存経路から外れている）。
 例外を Exception まで広げないのは、権限エラー（PermissionError）で
 中止する既存の動きを残すため。
+
+テストの前提（1.3.1 の CI で崩れた）: どのテストも、paramiko の読み込みが
+UnicodeDecodeError になって直した経路へ入ることを前提にしている。既定の
+文字コードが cp1252（英語の Windows）や UTF-8（Python の UTF-8 モード）だと
+注釈の UTF-8 が読めてしまい、その経路を通らない（windows-latest では
+test_unreadable_file_still_refuses_every_host が『HostKeyStoreError not
+raised』で落ち、ほかは直した経路を通らないまま通っていた）。そこで setUp で
+paramiko.hostkeys の open を、文字コードを指定しないテキストを cp932 で開く
+ものに差し替え（日本語の Windows の既定と同じ）、known_hosts を書いた直後に
+paramiko の読み込みが UnicodeDecodeError になることを確かめる。
 """
+import builtins
 import os
 import sys
 import tempfile
@@ -41,6 +52,14 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, "src")
+
+
+def _open_with_cp932_default(file, mode="r", buffering=-1, encoding=None,
+                             *args, **kwargs):
+    """文字コードを指定しないテキストの open を、日本語の Windows と同じ cp932 で開く"""
+    if "b" not in mode and encoding is None:
+        encoding = "cp932"
+    return builtins.open(file, mode, buffering, encoding, *args, **kwargs)
 
 
 class KnownHostsNonAsciiCommentTest(unittest.TestCase):
@@ -59,6 +78,13 @@ class KnownHostsNonAsciiCommentTest(unittest.TestCase):
                              return_value=self.dir)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # paramiko の読み込みの既定の文字コードを、実行する環境によらず
+        # cp932 にする（冒頭の「テストの前提」）
+        import paramiko.hostkeys
+        patcher = mock.patch.object(paramiko.hostkeys, "open",
+                                    _open_with_cp932_default, create=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.path = self.dir / "known_hosts"
 
     def _line(self, hostname, key, annotation=""):
@@ -68,6 +94,11 @@ class KnownHostsNonAsciiCommentTest(unittest.TestCase):
     def _write_known_hosts(self, lines):
         # 利用者が書き足す注釈は UTF-8。cp932 では読めないバイトを含む
         self.path.write_bytes(("\n".join(lines) + "\n").encode("utf-8"))
+        import paramiko
+        with self.assertRaises(
+                UnicodeDecodeError,
+                msg="前提: paramiko の読み込みが文字コードの誤りで失敗する"):
+            paramiko.HostKeys(str(self.path))
 
     def _setup(self, host, port=22):
         """本物の SSHClient に _setup_host_keys を通し、画面に出た文を返す。"""

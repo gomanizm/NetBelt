@@ -271,6 +271,23 @@ if not exist "!TEMP_DIR!" (
 echo   作成完了: !TEMP_DIR!
 echo.
 
+REM ここから先の powershell（展開の前の照合・展開・目印の判定）は、
+REM Windows PowerShell 5.1 に標準で入っているモジュールだけを使う。
+REM PowerShell 7（pwsh）の中から起動されると、PSModulePath の先頭に 7 用の
+REM モジュールの置き場所が足されたまま引き継がれ、5.1 はそこにある 7 用の
+REM Microsoft.PowerShell.Utility を読み込んで Get-FileHash を見失う。実測
+REM （1.3.1 のリリースのワークフロー run 36097480601。GitHub の windows-latest
+REM はテストを pwsh の中で走らせる）: 角括弧の無い普通の TEMP でも
+REM 「The term 'Get-FileHash' is not recognized」「展開に失敗しました」で
+REM 止まり、更新は当たらなかった。Expand-Archive も同じく先頭にある 7 用の
+REM Microsoft.PowerShell.Archive が選ばれる（tests/test_updater_psmodulepath.py）。
+REM PowerShell 7 のターミナルから NetBelt を起動した利用者も同じ道を通る。
+REM そこで 5.1 の標準の置き場所だけにする。利用者が足した置き場所も使わない
+REM （Archive の別の版が選ばれると、下の角括弧の逃がし方の前提が崩れる）。
+REM 呼び出し元の値は控えておき、[6/6] で NetBelt を起動し直す前に戻す。
+set "CALLER_PSMODULEPATH=!PSModulePath!"
+set "PSModulePath=%SystemRoot%\system32\WindowsPowerShell\v1.0\Modules"
+
 REM ZIPファイルを展開
 echo [4/6] ZIPファイルを展開中...
 REM 展開する前に、NetBelt が確かめたバイト列と同じものかを見る。
@@ -648,6 +665,9 @@ if not exist "!APP_PATH!" (
     pause
     exit /b 1
 )
+REM PSModulePath を呼び出し元の値へ戻す（[4/6] の手前の注を参照）。
+REM 起動し直す NetBelt の環境は、更新の前と変えない。
+set "PSModulePath=!CALLER_PSMODULEPATH!"
 cmd /d /c exit 0
 start "" "!APP_PATH!"
 if errorlevel 1 set "LAUNCH_FAILED=1"

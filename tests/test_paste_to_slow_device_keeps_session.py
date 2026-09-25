@@ -304,6 +304,9 @@ class PasteToSlowDeviceKeepsSessionTest(unittest.TestCase):
         server = SlowTCPServer()
         self.addCleanup(server.close)
         conn = self._connect("telnet", server.port)
+        # 送信バッファの大きさを OS に任せない（Windows は自動で大きくし、そうなると
+        # 詰まらずに素通りする。GitHub のランナーで前提が崩れた）
+        conn.socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
         expected = _wire_bytes(_paste_body(160 * 1024))
         stamps = self._ticker()
 
@@ -314,22 +317,40 @@ class PasteToSlowDeviceKeepsSessionTest(unittest.TestCase):
         self._assert_arrived_whole(conn, server.sessions[0], expected, stamps)
 
     def _stalled_paste(self):
-        """読まない相手へ Telnet で繋ぎ、貼り付けが詰まった状態にする"""
+        """読まない相手へ Telnet で繋ぎ、貼り付けが詰まった状態にする
+
+        詰まるか（見張りが動き出すか）を OS の送信バッファの大きさに任せない。
+        Windows は SO_SNDBUF を明示しないソケットの送信バッファを自動で
+        大きくする（動的な送信バッファ）ので、CI（windows-latest）では 192KB を
+        0.6 秒渡しても埋まらず、見張りが動かないまま進んでいた。
+        NetBelt のソケットの SO_SNDBUF を 4096 に明示し（相手の受信バッファは
+        SlowTCPServer が 4096 に絞っている）、見張りが動き出すまで待つ。
+        """
         server = SlowTCPServer()
         self.addCleanup(server.close)
         conn = self._connect("telnet", server.port)
+        conn.socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
         server.reading.clear()
         body = _paste_body(192 * 1024)
         self._paste(body)
+        self._pump(10, until=lambda: not self._still_connected(conn)
+                   or self._watcher_thread(conn) is not None)
+        # 詰まったあとも、時間切れで切断にならないことを確かめる
         self._pump(0.6, until=lambda: not self._still_connected(conn))
         self.assertTrue(self._still_connected(conn),
                         "相手が詰まっただけでセッションが切れた: %s"
                         % self.window.status_bar.currentMessage())
         self.assertTrue(self._terminal()._send_queue,
                         "前提: 渡していない分が端末の列に残っている")
-        watcher = getattr(conn, "_drain_watcher", None)
-        thread = watcher._thread if watcher is not None else None
+        thread = self._watcher_thread(conn)
+        self.assertIsNotNone(thread, "前提: 送信が詰まり、見張りが動いている")
         return server, conn, body, thread
+
+    @staticmethod
+    def _watcher_thread(conn):
+        """接続の見張りのスレッド（動いていなければ None）"""
+        watcher = getattr(conn, "_drain_watcher", None)
+        return watcher._thread if watcher is not None else None
 
     def test_stopping_a_macro_queued_behind_a_stalled_paste_sends_none_of_it(self):
         server, conn, body, _ = self._stalled_paste()

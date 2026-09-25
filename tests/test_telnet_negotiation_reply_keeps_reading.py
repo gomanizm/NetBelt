@@ -121,6 +121,11 @@ class TelnetNegotiationReplyKeepsReadingTest(unittest.TestCase):
         # テストのあとに届く知らせが、GC で空にされた lambda を呼ばないよう外す
         self.addCleanup(conn.disconnected.disconnect)
         self.assertTrue(conn.connect(), "前提: localhost の TCP に繋がる")
+        # 送信バッファの大きさを OS に任せない。Windows は SO_SNDBUF を明示
+        # しないソケットの送信バッファを自動で大きくする（動的な送信バッファ）
+        # ので、環境によっては貼り付けや応答を丸ごと受け取り、送信バッファが
+        # 埋まらない。4096 に明示すると、待たずに書ける量は数十 KB で止まる
+        conn.socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
         peer.accept()
 
         widget = TerminalWidget()

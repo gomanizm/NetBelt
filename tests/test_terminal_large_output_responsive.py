@@ -14,6 +14,7 @@
      イベントキューに積まれ、Qt はそれを 1 回の処理でまとめて配るので、
      積まれた数だけ描き終えるまでキー入力も再描画も受け付けない。
 """
+import gc
 import os
 import re
 import sys
@@ -109,8 +110,18 @@ class ReceivedBurstKeepsTheWindowResponsiveTest(unittest.TestCase):
         測る。積まれたかたまりを全部その場で描くと、その 1 回が描画の合計時間に
         なり、その間はキー入力（Ctrl+C での中断を含む）も再描画も効かない
         （実測: 1 万 1 千行 146 かたまりが processEvents 1 回で描かれ 0.61 秒）。
+
+        先に走ったテストの残りは GC の対象から外してから測る。全件を 1 プロセスで
+        流すと約 90 万個が残り、世代 2 の GC がそれを調べる間の止まりを描画の
+        止まりと取り違える（実測: 最長の 2 回 0.181 秒・0.124 秒が GC 0.152 秒・
+        0.103 秒と重なり、ほかの回は約 0.005 秒。GitHub のランナーでは 0.27〜
+        0.29 秒で落ちた）。外すのは窓を作る前の分だけで、窓とこのテストが作る
+        オブジェクトは普段どおり GC が調べる。
         """
         from core.ssh_connection import SSHConnection
+        gc.collect()
+        gc.freeze()
+        self.addCleanup(gc.unfreeze)
         w = self._window()
         chunks = _chunks(0, 16000)
         last_line = "line %06d" % 15999
