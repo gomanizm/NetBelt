@@ -90,20 +90,26 @@ def _names_same_endpoint(name, host, port):
     config.json の文字列のまま書いた "[host]:022"・"[host]:+22"・
     "[host]:02202" のような綴りも、ポートを整数にそろえて同じ接続先と
     みなす。22 番なら "host" と "[host]:22" もこの機器の名前。
+
+    ホスト名の大文字小文字は区別しない（OpenSSH と同じ）。ハッシュ化名は
+    設定の綴りのままと、小文字にそろえた綴りの両方で掛け直して比べる
+    （OpenSSH は小文字にしてから掛ける）。
     """
     try:
         port = int(port)            # known_hosts_server_name と同じ読み方
     except (TypeError, ValueError):
         port = 22
+    lowered = host.lower()
     if name.startswith("|1|"):
-        wanted = [known_hosts_server_name(host, port)]
+        wanted = {known_hosts_server_name(h, port) for h in (host, lowered)}
         if port == 22:
-            wanted.append("[%s]:22" % host)
+            wanted.update("[%s]:22" % h for h in (host, lowered))
         return any(_hostnames_match([name], w) for w in wanted)
     if name.startswith("[") and "]:" in name:
         name_host, _, name_port = name[1:].rpartition("]:")
-        return name_host == host and tcp_port_number(name_port) == port
-    return port == 22 and name == host
+        return (name_host.lower() == lowered
+                and tcp_port_number(name_port) == port)
+    return port == 22 and name.lower() == lowered
 
 
 def _iter_known_hosts_lines(path):
@@ -546,8 +552,8 @@ class SSHConnection(QObject):
             "\r\n[NetBelt] 警告: %s\r\n" % message)
         client.set_missing_host_key_policy(policy)
 
-    def _use_legacy_port_keys(self, client):
-        """旧版が文字列のポートの名前で保存した鍵を、照合に使う。
+    def _use_other_spelling_keys(self, client):
+        """同じ接続先を別の綴りの名前で保存した鍵を、照合に使う。
 
         paramiko 4.0.0 は known_hosts を引く名前を `port == 22`（整数との
         比較）で決める。ポートを整数へそろえる前の版は、config.json の
@@ -556,6 +562,11 @@ class SSHConnection(QObject):
         名前で保存されている。いまは "host" や "[host]:2202" で引くため
         この行が使われず、更新後の最初の接続で TOFU が黙って別の鍵を
         受け入れ、パスワードが相手へ届いていた（実測）。
+
+        ホスト名の大文字小文字だけが違う行も同じ。paramiko は名前を文字列の
+        まま比べるので、OpenSSH（小文字で書く）から写した行と大文字を含む
+        設定や、機器の編集で大文字小文字だけを変えた機器で同じことが
+        起きていた（実測）。
 
         接続先名の鍵が無いときだけ読み替える。22 番は今までどおり
         "[host]:22" の鍵を先に見る。それも無ければ、同じ接続先を指す
@@ -594,7 +605,8 @@ class SSHConnection(QObject):
         """
         server_name = known_hosts_server_name(self.host, self.port)
         # 旧版が文字列のポートの名前（"[host]:22" や "[host]:022"）で残した
-        # 行も照合に使う（_use_legacy_port_keys）。その行が壊れていたときも、
+        # 行や、大文字小文字だけが違う行も照合に使う
+        # （_use_other_spelling_keys）。その行が壊れていたときも、
         # この機器の行として中止する。警告だけで進むと TOFU が別の鍵を
         # 受け入れ、パスワードが相手へ届く（実測）
         mine = [(no, text) for no, text, _ in broken
@@ -800,7 +812,7 @@ class SSHConnection(QObject):
                 self._setup_host_keys(client)
             except HostKeyStoreError as e:
                 return self._fail(str(e))
-            self._use_legacy_port_keys(client)
+            self._use_other_spelling_keys(client)
             
             # 接続パラメータの準備
             connect_kwargs = {
