@@ -427,6 +427,27 @@ REM インストール先へ直接上書きし、途中で止まると起動で�
 REM だけが残った（実測）。そのうえ「含まれていません」と事実と逆の
 REM 報告をしていた。走査は短いので少し待ってやり直し、それでも
 REM 移せなければ、インストール先へ何も書かずに止める。
+rem xcopy silently skips a source of 260 characters or more and still
+rem returns 0, so a long TEMP left the new bundled files next to the old
+rem exe, blamed on the app still running. Stop before anything in the
+rem install folder is written. The staged name is longer than any file
+rem in the release, so its two paths are the ones to check.
+set "PATH_TOO_LONG="
+set "NB_LEN=!SOURCE_DIR!\!STAGED_NAME!"
+if not "!NB_LEN:~259,1!"=="" set "PATH_TOO_LONG=!NB_LEN!"
+set "NB_LEN=!STAGED_PATH!"
+if not "!NB_LEN:~259,1!"=="" set "PATH_TOO_LONG=!NB_LEN!"
+if defined PATH_TOO_LONG (
+    echo エラー: パスが長すぎるため、更新を当てられません
+    echo   場所: !PATH_TOO_LONG!
+    echo   260 文字以上のパスは、コピーで黙って飛ばされます。
+    echo   インストール先のファイルは何も変えていません。TEMP（または
+    echo   インストール先）を短い場所へ移すか、新しい ZIP を手で展開してください。
+    rd /s /q "!TEMP_DIR!" 2>nul
+    call :drop_apply_copy
+    pause
+    exit /b 1
+)
 set "REN_TRY=0"
 :stage_exe
 set /a REN_TRY+=1
