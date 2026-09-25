@@ -12,6 +12,19 @@
   %TEMP% の下に netbelt-tests-* を 1 つ作り、tempfile.tempdir と環境変数
   TEMP / TMP / TMPDIR をそこへ向ける（子プロセスも同じ場所を使う）。終わりに
   元へ戻してから、そのフォルダを丸ごと消す。すでに %TEMP% にある物には触らない。
+
+既定の設定ファイル（tests-03）
+  ConfigManager() の既定の config_path は作業ディレクトリからの相対の
+  "config.json" で、MainWindow・FTP/TFTP パネル・更新ダイアログは引数なしで作る。
+  ConfigManager を差し替えずに MainWindow() を作るテストは、リポジトリ直下の
+  config.json（ソースから起動したときの利用者の設定）を読み書きしていた。
+  実測（441ea02）: config.json の無い作業ディレクトリで test_updater_script.py の
+  UpdaterLaunchTest を流すと config.json ができた。同じことをするファイルは
+  ほかに 31 あった。子プロセスで窓を作る test_window_close_waits_for_mib_loader.py
+  も同じ。
+  直し方: conftest で、セッションの間だけ ConfigManager.__init__ の既定値を
+  セッションの一時フォルダの config.json へ差し替える（クラスは差し替えない）。
+  子プロセスのテストには作業ディレクトリを渡す。
 """
 import os
 import subprocess
@@ -73,6 +86,31 @@ class TempIsASessionFolderTest(unittest.TestCase):
         self.assertEqual(tempfile.gettempdir(), outer, "tempfile.tempdir が戻らない")
         for key in ("TEMP", "TMP", "TMPDIR"):
             self.assertEqual(os.environ.get(key), outer, key)
+
+
+class DefaultConfigIsNotInTheWorkingDirectoryTest(unittest.TestCase):
+
+    def _assert_not_in_the_working_directory(self, path):
+        used = os.path.normcase(os.path.abspath(str(path)))
+        self.assertNotEqual(used, os.path.normcase(os.path.abspath("config.json")),
+                            "作業ディレクトリの config.json を使っている")
+        self.assertTrue(used.startswith(os.path.normcase(tempfile.gettempdir())),
+                        "既定の設定がセッションの一時フォルダの外にある: %s" % used)
+
+    def test_a_config_manager_without_a_path(self):
+        from core.config_manager import ConfigManager
+        self._assert_not_in_the_working_directory(ConfigManager().config_path)
+
+    def test_a_window_does_not_use_the_working_directory_config(self):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PyQt6.QtWidgets import QApplication
+        QApplication.instance() or QApplication([])
+        from ui.main_window import MainWindow
+
+        window = MainWindow()
+        self.addCleanup(window.close)
+
+        self._assert_not_in_the_working_directory(window.config_manager.config_path)
 
 
 if __name__ == "__main__":

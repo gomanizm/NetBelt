@@ -111,6 +111,7 @@ class WindowCloseDoesNotCrashTest(unittest.TestCase):
         env["PYTHONIOENCODING"] = "utf-8"
 
         proc = subprocess.run([sys.executable, script], env=env,
+                              cwd=work,
                               capture_output=True, timeout=180)
 
         out = proc.stdout.decode("utf-8", "replace")

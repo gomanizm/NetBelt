@@ -106,6 +106,38 @@ def qapp():
               % ", ".join(t.name for t in leftovers))
 
 
+@pytest.fixture(scope="session", autouse=True)
+def default_config_outside_the_working_directory(tmp_path_factory):
+    """引数なしの ConfigManager() に、作業ディレクトリの config.json を使わせない。
+
+    ConfigManager の既定の config_path は作業ディレクトリからの相対の
+    "config.json" で、MainWindow・FTP/TFTP パネル・更新ダイアログは引数なしで
+    作る。差し替えずに窓を作るテスト（32 ファイル）は、リポジトリ直下の
+    config.json（ソースから起動したときの利用者の設定）を読み書きしていた。
+
+    セッションの間だけ、既定値をセッションの一時フォルダの config.json へ
+    差し替える。クラスは差し替えないので、クラス属性の参照は変わらない。
+    テストどうしで 1 つの設定を共有するのはこれまでと同じで、場所だけが
+    変わる。明示的なパスを渡す呼び出しと、自分で ConfigManager を差し替える
+    テストには影響しない。setUpClass で作る窓にも効くよう、セッションの
+    スコープにする。
+    """
+    from unittest import mock
+
+    src = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "src")
+    if src not in sys.path:
+        sys.path.insert(0, src)
+    try:
+        from core.config_manager import ConfigManager
+    except Exception:
+        yield
+        return
+    path = str(tmp_path_factory.mktemp("netbelt-config") / "config.json")
+    with mock.patch.object(ConfigManager.__init__, "__defaults__", (path,)):
+        yield
+
+
 @pytest.fixture(autouse=True)
 def no_startup_update_check():
     """テスト中は起動時の更新チェックを走らせない。
