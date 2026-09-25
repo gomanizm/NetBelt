@@ -36,6 +36,11 @@ class DeviceTree(QWidget):
     
     # 一般的なボーレート値
     BAUD_RATES = [300, 1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600]
+
+    # 自動検出で作った「コンソール接続」グループに付ける印。手編集の config に
+    # 同じ名前のグループがあっても取り違えないよう、名前ではなくこれで探す。
+    # UserRole は機器データの置き場（値のあるグループは機器として扱われる）
+    CONSOLE_GROUP_ROLE = Qt.ItemDataRole.UserRole + 1
     
     def __init__(self):
         super().__init__()
@@ -134,6 +139,7 @@ class DeviceTree(QWidget):
         
         # コンソール接続グループを作成
         console_group = QTreeWidgetItem(self.tree, ["コンソール接続"])
+        console_group.setData(0, self.CONSOLE_GROUP_ROLE, True)
         
         # 各シリアルポートをアイテムとして追加
         for port_info in serial_ports:
@@ -173,11 +179,16 @@ class DeviceTree(QWidget):
             else self._console_group_expanded)
 
     def _find_console_group(self) -> Optional[QTreeWidgetItem]:
-        """ツリーにある「コンソール接続」グループを返す（無ければ None）"""
+        """自動検出で作った「コンソール接続」グループを返す（無ければ None）
+
+        手編集の config に同じ名前のグループがあると、名前で探したときに
+        そちらを取り除いてしまう（ポートの抜き差しやボーレートの変更で、
+        設定のグループが一覧から消えていた）ので、作ったときの印で探す。
+        """
         root = self.tree.invisibleRootItem()
         for i in range(root.childCount()):
             item = root.child(i)
-            if item.text(0) == "コンソール接続":
+            if item.data(0, self.CONSOLE_GROUP_ROLE):
                 return item
         return None
 
