@@ -16,6 +16,64 @@ from .ftp_server import UNDECRYPTABLE_PASSWORD_MESSAGE
 from .tftp_server import PREVIOUS_STOP_INCOMPLETE_MESSAGE
 
 
+class _LogLimiter:
+    """診断の行（print）を種類ごとに間引く。
+
+    認証済みの相手が同じ要求を繰り返すだけで、要求ごとの行が際限なく出る
+    （実測: 3 秒で 2808 行ずつ・約 1.7GB/時）。exe では標準出力が上限も回転も
+    無いログファイルなので、ディスクを埋められる。種類ごとに WINDOW_SECONDS
+    あたり LIMIT 行まで出し、超えた分は数えるだけにする。省いた件数は、次の
+    窓の最初の行の前か、flush()（サーバーの停止）で 1 行にして出す
+    """
+
+    WINDOW_SECONDS = 60.0
+    LIMIT = 100
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._windows = {}   # 種類 -> [窓の始まり, 出した行数, 省いた行数]
+        self._now = time.monotonic
+
+    def log(self, kind, text):
+        now = self._now()
+        lines = []
+        with self._lock:
+            window = self._windows.get(kind)
+            if window is None or now - window[0] >= self.WINDOW_SECONDS:
+                if window is not None and window[2]:
+                    lines.append(self._summary(kind, window[2]))
+                window = self._windows[kind] = [now, 0, 0]
+            if window[1] < self.LIMIT:
+                window[1] += 1
+                lines.append(text)
+            else:
+                window[2] += 1
+        for line in lines:
+            print(line)
+
+    def flush(self):
+        """省いたまま出していない件数を出し、窓を空にする"""
+        with self._lock:
+            omitted = [(kind, window[2])
+                       for kind, window in self._windows.items() if window[2]]
+            self._windows.clear()
+        for kind, count in omitted:
+            print(self._summary(kind, count))
+
+    def _summary(self, kind, count):
+        return ("[SFTP Server] %s: %d more line(s) suppressed (limit %d per %ds)"
+                % (kind, count, self.LIMIT, self.WINDOW_SECONDS))
+
+
+# サーバー全体で 1 つ（ログファイルは 1 つなので、接続ごとには分けない）
+_diag_log = _LogLimiter()
+
+
+def _log_limited(kind, text):
+    """要求ごとに出る診断行を出す（_LogLimiter で種類ごとに間引く）"""
+    _diag_log.log(kind, text)
+
+
 class _OpenWriters:
     """書き込み用に開いているハンドルと、それを扱う SFTP のスレッドの一覧。
 
@@ -244,12 +302,13 @@ class SFTPServerHandler(SFTPServerInterface):
                     attr = SFTPAttributes.from_stat(stat_info, filename)
                     items.append(attr)
                 except Exception as e:
-                    print(f"[SFTP Server] list_folder skipped {filename}: {e}")
+                    _log_limited("list_folder skipped",
+                                 f"[SFTP Server] list_folder skipped {filename}: {e}")
                     continue
 
             return items
         except Exception as e:
-            print(f"[SFTP Server] list_folder error: {e}")
+            _log_limited("list_folder error", f"[SFTP Server] list_folder error: {e}")
             return SFTP_FAILURE
     
     def stat(self, path):
@@ -259,7 +318,7 @@ class SFTPServerHandler(SFTPServerInterface):
             stat_info = os.stat(real_path)
             return SFTPAttributes.from_stat(stat_info)
         except Exception as e:
-            print(f"[SFTP Server] stat error: {e}")
+            _log_limited("stat error", f"[SFTP Server] stat error: {e}")
             return SFTP_FAILURE
     
     def lstat(self, path):
@@ -282,7 +341,7 @@ class SFTPServerHandler(SFTPServerInterface):
             stat_info = os.lstat(real_path)
             return SFTPAttributes.from_stat(stat_info)
         except Exception as e:
-            print(f"[SFTP Server] lstat error: {e}")
+            _log_limited("lstat error", f"[SFTP Server] lstat error: {e}")
             return SFTP_FAILURE
     
     def open(self, path, flags, attr):
@@ -319,7 +378,8 @@ class SFTPServerHandler(SFTPServerInterface):
             if tracked and not self._open_writers.reserve(real_path):
                 # 開くと O_TRUNC が相手の書きかけを切り詰め、双方が成功で
                 # 終わるのに中身が混ざる。TFTP の同名 WRQ と同じく断る
-                print(f"[SFTP Server] open refused, already open for writing: {real_path}")
+                _log_limited("open refused",
+                             f"[SFTP Server] open refused, already open for writing: {real_path}")
                 if self._notify is not None:
                     self._notify("他の転送が書き込み中のため断りました: %s" % path)
                 return SFTP_FAILURE
@@ -358,7 +418,7 @@ class SFTPServerHandler(SFTPServerInterface):
             if reserved:
                 # 開けなかった。予約を残すと、その保存先へ二度と書けなくなる
                 self._open_writers.release(real_path)
-            print(f"[SFTP Server] open error: {e}")
+            _log_limited("open error", f"[SFTP Server] open error: {e}")
             return SFTP_FAILURE
 
     def remove(self, path):
@@ -370,7 +430,7 @@ class SFTPServerHandler(SFTPServerInterface):
                 os.remove(target)
             return SFTP_OK
         except Exception as e:
-            print(f"[SFTP Server] remove error: {e}")
+            _log_limited("remove error", f"[SFTP Server] remove error: {e}")
             return SFTP_FAILURE
     
     def rename(self, oldpath, newpath):
@@ -383,7 +443,7 @@ class SFTPServerHandler(SFTPServerInterface):
                 os.rename(source, target)
             return SFTP_OK
         except Exception as e:
-            print(f"[SFTP Server] rename error: {e}")
+            _log_limited("rename error", f"[SFTP Server] rename error: {e}")
             return SFTP_FAILURE
     
     def mkdir(self, path, attr):
@@ -393,7 +453,7 @@ class SFTPServerHandler(SFTPServerInterface):
             os.mkdir(real_path)
             return SFTP_OK
         except Exception as e:
-            print(f"[SFTP Server] mkdir error: {e}")
+            _log_limited("mkdir error", f"[SFTP Server] mkdir error: {e}")
             return SFTP_FAILURE
     
     def rmdir(self, path):
@@ -403,7 +463,7 @@ class SFTPServerHandler(SFTPServerInterface):
             os.rmdir(self._get_link_path(path))
             return SFTP_OK
         except Exception as e:
-            print(f"[SFTP Server] rmdir error: {e}")
+            _log_limited("rmdir error", f"[SFTP Server] rmdir error: {e}")
             return SFTP_FAILURE
     
     def chattr(self, path, attr):
@@ -427,7 +487,8 @@ class SFTPServerHandler(SFTPServerInterface):
                 if self._open_writers is not None:
                     reserved = self._open_writers.reserve_for_truncate(real_path)
                     if reserved is None:
-                        print(f"[SFTP Server] truncate refused, open for writing: {real_path}")
+                        _log_limited("truncate refused",
+                                     f"[SFTP Server] truncate refused, open for writing: {real_path}")
                         if self._notify is not None:
                             self._notify("他の転送が書き込み中のため断りました: %s" % path)
                         return SFTP_FAILURE
@@ -453,7 +514,7 @@ class SFTPServerHandler(SFTPServerInterface):
                 os.chmod(real_path, attr.st_mode)
             return SFTP_OK
         except Exception as e:
-            print(f"[SFTP Server] chattr error: {e}")
+            _log_limited("chattr error", f"[SFTP Server] chattr error: {e}")
             return SFTP_FAILURE
 
 
@@ -806,6 +867,9 @@ class SFTPServerManager(QObject):
             print(f"[SFTP Server] File operation still in progress after stop: {path}")
             if writer not in self._unfinished:
                 self._unfinished.append(writer)
+        # 間引いたまま出していない件数を残す（同じ種類の行がもう来なくても
+        # 失わない）
+        _diag_log.flush()
         self.stopped.emit()
         print("[SFTP Server] Server stopped")
         return self._previous_stop_finished()
