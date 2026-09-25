@@ -1331,6 +1331,7 @@ class SNMPPanel(QWidget):
             self.snmp_manager.operation_completed.connect(self._on_operation_completed)
             self.snmp_manager.operation_partial.connect(self._on_operation_partial)
             self.snmp_manager.operation_cancelled.connect(self._on_operation_cancelled)
+            self.snmp_manager.progress_update.connect(self._on_operation_progress)
             self.snmp_manager.trap_received.connect(self._on_trap_received)
             self.snmp_manager.trap_receiver_started.connect(self._on_trap_receiver_started)
             self.snmp_manager.trap_receiver_stopped.connect(self._on_trap_receiver_stopped)
@@ -1358,6 +1359,20 @@ class SNMPPanel(QWidget):
         使われると、機器に無いものを「無い」と読み違える。
         """
         self._partial_reason = reason
+
+    def _on_operation_progress(self, message: str):
+        """WALK の途中経過（100 件ごとの件数）を表示へ出す
+
+        表は完了まで空なので、出さないと長い WALK の実行中に件数を知る
+        手段が無い（進捗を出すのは WALK だけ）。出すのは停止ボタンが出て
+        いて押せるとき（実行中で、停止を押す前）だけにし、「停止中…」と
+        結果の表示は上書きしない。isVisible() は使わない（パネル自体が
+        隠れていると偽になる）。進捗は結果と同じワーカーから queued で
+        積まれるので、結果より後に届くことは無い。
+        """
+        if self.stop_button.isHidden() or not self.stop_button.isEnabled():
+            return
+        self.status_label.setText("WALK実行中...（%s）" % message.rstrip("."))
 
     # 利用者が止めた結果の、途中までの理由。書き出しの partial_reason にも入る
     USER_CANCEL_REASON = "利用者が中断"
