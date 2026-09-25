@@ -11,7 +11,7 @@ from typing import Dict, Optional
 # MIB 解析器の版。抽出・解決の規則を変えたら上げる。mib_cache.json は
 # この値も鍵にするので、古い解析器が作ったキャッシュがアプリの更新後に
 # そのまま使われることがなくなる。
-MIB_PARSER_VERSION = '2026-09-23.2'
+MIB_PARSER_VERSION = '2026-09-26.1'
 
 
 def app_dir() -> str:
@@ -546,6 +546,12 @@ class MIBResolver:
         _MIB_NAME + r'\s+OBJECT-IDENTITY\b' + _MIB_DEFINITION_BODY
         + _MIB_ASSIGNMENT,
     )
+    # SMIv1 の Trap（RFC 1215）。`ENTERPRISE 親 … ::= 番号` の Trap は
+    # 親の下の 0.番号 として届く（RFC 3584 の v1→v2 変換。pysnmp も同じ
+    # OID を snmpTrapOID に置く）。拾わないと、SMIv1 のベンダー Trap が
+    # 'acme.0.7' のように番号のまま出る（実測）
+    _MIB_TRAP_TYPE = (_MIB_NAME + r'\s+TRAP-TYPE\s+ENTERPRISE\s+([\w-]+)'
+                      + _MIB_DEFINITION_BODY + r'::=\s*(\d+)')
     # そのモジュールが宣言している名前。上の抽出は `::= { 親 添字 }` の形
     # しか拾わないので、実 MIB にある複数添字の右辺（`::= { aRoot 0 1 }`）
     # で宣言された名前は定義の一覧から落ちる。落ちた名前を「このモジュール
@@ -779,6 +785,10 @@ class MIBResolver:
                         definitions.append(
                             (match.group(1), match.group(2), match.group(3),
                              module))
+                for match in re.finditer(self._MIB_TRAP_TYPE, text,
+                                         re.MULTILINE | re.DOTALL):
+                    definitions.append((match.group(1), match.group(2),
+                                        '0.' + match.group(3), module))
         except OSError:
             # 読めなかった（排他ロック・ACL など）ことは空の結果にせず、
             # 呼び出し側へ返す。空で返すと解析済みとして mtime ごと
