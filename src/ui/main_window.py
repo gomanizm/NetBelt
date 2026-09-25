@@ -1158,7 +1158,13 @@ class MainWindow(QMainWindow):
         self.terminal_widget.queue_output(device_name, text)
 
     def _drop_sftp_manager(self, device_name: str) -> None:
-        """機器の SFTP マネージャを切断して外し、表示中ならパネルも空にする"""
+        """機器の SFTP マネージャを切断して外し、表示中ならパネルも空にする
+
+        後始末では SSH の接続を先に閉じてから呼ぶ。SFTPClient.close は SFTP の
+        チャネルへ CHANNEL_CLOSE を書くので、相手が TCP まで受け取りを止めて
+        いる間は書けるまで GUI スレッドが止まる（実測: タブを閉じるのに 4.9 秒）。
+        先に Transport が閉じていれば、チャネルも閉じ済みで何も書かない。
+        """
         if device_name not in self.sftp_managers:
             return
         sftp_mgr = self.sftp_managers.pop(device_name)
@@ -1571,11 +1577,12 @@ class MainWindow(QMainWindow):
             return
         self.status_bar.showMessage(f"{device_name} から切断されました")
         
+        # 接続を閉じてから削除（閉じないとポートを掴んだまま残る）。
+        # SFTP より先に閉じる（_drop_sftp_manager 参照）
+        self._dispose_connection(device_name)
+        
         # SFTP接続を切断
         self._drop_sftp_manager(device_name)
-        
-        # 接続を閉じてから削除（閉じないとポートを掴んだまま残る）
-        self._dispose_connection(device_name)
 
         # 切断メッセージと再接続方法を表示
         self.terminal_widget.show_notice(
@@ -1603,9 +1610,9 @@ class MainWindow(QMainWindow):
         else:
             # その他のエラー
             self.terminal_widget.show_notice(device_name, f"\nエラー: {error}\n")
-            # 閉じた client を抱えた SFTP マネージャを残さない
-            self._drop_sftp_manager(device_name)
             self._dispose_connection(device_name)
+            # 閉じた client を抱えた SFTP マネージャを残さない（SSH の後に閉じる）
+            self._drop_sftp_manager(device_name)
             # 切断時（_on_connection_closed）と同じく再接続待ちへ戻す。
             # ここを抜かすと、Enter で始めた再接続が失敗したあと誰も待ちを
             # 張り直さず、画面に残る案内どおりに Enter を押しても何も
@@ -1697,10 +1704,8 @@ class MainWindow(QMainWindow):
         # マクロマネージャーのクリーンアップ
         self.macro_manager.cleanup_device(device_name)
         
-        # SFTP接続を切断
-        self._drop_sftp_manager(device_name)
-        
-        # SSH接続を切断（接続が存在する場合のみ）
+        # SSH接続を切断（接続が存在する場合のみ）。SFTP より先に閉じる
+        # （_drop_sftp_manager 参照）
         if device_name in self.connections:
             try:
                 self.connections[device_name].disconnect()
@@ -1712,6 +1717,9 @@ class MainWindow(QMainWindow):
                 del self.connections[device_name]
             
             self.status_bar.showMessage(f"{device_name} の接続を切断しました")
+        
+        # SFTP接続を切断
+        self._drop_sftp_manager(device_name)
     
     def _on_add_group(self):
         """グループ追加ダイアログを表示"""
@@ -2964,26 +2972,27 @@ for details.
         for device_name in list(self.connections.keys()):
             self.macro_manager.cleanup_device(device_name)
         
+        # すべての接続を切断（SSH/シリアル）。記録を閉じるより先に切るのは、
+        # 受信スレッドを止めてからでないと記録し切れないため（下の
+        # _drain_output_before_log_finish）。conn.disconnect() ではなく
+        # _dispose_connection() を使う。disconnect() は disconnected を出し、
+        # その先の _on_connection_closed が切断バナーを端末へ書くので、
+        # まだ開いている記録へ終了時の案内が混ざる。
+        # SFTP より先に閉じる（_drop_sftp_manager 参照）
+        closed = list(self.connections.values())
+        for device_name in list(self.connections.keys()):
+            self._dispose_connection(device_name)
+
+        self.connections.clear()
+
         # すべてのSFTP接続を切断。知らせを外すのは、配送待ちを配り切った後
-        closed = list(self.sftp_managers.values())
+        closed.extend(self.sftp_managers.values())
         for device_name, sftp_mgr in list(self.sftp_managers.items()):
             try:
                 sftp_mgr.disconnect()
             except Exception:
                 pass
         self.sftp_managers.clear()
-        
-        # すべての接続を切断（SSH/シリアル）。記録を閉じるより先に切るのは、
-        # 受信スレッドを止めてからでないと記録し切れないため（下の
-        # _drain_output_before_log_finish）。conn.disconnect() ではなく
-        # _dispose_connection() を使う。disconnect() は disconnected を出し、
-        # その先の _on_connection_closed が切断バナーを端末へ書くので、
-        # まだ開いている記録へ終了時の案内が混ざる
-        closed.extend(self.connections.values())
-        for device_name in list(self.connections.keys()):
-            self._dispose_connection(device_name)
-
-        self.connections.clear()
 
         # 受信済みでまだ描いていない出力を記録し切ってから、記録を止めて
         # ファイルを閉じる。記録へ書くのは描くときなので、ここで済ませないと

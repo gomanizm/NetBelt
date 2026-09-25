@@ -1042,13 +1042,18 @@ class SSHConnection(QObject):
         if self._read_thread and self._read_thread.is_alive():
             self._read_thread.join(timeout=2)
 
-        if self.channel:
-            self.channel.close()
-            self.channel = None
-
+        # client（Transport）をチャネルより先に閉じる。channel.close は相手へ
+        # CHANNEL_CLOSE を書くので、相手が TCP まで受け取りを止めている間は
+        # 書けるまで戻らず、GUI スレッドが止まっていた（実測 7 秒。相手が
+        # 受け取らないままなら無期限）。Transport.close は書き込みを待たずに
+        # ソケットを閉じ、そのあとの channel.close は閉じ済みで何も書かない
         if self.client:
             self.client.close()
             self.client = None
+
+        if self.channel:
+            self.channel.close()
+            self.channel = None
 
     def disconnect(self):
         """SSH接続を切断（同じオブジェクトで繋ぎ直せる）"""
