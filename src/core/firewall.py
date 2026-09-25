@@ -270,9 +270,18 @@ def _self_rule_name():
     return "{0} - app inbound (self)".format(_RULE_PREFIX)
 
 
+# 自exe受信許可の成功の文言に添える但し書き。ブロック規則の delete は対象が
+# 無くても rc!=0 なので結果で判断できず、昇格の経路も許可規則の存在しか
+# 確かめていない。GPO で配られたブロック規則はローカルの delete では消えず、
+# Windows はブロックを許可より優先するので、「保証」と言い切ると受信が
+# 通らないのに完了と読める（実測）
+_BLOCK_NOT_CHECKED = "既存のブロック規則の除去は確認していません"
+
+
 def ensure_self_program_allow():
     """自 exe 宛の受信ブロックを削除し受信許可を追加する（ブロックは許可を上書きするため）。
-    Windows かつ frozen のときのみ実行。冪等。未昇格なら UAC 昇格で netsh 実行。"""
+    Windows かつ frozen のときのみ実行。冪等。未昇格なら UAC 昇格で netsh 実行。
+    ブロックの削除は試みるだけで、消えたかは確かめない（_BLOCK_NOT_CHECKED）。"""
     if not is_windows():
         return True, "非Windowsのためスキップ"
     prog = _self_program()
@@ -290,7 +299,7 @@ def ensure_self_program_allow():
                         "action=allow", 'program=' + prog, "profile=any", "enable=yes"])
             if r.returncode != 0:
                 return False, "自exe受信許可の追加に失敗: " + name
-            return True, "自exe受信許可を保証: " + name
+            return True, "自exe受信許可を追加（%s）: %s" % (_BLOCK_NOT_CHECKED, name)
         # 未昇格: cmd.exe /c 経由で delete(block)+add(allow) を昇格実行（& をシェルに解釈させる）。
         # ShellExecuteW(lpFile="netsh") は netsh を直接起動するため & がシェル区切りにならず add が実行されない。
         #
@@ -317,7 +326,8 @@ def ensure_self_program_allow():
             # 名前だけで確かめると、旧配置先向けの同名ルールが残っている
             # 環境で、新しい exe への add が失敗していても「完了」と出る
             if rule_exists(name, program=prog):
-                return True, "自exe受信許可を追加(昇格): " + name
+                return True, "自exe受信許可を追加（管理者昇格。%s）: %s" % (
+                    _BLOCK_NOT_CHECKED, name)
         # 反映を確認できないものを成功にすると「通らないのに完了」と出る
         return False, "自exe受信許可を要求したが反映を確認できず: " + name
     except Exception as e:
