@@ -551,10 +551,13 @@ class Screen(object):
             self._pending_wrap = False
             self._printed_at_last_col = False
         elif ch == "\t":
-            self.cursor_col = min(self.cols - 1,
-                                  (self.cursor_col // 8 + 1) * 8)
-            self._pending_wrap = False
-            self._printed_at_last_col = False
+            # 右端で折り返し待ちなら何もしない。xterm の TAB も桁を動かす
+            # だけで待ちを解かない。解くと、右端のままのカーソルへ続く
+            # 1 文字が受信済みの右端の文字を黙って潰す
+            if not self._pending_wrap:
+                self.cursor_col = min(self.cols - 1,
+                                      (self.cursor_col // 8 + 1) * 8)
+                self._printed_at_last_col = False
         elif ch == "\x0e":              # SO: G1 へ
             self._charset = ")"
         elif ch == "\x0f":              # SI: G0 へ
