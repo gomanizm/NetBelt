@@ -18,7 +18,9 @@ XTerm Control Sequences。
 (右端まで届かない形で) 書き直すと印が外れ、履歴・コピー・ログでは次の
 行との間に改行が入る。印字が複数回に分かれて届いた場合も、右端までの
 書き直しが途中で切れると印は外れる。続きの行そのものが無くなる命令
-(ED 0・IL・DL・スクロール) では、その場で印を外す。
+(ED 0・IL・DL・スクロール) では、その場で印を外す。0 行目の上 (履歴へ
+送った最後の行) も同じ扱いで、0 行目へ別の行が来たら閉じる
+(_break_history。代替画面にいる間は閉じない)。
 
 DECOM (ESC[?6h) は保持しない。有効なら CUP・VPA の行番号は
 スクロール範囲の上端から数えるべきだが、ここでは常に画面の
@@ -113,6 +115,10 @@ class Screen(object):
         self._new_history = collections.deque()
         self._new_history_lines = 0     # 差分に入っている論理行の数
         self._history_dropped = False
+        # 最後に記録した履歴の行が、折り返しで画面の 0 行目へ続いている
+        self._history_open = False
+        # 描画側へ渡し済みのその行を、文書の上で閉じてほしい
+        self._history_break = False
         self.title = ""
         self.responses = []             # 機器へ送り返す応答 (DSR/DA)
         self.reset()
@@ -210,6 +216,7 @@ class Screen(object):
         する必要があるので、印付きの行は 1 回の描画単位ぶんの入力で
         抑えられており、上限に数えなくても青天井にはならない。
         """
+        self._history_open = wrapped
         self._new_history.append((line, wrapped))
         if not wrapped:
             self._new_history_lines += 1
@@ -230,6 +237,29 @@ class Screen(object):
         dropped = self._history_dropped
         self._history_dropped = False
         return dropped
+
+    def take_history_break(self):
+        """渡し済みの履歴の最後の行を文書の上で閉じるべきかを返して忘れる。"""
+        brk = self._history_break
+        self._history_break = False
+        return brk
+
+    def _break_history(self):
+        """0 行目へ別の行が来たので、履歴の最後の行はもう 0 行目へ続かない。
+
+        画面の中なら _drop_mark_above や行頭からの印字が上の行の印を外すが、
+        0 行目の上は履歴で、印ごと記録済み。描画側へまだ渡していなければ
+        差分の最後の行の印を外し、渡し済みなら描画側へ知らせる。代替画面に
+        いる間は閉じない (戻ればメイン画面の 0 行目は元の続きのまま)。
+        """
+        if self.alt_active or not self._history_open:
+            return
+        self._history_open = False
+        if self._new_history:
+            self._new_history[-1] = (self._new_history[-1][0], False)
+            self._new_history_lines += 1
+        else:
+            self._history_break = True
 
     def take_dirty(self):
         """描き直しが要る行番号を返して忘れる。"""
@@ -432,6 +462,8 @@ class Screen(object):
                 # 折り返しで来たのではなく行頭から書き始めた。ここは
                 # 新しい論理行の先頭なので、前の行の古い印を落とす
                 self.wrapped[self.cursor_row - 1] = False
+            elif self.cursor_col == 0:
+                self._break_history()   # 0 行目の上は履歴の最後の行
             if entry_row != self.cursor_row:
                 entry_row = self.cursor_row
                 entry_mark = self.wrapped[entry_row]
@@ -495,6 +527,8 @@ class Screen(object):
             elif self.cursor_col == 0 and self.cursor_row:
                 # 行頭から書き始めた。前の行の古い印を落とす (_print_chars)
                 self.wrapped[self.cursor_row - 1] = False
+            elif self.cursor_col == 0:
+                self._break_history()   # 0 行目 (_print_chars)
             row, col = self.cursor_row, self.cursor_col
             if entry_row != row:
                 entry_row = row
@@ -656,7 +690,10 @@ class Screen(object):
             self.lines.insert(self.scroll_top, self._blank_line())
             self.wrapped.insert(self.scroll_top, False)
         # 範囲の上端へ空行が割り込んだ。1 つ上の行の続きはそこには無い
+        # (上端が画面の先頭なら、1 つ上は履歴の最後の行)
         self._drop_mark_above(self.scroll_top)
+        if self.scroll_top == 0:
+            self._break_history()
         # 下端も同じ。下端にあった行は範囲の外へ続きを置いたまま捨てられ、
         # 代わりに 1 つ上の行が上がってくる。その行の続きは今捨てた行
         # なので、印を残すと範囲の外の行と 1 行に繋がる
@@ -1170,6 +1207,10 @@ class Screen(object):
         # もう下に無いので印を外す。残すと、無関係な 2 つの論理行が履歴・
         # コピー・文書で 1 行に繋がる
         self._drop_mark_above(self.cursor_row)
+        if insert and self.cursor_row == 0:
+            # 0 行目へ空行が来た。1 つ上は履歴の最後の行。DL は 0 行目
+            # そのものを履歴へ送る (その行が新しい最後の行) ので閉じない
+            self._break_history()
         if insert:
             # IL は範囲の下端の行を、続きを範囲の外へ置いたまま捨てて
             # 1 つ上の行を下端へ上げる。上がってきた行の続きは今捨てた行

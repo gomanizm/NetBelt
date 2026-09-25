@@ -1295,6 +1295,12 @@ class TerminalWidget(QWidget):
         pending = []                        # (属性, [文字列, ...]) の並び
         column = region.positionInBlock()   # 溜めた分を書いた後の行内位置
         probe_text = None
+        if screen.take_history_break() and column:
+            # 書き済みの履歴の最後の行は折り返しで画面の 0 行目へ続いていた
+            # (改行なしで書いた) が、0 行目は別の行に入れ替わった。境目で
+            # 行を閉じる。MAX_BLOCK_CHARS で既に切ってあれば (行頭) 足さない
+            region.insertText("\n", QTextCharFormat())
+            column = 0
         if screen.take_history_dropped():
             # 押し出された行が多すぎて、画面側が古い方を捨てた（ESC[nS の
             # 連打）。文書の先頭を切り捨てたのと同じことなので、「全ログ
