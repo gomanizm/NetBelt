@@ -290,6 +290,7 @@ class Screen(object):
             alt, alt_marks = self._other, self._other_wrapped
             keep_row = self.cursor_row
 
+        pushed = 0                      # 履歴へ送った行の数
         while len(main) > rows:
             if keep_row < len(main) - 1 and all(c == BLANK for c in main[-1]):
                 main.pop()
@@ -299,6 +300,18 @@ class Screen(object):
                 self._record_new_history(self.history[-1],
                                          main_marks.pop(0))
                 keep_row = max(0, keep_row - 1)
+                pushed += 1
+        if pushed:
+            # メイン画面の DECSC (ESC 7 / ?1048h) の保存行も、履歴へ送った
+            # ぶんだけ上へずらす (代替画面にいる間は裏の _other_saved)。
+            # 1049 の保存と生きているカーソルは keep_row で追っている。
+            # ずらさないと ESC 8 が控えた行より下の受信済みの行へ戻って潰す
+            saved = self._other_saved if self.alt_active else self._saved
+            saved = (max(0, saved[0] - pushed),) + saved[1:]
+            if self.alt_active:
+                self._other_saved = saved
+            else:
+                self._saved = saved
         while len(main) < rows:
             main.append([BLANK] * cols)
             main_marks.append(False)
