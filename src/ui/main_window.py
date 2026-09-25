@@ -675,8 +675,11 @@ class MainWindow(QMainWindow):
         # タブを開いている（接続が残っている）機器の削除は、改名と同じく断る。
         # 消すと接続先リストから項目が無くなり、実行中のマクロを「ツール」
         # から止められなくなる（接続もマクロも残る）
-        if (self.terminal_widget.has_terminal(device_name)
-                or device_name in self.connections):
+        # （接続先が違えば同名の別の機器＝手編集の config のセッションなので通す）
+        if ((self.terminal_widget.has_terminal(device_name)
+                or device_name in self.connections)
+                and not (device_data is not None and
+                         self._session_target_conflict(device_name, device_data))):
             QMessageBox.warning(
                 self, "機器の削除",
                 f"'{device_name}' のタブを開いている間は、削除できません。\n"
@@ -705,7 +708,11 @@ class MainWindow(QMainWindow):
                     endpoint=self._endpoint_of(device_data)):
                 # 消した機器の接続情報を残さない（残すと、開いたままの
                 # タブで Enter を押したときに消したはずの機器へ繋がる）
-                self.device_info.pop(device_name, None)
+                # （接続先が違う写しは、同名の別の機器のセッションのものなので残す）
+                session = self.device_info.get(device_name)
+                if (device_data is None or session is None
+                        or self._endpoint_of(session) == self._endpoint_of(device_data)):
+                    self.device_info.pop(device_name, None)
                 # ツリーを再読み込み
                 self._load_devices()
                 self.status_bar.showMessage(f"機器 '{device_name}' を削除しました")
