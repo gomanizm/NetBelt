@@ -209,6 +209,46 @@ class SFTPManager(QObject):
         self.error_occurred.emit(f"SFTP接続エラー: {reason}")
         return False
 
+    def _open_sftp_within_deadline(self, ssh_client):
+        """open_sftp() を CHANNEL_TIMEOUT_SECONDS まで待つ（過ぎたら TimeoutError）
+
+        paramiko の open_sftp() は subsystem 要求の返事も VERSION も期限なしで
+        待つ（settimeout は開けたあとにしか掛けられない）。SFTP だけ黙る機器
+        では connect が戻らず、知らせも出ないまま SFTP 非対応の機器と見分けが
+        つかなくなる。内側のスレッドで呼び、期限で待つのをやめる（利用者の
+        決定: 案 W）。期限のあとで開けたクライアントはそのスレッドが閉じる。
+        内側のスレッドと機器側のチャンネルは、応答が来るか SSH が切れるまで残る。
+        """
+        box = {}
+        box_lock = threading.Lock()
+
+        def opener():
+            try:
+                client = ssh_client.open_sftp()
+            except Exception as e:
+                with box_lock:
+                    box["error"] = e
+                return
+            with box_lock:
+                if not box.get("abandoned"):
+                    box["client"] = client
+                    return
+            try:
+                client.close()   # 待つのをやめたあとに開けた。誰も使わない
+            except Exception:
+                pass
+
+        worker = threading.Thread(target=opener, daemon=True)
+        worker.start()
+        worker.join(self.CHANNEL_TIMEOUT_SECONDS)
+        with box_lock:
+            if "client" in box:
+                return box["client"]
+            if "error" in box:
+                raise box["error"]
+            box["abandoned"] = True
+        raise TimeoutError(f"機器が{self.CHANNEL_TIMEOUT_SECONDS:g}秒応答しません")
+
     def connect(self, ssh_client: paramiko.SSHClient) -> bool:
         """
         SFTP接続を開始（既存のSSHクライアントを使用）
@@ -224,9 +264,9 @@ class SFTPManager(QObject):
                 self.error_occurred.emit("SSHクライアントが無効です")
                 return False
             
-            # SSHクライアントからSFTPセッションを取得
+            # SSHクライアントからSFTPセッションを取得（期限つき）
             self.ssh_client = ssh_client
-            self.sftp_client = ssh_client.open_sftp()
+            self.sftp_client = self._open_sftp_within_deadline(ssh_client)
             # 応答待ちに期限を入れる。ここより後の normalize を含め、
             # このチャンネル越しの全操作が期限切れで socket.timeout を
             # 投げるようになり、各操作の except がエラー通知へ変える
