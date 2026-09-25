@@ -622,6 +622,23 @@ class SNMPPanel(QWidget):
             self.trap_v3_priv_combo.currentData(),
             self.trap_v3_priv_password_edit.text())
 
+    def _trap_community_input_error(self):
+        """
+        Trap 受信が何も受け付けない設定なら、その説明を返す（無ければ None）
+
+        Community が空（空白だけも core が落とす）で v3 ユーザも無いと、
+        登録する資格情報が 1 つも無いまま受信が始まり、「受信中」と出るのに
+        1 件も受けない（実測）。v3 の検査と同じ理由で、実行前に止める。
+        「両方」で v3 ユーザがあれば、v3 は受けられるので止めない。
+        """
+        version = self.trap_version_combo.currentText()
+        if version == 'v3' or self.trap_community_edit.text().strip():
+            return None
+        if version == '両方' and self.trap_v3_username_edit.text().strip():
+            return None
+        return ("v1/v2c の Trap を受けるには Community を入力してください。\n"
+                "v3 だけを受けるならバージョンを「v3」にしてください。")
+
     def _collect_trap_v3_users(self) -> list:
         """
         Trap 受信用の v3 ユーザ定義を組み立てる
@@ -1027,6 +1044,10 @@ class SNMPPanel(QWidget):
         v3_error = self._trap_v3_input_error()
         if v3_error:
             QMessageBox.warning(self, "エラー", v3_error)
+            return
+        community_error = self._trap_community_input_error()
+        if community_error:
+            QMessageBox.warning(self, "エラー", community_error)
             return
         
         # Trap受信を開始
