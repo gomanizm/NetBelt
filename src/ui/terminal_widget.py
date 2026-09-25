@@ -201,8 +201,11 @@ class InteractiveTerminal(QTextEdit):
         ドラッグ＆ドロップを始める。端末では Tera Term と同じく、どこから
         ドラッグしても範囲選択にする。押す前に選択を外しておけば、Qt は
         ドラッグではなく選択として扱う。
+        修飾キーが Shift だけのときは外さない。Qt はそのとき選択の起点から
+        広げ（ドラッグは始めない）、外すと Shift+クリックの拡張が空になる。
         """
         if (event.button() == Qt.MouseButton.LeftButton
+                and event.modifiers() != Qt.KeyboardModifier.ShiftModifier
                 and self.textCursor().hasSelection()):
             bar = self.verticalScrollBar()
             value = bar.value()
