@@ -60,7 +60,7 @@ class FTPServerManager(QObject):
         # 積み上がる（パネルのログの行数上限が効くのは配送の後）。TFTP の
         # protocol_event と同じく、超過中は数えるだけにして、はけた時点で
         # 省略した件数を 1 行だけ出す。数え違えないよう、この信号はすべて
-        # _emit_activity から出す。
+        # 配送待ちに数えてから出す（_emit_activity と、省略件数の要約）。
         # 転送の通知（開始・進捗・完了・中断）も同じカウンタに数える。
         # 数えないと、機器が小さいファイルの RETR を連打するだけで、
         # 接続・切断と同じようにキューへ積み上がる
@@ -152,10 +152,13 @@ class FTPServerManager(QObject):
             if self._pending_notices > 0:
                 self._pending_notices -= 1
             dropped = 0
-            if self._pending_notices == 0:
+            if self._pending_notices == 0 and self._dropped_notices:
                 dropped, self._dropped_notices = self._dropped_notices, 0
+                # 要約の枠は取り出すのと同じ錠の中で取る。錠を離してから取ると、
+                # その隙に別スレッドが枠を埋めて要約ごと省かれ、件数が失われる
+                self._pending_notices += 1
         if dropped:
-            self._emit_activity("", "表示が追いつかず %d 件の通知を省略しました" % dropped)
+            self.client_activity.emit("", "表示が追いつかず %d 件の通知を省略しました" % dropped)
 
     def _emit_started(self, ip, filename, total, direction, path=None, ftp_path=None):
         """開始を通知し、この転送の表示名を返す（束ねたときは既存の行の表示名）。

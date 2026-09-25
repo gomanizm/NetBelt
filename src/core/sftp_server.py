@@ -624,7 +624,7 @@ class SFTPServerManager(QObject):
         # 書き込みを断った通知（client_activity）も同じカウンタに数える。
         # 認証済みの相手が同じ名前への要求を繰り返すだけで、要求ごとに 1 件
         # 出る（実測: 5 秒で 10642 件）。数え違えないよう、この信号はすべて
-        # _emit_activity から出す
+        # 配送待ちに数えてから出す（_emit_activity と、省略件数の要約）
         self.max_pending_notices = 1000
         self._notice_lock = threading.Lock()
         self._pending_notices = 0
@@ -687,12 +687,15 @@ class SFTPServerManager(QObject):
             if self._pending_notices > 0:
                 self._pending_notices -= 1
             dropped = 0
-            if self._pending_notices == 0:
+            if self._pending_notices == 0 and self._dropped_notices:
                 dropped, self._dropped_notices = self._dropped_notices, 0
+                # この 1 行も client_activity なので同じく数える（FTP と同じ）。
+                # 数えずに出すと、届いたときに他の通知の分まで戻してしまう。
+                # 枠は取り出すのと同じ錠の中で取る。錠を離してから取ると、
+                # その隙に別スレッドが枠を埋めて要約ごと省かれ、件数が失われる
+                self._pending_notices += 1
         if dropped:
-            # この 1 行も client_activity なので同じく数える（FTP と同じ）。
-            # 数えずに出すと、届いたときに他の通知の分まで戻してしまう
-            self._emit_activity(
+            self.client_activity.emit(
                 "", "表示が追いつかず %d 件の通知を省略しました" % dropped)
 
     def _load_or_create_host_key(self):
