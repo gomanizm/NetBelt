@@ -1,4 +1,5 @@
 """SFTP サーバー実装"""
+import contextlib
 import os
 import socket
 import threading
@@ -86,6 +87,24 @@ class _OpenWriters:
         with self._lock:
             self._entries[handle] = (threading.current_thread(), real_path)
 
+    @contextlib.contextmanager
+    def busy(self, real_path):
+        """保存先を触っている最中（削除・改名・切り詰めなど）を一覧へ載せる。
+
+        書き込みハンドルと同じく alive() に出るので、共有フォルダで止まった
+        まま停止を迎えたスレッドを stop() が生き残りとして数え、次の start()
+        を断る。数えないと、後から戻った旧操作が新しい起動で受けた同名の
+        ファイルを消す・別名へ動かす。抜けたら外す
+        """
+        token = object()
+        with self._lock:
+            self._entries[token] = (threading.current_thread(), real_path)
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._entries.pop(token, None)
+
     def discard(self, handle):
         with self._lock:
             entry = self._entries.pop(handle, None)
@@ -136,6 +155,12 @@ class SFTPServerHandler(SFTPServerInterface):
         # 利用者へ見せる出来事をパネルのログへ渡す口（1 行の文字列を受け取る）
         self._notify = notify
         
+    def _busy(self, real_path):
+        """保存先を触る間、停止に見えるよう一覧へ載せる（_OpenWriters.busy）"""
+        if self._open_writers is None:
+            return contextlib.nullcontext()
+        return self._open_writers.busy(real_path)
+
     def _get_real_path(self, path):
         """SFTP のパスを実際のファイルシステムパスに変換する（chroot を模擬）。
 
@@ -300,7 +325,10 @@ class SFTPServerHandler(SFTPServerInterface):
                 return SFTP_FAILURE
             reserved = tracked
 
-            fd = os.open(real_path, flags | getattr(os, "O_BINARY", 0))
+            # O_TRUNC は開く時点で切り詰めるので、開く間も停止に見せる
+            with (self._busy(real_path) if tracked
+                  else contextlib.nullcontext()):
+                fd = os.open(real_path, flags | getattr(os, "O_BINARY", 0))
             if flags & os.O_RDWR:
                 mode = 'a+b' if (flags & os.O_APPEND) else 'r+b'
             elif writing:
@@ -337,7 +365,9 @@ class SFTPServerHandler(SFTPServerInterface):
         """ファイルを削除"""
         try:
             # リンクの先ではなくリンク自体を消す
-            os.remove(self._get_link_path(path))
+            target = self._get_link_path(path)
+            with self._busy(target):
+                os.remove(target)
             return SFTP_OK
         except Exception as e:
             print(f"[SFTP Server] remove error: {e}")
@@ -347,7 +377,10 @@ class SFTPServerHandler(SFTPServerInterface):
         """ファイル/ディレクトリ名を変更"""
         try:
             # リンクの先ではなくリンク自体を改名する
-            os.rename(self._get_link_path(oldpath), self._get_link_path(newpath))
+            source = self._get_link_path(oldpath)
+            target = self._get_link_path(newpath)
+            with self._busy(source), self._busy(target):
+                os.rename(source, target)
             return SFTP_OK
         except Exception as e:
             print(f"[SFTP Server] rename error: {e}")
@@ -399,7 +432,8 @@ class SFTPServerHandler(SFTPServerInterface):
                             self._notify("他の転送が書き込み中のため断りました: %s" % path)
                         return SFTP_FAILURE
                 try:
-                    os.truncate(real_path, attr.st_size)
+                    with self._busy(real_path):
+                        os.truncate(real_path, attr.st_size)
                 finally:
                     if reserved:
                         # 失敗しても外す。残すと、この接続が切れるまで
@@ -761,14 +795,15 @@ class SFTPServerManager(QObject):
             thread.join(timeout=self.STOP_TIMEOUT_SECONDS)
         # 接続はすべて閉じた。書き込み用のハンドルを開いたまま生きている
         # スレッドは、切断に気づいて抜ける途中か、保存先への write()/close()
-        # の中で止まっている（共有フォルダの遅延・切断など）。前者を取り
-        # 違えないよう少しだけ待ち、それでも残った分を覚えて、消えるまで
-        # 次の start() を断る
+        # の中で止まっている（共有フォルダの遅延・切断など）。削除・改名・
+        # 切り詰めの最中のスレッドも同じ一覧に載る（_OpenWriters.busy）。
+        # 前者を取り違えないよう少しだけ待ち、それでも残った分を覚えて、
+        # 消えるまで次の start() を断る
         deadline = time.monotonic() + self.WRITER_STOP_TIMEOUT_SECONDS
         for writer, _path in self._open_writers.alive():
             writer.join(timeout=max(0.0, deadline - time.monotonic()))
         for writer, path in self._open_writers.alive():
-            print(f"[SFTP Server] Write still in progress after stop: {path}")
+            print(f"[SFTP Server] File operation still in progress after stop: {path}")
             if writer not in self._unfinished:
                 self._unfinished.append(writer)
         self.stopped.emit()
