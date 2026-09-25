@@ -819,19 +819,45 @@ class SFTPPanel(QWidget):
             self.SFTP_SETTING_DEFAULTS["default_download_path"])
         suggested = os.path.join(download_dir, file_info['name'])
         
-        local_path, _ = QFileDialog.getSaveFileName(
-            self,
-            "ファイルを保存",
-            suggested,
-            "すべてのファイル (*.*)"
-        )
-        
-        if local_path:
+        # 上書きの確認は保存ダイアログに任せず、ここで行う。ダイアログの確認に
+        # 任せると承認したかどうかが download_file へ届かず、呼ばれた時点の
+        # 有無から推し量るので、確認のあと外で作られた保存先を「承認済み」と
+        # 読んで置き換える（利用者の決定: 「いいえ」なら保存ダイアログを開き直す）
+        while True:
+            local_path, _ = QFileDialog.getSaveFileName(
+                self,
+                "ファイルを保存",
+                suggested,
+                "すべてのファイル (*.*)",
+                options=QFileDialog.Option.DontConfirmOverwrite
+            )
+            if not local_path:
+                return
             if not self._still_on(manager):
                 self._abandon("ダウンロード")
                 return
-            remote_path = self._remote_path(base_path, file_info['name'])
-            manager.download_file(remote_path, local_path)
+            overwrite = os.path.exists(local_path)
+            if not overwrite:
+                break
+            reply = QMessageBox.question(
+                self,
+                "上書き確認",
+                "'%s' が既にあります。上書きしますか？\n%s"
+                % (os.path.basename(local_path), local_path),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                if not self._still_on(manager):
+                    self._abandon("ダウンロード")
+                    return
+                break
+            # 選び直してもらう（ネイティブの確認で「いいえ」を押したときと同じ）
+            suggested = local_path
+        remote_path = self._remote_path(base_path, file_info['name'])
+        # 承認したかどうかをそのまま渡す。承認していなければ、このあと外で
+        # 作られた保存先も download_file が置き換えずに断る
+        manager.download_file(remote_path, local_path, overwrite=overwrite)
     
     def _on_create_directory(self, pinned=None):
         """新規ディレクトリ作成"""

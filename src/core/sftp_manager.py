@@ -1016,13 +1016,18 @@ class SFTPManager(QObject):
         with cls._download_targets_lock:
             cls._download_targets.discard(key)
 
-    def download_file(self, remote_path: str, local_path: str):
+    def download_file(self, remote_path: str, local_path: str,
+                      overwrite: Optional[bool] = None):
         """
         ファイルをダウンロード（バックグラウンド）
         
         Args:
             remote_path: リモートファイルパス
             local_path: ローカルファイルパス
+            overwrite: 利用者が保存先の上書きを承認したか。True なら既存を
+                置き換え、False なら保存先があれば置き換えずに断る（呼ぶ前の
+                確認のあとに外で作られた保存先も含む）。None なら下のとおり
+                呼ばれた時点の有無から推し量る（パネルは必ず明示して渡す）
 
         同じ保存先へのダウンロードが進行中（順番待ちを含む）なら、断って
         何もしない。保存ダイアログの上書き確認はその時点で有るものしか
@@ -1041,9 +1046,11 @@ class SFTPManager(QObject):
             self.error_occurred.emit("SFTP接続がありません")
             return
         
-        # 保存ダイアログが上書きを確認したかどうかの手掛かり。ここは
-        # ダイアログの直後（GUI スレッド）なので、まだ誰も割り込んでいない
-        overwrite_granted = os.path.exists(local_path)
+        # 上書きが承認されたか。渡されなければ、保存ダイアログが確認した
+        # かどうかを呼ばれた時点の有無から推し量る（確認のあと、ここまでに
+        # 外で作られた保存先は承認済みと読んでしまうので、明示が望ましい）
+        overwrite_granted = (os.path.exists(local_path) if overwrite is None
+                             else bool(overwrite))
 
         target_key = self._download_target_key(local_path)
         with self._download_targets_lock:
