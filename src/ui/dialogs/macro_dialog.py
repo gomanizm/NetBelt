@@ -11,6 +11,8 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, pyqtSignal
 from typing import List, Optional
 
+from core.config_manager import count_macros_named, is_readable_macro
+
 
 class MacroDialog(QDialog):
     """マクロ設定ダイアログ"""
@@ -25,10 +27,15 @@ class MacroDialog(QDialog):
                  keepalive_active: bool = False,
                  command_list_active: bool = False,
                  config_manager=None,
-                 keepalive_interval: int = 60):
+                 keepalive_interval: int = 60,
+                 connected: bool = True):
         super().__init__(parent)
         self.device_name = device_name
         self.keepalive_active = keepalive_active
+        # いまも繋がっているか。切断してもタブは残るので、切断済みのタブ名で
+        # このダイアログを開ける。繋がっていない機器で「開始」を押しても
+        # MainWindow は始めないので、押せる見た目にしない
+        self.connected = connected
         # いま動いている（または前回使った）送信間隔。_create_ui より前に
         # 退避しておかないと、送信間隔の欄が既定値のままになり、
         # 動作中の表示も次の開始も実間隔とずれる
@@ -110,13 +117,16 @@ class MacroDialog(QDialog):
         # ステータスラベル
         self.keepalive_status_label = QLabel("状態: 停止中")
         layout.addWidget(self.keepalive_status_label)
-        
+
         layout.addStretch()
-        
+
         # 初期状態を反映
         if self.keepalive_active:
             self._update_keepalive_ui(True)
-        
+        elif not self.connected:
+            self.keepalive_start_btn.setEnabled(False)
+            self.keepalive_status_label.setText("状態: 停止中（接続が切れています）")
+
         return widget
     
     def _create_preset_tab(self) -> QWidget:
@@ -176,17 +186,49 @@ class MacroDialog(QDialog):
         self.preset_list_widget.clear()
         
         # プリセットを読み込み
+        # 読み手側の保険。設定から来るので、リストでない値や、名前で指せない
+        # 要素（辞書でない・name が文字列でない）が混ざると、ここで落ちて
+        # マクロ設定が開かなくなる
         macros = self.config_manager.get_global_macros()
-        for macro in macros:
+        for macro in macros if isinstance(macros, list) else []:
+            if not is_readable_macro(macro):
+                continue
             name = macro.get("name", "")
             self.preset_list_widget.addItem(name)
     
     def _on_preset_new(self):
         """新規プリセットを作成"""
         dialog = PresetEditDialog(self, config_manager=self.config_manager)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
+        if self._exec_preset_dialog(dialog) == QDialog.DialogCode.Accepted:
             self._load_presets()
-    
+
+    def _exec_preset_dialog(self, dialog) -> int:
+        """プリセット編集ダイアログを開き、閉じたあとの破棄を予約して結果を返す
+
+        このダイアログは parent=self（マクロ設定）で作るので、exec() から
+        抜けても非表示のまま子として残り続ける。マクロ設定を開いたまま
+        プリセットを作り直すたびに積み上がるので、他のダイアログと同じく
+        破棄を予約して手放す（MacroDialog からは MainWindow._exec_dialog を
+        呼べないので、同じ中身をここへ置く）。
+
+        親から外す（setParent(None)）形は採らない。同じリポジトリの
+        PasteConfirmDialog はその形だが、ダイアログの親をここで外すと
+        トップレベルの窓になり、offscreen で走らせた試験一式では、その後の
+        イベント配送でプロセスごと落ちた（0xC0000005 / 0xC0000409。
+        tests/test_preset_edit_dialogs_are_released.py の冒頭を参照）。
+        破棄の予約だけなら _exec_dialog を通る 8 か所と同じ扱いになる。
+
+        Args:
+            dialog: 開くプリセット編集ダイアログ
+
+        Returns:
+            int: exec() の戻り値（QDialog.DialogCode）
+        """
+        try:
+            return dialog.exec()
+        finally:
+            dialog.deleteLater()
+
     def _on_preset_edit(self):
         """プリセットを編集"""
         current_item = self.preset_list_widget.currentItem()
@@ -196,6 +238,11 @@ class MacroDialog(QDialog):
         
         preset_name = current_item.text()
         if not self.config_manager:
+            return
+
+        # 同じ名前が複数あると、名前で引くので開くのは先頭の 1 件になる
+        # （2 行目を選んでも 1 件目の中身が開き、保存も 1 件目へ入る）
+        if self._refuse_duplicate_name(preset_name, "編集"):
             return
         
         macro = self.config_manager.get_macro_by_name(preset_name)
@@ -210,8 +257,8 @@ class MacroDialog(QDialog):
             commands=macro.get("commands", []),
             description=macro.get("description", "")
         )
-        
-        if dialog.exec() == QDialog.DialogCode.Accepted:
+
+        if self._exec_preset_dialog(dialog) == QDialog.DialogCode.Accepted:
             self._load_presets()
     
     def _on_preset_delete(self):
@@ -222,6 +269,10 @@ class MacroDialog(QDialog):
             return
         
         preset_name = current_item.text()
+
+        # 同じ名前が複数あると、削除は名前で消すので同じ名前が全部消える
+        if self._refuse_duplicate_name(preset_name, "削除"):
+            return
         
         reply = QMessageBox.question(
             self,
@@ -235,23 +286,57 @@ class MacroDialog(QDialog):
                 self._load_presets()
                 QMessageBox.information(self, "成功", f"プリセット '{preset_name}' を削除しました。")
             else:
+                # 一覧にだけ残ったプリセット（設定からは既に消えている）を
+                # 選んだ場合、案内だけでは利用者が一覧から消せない。
+                # 設定に合わせて読み直してから知らせる
+                self._load_presets()
                 QMessageBox.warning(self, "エラー", "プリセットの削除に失敗しました。")
     
+    def _refuse_duplicate_name(self, preset_name: str, action: str) -> bool:
+        """同じ名前のプリセットが複数あれば理由を出して True を返す（操作は断る）
+
+        Args:
+            preset_name: 選ばれたプリセットの名前
+            action: 断る操作の名前（「編集」「削除」）
+        """
+        if not self.config_manager or count_macros_named(
+                self.config_manager.get_global_macros(), preset_name) < 2:
+            return False
+        QMessageBox.warning(
+            self, "エラー",
+            f"同じ名前のプリセット '{preset_name}' が複数あるため、"
+            f"どれを{action}するか決められません。\n"
+            f"設定ファイル (config.json) で名前を変えてから{action}してください。")
+        return True
+
     def _on_keepalive_start(self):
-        """キープアライブ開始"""
+        """キープアライブ開始を要求する（表示は進めない）
+
+        connected は開いた時点の値なので、開いている最中に機器側が切れると
+        「開始」は有効のまま残る。押しても MainWindow は始めないのに、
+        ここで _update_keepalive_ui(True) まで進めていたため、
+        「状態: 動作中」の表示だけが進んでいた。表示は要求ではなく実際に
+        始まったかで進めるので、受け口（MainWindow）に更新させる。
+        """
         interval = self.keepalive_interval_spin.value()
         self.keepalive_start_requested.emit(interval)
-        self._update_keepalive_ui(True)
-    
+
     def _on_keepalive_stop(self):
-        """キープアライブ停止"""
+        """キープアライブ停止を要求する（表示は進めない。開始と同じ理由）"""
         self.keepalive_stop_requested.emit()
-        self._update_keepalive_ui(False)
-    
+
+    def show_keepalive_running(self, active: bool):
+        """いま動いているかを表示へ反映する（受け口の MainWindow が呼ぶ）
+
+        Args:
+            active: macro_manager が実際にタイマーを持っているか
+        """
+        self._update_keepalive_ui(active)
+
     def _update_keepalive_ui(self, active: bool):
         """キープアライブUIを更新"""
         self.keepalive_active = active
-        self.keepalive_start_btn.setEnabled(not active)
+        self.keepalive_start_btn.setEnabled(not active and self.connected)
         self.keepalive_stop_btn.setEnabled(active)
         self.keepalive_interval_spin.setEnabled(not active)
         

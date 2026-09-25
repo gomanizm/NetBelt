@@ -19,6 +19,13 @@ TEMP の作業場所は `md` で排他確保しているが（tests/test_updater
 同時に動く窓を作るために、ZIP には NetBelt.exe より後ろに並ぶ詰め物を
 入れてある。xcopy が一時名の exe を書いてから move へ進むまでの間を
 数秒引き延ばすためで、名前の共有そのものとは関係がない。
+
+2026-09-20 追記: 一時名を実行ごとに変えても、インストール先そのものは
+共有されたままで、どちらの版のファイルが残るかは混ざっていた。利用者の
+決定（release-02）により、インストール先を変える前に目印フォルダで排他を
+取り、取れなかった更新は『別の更新が進行中です』と伝えて中止するように
+なった（tests/test_updater_shared_appdir_lock.py）。重なったときに後から
+来たほうが exit 0 で終わることは、もう無い。
 """
 import io
 import os
@@ -102,7 +109,12 @@ class UpdaterSharedAppDirTest(unittest.TestCase):
         return io.open(path, encoding="ascii", errors="replace").read()
 
     def test_two_updates_into_one_install_folder_do_not_share_a_staging_name(self):
-        """インストール先が同じでも、一時名の exe を共有しないこと。"""
+        """インストール先が同じでも、一時名の exe を共有しないこと。
+
+        排他が入ってからは、重なった側は『別の更新が進行中です』で中止する
+        ようになった。ここで見るのは元どおり一時名の共有だけなので、失敗が
+        その中止であることと、少なくとも一方が当たりきることを確かめる。
+        """
         a = _Run(self.base, self.app_dir, "A")
         b = _Run(self.base, self.app_dir, "B")
 
@@ -116,10 +128,15 @@ class UpdaterSharedAppDirTest(unittest.TestCase):
                 "差し替えられませんでした", run.output,
                 "%s が、他の実行に一時名の exe を持って行かれた:\n%s"
                 % (run.tag, run.output))
-            self.assertEqual(
-                codes[run.tag], 0,
-                "%s が失敗として返った:\n%s" % (run.tag, run.output))
+            if codes[run.tag] != 0:
+                self.assertIn(
+                    "別の更新が進行中です", run.output,
+                    "%s が、重なり以外の理由で失敗した:\n%s"
+                    % (run.tag, run.output))
 
+        self.assertIn(
+            0, codes.values(),
+            "どちらの更新も当たらなかった:\n%s\n%s" % (a.output, b.output))
         self.assertIn(
             self._installed(), (a.body, b.body),
             "据わった exe がどちらの更新のものでもない:\n%s\n%s"

@@ -6,15 +6,21 @@ from PyQt6.QtCore import Qt, pyqtSignal, QTimer
 from PyQt6.QtGui import QDrag
 from typing import List, Dict, Optional, Set
 from core.serial_connection import list_serial_ports
+from core.config_manager import is_readable_macro
 
 class DeviceTree(QWidget):
     # シグナル定義
     device_connect = pyqtSignal(str, dict)  # グループ名, 機器データ
     device_edit = pyqtSignal(str, dict)     # グループ名, 機器データ
-    device_delete = pyqtSignal(str, str)    # グループ名, 機器名
+    # グループ名, 機器名, 機器データ。機器データも添えるのは、同じグループに
+    # 同名が並んでいるときに、右クリックした項目を名前だけでは指せないため
+    device_delete = pyqtSignal(str, str, dict)
     device_duplicate = pyqtSignal(str, dict) # グループ名, 機器データ
     connect_requested = pyqtSignal(dict)    # 機器データ
-    device_moved = pyqtSignal(str, str, str)  # 移動元グループ名, 移動先グループ名, デバイス名
+    # 移動元グループ名, 移動先グループ名, デバイス名, 機器データ。
+    # 機器データも添えるのは device_delete と同じ理由で、同じグループに
+    # 同名が並んでいるときに掴んだ項目を名前だけでは指せないため
+    device_moved = pyqtSignal(str, str, str, dict)
     group_add_requested = pyqtSignal()  # グループ追加要求
     group_edit_requested = pyqtSignal(str)  # グループ編集要求（グループ名）
     group_delete_requested = pyqtSignal(str)  # グループ削除要求（グループ名）
@@ -22,12 +28,26 @@ class DeviceTree(QWidget):
     # 自動検出ポートのボーレート変更（ポート名, ボーレート）。ツリーの外に
     # ある再接続用の写しへ届けるために出す
     serial_baudrate_changed = pyqtSignal(str, int)
+    # 機器メニューの「ツール」から、接続中のセッションへの操作を求める（機器名, …）
+    keepalive_start_requested = pyqtSignal(str)
+    keepalive_stop_requested = pyqtSignal(str)
+    macro_execute_requested = pyqtSignal(str, str)  # 機器名, マクロ名
+    macro_stop_requested = pyqtSignal(str)
     
     # 一般的なボーレート値
     BAUD_RATES = [300, 1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600]
     
     def __init__(self):
         super().__init__()
+        # 機器名 -> そのセッションの状態（set_tools_state_provider を参照）
+        self._tools_state_provider = None
+        # (機器名, 項目の機器データ) -> 接続先が同じか（set_tools_target_check を参照）
+        self._tools_target_check = None
+        # _set_baudrate の最中か（restore_baudrate の作り直しを 1 回にまとめる）
+        self._applying_baudrate = False
+        # 「コンソール接続」の折りたたみ状態（None = まだ一度も作っていない）。
+        # 作り直すたびに開き直さないよう、作り直す直前の値をここへ控える
+        self._console_group_expanded: Optional[bool] = None
         self._create_ui()
         
         # シリアルポート監視用
@@ -80,6 +100,8 @@ class DeviceTree(QWidget):
         Args:
             groups: グループリスト
         """
+        # 作り直しで消える折りたたみ状態を、消す前に控える
+        self._remember_console_expanded()
         self.tree.clear()
         
         for group_data in groups:
@@ -145,8 +167,30 @@ class DeviceTree(QWidget):
             # デバイスデータを保存
             device_item.setData(0, Qt.ItemDataRole.UserRole, device_data)
         
-        # グループを展開
-        console_group.setExpanded(True)
+        # 折りたたみ状態を戻す（まだ一度も作っていなければ開いた状態）
+        console_group.setExpanded(
+            True if self._console_group_expanded is None
+            else self._console_group_expanded)
+
+    def _find_console_group(self) -> Optional[QTreeWidgetItem]:
+        """ツリーにある「コンソール接続」グループを返す（無ければ None）"""
+        root = self.tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            item = root.child(i)
+            if item.text(0) == "コンソール接続":
+                return item
+        return None
+
+    def _remember_console_expanded(self):
+        """作り直しの前に「コンソール接続」の折りたたみ状態を控える
+
+        作り直すとグループは別の項目になるので、畳んだ状態は項目と一緒に
+        消える。消す直前の値をここで覚えておき、_add_serial_ports_group が
+        戻す。まだ一度も作っていないときは控えるものが無いので触らない。
+        """
+        item = self._find_console_group()
+        if item is not None:
+            self._console_group_expanded = item.isExpanded()
     
     def detected_port_names(self) -> Set[str]:
         """いまツリーに並んでいる自動検出ポートの名前を返す
@@ -169,6 +213,16 @@ class DeviceTree(QWidget):
                     if name:
                         names.add(name)
         return names
+
+    def stop_serial_monitor(self) -> None:
+        """シリアルポートの定期確認を止める
+
+        窓を閉じるときに呼ぶ。閉じたあとも 1 秒ごとに走り続け、その中で
+        機器一覧を組み直すことがある。閉じた窓に用は無いうえ、生き残った
+        まま鳴り続けるタイマーは、鳴っている最中に GC が窓を捨てると
+        プロセスごと落とす（実測: テスト一式で 0xC0000409）。
+        """
+        self._serial_monitor_timer.stop()
 
     def _check_serial_ports(self):
         """シリアルポートの変化を定期的にチェック"""
@@ -193,17 +247,79 @@ class DeviceTree(QWidget):
     
     def refresh_serial_ports(self):
         """シリアルポート一覧を更新"""
-        # 既存のコンソール接続グループを削除
-        root = self.tree.invisibleRootItem()
-        for i in range(root.childCount()):
-            item = root.child(i)
-            if item.text(0) == "コンソール接続":
-                root.removeChild(item)
-                break
+        # 既存のコンソール接続グループを削除（折りたたみ状態は控えてから）
+        item = self._find_console_group()
+        if item is not None:
+            self._console_group_expanded = item.isExpanded()
+            self.tree.invisibleRootItem().removeChild(item)
         
         # 再度追加
         self._add_serial_ports_group()
     
+    def set_tools_state_provider(self, provider):
+        """「ツール」に出すセッションの状態を返す関数を登録する
+
+        接続先リストはセッションを持たないので、開くたびに聞く。
+        provider(機器名) は connected / keepalive_active /
+        command_list_active / macros を持つ辞書を返す。
+        """
+        self._tools_state_provider = provider
+
+    def set_tools_target_check(self, check):
+        """項目の接続先が、その名前のセッションの接続先と同じかを答える関数を登録する
+
+        状態は機器名で引くので、名前だけが同じ別の接続先の項目（後から挿した
+        自動検出の COM3 と、登録機器の「COM3」など）からも、そのセッションを
+        操作できてしまう。check(機器名, 項目の機器データ) が False なら
+        「ツール」を灰色にする。
+        """
+        self._tools_target_check = check
+
+    def _add_tools_menu(self, menu, device_name, device_data=None):
+        """機器メニューに「ツール」を足す（選ばれた項目は要求のシグナルを出す）
+
+        キープアライブとマクロは、以前は端末の右クリックにあった。端末の
+        右クリックは貼り付けにしたので、ここへ移した。接続していない機器では
+        灰色にして選べないようにする（隠すと、どこにあるのか分からなくなる）。
+        項目の接続先がセッションの接続先と違うときも灰色にする。
+        ログの保存・記録はメニューバーの「ログ」にあるので入れない。
+        """
+        state = {}
+        if self._tools_state_provider is not None:
+            state = self._tools_state_provider(device_name) or {}
+        enabled = bool(state.get("connected"))
+        if enabled and self._tools_target_check is not None:
+            enabled = bool(self._tools_target_check(device_name, device_data))
+        tools = menu.addMenu("ツール")
+        tools.setEnabled(enabled)
+
+        if state.get("keepalive_active"):
+            tools.addAction("キープアライブ停止").triggered.connect(
+                lambda: self.keepalive_stop_requested.emit(device_name))
+        else:
+            tools.addAction("キープアライブ開始").triggered.connect(
+                lambda: self.keepalive_start_requested.emit(device_name))
+        # 読み手側の保険。状態は設定から来るので、リストでない値や、名前で
+        # 指せない要素（辞書でない・name が文字列でない）が混ざると、
+        # ここで落ちて右クリックが一切開かなくなる
+        raw_macros = state.get("macros")
+        macros = ([m for m in raw_macros if is_readable_macro(m)]
+                  if isinstance(raw_macros, list) else [])
+        if macros:
+            macro_menu = tools.addMenu("マクロ実行")
+            for macro in macros:
+                name = macro.get("name", "")
+                description = macro.get("description", "")
+                text = f"{name} - {description}" if description else name
+                macro_menu.addAction(text).triggered.connect(
+                    lambda checked=False, n=name:
+                    self.macro_execute_requested.emit(device_name, n))
+        # 実行中のマクロを止める。これが無いと、誤ったマクロを流し始めたとき
+        # タブを閉じる以外に中断する手段が無い
+        if state.get("command_list_active"):
+            tools.addAction("マクロ停止").triggered.connect(
+                lambda: self.macro_stop_requested.emit(device_name))
+
     def _add_hide_action(self, menu):
         """どの右クリックメニューにも「非表示」を足す。
 
@@ -263,6 +379,7 @@ class DeviceTree(QWidget):
         menu = QMenu(self)
         
         connect_action = menu.addAction("接続")
+        self._add_tools_menu(menu, device_data["name"], device_data)
         
         # コンソール接続の場合はボーレート設定メニューを追加
         if is_serial:
@@ -308,7 +425,7 @@ class DeviceTree(QWidget):
         elif action == edit_action and edit_action is not None:
             self.device_edit.emit(group_name, device_data)
         elif action == delete_action and delete_action is not None:
-            self.device_delete.emit(group_name, device_data["name"])
+            self.device_delete.emit(group_name, device_data["name"], device_data)
         elif action == duplicate_action and duplicate_action is not None:
             self.device_duplicate.emit(group_name, device_data)
         elif is_serial and baudrate_actions:
@@ -403,16 +520,52 @@ class DeviceTree(QWidget):
         """
         # ボーレート設定を保存
         self._serial_port_baudrates[port] = baudrate
-        print(f"[INFO] {port} のボーレートを {baudrate} baud に設定しました")
-        
-        # リストを更新（表示には影響しないが、内部データを更新）
-        self.refresh_serial_ports()
 
         # ツリーの外にも同じ値を持っている相手がいる。MainWindow は初回接続
         # 時の機器データを再接続用に写しており、そこを更新しないと Enter に
-        # よる再接続だけ旧ボーレートのまま繋がる
-        self.serial_baudrate_changed.emit(port, baudrate)
-    
+        # よる再接続だけ旧ボーレートのまま繋がる。開いているポートがこの値を
+        # 拒んだ場合は、MainWindow が restore_baudrate() で実際の値を書き戻す
+        # （その作り直しは下の 1 回にまとめる）
+        self._applying_baudrate = True
+        try:
+            self.serial_baudrate_changed.emit(port, baudrate)
+        finally:
+            self._applying_baudrate = False
+
+        # 受け付けられたと分かってから記録する。要求した時点で「設定しました」
+        # と出すと、拒まれたときにログだけが実際の値と食い違う
+        applied = self._serial_port_baudrates.get(port, baudrate)
+        if applied == baudrate:
+            print(f"[INFO] {port} のボーレートを {baudrate} baud に設定しました")
+        else:
+            print(f"[INFO] {port} のボーレートを {baudrate} baud に"
+                  f"変更できませんでした（{applied} baud のままです）")
+
+        # リストを更新（表示には影響しないが、内部データを更新）
+        self.refresh_serial_ports()
+
+    def restore_baudrate(self, port: str, baudrate: int):
+        """ポートが拒んだボーレートの表示を、実際の値へ戻す
+
+        _set_baudrate は選んだ値を先に覚えて表示し直す。ポートがその値を
+        拒むと、チェックと次の接続が使えない値のまま残るので、MainWindow が
+        実際の値で呼び直す。serial_baudrate_changed は出さない（出すと
+        開いている接続へもう一度同じ値を設定しにいく）。
+
+        _set_baudrate から呼ばれている間は値を書くだけにする。一覧の作り直しは
+        実機のポート列挙を伴い、「コンソール接続」を作り直すたびに折りたたみ
+        状態も戻るので、拒否 1 回につき 1 度で済ませる（_set_baudrate が
+        最後に行う）。接続できたときの経路はここで作り直す。
+
+        Args:
+            port: ポート名
+            baudrate: 実際に使っているボーレート
+        """
+        self._serial_port_baudrates[port] = baudrate
+        if self._applying_baudrate:
+            return
+        self.refresh_serial_ports()
+
     def _on_item_double_clicked(self, item: QTreeWidgetItem, column: int):
         """
         アイテムがダブルクリックされたときの処理
@@ -494,7 +647,8 @@ class DeviceTree(QWidget):
         # デバイス移動シグナルを発行
         device_name = device_data.get('name')
         if device_name:
-            self.device_moved.emit(source_group_name, target_group_name, device_name)
+            self.device_moved.emit(source_group_name, target_group_name,
+                                   device_name, device_data)
             event.accept()
         else:
             event.ignore()

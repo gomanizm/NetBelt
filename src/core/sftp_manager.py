@@ -6,6 +6,37 @@ import uuid
 from typing import List, Dict, Optional, Callable
 from PyQt6.QtCore import QObject, pyqtSignal
 import paramiko
+from paramiko.sftp import (CMD_HANDLE, CMD_OPEN, SFTP_FLAG_CREATE, SFTP_FLAG_EXCL,
+                           SFTP_FLAG_WRITE)
+
+
+class _DroppedConnection(IOError):
+    """接続が切れた失敗を、案内文で包み直したあとも見分けるための印
+
+    upload_file は改名の失敗を「どう確かめるか」を添えた IOError に包んで
+    上へ送るので、包んだ時点で元の例外の型が消える。_fail が接続を畳む
+    判断をできるよう、原因が切断・壊れた応答だったものだけこの型にする。
+    """
+
+
+# paramiko がトランスポートの死んだ読み取り・壊れた応答で上げる例外。
+# OSError の仲間ではないので、IOError だけ見ていると取りこぼす
+_DROPPED_CONNECTION_ERRORS = (EOFError, paramiko.SSHException,
+                              paramiko.SFTPError, _DroppedConnection)
+
+# 以後このチャンネルが使えないと分かる失敗（期限切れ＋切断・壊れた応答）。
+# except 節へそのまま渡す
+_UNUSABLE_CHANNEL_ERRORS = (TimeoutError,) + _DROPPED_CONNECTION_ERRORS
+
+# connect() のホーム取得で接続ごと畳む失敗。SFTPError は含めない。
+# REALPATH の応答を 1 件で返さない機器でもそれは起きるので、ここまで
+# 広げると繋がる機器の SFTP を断ることになる（保守的な側を採る）
+_UNUSABLE_CONNECT_ERRORS = (TimeoutError, EOFError, paramiko.SSHException)
+
+
+def _is_dropped_connection(e: Exception) -> bool:
+    """接続が切れた・応答が壊れたと分かる失敗か"""
+    return isinstance(e, _DROPPED_CONNECTION_ERRORS)
 
 
 class SFTPManager(QObject):
@@ -14,8 +45,9 @@ class SFTPManager(QObject):
     # シグナル定義
     file_list_ready = pyqtSignal(list)  # ファイル一覧取得完了 [(name, size, mtime, mode, is_dir), ...]
     # ワーカーから GUI スレッドへ「一覧が取れた」を運ぶ内部用。current_path の
-    # 更新と file_list_ready の発火を同じスレッド・同じ順序で行うために挟む
-    _listing_done = pyqtSignal(str, list)
+    # 更新と file_list_ready の発火を同じスレッド・同じ順序で行うために挟む。
+    # 先頭は要求番号（発行順）で、古い一覧を捨てるために使う
+    _listing_done = pyqtSignal(int, str, list)
     # 転送進捗 (転送済みバイト数, 全体バイト数)
     # int で宣言すると C++ の 32bit int に対応し、2GiB を超えるバイト数が
     # 例外も出さずに黙って丸められる（負値や桁落ちした値になる）。
@@ -41,6 +73,10 @@ class SFTPManager(QObject):
         self.ssh_client: Optional[paramiko.SSHClient] = None
         self.is_connected = False
         self.current_path = "/"
+        # 一覧の要求に振る通し番号。最後に発行したものだけを採る
+        # （list_directory は転送スレッドからも呼ばれるのでロックで守る）
+        self._listing_seq = 0
+        self._listing_seq_lock = threading.Lock()
         self._listing_done.connect(self._on_listing_done)
     
     # GUI スレッドから直接呼ぶ操作が、転送の終わりを待つ最大時間。
@@ -76,12 +112,16 @@ class SFTPManager(QObject):
         return False
 
     def _fail(self, prefix: str, e: Exception):
-        """操作の失敗を通知する。応答待ちの期限切れなら接続も畳む
+        """操作の失敗を通知する。接続が使えなくなったと分かるなら接続も畳む
 
         期限で戻ったあとも要求と応答はずれたままなので、同じチャンネルの
         以後の操作は失敗し続ける。それでも接続中のままだと、操作のたびに
         期限ぶん画面が固まり、しかも socket.timeout は str が空なので
         理由の無いエラーだけが並ぶ。使用不能と分かる形にして再接続を促す。
+
+        切断・壊れた応答も同じ（利用者の決定 2026-09-20）。トランスポートが
+        死んだ印なのに接続中の表示のまま残ると、以後の一覧・転送がすべて
+        同じ失敗を繰り返すだけになる。
 
         ロックを持ったまま呼ばない（disconnect がロックを取りにいく）。
         """
@@ -89,9 +129,83 @@ class SFTPManager(QObject):
             self.error_occurred.emit(
                 f"{prefix}: 機器が{self.CHANNEL_TIMEOUT_SECONDS:g}秒応答しません。"
                 "SFTP接続を切断しました。接続し直してください")
-            self.disconnect()
+            self._disconnect_after_notice()
             return
-        self.error_occurred.emit(f"{prefix}: {str(e) or e.__class__.__name__}")
+        reason = str(e) or e.__class__.__name__
+        # 機器が SFTP のチャンネルだけを閉じると、paramiko は OSError
+        # ('Socket is closed') を上げるので型では見分けられない。接続中の
+        # ままチャンネルが閉じていれば同じく畳む（畳んだあとの失敗には
+        # 切断を重ねない）
+        if _is_dropped_connection(e) or (self.is_connected
+                                         and self._channel_closed()):
+            # paramiko の 'Server connection dropped: ' のように、理由が
+            # コロンで終わることがある。そのまま続けると「: 。」になる
+            self.error_occurred.emit(
+                f"{prefix}: {reason.strip().rstrip(':').rstrip()}。"
+                "SFTP接続を切断しました。接続し直してください")
+            self._disconnect_after_notice()
+            return
+        self.error_occurred.emit(f"{prefix}: {reason}")
+
+    def _disconnect_after_notice(self):
+        """通知を配ったあとに接続を畳む（配達中に捨てられていても落ちない）
+
+        error_occurred は GUI スレッドからの操作では同期配送で、受け手の
+        パネルが QMessageBox を開くと入れ子のイベントループが回る。その間に
+        SSH の切断が届くと MainWindow がこのマネージャを deleteLater で
+        捨てるので、戻ってきたときには C++ 側だけが消えていて
+        disconnected.emit が『wrapped C/C++ object ... has been deleted』の
+        RuntimeError になる。共通の例外ハンドラが受けるので落ちはしないが、
+        SFTP エラーの警告を閉じた直後に「予期しないエラー」がもう 1 枚出る。
+
+        畳む仕事（is_connected を落とす・クライアントを閉じる）は emit の
+        前に終わっているので、この RuntimeError は飲んでよい。捨てた側も
+        同じ後始末を済ませている。
+        """
+        try:
+            self.disconnect()
+        except RuntimeError:
+            # 既に捨てられている。切断を知らせる相手も一緒に外れている
+            print("[SFTP] 通知の間に破棄されたため、切断の通知は省きました")
+
+    def _channel_closed(self) -> bool:
+        """SFTP のチャンネルが既に閉じられているかを返す
+
+        機器が SFTP サブシステムだけを閉じると（SSH のトランスポートは
+        生きている）、paramiko は以後の操作で OSError('Socket is closed')
+        を上げる。型では切断と見分けられないので、チャンネルの状態を見る。
+        .closed が True そのもののときだけ閉じたと見なす（差し替えの Mock
+        のように、真と評価されるだけの値を取り違えない）。
+        """
+        client = self.sftp_client
+        if client is None:
+            return False
+        try:
+            return client.get_channel().closed is True
+        except Exception:
+            return False
+
+    def _abort_connect(self, e: Exception) -> bool:
+        """connect() のホーム取得でチャンネルが使えないと分かったら畳み、False を返す
+
+        connected をまだ出していないので、disconnect ではなく直接閉じる。
+        SSH の接続は端末側のものなので閉じない。
+        """
+        if isinstance(e, TimeoutError):
+            reason = f"機器が{self.CHANNEL_TIMEOUT_SECONDS:g}秒応答しません"
+        else:
+            # 'Server connection dropped: ' のように理由がコロンで
+            # 終わることがある。理由を持たない例外は型名で出す
+            reason = (str(e) or e.__class__.__name__).strip()
+            reason = reason.rstrip(':').rstrip()
+        try:
+            self.sftp_client.close()
+        except Exception:
+            pass
+        self.sftp_client = None
+        self.ssh_client = None
+        self.error_occurred.emit(f"SFTP接続エラー: {reason}")
+        return False
 
     def connect(self, ssh_client: paramiko.SSHClient) -> bool:
         """
@@ -119,22 +233,24 @@ class SFTPManager(QObject):
             # ホームディレクトリを取得
             try:
                 self.current_path = self.sftp_client.normalize('.')
-            except TimeoutError:   # socket.timeout の別名
-                # 期限切れは「ホームが分からない」ではなく、チャンネルが
-                # 使えないという印。要求と応答はずれたままなので、'/' から
-                # 始めても以後の操作は失敗し続ける。掴んだまま接続成功を
-                # 返さず、ここで畳んで失敗にする（connected をまだ出して
-                # いないので、disconnect ではなく直接閉じる）
-                try:
-                    self.sftp_client.close()
-                except Exception:
-                    pass
-                self.sftp_client = None
-                self.ssh_client = None
-                self.error_occurred.emit(
-                    f"SFTP接続エラー: 機器が{self.CHANNEL_TIMEOUT_SECONDS:g}秒応答しません")
-                return False
-            except Exception:
+            except _UNUSABLE_CONNECT_ERRORS as e:
+                # 期限切れ（socket.timeout の別名）も切断も「ホームが
+                # 分からない」ではなく、チャンネルが使えないという印。
+                # 要求と応答はずれたままなので、'/' から始めても以後の
+                # 操作は失敗し続ける。掴んだまま接続成功を返さず、ここで
+                # 畳んで失敗にする（connected をまだ出していないので、
+                # disconnect ではなく直接閉じる）。切断・壊れた応答を
+                # 期限切れと同じに扱うのは他の操作と揃える
+                # （利用者の決定 2026-09-20。_fail を参照）
+                return self._abort_connect(e)
+            except Exception as e:
+                # 型では切断と分からなくても、機器が SFTP のチャンネルを
+                # 既に閉じていれば同じく使えない印（paramiko は
+                # OSError('Socket is closed') を上げる）。開いている
+                # チャンネルでの失敗はホームが分からないだけなので、
+                # これまでどおり '/' から始める
+                if self._channel_closed():
+                    return self._abort_connect(e)
                 self.current_path = "/"
             
             self.is_connected = True
@@ -180,13 +296,20 @@ class SFTPManager(QObject):
                   "（SSH の切断で解放されます）")
         self.disconnected.emit()
     
-    def _on_listing_done(self, path: str, file_list: list):
+    def _on_listing_done(self, seq: int, path: str, file_list: list):
         """一覧が取れたときの GUI スレッド側の処理。
 
         current_path の更新と file_list_ready の発火を、同じスレッドで
         この順に行う。受け手（パネル）はスロットの中で get_current_path()
         を見て表示を組み立てるので、通知より先に更新されている必要がある。
+
+        一覧は 1 件ごとに別スレッドで、しかも通信のロックを離してから
+        変換・ソートするので、先に頼んだ分が後から届くことがある。そのまま
+        current_path を書くと、移った先が勝手に元へ戻る。最後に発行した
+        要求の分だけを採り、追い越された分は捨てる。
         """
+        if seq != self._listing_seq:
+            return
         self.current_path = path
         self.file_list_ready.emit(file_list)
 
@@ -203,7 +326,13 @@ class SFTPManager(QObject):
         
         if path is None:
             path = self.current_path
-        
+
+        # 発行の順番を控える。これより新しい要求が出ていたら、この一覧は
+        # 届いても捨てられる
+        with self._listing_seq_lock:
+            self._listing_seq += 1
+            seq = self._listing_seq
+
         def list_thread():
             import stat as stat_mod
             try:
@@ -235,7 +364,19 @@ class SFTPManager(QObject):
                             # 期限を積み上げると一覧が何分も返らないので、
                             # ここでやめて失敗として扱う（_fail が畳む）
                             raise
-                        except Exception:
+                        except Exception as link_error:
+                            if (_is_dropped_connection(link_error)
+                                    or self._channel_closed()):
+                                # 切断・壊れた応答も期限切れと同じ扱い
+                                # （利用者の決定 2026-09-20）。ここで拾って
+                                # 続けると、既に切れたあとの一覧を「取得成功」
+                                # として配り、接続中の表示まで残る。取れた分を
+                                # 捨てることになるが、期限切れの枝が同じ選択を
+                                # している。機器が SFTP のチャンネルだけを
+                                # 閉じたとき（OSError('Socket is closed')）も
+                                # 同じで、型では分からないので状態で見る
+                                # （利用者の決定 2026-09-23。_fail が畳む）
+                                raise
                             continue
                         link_modes[item.filename] = getattr(target, "st_mode", None)
                 
@@ -270,7 +411,7 @@ class SFTPManager(QObject):
                 # シグナルが GUI へ届くまでの間「場所は新しい、画面は古い一覧」
                 # になり、その窓で始めた操作が見ていないディレクトリへ飛ぶ。
                 # 更新と通知を GUI スレッドで同じ順序に行う
-                self._listing_done.emit(path, file_list)
+                self._listing_done.emit(seq, path, file_list)
                 
             except Exception as e:
                 self._fail("ディレクトリ一覧取得エラー", e)
@@ -286,6 +427,31 @@ class SFTPManager(QObject):
     # 期限切れ。有無が分からないのは unsure と同じだが、以後この接続が
     # 使えないことまで分かるので、呼び出し側が切断へ回せるよう分ける
     _REMOTE_TIMEOUT = "timeout"
+
+    # 一時名の basename に許す長さ。多くのファイルシステムが名前を 255 で
+    # 切る（Linux は 255 バイト、NTFS は 255 文字）ので、両方の数え方で見る
+    TMP_NAME_LIMIT = 255
+
+    @classmethod
+    def _fit_tmp_basename(cls, basename: str, extra: int) -> str:
+        """一時名が長さの制限に触れないよう、元の名前を前方だけ残して切り詰める
+
+        一時名はどちらの向きも元の basename 全体を含むので、元の名前が
+        ファイルシステムの制限内でも一時名だけが超えることがある（実測:
+        240 文字の保存先で mkstemp が [Errno 22] Invalid argument）。
+        元の名前は手掛かりとして前方を残す。完全に捨てて短い識別子だけに
+        すると、「一時名 X が残っています」の案内から元ファイルを辿れない。
+
+        Args:
+            basename: 元のファイル名
+            extra: 一時名で basename に足す分の長さ（接頭辞・識別子・接尾辞）
+        """
+        room = max(cls.TMP_NAME_LIMIT - extra, 0)
+        fitted = basename[:room]
+        # バイトで数える相手に合わせる（日本語名なら 1 文字 3 バイト）
+        while fitted and len(fitted.encode("utf-8", "replace")) > room:
+            fitted = fitted[:-1]
+        return fitted
 
     def _remote_probe(self, remote_path: str):
         """送る直前のリモートの状態を stat で確かめる（ロック内で呼ぶ）
@@ -331,18 +497,93 @@ class SFTPManager(QObject):
 
         読めない相手（stat が失敗する）や、当てられない相手（機器の flash の
         ように mode が意味を持たない）では、これまでどおり何もしない。
+        ただし期限切れは握りつぶさずに上へ送る。チャンネルはもう使えないので、
+        そのまま改名へ進むと、もう一度期限まで待ったうえ接続中のまま残る。
         """
         try:
             mode = getattr(self.sftp_client.stat(remote_path), "st_mode", None)
+        except TimeoutError:   # socket.timeout の別名
+            raise
         except Exception:
             return
         if not isinstance(mode, int):
             return
         try:
             self.sftp_client.chmod(tmp_remote, mode & 0o7777)
+        except TimeoutError:
+            raise
         except Exception:
             # 権限を引き継げないことは、転送そのものの失敗にはしない
             pass
+
+    def _create_tmp_with_mode(self, remote_path: str, tmp_remote: str):
+        """中身を送る前に、置き換え先の mode を当てた空の一時名を作る（ロック内で呼ぶ）
+
+        put() は mode を付けずに開くので、一時名はサーバの既定（OpenSSH なら
+        0666 & ~umask = 0644 など）で作られる。_carry_over_mode が当て直すのは
+        全部送ったあとなので、転送中や途中で切れて残った一時名は、0600 の
+        設定ファイルの中身を他のユーザーが読める状態になる。先に空で作って
+        mode を当てておけば、put() が O_TRUNC で開き直しても mode は残る。
+
+        既存の mode が読めない（新しい名前など）ときは作らない（これまで
+        どおりサーバの既定になる）。ハンドルへの chmod を受け付けない機器
+        でも転送は止めない（最終名の mode は _carry_over_mode が当てる）。
+        期限切れはチャンネルが使えない印なので、握りつぶさずに上へ送る。
+
+        作るときの OPEN にも既存の mode を付ける。paramiko の open() は属性の
+        無い OPEN を送るので、作ってから chmod するまでのあいだは一時名が
+        サーバの既定（0644 など）になる。OpenSSH の sftp-server は OPEN の
+        permissions を open(2) の mode に渡すので、最初から既存と同じ mode で
+        作られる。umask で落ちたビットは続くハンドルへの chmod で当て直す。
+        mode 付きの OPEN を断る機器では、これまでどおり属性なしで開く。
+
+        当てる mode には所有者の書込みビットを足す。ここで作ったハンドルは
+        すぐ閉じ、続く put() が同じ名前を 'wb' で開き直すので、既存が 0444 や
+        0400 だと open(2) の権限検査で断られ、書込みビットの無いファイルを
+        一切置き換えられなくなる（実測: 「[Errno 13] Permission denied」だけが
+        出て、原因が一時名の mode だとは分からない）。他のユーザーへの
+        見え方は広がらず（0444→0644、0400→0600）、転送後の _carry_over_mode が
+        最終的に元どおりの mode を当て直す。
+        """
+        try:
+            mode = getattr(self.sftp_client.stat(remote_path), "st_mode", None)
+        except TimeoutError:   # socket.timeout の別名
+            raise
+        except Exception:
+            return
+        if not isinstance(mode, int):
+            return
+        tmp_mode = (mode & 0o7777) | 0o200
+        try:
+            handle = self._open_new_with_mode(tmp_remote, tmp_mode)
+        except TimeoutError:
+            raise
+        except Exception:
+            # mode 付きの OPEN（や EXCL）を受け付けない機器
+            handle = self.sftp_client.open(tmp_remote, "wb")
+        try:
+            handle.chmod(tmp_mode)
+        except TimeoutError:
+            raise   # 閉じにいっても、さらに期限ぶん待つだけ
+        except Exception:
+            pass
+        handle.close()
+
+    def _open_new_with_mode(self, path: str, mode: int):
+        """permissions 属性を付けた OPEN で新しいファイルを作って開く（ロック内で呼ぶ）
+
+        paramiko の公開 API（open()）では OPEN に属性を付けられないので、
+        open() と同じ要求を属性付きで直接送る。既にある名前は開かない（EXCL）。
+        """
+        client = self.sftp_client
+        attr = paramiko.SFTPAttributes()
+        attr.st_mode = mode
+        t, msg = client._request(
+            CMD_OPEN, client._adjust_cwd(path),
+            SFTP_FLAG_WRITE | SFTP_FLAG_CREATE | SFTP_FLAG_EXCL, attr)
+        if t != CMD_HANDLE:
+            raise paramiko.SFTPError("Expected handle")
+        return paramiko.SFTPFile(client, msg.get_binary(), "wb")
 
     def upload_file(self, local_path: str, remote_path: str = None,
                     overwrite: bool = False):
@@ -405,8 +646,12 @@ class SFTPManager(QObject):
         # 固定名だと、置き換えに失敗して残した「唯一の完全な写し」を次の試行が
         # 黙って上書きし、その試行が失敗すれば後始末が消してしまう。一意なら
         # 消す相手は必ず今回作った一時名に限られる
-        tmp_remote = (tmp_dir + ".%s.netbelt-part.%d-%s"
-                      % (remote_name, os.getpid(), uuid.uuid4().hex[:8]))
+        tmp_tag = "%d-%s" % (os.getpid(), uuid.uuid4().hex[:8])
+        # '.' + 名前 + '.netbelt-part.' + 識別子。名前以外の長さを先に数える
+        tmp_remote = (tmp_dir + ".%s.netbelt-part.%s"
+                      % (self._fit_tmp_basename(
+                          remote_name, len(".") + len(".netbelt-part.") + len(tmp_tag)),
+                         tmp_tag))
         # 最終名を消したあとで置き換えに失敗した場合は、一時名が唯一の完全な
         # 写しになるので消さない
         keep_tmp = [False]
@@ -416,9 +661,17 @@ class SFTPManager(QObject):
         # 期限切れで抜けるときに添える補足（転送済みの一時名など）。
         # _fail の期限切れ文面は固定なので、前置きの側へ足す
         timed_out_note = [""]
+        # 畳む理由として _fail へ渡す例外。印を立てる枝のほとんどは期限切れ
+        # なので既定は None（= TimeoutError）で、後始末で切断・壊れた応答を
+        # 観測したときだけ、その例外に差し替えて理由を正しく出す
+        fold_error = [None]
+        # 元の失敗そのものが期限切れだったときの補足。通知は 1 回にまとめる
+        # ので、finally ではなく元の失敗の文面へ足す
+        cleanup_note = [""]
 
-        def unknown_outcome(e, final_removed: bool = False):
-            """置き換わったか確かめられないときの扱いを返す。
+        def unknown_outcome_note(final_removed: bool = False,
+                                 cause: str = "") -> str:
+            """置き換わったか確かめられないときの説明を組み立てる。
 
             応答が期限切れになっただけで、機器側では置き換えが済んでいる
             ことがある。そこから「消してやり直す」手順へ進むと、置き換わった
@@ -426,19 +679,35 @@ class SFTPManager(QObject):
             どちらの名前にも触れず、確かめ方だけを伝える。
 
             Args:
-                e: 期限切れの例外。socket.timeout は str が空なので、
-                    そのまま連結すると理由の無い「: 」で終わる
                 final_removed: 復旧手順で最終名を既に remove したあとなら
                     True。利用者が最終名の無事を誤解しないよう書き添える
+                cause: 確かめられない理由。期限切れのときは _fail が理由と
+                    切断まで添えるので空のまま
+            """
+            gone = "最終名は置き換えの手順で既に消してあります。" if final_removed else ""
+            return ("最終名へ置き換えられたか確かめられませんでした%s。"
+                    "機器側を確認してください。" % cause + gone +
+                    "一時名 %s が残っていれば置き換えは"
+                    "終わっていません" % tmp_remote)
+
+        def unknown_outcome_error(e, final_removed: bool = False) -> IOError:
+            """期限切れ以外で置き換わったか確かめられない失敗を作る。
+
+            paramiko は切断した読み取りや壊れた応答で、OSError の仲間でない
+            例外（EOFError / SFTPError / SSHException）を上げる。改名の要求を
+            送ったあとに落ちたのなら、置き換わったかどうかは分からない。
+            確定した失敗として外側へ落とすと keep_tmp が立たず、後始末が
+            転送した唯一の完全な写し（一時名）まで消す。
+
+            原因が切断・壊れた応答だったものは _DroppedConnection にして、
+            包んだあとも _fail が接続を畳む判断をできるようにする。
             """
             keep_tmp[0] = True
-            why = str(e) or f"機器が{self.CHANNEL_TIMEOUT_SECONDS:g}秒応答しません"
-            gone = "最終名は置き換えの手順で既に消してあります。" if final_removed else ""
-            return IOError(
-                "最終名へ置き換えられたか確かめられませんでした（応答が期限切れ）。"
-                "機器側を確認してください。" + gone +
-                "一時名 %s が残っていれば置き換えは"
-                "終わっていません: %s" % (tmp_remote, why))
+            wrapper = _DroppedConnection if _is_dropped_connection(e) else IOError
+            return wrapper("%s: %s" % (
+                unknown_outcome_note(final_removed,
+                                     "（接続が切れたか応答が壊れています）"),
+                str(e) or e.__class__.__name__))
 
         def upload_thread():
             try:
@@ -490,6 +759,9 @@ class SFTPManager(QObject):
                                 f"リモートに '{remote_name}' があるか確かめられませんでした"
                                 f"（{why}）。上書きになる恐れがあるので送りませんでした")
                             return
+                    else:
+                        # 置き換えなら、転送中の一時名も既存より緩くしない
+                        self._create_tmp_with_mode(remote_path, tmp_remote)
                     self.sftp_client.put(local_path, tmp_remote,
                                          callback=progress_callback)
                     if not overwrite:
@@ -535,38 +807,143 @@ class SFTPManager(QObject):
                         # 置き換えなら、既存の権限を一時名へ写しておく
                         # （overwrite=False のときは上で「無い」と確かめた
                         # あとなので、引き継ぐ mode は無い）
-                        self._carry_over_mode(remote_path, tmp_remote)
+                        try:
+                            self._carry_over_mode(remote_path, tmp_remote)
+                        except TimeoutError:   # socket.timeout の別名
+                            # 使えないチャンネルで改名へ進まない。転送した
+                            # 内容は一時名に残し、抜けてから接続を畳む
+                            # （ロックの中では畳めない。畳むのは finally）
+                            keep_tmp[0] = True
+                            probe_timed_out[0] = True
+                            timed_out_note[0] = (
+                                "（置き換えていません。転送した内容は一時名 %s に"
+                                "残っています）" % tmp_remote)
+                            return
                     # 全部送れてから最終名へ。posix_rename（OpenSSH 拡張）は
-                    # 既存を上書きできる。無いサーバでは、まず rename を試し、
-                    # 既存があって失敗したときだけ消してからもう一度 rename
-                    # する（先に消すと、rename に失敗した瞬間に元が消える）
+                    # 既存を上書きできるので、上書きの確認を得ている送信だけが
+                    # 使う。確認を経ていない送信は、既存があれば失敗する
+                    # ふつうの rename を使う（STAT を実装しない機器では送る
+                    # 直前の確認も転送後の再確認も「無い」と読むので、既存を
+                    # 潰さないための最後の砦がこの失敗になる）。posix_rename
+                    # の無いサーバでは、まず rename を試し、既存があって失敗
+                    # したときだけ消してからもう一度 rename する（先に消すと、
+                    # rename に失敗した瞬間に元が消える）
                     try:
-                        self.sftp_client.posix_rename(tmp_remote, remote_path)
-                    except TimeoutError as e:      # socket.timeout の別名
-                        raise unknown_outcome(e)
-                    except (AttributeError, IOError):
+                        if overwrite:
+                            self.sftp_client.posix_rename(tmp_remote, remote_path)
+                        else:
+                            self.sftp_client.rename(tmp_remote, remote_path)
+                    except TimeoutError:      # socket.timeout の別名
+                        # 期限切れのあとは要求と応答がずれたままで、この
+                        # チャンネルはもう使えない。送る前の確認や権限の
+                        # 引き継ぎと同じく、抜けてから接続を畳んで知らせる
+                        # （ロックの中では畳めない。畳むのは finally）
+                        keep_tmp[0] = True
+                        probe_timed_out[0] = True
+                        timed_out_note[0] = "（%s）" % unknown_outcome_note()
+                        return
+                    except (AttributeError, IOError) as first_error:
+                        if not overwrite:
+                            # 非 posix の rename が断る理由の筆頭は
+                            # 「既にある」。上書きの確認を経ていない送信で
+                            # その失敗から最終名を消しにいくと、既存を
+                            # 潰さないための安全網を自分で外すことになる。
+                            # 最終名には触れず、一時名に残して知らせる
+                            keep_tmp[0] = True
+                            raise IOError(
+                                "リモートの '%s' へ置き換えられませんでした"
+                                "（既にある可能性があります）。上書きの確認を経て"
+                                "いないので最終名には触れていません。転送した内容は"
+                                "機器の一時名 %s に残っています。上書きしてよければ"
+                                "一覧を更新してからやり直してください: %s"
+                                # paramiko は message の無い応答でも読み進むので、
+                                # str が空の IOError が届く。そのまま連結すると
+                                # 理由の無い「: 」で終わる
+                                % (remote_name, tmp_remote,
+                                   str(first_error) or first_error.__class__.__name__))
+                        # posix_rename の無いサーバ。ふつうの rename を試す
                         try:
                             self.sftp_client.rename(tmp_remote, remote_path)
-                        except TimeoutError as e:
-                            raise unknown_outcome(e)
+                        except TimeoutError:
+                            # 1 本目と同じ。畳むのは finally
+                            keep_tmp[0] = True
+                            probe_timed_out[0] = True
+                            timed_out_note[0] = "（%s）" % unknown_outcome_note()
+                            return
                         except IOError:
+                            # remove が断られたら最終名は残っている。消えたと
+                            # 伝えてよいのは remove が成功したときだけ
+                            final_removed = False
                             try:
                                 self.sftp_client.remove(remote_path)
-                            except IOError:
+                                final_removed = True
+                            except TimeoutError:   # socket.timeout の別名
+                                # IOError の仲間なので先に受ける。消せたかは
+                                # 分からず、チャンネルも以後使えない。2 本目の
+                                # rename へ進まず、抜けてから接続を畳む
+                                keep_tmp[0] = True
+                                probe_timed_out[0] = True
+                                timed_out_note[0] = (
+                                    "（最終名を消せたか確かめられませんでした。"
+                                    "転送した内容は一時名 %s に残っています）"
+                                    % tmp_remote)
+                                return
+                            except Exception:
+                                # paramiko は OSError の仲間でない例外も上げる
+                                # （EOFError / SFTPError / SSHException）。
+                                # IOError だけ見ていると、外側の except へ
+                                # 落ちて 2 本目の rename にも進めない
                                 pass
                             try:
                                 self.sftp_client.rename(tmp_remote, remote_path)
-                            except TimeoutError as e:
+                            except TimeoutError:
                                 # 1本目・2本目と同じ。機器側では置き換わって
                                 # いて応答だけが返らないことがあるので、
-                                # 確定した失敗として報告しない
-                                raise unknown_outcome(e, final_removed=True)
-                            except IOError as e:
+                                # 確定した失敗として報告せず、使えなくなった
+                                # チャンネルは抜けてから畳む
                                 keep_tmp[0] = True
+                                probe_timed_out[0] = True
+                                timed_out_note[0] = "（%s）" % unknown_outcome_note(
+                                    final_removed=final_removed)
+                                return
+                            except IOError as e:
+                                # 機器が答えた失敗。改名は行われていないと
+                                # 分かるので、これまでどおり断定してよい。
+                                # 復旧手順で最終名を消したあとなら、利用者が
+                                # 元の設定の無事を誤解しないよう書き添える
+                                keep_tmp[0] = True
+                                gone = ("最終名は置き換えの手順で既に消してあります。"
+                                        if final_removed else "")
                                 raise IOError(
-                                    "最終名への置き換えに失敗しました。転送済みの内容は"
-                                    "機器の一時名 %s に残っています: %s" % (tmp_remote, e))
-                
+                                    "最終名への置き換えに失敗しました。" + gone +
+                                    "転送済みの内容は"
+                                    "機器の一時名 %s に残っています: %s"
+                                    # paramiko は切断した読み取りで素の
+                                    # EOFError() を上げる（str が空）。
+                                    # そのまま連結すると「: 」で終わる
+                                    % (tmp_remote, str(e) or e.__class__.__name__))
+                            except Exception as e:
+                                # 切断・壊れた応答（EOFError / SFTPError /
+                                # SSHException）。改名の要求は届いていて応答
+                                # だけが返らなかったのなら、最終名には新しい
+                                # 内容があり一時名は無い。それを「失敗した」
+                                # 「写しは一時名にある」と断定すると、利用者は
+                                # 両方失ったと読んで無用な復旧へ向かう。
+                                # 期限切れの枝と同じく、確かめ方だけを伝える
+                                raise unknown_outcome_error(
+                                    e, final_removed=final_removed)
+                        except Exception as e:
+                            # 2 本目の rename が、機器の答えた失敗ではなく
+                            # 接続の切断や壊れた応答で落ちた。置き換わったかは
+                            # 分からないので、最終名を消してやり直す復旧手順へ
+                            # は進まない
+                            raise unknown_outcome_error(e)
+                    except Exception as e:
+                        # 1 本目（posix_rename / rename）が同じように落ちた。
+                        # 代わりの rename へ進んでも同じチャンネルなので、
+                        # 置き換わったか不明なまま一時名を残して知らせる
+                        raise unknown_outcome_error(e)
+
                 # 完了通知
                 self.transfer_complete.emit(f"アップロード完了: {os.path.basename(local_path)}")
                 
@@ -583,18 +960,62 @@ class SFTPManager(QObject):
                         with self._sftp_lock:
                             if self.is_connected and self.sftp_client is not None:
                                 self.sftp_client.remove(tmp_remote)
+                    except _UNUSABLE_CHANNEL_ERRORS as cleanup_error:
+                        # 後始末が期限切れ・切断（EOFError / SFTPError /
+                        # SSHException）で落ちたなら、以後このチャンネルは
+                        # 要求と応答がずれたまま使えない。元の失敗を伝えた
+                        # うえで、期限切れの経路と同じように畳む（ロックの
+                        # 中では畳めない。畳むのは finally）。ここで飲むと、
+                        # 後始末が通った場合と出力が全く同じになり、切断を
+                        # 観測したことがどこにも残らない
+                        note = ("（送りかけの一時名 %s を片づけられませんでした）"
+                                % tmp_remote)
+                        if isinstance(e, TimeoutError) or _is_dropped_connection(e):
+                            # 元の失敗そのもので接続が畳まれる。すぐ下の _fail が
+                            # 既に切断まで伝えるので、印は立てない（立てると
+                            # finally がもう一度 _fail を呼び、同じ文面と
+                            # disconnected が 2 回出る）。死んだチャンネルでは
+                            # put が期限切れなら後始末の remove も期限切れに
+                            # なるので、この重なりは珍しくない。切断・壊れた
+                            # 応答でも _fail は畳むので（利用者の決定
+                            # 2026-09-20）、同じ重なりが起きる
+                            cleanup_note[0] = note
+                        else:
+                            # 元の失敗は機器が答えた通常のもの。その文面を
+                            # 先に出し、畳む理由は後始末で観測したほうで伝える
+                            probe_timed_out[0] = True
+                            timed_out_note[0] = note
+                            fold_error[0] = cleanup_error
                     except Exception:
                         pass
-                self._fail("アップロードエラー", e)
+                self._fail("アップロードエラー" + cleanup_note[0], e)
             finally:
                 # ロックの外。理由を出して接続を畳むのは _fail に任せる
                 if probe_timed_out[0]:
                     self._fail("アップロードエラー" + timed_out_note[0],
-                               TimeoutError())
+                               fold_error[0] or TimeoutError())
         
         # バックグラウンドスレッドで実行
         threading.Thread(target=upload_thread, daemon=True).start()
     
+    # 進行中のダウンロードの保存先（_download_target_key の鍵）。機器ごとに
+    # マネージャは別なので、インスタンスをまたいでプロセス全体で共有する
+    _download_targets = set()
+    _download_targets_lock = threading.Lock()
+
+    @staticmethod
+    def _download_target_key(local_path: str) -> str:
+        """保存先を比べるための鍵。realpath で短縮名（8.3 形式）を解き、
+        normcase で大文字小文字と区切り文字の違いをならす（まだ無い
+        ファイルでも、あるところまでのフォルダは解かれる）"""
+        return os.path.normcase(os.path.realpath(local_path))
+
+    @classmethod
+    def _release_download_target(cls, key: str):
+        """保存先の予約を外す（何度呼んでもよい）"""
+        with cls._download_targets_lock:
+            cls._download_targets.discard(key)
+
     def download_file(self, remote_path: str, local_path: str):
         """
         ファイルをダウンロード（バックグラウンド）
@@ -602,11 +1023,39 @@ class SFTPManager(QObject):
         Args:
             remote_path: リモートファイルパス
             local_path: ローカルファイルパス
+
+        同じ保存先へのダウンロードが進行中（順番待ちを含む）なら、断って
+        何もしない。保存ダイアログの上書き確認はその時点で有るものしか
+        見ないので、まだ無い同じ保存先へ 2 件落とすと、後から終わった方の
+        置き換えで先の方が確認なしに消える。予約は転送が終わったとき
+        （成功・失敗・中断）に外す。
+
+        予約が見るのは同一プロセスの SFTP ダウンロード同士だけなので、
+        別アプリ・別プロセスの書き込みは素通りする。そこで、呼ばれた時点
+        （GUI スレッド、保存ダイアログの直後）で保存先の有無も控える。
+        無ければ上書きは承認されていないので、最後の確定を os.replace では
+        なく os.rename で行う。Windows の os.rename は宛先があると
+        FileExistsError（WinError 183）で断り、宛先の中身には触れない。
         """
         if not self.is_connected or not self.sftp_client:
             self.error_occurred.emit("SFTP接続がありません")
             return
         
+        # 保存ダイアログが上書きを確認したかどうかの手掛かり。ここは
+        # ダイアログの直後（GUI スレッド）なので、まだ誰も割り込んでいない
+        overwrite_granted = os.path.exists(local_path)
+
+        target_key = self._download_target_key(local_path)
+        with self._download_targets_lock:
+            busy = target_key in self._download_targets
+            if not busy:
+                self._download_targets.add(target_key)
+        if busy:
+            self.error_occurred.emit(
+                "同じ保存先へのダウンロードが進行中です。終わってからやり直すか、"
+                f"別の保存先を選んでください: {local_path}")
+            return
+
         # 最終の保存先へ直接書かない。paramiko の get() はリモートを読む前に
         # ローカルを 'wb' で開くので、リモート側で消えていただけでも既存の
         # 正常なバックアップが 0 バイトになり、途中で切れれば部分ファイルが
@@ -615,15 +1064,25 @@ class SFTPManager(QObject):
         # 同じ一時名の取り合いで片方が誤って失敗する）
         import tempfile
         try:
+            # 名前 + '.' + mkstemp の乱数 8 文字 + '.netbelt-part'。
+            # 名前以外の長さを先に数えて、元の名前をそのぶん切り詰める
             fd, tmp_local = tempfile.mkstemp(
-                prefix=os.path.basename(local_path) + ".", suffix=".netbelt-part",
+                prefix=self._fit_tmp_basename(
+                    os.path.basename(local_path),
+                    len(".") + 8 + len(".netbelt-part")) + ".",
+                suffix=".netbelt-part",
                 dir=os.path.dirname(os.path.abspath(local_path)))
             os.close(fd)
         except OSError as e:
+            # 始まらなかったので予約も外す
+            self._release_download_target(target_key)
             # ここは GUI スレッド。例外を上げるとスロットの外へ抜けるので、
             # 転送の失敗と同じ経路で知らせる
             self.error_occurred.emit(f"ダウンロードエラー: {str(e)}")
             return
+
+        # 置き換えを断ったときは、落とした内容が一時名にしか無いので消さない
+        keep_tmp = [False]
 
         def download_thread():
             try:
@@ -644,16 +1103,34 @@ class SFTPManager(QObject):
                                          callback=progress_callback)
                 
                 # 全部落とせてから最終名へ（同じディレクトリなので原子的）
-                os.replace(tmp_local, local_path)
+                if overwrite_granted:
+                    os.replace(tmp_local, local_path)
+                else:
+                    # 呼ばれた時点では無かった＝上書きは承認されていない。
+                    # 転送しているあいだに外から作られていたら置き換えない
+                    try:
+                        os.rename(tmp_local, local_path)
+                    except FileExistsError:
+                        keep_tmp[0] = True
+                        raise OSError(
+                            "転送しているあいだに保存先 '%s' が作られました。"
+                            "上書きの確認を経ていないので置き換えていません。"
+                            "落とした内容は %s に残っています"
+                            % (os.path.basename(local_path), tmp_local))
+                # 予約は通知より先に外す（完了を見てすぐ落とし直しても断られない）
+                self._release_download_target(target_key)
                 # 完了通知
                 self.transfer_complete.emit(f"ダウンロード完了: {os.path.basename(remote_path)}")
                 
             except Exception as e:
-                # 失敗した転送の残骸を消す。既存の保存先には触っていない
-                try:
-                    os.remove(tmp_local)
-                except OSError:
-                    pass
+                # 失敗した転送の残骸を消す。既存の保存先には触っていない。
+                # 置き換えを断った場合は、落とした内容がここにしか無い
+                if not keep_tmp[0]:
+                    try:
+                        os.remove(tmp_local)
+                    except OSError:
+                        pass
+                self._release_download_target(target_key)
                 self._fail("ダウンロードエラー", e)
         
         # バックグラウンドスレッドで実行
@@ -776,7 +1253,65 @@ class SFTPManager(QObject):
         self.transfer_complete.emit(f"パーミッション変更完了: {os.path.basename(path)}")
         # ディレクトリ一覧を更新（ロックを離してから）
         self.list_directory(self.current_path)
-    
+
+    def inspect_link_target(self, path: str):
+        """シンボリックリンクの先の mode と名前を読む（GUI スレッドから呼ぶ）
+
+        一覧の mode はリンク自身（lstat 相当、多くは 0777）だが、chmod は
+        リンクをたどって先へ効く。それを権限変更の初期値にすると、何も
+        変えずに OK しただけでリンク先が 0777 になる。初期値に使うために
+        stat でたどり直し、ダイアログに出す名前を readlink で読む。
+
+        Returns:
+            (mode, リンク先の名前)。名前を読めない機器では名前が None。
+            リンク先を読めない（壊れたリンク・権限が無い）、転送中、
+            未接続のときは None で、理由は error_occurred で通知済み
+        """
+        if not self.is_connected or not self.sftp_client:
+            self.error_occurred.emit("SFTP接続がありません")
+            return None
+        if not self._acquire_for_gui("パーミッション変更"):
+            return None
+        err = mode = target = None
+        try:
+            mode = getattr(self.sftp_client.stat(path), "st_mode", None)
+            try:
+                target = self.sftp_client.readlink(path)
+            except _UNUSABLE_CHANNEL_ERRORS:
+                # 期限切れも切断・壊れた応答も、以後このチャンネルは
+                # 使えない（利用者の決定 2026-09-20）。名前が読めなかった
+                # だけとして進むと、リンク先なしのダイアログが開いたうえに
+                # 接続中の表示が残る
+                raise
+            except Exception:
+                # 機器が SFTP のチャンネルだけを閉じていたら
+                # （OSError('Socket is closed')）、名前が読めなかったのでは
+                # なく以後使えない印。上の枝と同じく外へ出す
+                if self._channel_closed():
+                    raise
+                # 名前が読めなくても、権限は読めている
+        except Exception as e:
+            err = e
+        finally:
+            self._sftp_lock.release()
+        # 通知はロックを離してから（_fail が切断するときロックを取る）。
+        # チャンネルが閉じていた失敗は「リンク先を読めない」ではなく、
+        # 切断として畳む（利用者の決定 2026-09-23）
+        if isinstance(err, _UNUSABLE_CHANNEL_ERRORS) or (
+                err is not None and self._channel_closed()):
+            # 理由の整形（空の str を型名にする・末尾のコロンを落とす）も
+            # 切断の文面も _fail が持っている
+            self._fail("リンク先の確認エラー", err)
+            return None
+        if err is not None or not isinstance(mode, int):
+            why = (str(err) or err.__class__.__name__) if err is not None \
+                else "権限が返されませんでした"
+            self.error_occurred.emit(
+                f"'{posixpath.basename(path)}' のリンク先を読めないため、"
+                f"パーミッションを変更できません（{why}）")
+            return None
+        return mode, target
+
     def get_current_path(self) -> str:
         """
         現在のディレクトリパスを取得

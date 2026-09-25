@@ -26,11 +26,10 @@ class MenuActionsTest(unittest.TestCase):
             fake.return_value = ConfigManager(config_path=os.path.join(d, "config.json"))
             return MainWindow()
 
-    def test_copy_and_paste_use_shift_shortcuts(self):
+    def test_copy_uses_the_shift_shortcut(self):
         """Ctrl+C は機器への中断送信に残す。"""
         w = self._window()
         self.assertEqual(w.copy_action.shortcut().toString(), "Ctrl+Shift+C")
-        self.assertEqual(w.paste_action.shortcut().toString(), "Ctrl+Shift+V")
 
     def test_copy_calls_copy_on_the_current_terminal(self):
         w = self._window()
@@ -39,27 +38,53 @@ class MenuActionsTest(unittest.TestCase):
             w._on_copy()
         copy_call.assert_called_once()
 
-    def test_paste_sends_to_the_current_interactive_terminal(self):
+    def test_there_is_no_paste_in_the_menus(self):
+        """貼り付けは端末の右クリックだけ。メニューにもショートカットにも置かない。
+
+        編集→ペースト（Ctrl+Shift+V）は、改行を含む内容でも確かめずに
+        機器へ送っていた。貼り付けは確認つきの右クリックへ一本化する
+        （利用者判断 2026-09-17）。
+        """
+        from PyQt6.QtGui import QAction
         w = self._window()
+        items = [(a.text(), a.shortcut().toString())
+                 for a in w.menuBar().findChildren(QAction)]
+        self.assertFalse([i for i in items if "ペースト" in i[0]
+                          or "貼り付け" in i[0]],
+                         "メニューに貼り付けが残っている: %r" % items)
+        self.assertFalse([i for i in items if i[1] == "Ctrl+Shift+V"],
+                         "Ctrl+Shift+V が割り当てられたまま: %r" % items)
+
+    def test_ctrl_shift_v_does_not_paste(self):
+        """接続中の端末で Ctrl+Shift+V を押しても、クリップボードの中身を送らないこと。"""
+        from PyQt6.QtCore import Qt
+        from PyQt6.QtTest import QTest
+        from PyQt6.QtWidgets import QApplication
+        w = self._window()
+        w.show()
         terminal = w.terminal_widget.create_terminal_tab("ルータA")
         terminal.set_input_enabled(True)   # 接続成功を模す
-        with mock.patch.object(terminal, "custom_paste") as paste_call:
-            w._on_paste()
-        paste_call.assert_called_once()
+        terminal.setFocus()
+        self.app.processEvents()
+        sent = []
+        terminal.key_pressed.connect(sent.append)
+        QApplication.clipboard().setText("show clock\nreload\n")
 
-    def test_paste_is_ignored_on_a_tab_that_never_connected(self):
-        """タブはあるがまだ接続していない状態でも、黙って無視しないこと。"""
-        w = self._window()
-        w.terminal_widget.create_terminal_tab("未接続")
-        messages = []
-        w.status_bar.showMessage = lambda text, *a: messages.append(text)
-        w._on_paste()
-        self.assertEqual(len(messages), 1)
+        with mock.patch("PyQt6.QtWidgets.QDialog.exec", return_value=1) as dialog:
+            try:
+                QTest.keyClick(terminal, Qt.Key.Key_V,
+                               Qt.KeyboardModifier.ControlModifier
+                               | Qt.KeyboardModifier.ShiftModifier)
+                self.app.processEvents()
+            finally:
+                # QTest の keyClick は Shift を押したままの状態をアプリ全体に残す。
+                # 残すと後のテストの行選択が Shift 付き（範囲選択）として扱われる
+                QTest.keyRelease(terminal, Qt.Key.Key_Shift)
+        w.close()
 
-    def test_paste_is_ignored_on_the_home_tab(self):
-        """ホームタブは読み取り専用の QTextEdit で custom_paste を持たない。"""
-        w = self._window()
-        w._on_paste()  # 例外が出ないこと
+        self.assertNotIn("show clock", "".join(sent),
+                         "Ctrl+Shift+V でクリップボードの中身を送った")
+        self.assertEqual(dialog.call_count, 0, "貼り付けの確認が出た")
 
     def test_font_size_increase_and_decrease(self):
         w = self._window()
@@ -281,33 +306,23 @@ class PasteGuardTest(unittest.TestCase):
         terminal.custom_paste()
         self.assertEqual("".join(sent), "show version")
 
-    def test_context_menu_paste_is_disabled_while_waiting_to_reconnect(self):
-        """右クリック経路も同じ条件で塞がっていること。"""
+    def test_right_click_sends_nothing_while_waiting_to_reconnect(self):
+        """右クリックの貼り付けも同じ条件で塞がっていること（確認も出さない）。"""
         from PyQt6.QtGui import QContextMenuEvent
         from PyQt6.QtCore import QPoint
+        from PyQt6.QtWidgets import QApplication
         terminal = self._terminal(reconnecting=True)
-        captured = {}
+        sent = []
+        terminal.key_pressed.connect(sent.append)
+        QApplication.clipboard().setText("show running-config\n")
 
-        def fake_exec(menu, *args, **kwargs):
-            captured["items"] = [(a.text(), a.isEnabled()) for a in menu.actions()]
-            return None
-
-        with mock.patch("PyQt6.QtWidgets.QMenu.exec", fake_exec):
+        with mock.patch("PyQt6.QtWidgets.QMenu.exec", return_value=None), \
+                mock.patch("PyQt6.QtWidgets.QDialog.exec", return_value=1) as dialog:
             terminal.contextMenuEvent(QContextMenuEvent(
                 QContextMenuEvent.Reason.Mouse, QPoint(1, 1)))
-        self.assertIn(("貼り付け", False), captured["items"])
 
-    def test_menu_paste_explains_why_nothing_happened(self):
-        """メニューからのペーストは理由を伝えること（無反応にしない）。"""
-        w = MenuActionsTest._window(self)
-        terminal = w.terminal_widget.create_terminal_tab("ルータA")
-        terminal.set_input_enabled(True)
-        terminal.set_reconnect_mode(True)
-        messages = []
-        w.status_bar.showMessage = lambda text, *a: messages.append(text)
-        w._on_paste()
-        self.assertEqual(len(messages), 1)
-        self.assertIn("接続中", messages[0])
+        self.assertEqual(sent, [])
+        self.assertEqual(dialog.call_count, 0)
 
 
 if __name__ == "__main__":

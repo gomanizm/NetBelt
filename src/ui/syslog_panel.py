@@ -8,13 +8,18 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QAbstractTableModel, QModelIndex, QSortFilterProxyModel, pyqtSignal, QEvent
 from PyQt6.QtGui import QColor, QBrush, QAction, QStandardItemModel, QStandardItem
+from PyQt6 import sip
 from datetime import datetime
 import json
 import os
+import re
 import tempfile
 
+from core import save_defaults
 
-def _write_text_file_atomically(filename, write_body):
+
+def _write_text_file_atomically(filename, write_body,
+                                encoding='utf-8', newline=None):
     """保存先を壊さずにテキストを書き出す
 
     保存先を直接 open('w') すると、その時点で旧内容は失われ、書き込み中の
@@ -28,6 +33,8 @@ def _write_text_file_atomically(filename, write_body):
     Args:
         filename: 保存先のパス
         write_body: 開いたファイルオブジェクトを受け取って中身を書く関数
+        encoding: 書き出す文字コード（CSV は Excel 向けに utf-8-sig）
+        newline: open() へ渡す改行の扱い（csv.writer は newline='' を要する）
     """
     tmp_path = None
     try:
@@ -35,7 +42,7 @@ def _write_text_file_atomically(filename, write_body):
         fd, tmp_path = tempfile.mkstemp(
             prefix=os.path.basename(target) + ".", suffix=".tmp",
             dir=os.path.dirname(target))
-        with open(fd, 'w', encoding='utf-8') as f:
+        with open(fd, 'w', encoding=encoding, newline=newline) as f:
             write_body(f)
 
         # 閉じてから差し替える（Windows では開いたままだと置き換えられない）
@@ -47,6 +54,51 @@ def _write_text_file_atomically(filename, write_body):
                 os.remove(tmp_path)
             except OSError:
                 pass   # 消せなくても保存先は無傷。残骸は .tmp なので見分けがつく
+
+
+# 表計算ソフトが数式として解釈しうる値の先頭文字と、素の数の形
+_CSV_FORMULA_STARTERS = "=+-@"
+_CSV_PLAIN_NUMBER = re.compile(r"^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$")
+
+
+def _csv_safe(value):
+    """表計算ソフトが数式として解釈しうる値を、文字列として書き出す
+
+    Syslog は認証なしの UDP で届き、本文もホスト名も送り手が決められる。
+    先頭が = + - @ の値をそのまま CSV へ書くと、受け取った側が Excel /
+    LibreOffice で開いた瞬間に数式（DDE を含む）として評価される。
+    エクスポートは障害チケットや報告書へ回る前提なので、発火するのは
+    こちらの端末とは限らない。
+
+    判定は SNMPPanel._csv_safe と同じ（前置きの空白は落としてから見る。
+    空白を 1 つ置くだけで抜けられるため）。数として読める値は、表として
+    読みにくくなるのでそのまま通す。
+    """
+    text = "" if value is None else str(value)
+    if not text:
+        return text
+    stripped = text.lstrip()
+    if not stripped or stripped[0] not in _CSV_FORMULA_STARTERS:
+        return text
+    if _CSV_PLAIN_NUMBER.match(stripped):
+        return text
+    return "'" + text
+
+
+# str.splitlines() が行の区切りとみなす文字のうち、改行・復帰（_escape_for_export
+# が置き換える）以外と、その見える表記。ソースへ生の制御文字を書かないよう
+# chr() で組み立てる（ui/plain_log.py と同じ作法・同じ表記）
+_BACKSLASH = chr(92)
+_TEXT_LINE_BREAKS = (
+    (chr(0x0B), _BACKSLASH + "v"),
+    (chr(0x0C), _BACKSLASH + "f"),
+    (chr(0x1C), _BACKSLASH + "x1c"),
+    (chr(0x1D), _BACKSLASH + "x1d"),
+    (chr(0x1E), _BACKSLASH + "x1e"),
+    (chr(0x85), _BACKSLASH + "u0085"),
+    (chr(0x2028), _BACKSLASH + "u2028"),
+    (chr(0x2029), _BACKSLASH + "u2029"),
+)
 
 
 class CheckableComboBox(QComboBox):
@@ -86,6 +138,12 @@ class CheckableComboBox(QComboBox):
         self.lineEdit().setText(t)
 
     def eventFilter(self, obj, event):
+        # 自分の入力欄と一覧に掛けたフィルタなので、窓が GC で片付けられる
+        # 途中、ラッパーが破棄済みになったあとも呼ばれることがある。self を
+        # 引くと RuntimeError になり、excepthook が既定のテストでは PyQt が
+        # qFatal でプロセスを落とした（実測）。破棄済みなら素通しにする
+        if sip.isdeleted(self):
+            return False
         if obj is self.lineEdit() and event.type() == QEvent.Type.MouseButtonRelease:
             if self.view().isVisible():
                 self.hidePopup()
@@ -183,14 +241,28 @@ class SyslogTableModel(QAbstractTableModel):
             return self.headers[section]
         return None
     
+    def _limit_reached(self):
+        """保持件数が上限に達しているか。上限が数でなければ達していない扱い。
+
+        max_messages は手編集の config.json から来ることがあり、null や
+        文字列だと比較そのものが TypeError になる。ここで受け止めないと、
+        受信スロットを例外が抜けて PyQt6 がプロセスを落とす
+        """
+        try:
+            return len(self.messages) >= int(self.max_messages)
+        except (TypeError, ValueError):
+            return False
+
     def add_message(self, msg: SyslogMessage):
         """メッセージを追加"""
-        # 最大行数を超える場合は古いものを削除
-        if len(self.messages) >= self.max_messages:
+        # 最大行数を超える場合は古いものを削除。保持している行があるときだけ
+        # 削除する。上限が 0 以下だと条件が常に真になり、beginRemoveRows の
+        # 後の pop(0) が空リストで失敗して、行削除通知が開いたまま残っていた
+        if self.messages and self._limit_reached():
             self.beginRemoveRows(QModelIndex(), 0, 0)
             self.messages.pop(0)
             self.endRemoveRows()
-        
+
         # 新しいメッセージを追加
         row = len(self.messages)
         self.beginInsertRows(QModelIndex(), row, row)
@@ -267,7 +339,16 @@ class SyslogFilterProxyModel(QSortFilterProxyModel):
 
 class SyslogPanel(QWidget):
     """Syslogビューアパネル"""
-    
+
+    # 保持するメッセージ件数の既定値
+    DEFAULT_MAX_MESSAGES = 1000
+
+    # アプリの終了処理に入ったか（MainWindow.closeEvent が立てる）。
+    # 立っている間はモーダルを開かない。FTP / TFTP / SFTP の各パネルと同じ理由
+    # （終了処理は配送待ちのシグナルをその場で配るので、受信スレッドが出した
+    # エラーもそこで届く。答えるまで終了が止まり、そのとき受信は停止済み）。
+    _closing = False
+
     def __init__(self, parent=None, config_manager=None):
         super().__init__(parent)
         self.config_manager = config_manager
@@ -286,15 +367,45 @@ class SyslogPanel(QWidget):
         
         self._init_ui()
     
+    def _syslog_settings(self):
+        """settings.syslog を dict で返す。
+
+        config.json は手で編集できるので、settings や syslog が null などの
+        dict でない値になっていることがある。そのまま .get を呼ぶと
+        AttributeError でパネル（ひいては MainWindow）の構築が失敗するので、
+        dict でなければ既定値（空の設定）として扱う。
+        """
+        settings = self.config_manager.config.get("settings", {})
+        section = settings.get("syslog", {}) if isinstance(settings, dict) else {}
+        return section if isinstance(section, dict) else {}
+
+    @staticmethod
+    def _sanitize_max_messages(value):
+        """保持件数を int へ寄せる。使えない値は既定値へ戻す。
+
+        config.json は手で編集できるうえ、max_messages は GUI からもアプリからも
+        書かれないので、ここへ来る値は手書きのものだけ。null・0・負数・文字列が
+        入ると最初の受信で add_message が例外になり、それが受信スロットを抜けて
+        PyQt6 がプロセスを落としていた（メッセージも出ずに終了）。auto_scroll と
+        同じく、値が不正でも起動と受信は続けたいので既定値へ戻す
+        """
+        if isinstance(value, bool):
+            return SyslogPanel.DEFAULT_MAX_MESSAGES
+        try:
+            limit = int(value)
+        except (TypeError, ValueError):
+            return SyslogPanel.DEFAULT_MAX_MESSAGES
+        return limit if limit >= 1 else SyslogPanel.DEFAULT_MAX_MESSAGES
+
     def _load_config(self):
         """設定の読み込み"""
         if self.config_manager:
-            settings = self.config_manager.config.get("settings", {})
-            syslog_config = settings.get("syslog", {})
-            self.max_messages = syslog_config.get("max_messages", 1000)
+            syslog_config = self._syslog_settings()
+            self.max_messages = self._sanitize_max_messages(
+                syslog_config.get("max_messages", self.DEFAULT_MAX_MESSAGES))
             self.auto_scroll = syslog_config.get("auto_scroll", True)
         else:
-            self.max_messages = 1000
+            self.max_messages = self.DEFAULT_MAX_MESSAGES
             self.auto_scroll = True
     
     def _init_ui(self):
@@ -340,7 +451,10 @@ class SyslogPanel(QWidget):
         # フィルタエリア
         filter_group = self._create_filter_area()
         layout.addWidget(filter_group)
-        
+
+        # 表示操作ボタン（一覧のすぐ上に左寄せ1行。SNMP の Trap 受信と同じ形）
+        layout.addLayout(self._create_list_buttons())
+
         # テーブルビュー
         self.table_view = QTableView()
         self.table_view.setModel(self.proxy_model)
@@ -361,8 +475,11 @@ class SyslogPanel(QWidget):
         
         layout.addWidget(self.table_view)
         
-        # ステータスバー
+        # ステータスバー。ファイアウォール許可の結果など長い文面が入るので
+        # 折り返す。折り返さないと、その文面が出た瞬間にパネルの最小幅が
+        # 伸び、窓を縮められなくなる
         self.status_label = QLabel("メッセージ: 0")
+        self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
         
         self.setLayout(layout)
@@ -402,19 +519,11 @@ class SyslogPanel(QWidget):
         toolbar.addAction(self.pause_action)
         
         toolbar.addSeparator()
-        
-        # クリアボタン
-        clear_action = QAction("🗑 クリア", self)
-        clear_action.triggered.connect(self._clear_messages)
-        toolbar.addAction(clear_action)
-        
-        # エクスポートボタン
-        export_action = QAction("💾 エクスポート", self)
-        export_action.triggered.connect(self._export_messages)
-        toolbar.addAction(export_action)
-        
-        toolbar.addSeparator()
-        
+
+        # クリアとエクスポートはツールバーに置かない。他の画面と同じく
+        # 一覧のすぐ上のボタン行（_create_list_buttons）へ移した。
+        # ここに残すのは受信まわり（プロトコルとポート・一時停止）だけ
+
         # 自動スクロールチェックボックス
         self.auto_scroll_checkbox = QCheckBox("自動スクロール")
         self.auto_scroll_checkbox.setChecked(self.auto_scroll)
@@ -423,6 +532,23 @@ class SyslogPanel(QWidget):
         
         return toolbar
     
+    def _create_list_buttons(self):
+        """一覧のすぐ上に置く、左寄せ1行のボタン行を作る
+
+        押したときの動きはツールバーにあったときと同じ（クリアは確認を
+        出し、エクスポートは記録中のファイルを断る）。
+        """
+        row = QHBoxLayout()
+        self.export_button = QPushButton("エクスポート")
+        self.export_button.clicked.connect(self._export_messages)
+        row.addWidget(self.export_button)
+        self.clear_button = QPushButton("クリア")
+        self.clear_button.clicked.connect(self._clear_messages)
+        row.addWidget(self.clear_button)
+        # 余った幅は行末の空きへ（無いとボタン自身が横へ間延びする）
+        row.addStretch()
+        return row
+
     def _create_filter_area(self):
         """フィルタエリアの作成"""
         group = QGroupBox("フィルタ")
@@ -559,8 +685,7 @@ class SyslogPanel(QWidget):
     def _get_listen_port(self):
         """設定から待ち受けポートを取得"""
         if self.config_manager:
-            config = self.config_manager.config
-            return config.get("settings", {}).get("syslog", {}).get("listen_port", 514)
+            return self._syslog_settings().get("listen_port", 514)
         return 514
     
     def _toggle_pause(self):
@@ -600,10 +725,27 @@ class SyslogPanel(QWidget):
                 .replace("\t", "\\t"))
 
     @classmethod
+    def _escape_for_text(cls, text: str) -> str:
+        """テキストの 1 行へ入れる値を作る（テキスト保存・選択行の保存・コピー）
+
+        _escape_for_export に加えて、str.splitlines() が行の区切りとみなす残りの
+        文字（U+000B / U+000C / U+001C〜U+001E / U+0085 / U+2028 / U+2029）も
+        見える表記へ置き換える。残すと、Unicode の改行を解するビューアや
+        splitlines() では 1 件が割れ、続きが別機器の独立した記録に見える。
+        バックスラッシュは先に二重にしてあるので、元の綴りとは区別できる。
+        CSV は値を引用符で囲む形式なので使わない（中身を変えない）
+        """
+        text = cls._escape_for_export(text)
+        for char, shown in _TEXT_LINE_BREAKS:
+            if char in text:
+                text = text.replace(char, shown)
+        return text
+
+    @classmethod
     def _export_line(cls, msg: SyslogMessage) -> str:
         """保存用の1行を作る（画面と同じく送信元を含め、機器を区別できるようにする）"""
-        hostname = cls._escape_for_export(msg.hostname)
-        message = cls._escape_for_export(msg.message)
+        hostname = cls._escape_for_text(msg.hostname)
+        message = cls._escape_for_text(msg.message)
         return f"{msg.timestamp} {msg.source_ip} {hostname} [{msg.level}] {message}"
 
     def _refuse_if_recording(self, title: str, file_path: str) -> bool:
@@ -630,7 +772,7 @@ class SyslogPanel(QWidget):
 
     @staticmethod
     def _export_format(file_path: str) -> str:
-        """保存先の拡張子から書き出す形式を決める（"json" / "txt"）
+        """保存先の拡張子から書き出す形式を決める（"csv" / "json" / "txt"）
 
         大文字小文字は区別しない。区別すると out.JSON がテキストの中身で
         書かれたうえ「エクスポートしました」と成功扱いになり、中身と拡張子
@@ -642,24 +784,62 @@ class SyslogPanel(QWidget):
         当てはまらない拡張子は従来どおり TXT（既定の形式）。
         """
         ext = os.path.splitext(file_path)[1].lower()
-        if ext == '.json':
-            return 'json'
+        if ext in ('.csv', '.json'):
+            return ext[1:]
         return 'txt'
 
+    def _export_messages_to_csv(self, filename, messages):
+        """CSV で書き出す（1 件 1 行。列はテキスト形式と同じ並び）
+
+        BOM 付き（utf-8-sig）。日本語版 Excel は BOM の無い UTF-8 の CSV を
+        cp932 として開くため、見出しも機器から来た日本語も文字化けする
+        （SNMPPanel._export_results_to_csv と同じ）。
+
+        本文とホスト名はテキスト形式と同じく改行・タブを表記へ置き換える。
+        CSV は引用符で囲めば改行を持てるが、1 件が複数行になると行単位の
+        突き合わせで別機器の独立した記録と見分けが付かなくなる。
+        """
+        import csv
+
+        def write_rows(f):
+            writer = csv.writer(f)
+            writer.writerow(['時刻', '送信元', 'ホスト名', 'レベル', 'メッセージ'])
+            for msg in messages:
+                writer.writerow([_csv_safe(value) for value in (
+                    msg.timestamp,
+                    msg.source_ip,
+                    self._escape_for_export(msg.hostname),
+                    msg.level,
+                    self._escape_for_export(msg.message),
+                )])
+
+        _write_text_file_atomically(filename, write_rows,
+                                    encoding='utf-8-sig', newline='')
+
     def _export_messages(self):
-        """メッセージをエクスポート"""
-        filename, _ = QFileDialog.getSaveFileName(
+        """メッセージをエクスポート（txt/csv/json）"""
+        default_name = f"syslog_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        filename, selected_filter = QFileDialog.getSaveFileName(
             self, "メッセージをエクスポート",
-            f"syslog_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-            "テキストファイル (*.txt);;JSONファイル (*.json);;すべてのファイル (*.*)"
+            save_defaults.initial_path(self.config_manager, default_name),
+            save_defaults.TABLE_FILTERS
         )
 
         if filename:
+            # 選んだ種類に合わせて拡張子を付け替える（中身は拡張子で決まるので、
+            # ここで揃えないと CSV を選んでもテキストが書かれる）。付け替えた
+            # 先が既にあれば、ダイアログが訊いていない上書きなので確認する
+            filename = save_defaults.apply_filter_suffix_confirmed(
+                self, "メッセージをエクスポート", filename, selected_filter,
+                default_name)
+            if not filename:
+                return
             if self._refuse_if_recording("メッセージをエクスポート", filename):
                 return
             try:
                 messages = self.model.get_all_messages()
-                if self._export_format(filename) == 'json':
+                fmt = self._export_format(filename)
+                if fmt == 'json':
                     # JSON形式でエクスポート（送信元と受信生データも残す）
                     data = [
                         {
@@ -675,6 +855,8 @@ class SyslogPanel(QWidget):
                     _write_text_file_atomically(
                         filename,
                         lambda f: json.dump(data, f, ensure_ascii=False, indent=2))
+                elif fmt == 'csv':
+                    self._export_messages_to_csv(filename, messages)
                 else:
                     # テキスト形式でエクスポート
                     def write_lines(f):
@@ -683,6 +865,8 @@ class SyslogPanel(QWidget):
 
                     _write_text_file_atomically(filename, write_lines)
 
+                # 書き終えてから覚える（取り消し・失敗では変えない）
+                save_defaults.remember(self.config_manager, filename)
                 QMessageBox.information(self, "成功", f"メッセージを {filename} にエクスポートしました。")
             except Exception as e:
                 QMessageBox.critical(self, "エラー", f"エクスポートに失敗しました: {e}")
@@ -765,13 +949,19 @@ class SyslogPanel(QWidget):
             if msg:
                 messages.append(msg)
 
-        filename, _ = QFileDialog.getSaveFileName(
+        default_name = f"syslog_selected_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        filename, selected_filter = QFileDialog.getSaveFileName(
             self, "選択行を保存",
-            f"syslog_selected_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-            "テキストファイル (*.txt);;すべてのファイル (*.*)"
+            save_defaults.initial_path(self.config_manager, default_name),
+            "テキスト (*.txt);;すべてのファイル (*.*)"
         )
 
         if filename:
+            # エクスポートと同じく、選んだ種類へ拡張子を合わせる
+            filename = save_defaults.apply_filter_suffix_confirmed(
+                self, "選択行を保存", filename, selected_filter, default_name)
+            if not filename:
+                return
             if self._refuse_if_recording("選択行を保存", filename):
                 return
             try:
@@ -781,6 +971,8 @@ class SyslogPanel(QWidget):
 
                 _write_text_file_atomically(filename, write_lines)
 
+                # 書き終えてから覚える（取り消し・失敗では変えない）
+                save_defaults.remember(self.config_manager, filename)
                 QMessageBox.information(self, "成功", f"選択行を {filename} に保存しました。")
             except Exception as e:
                 QMessageBox.critical(self, "エラー", f"保存に失敗しました: {e}")
@@ -795,9 +987,36 @@ class SyslogPanel(QWidget):
             self.status_label.setText(f"メッセージ: {filtered} / {total}")
     
     def set_syslog_receiver(self, receiver):
-        """Syslogレシーバーを設定（親ウィンドウから呼ばれる）"""
+        """Syslogレシーバーを設定（親ウィンドウから呼ばれる）
+
+        error_occurred をここで繋ぐ。繋がないと bind 失敗の理由がどこへも
+        出ず、利用者からは「開始を押したが何も起こらず停止中のまま」に
+        見える（FTP / TFTP / SFTP の各パネルは同じ信号を _on_error へ
+        繋いでいる）。
+        """
+        old = getattr(self, "syslog_receiver", None)
+        if old is not None and old is not receiver:
+            try:
+                old.error_occurred.disconnect(self._on_receiver_error)
+            except (TypeError, RuntimeError):
+                pass   # 繋いでいない / 既に破棄済み
         self.syslog_receiver = receiver
-    
+        if receiver is not None and receiver is not old:
+            receiver.error_occurred.connect(self._on_receiver_error)
+
+    def _on_receiver_error(self, error_message):
+        """受信側の障害（ポート使用中・特権ポートなど）を利用者へ見せる
+
+        ここへ来るのは待ち受けそのものが始められなかった場合だけ。
+        受信したメッセージの不備は一覧に出るので、モーダルにはしない。
+        """
+        if self._closing:
+            # 終了処理の途中。開いても何もできない（_closing の説明を参照）
+            print("[Syslog] %s" % error_message)
+            return
+        QMessageBox.critical(self, "Syslog受信 エラー", error_message)
+
+
     def add_message(self, syslog_msg):
         """メッセージを追加（外部から呼び出される）"""
         if self.paused:

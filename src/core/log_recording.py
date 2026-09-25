@@ -9,19 +9,28 @@
 ここへ集める。
 """
 import os
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
-_recording: Dict[str, str] = {}   # 機器名 -> 記録先のパス
+# 機器名 -> 記録先のパス。停止したが、停止より前に受信した分をまだ書いている
+# 記録も含む（その間に同じ機器で次の記録を始めると、1 台で 2 つになる）
+_recording: Dict[str, List[str]] = {}
 
 
 def start(device_name: str, file_path: str) -> None:
     """その機器の記録先を覚える"""
-    _recording[device_name] = file_path
+    _recording.setdefault(device_name, []).append(file_path)
 
 
-def stop(device_name: str) -> None:
-    """その機器の記録先を忘れる（記録していなくても呼んでよい）"""
-    _recording.pop(device_name, None)
+def stop(device_name: str, file_path: Optional[str] = None) -> None:
+    """その機器の記録先を忘れる（記録していなくても呼んでよい）
+
+    file_path を渡すと、そのパスだけを忘れる。省略するとその機器の全部。
+    """
+    paths = _recording.get(device_name, [])
+    if file_path in paths:
+        paths.remove(file_path)
+    if file_path is None or not paths:
+        _recording.pop(device_name, None)
 
 
 def device_using(file_path: str) -> Optional[str]:
@@ -33,7 +42,9 @@ def device_using(file_path: str) -> Optional[str]:
     アクセスできない）は絶対化した文字列で比べる。
     """
     wanted = os.path.normcase(os.path.abspath(file_path))
-    for device_name, path in _recording.items():
+    for device_name, path in [(name, path)
+                              for name, paths in _recording.items()
+                              for path in paths]:
         try:
             if os.path.samefile(path, file_path):
                 return device_name

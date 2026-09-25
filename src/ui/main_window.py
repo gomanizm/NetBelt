@@ -16,7 +16,8 @@ from .dialogs.device_dialog import DeviceDialog
 from .dialogs.group_dialog import GroupDialog
 from .dialogs.macro_dialog import MacroDialog
 from .dialogs.settings_dialog import SettingsDialog
-from core.config_manager import ConfigManager
+from core.config_manager import (ConfigManager, count_macros_named,
+                                 device_endpoint)
 from core.ssh_connection import SSHConnection
 from core.serial_connection import SerialConnection
 from core.telnet_connection import TelnetConnection
@@ -122,6 +123,11 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         
+        # 終了処理に入ったか。終了処理は記録を救うために配送待ちのシグナルを
+        # その場で配るので、更新チェックの知らせがここで届きうる。受け手は
+        # モーダルなので、開くと終了が止まる（_show_update_dialog）
+        self._shutting_down = False
+
         # 更新通知シグナルを接続
         self.update_available.connect(self._show_update_dialog)
         self.update_check_error.connect(self._show_update_check_error)
@@ -150,6 +156,12 @@ class MainWindow(QMainWindow):
         
         # SFTP管理用辞書
         self.sftp_managers: Dict[str, SFTPManager] = {}  # 機器名 -> SFTPManager
+        # 知らせ（受信・接続・切断・エラー）を lambda で結んだ接続と SFTP
+        # マネージャ。辞書から外したあとも、閉じるときに結び付きを外すため
+        # に控える（_detach_notifications）。弱参照なので、破棄されたものは
+        # 自然に消える
+        import weakref
+        self._notice_sources = weakref.WeakSet()
         
         # Syslogレシーバー初期化
         self.syslog_receiver = SyslogReceiver(self)
@@ -236,16 +248,14 @@ class MainWindow(QMainWindow):
         file_menu.addAction("終了(&X)", self.close)
         
         # 編集メニュー
-        # 端末ソフトの慣習に合わせて Ctrl+Shift+C / Ctrl+Shift+V を使う。
+        # 端末ソフトの慣習に合わせて Ctrl+Shift+C を使う。
         # Ctrl+C はターミナルから機器へ 0x03（中断）として送られるので奪わない。
+        # ペースト（Ctrl+Shift+V）は置かない。改行を含む内容でも確かめずに
+        # 機器へ送っていたので、貼り付けは確認つきの端末の右クリックだけにした
         edit_menu = menubar.addMenu("編集(&E)")
         self.copy_action = edit_menu.addAction("コピー(&C)")
         self.copy_action.setShortcut("Ctrl+Shift+C")
         self.copy_action.triggered.connect(self._on_copy)
-
-        self.paste_action = edit_menu.addAction("ペースト(&P)")
-        self.paste_action.setShortcut("Ctrl+Shift+V")
-        self.paste_action.triggered.connect(self._on_paste)
         
         # 表示メニュー
         view_menu = menubar.addMenu("表示(&V)")
@@ -341,21 +351,28 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self.device_tree)
         
         # 右側: ターミナル
-        self.terminal_widget = TerminalWidget()
+        self.terminal_widget = TerminalWidget(config_manager=self.config_manager)
         self.terminal_widget.tab_closed.connect(self._on_tab_closed)
         self.terminal_widget.current_tab_changed.connect(
             self._on_terminal_tab_changed)
         self.terminal_widget.font_size_change_requested.connect(
             self._on_font_size_wheel)
-        self.terminal_widget.macro_execute_requested.connect(self._on_macro_execute_requested)
         self.terminal_widget.macro_settings_requested.connect(self._on_macro_settings_from_context)
-        # 右クリックの「マクロ停止」と、実行状態のメニューへの反映
-        self.terminal_widget.macro_stop_requested.connect(self.macro_manager.stop_command_list)
+        # マクロの実行状態を、接続先リストの「ツール」に出す「マクロ停止」へ反映する
         self.macro_manager.command_list_state_changed.connect(
             self.terminal_widget.set_command_list_status)
-        self.terminal_widget.keepalive_start_requested.connect(self._on_keepalive_start_requested)
-        self.terminal_widget.keepalive_stop_requested.connect(self._on_keepalive_stop_requested)
         self.terminal_widget.terminal_resized.connect(self._on_terminal_resized)
+        # 接続先リストの機器メニュー「ツール」（キープアライブ・マクロ）
+        self.device_tree.set_tools_state_provider(self._tools_state_for)
+        self.device_tree.set_tools_target_check(self._tools_target_matches)
+        self.device_tree.macro_execute_requested.connect(
+            self._on_macro_execute_requested)
+        self.device_tree.macro_stop_requested.connect(
+            self.macro_manager.stop_command_list)
+        self.device_tree.keepalive_start_requested.connect(
+            self._on_keepalive_start_requested)
+        self.device_tree.keepalive_stop_requested.connect(
+            self._on_keepalive_stop_requested)
         splitter.addWidget(self.terminal_widget)
         
         # デフォルトの分割比率を設定（30% : 70%）
@@ -378,7 +395,8 @@ class MainWindow(QMainWindow):
         
         # 各ツールをスクロール内包でタブに収める（QDockWidget は廃止）
         self.sftp_panel = SFTPPanel(config_manager=self.config_manager)
-        self.sftp_server_panel = SFTPServerPanel()
+        self.sftp_server_panel = SFTPServerPanel(
+            config_manager=self.config_manager)
         self.tftp_server_panel = TFTPServerPanel(config_manager=self.config_manager)
         self.ftp_server_panel = FTPServerPanel(config_manager=self.config_manager)
         self.syslog_panel = SyslogPanel(config_manager=self.config_manager)
@@ -485,6 +503,31 @@ class MainWindow(QMainWindow):
             self, "機器名の重複",
             "%s\n別の名前を付けてください。" % reason)
 
+    def _exec_dialog(self, dialog) -> int:
+        """ダイアログを開き、閉じたあとの破棄を予約して結果を返す
+
+        ダイアログはどれも parent=self（MainWindow）で作るので、exec() から
+        抜けても非表示のまま子として残り続けていた（実測: 機器の編集を
+        20 回繰り返すと DeviceDialog が 20 個・子ウィジェットが 1000 個、
+        設定は 1 回あたり 47 個、マクロは 27 個増える）。OK でもキャンセル
+        でも積み上がり、アプリを閉じるまで解放されない。
+
+        戻り値を見たあとの早期 return が多いので、ここで try/finally にして
+        予約を取りこぼさないようにする。deleteLater() はイベントループへ
+        戻るまで実際には消さないため、戻り値を見てから dialog.get_*() を
+        読む呼び出し側はそのまま動く。
+
+        Args:
+            dialog: 開くダイアログ
+
+        Returns:
+            int: exec() の戻り値（QDialog.DialogCode）
+        """
+        try:
+            return dialog.exec()
+        finally:
+            dialog.deleteLater()
+
     def _on_add_device(self):  # 追加
         """機器追加ダイアログを表示"""
         # グループ名リストを取得
@@ -500,7 +543,7 @@ class MainWindow(QMainWindow):
         
         # ダイアログ表示
         dialog = DeviceDialog(self, groups=group_names)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
+        if self._exec_dialog(dialog) == QDialog.DialogCode.Accepted:
             # 機器データ取得
             device_data = dialog.get_device_data()
             group_name = dialog.get_selected_group()
@@ -550,7 +593,7 @@ class MainWindow(QMainWindow):
         if index >= 0:
             dialog.group_combo.setCurrentIndex(index)
         
-        if dialog.exec() == QDialog.DialogCode.Accepted:
+        if self._exec_dialog(dialog) == QDialog.DialogCode.Accepted:
             # 新しい機器データを取得
             new_device_data = dialog.get_device_data()
             new_group_name = dialog.get_selected_group()
@@ -564,15 +607,48 @@ class MainWindow(QMainWindow):
                 self._warn_device_name_conflict(conflict)
                 return
 
+            # タブを開いている（接続が残っている）機器の改名は断る。タブ・接続・
+            # マクロの実行状態は古い名前のまま残り、接続先リストの「ツール」は
+            # 新しい名前で引くので、そのセッションのマクロやキープアライブを
+            # 止められなくなる。名前以外の変更はそのまま通す
+            session_open = (self.terminal_widget.has_terminal(old_device_name)
+                            or old_device_name in self.connections)
+            if new_name != old_device_name and session_open:
+                QMessageBox.warning(
+                    self, "機器の編集",
+                    f"'{old_device_name}' のタブを開いている間は、名前を変えられません。\n"
+                    "タブを閉じてから、もう一度名前を変更してください。\n"
+                    "（今回の変更は保存していません）")
+                return
+
+            # 接続先（ホスト・ポート・プロトコル、シリアルならポート）の変更も
+            # 同じく断る。タブと接続は古い接続先のまま残り、「ツール」から
+            # 選んだマクロは古い接続先へ送られる。接続先以外の変更は通す
+            if session_open and (self._endpoint_of(new_device_data)
+                                 != self._endpoint_of(device_data)):
+                QMessageBox.warning(
+                    self, "機器の編集",
+                    f"'{old_device_name}' のタブを開いている間は、接続先を変えられません。\n"
+                    "タブを閉じてから変更してください。\n"
+                    "（今回の変更は保存していません）")
+                return
+
             # 差し替えは 1 回の保存で行う。削除→追加の 2 段階だと、片方の
-            # 保存だけ失敗したときに機器が消えたり新旧 2 件になったりする
+            # 保存だけ失敗したときに機器が消えたり新旧 2 件になったりする。
+            # 編集前の接続先も渡す。同じグループに同名が並んでいると、名前
+            # だけでは開いた項目を指せず、別の 1 台が書き換わってしまう
             if self.config_manager.update_device(group_name, old_device_name,
-                                                 new_group_name, new_device_data):
+                                                 new_group_name, new_device_data,
+                                                 old_endpoint=self._endpoint_of(device_data)):
                 # 開いているタブの再接続は device_info の写しを見る。
                 # ここを更新しないと編集内容が届かず、古い接続情報のまま
                 # 繋がり続ける（存在しない鍵を指定しても、以前の鍵で
                 # 繋がってしまう）。名前を変えたときは古い写しを残さない。
-                if old_device_name in self.device_info:
+                # 写しが名前だけ同じ別の接続先（自動検出の COM3 と登録機器
+                # 「COM3」など）のものなら、そのセッションの写しなので触らない
+                session = self.device_info.get(old_device_name)
+                if (session is not None and self._endpoint_of(session)
+                        == self._endpoint_of(device_data)):
                     del self.device_info[old_device_name]
                     self.device_info[new_device_data["name"]] = new_device_data
                 # ツリーを再読み込み
@@ -581,14 +657,27 @@ class MainWindow(QMainWindow):
             else:
                 QMessageBox.warning(self, "エラー", "機器の更新に失敗しました。設定は変更されていません。")
     
-    def _on_device_delete(self, group_name: str, device_name: str):
+    def _on_device_delete(self, group_name: str, device_name: str,
+                          device_data: dict = None):
         """
         機器削除
-        
+
         Args:
             group_name: グループ名
             device_name: 機器名
+            device_data: 削除を頼んだ項目の機器データ（省略時は先頭の 1 件）
         """
+        # タブを開いている（接続が残っている）機器の削除は、改名と同じく断る。
+        # 消すと接続先リストから項目が無くなり、実行中のマクロを「ツール」
+        # から止められなくなる（接続もマクロも残る）
+        if (self.terminal_widget.has_terminal(device_name)
+                or device_name in self.connections):
+            QMessageBox.warning(
+                self, "機器の削除",
+                f"'{device_name}' のタブを開いている間は、削除できません。\n"
+                "タブを閉じてから削除してください。")
+            return
+
         # 確認ダイアログ
         reply = QMessageBox.question(
             self,
@@ -599,7 +688,16 @@ class MainWindow(QMainWindow):
         )
         
         if reply == QMessageBox.StandardButton.Yes:
-            if self.config_manager.remove_device(group_name, device_name):
+            # 削除に失敗したとき、設定に元から無かったのか（ツリーにだけ
+            # 残っていた）、保存だけ失敗したのかを見分けるために控えておく
+            group = self.config_manager.get_group(group_name) or {}
+            existed = any(d.get("name") == device_name
+                          for d in group.get("devices", []))
+            # 同じグループに同名が並んでいるときは、右クリックした項目の
+            # 接続先で 1 台に絞る（名前だけだと別の 1 台が消える）
+            if self.config_manager.remove_device(
+                    group_name, device_name,
+                    endpoint=self._endpoint_of(device_data)):
                 # 消した機器の接続情報を残さない（残すと、開いたままの
                 # タブで Enter を押したときに消したはずの機器へ繋がる）
                 self.device_info.pop(device_name, None)
@@ -607,6 +705,12 @@ class MainWindow(QMainWindow):
                 self._load_devices()
                 self.status_bar.showMessage(f"機器 '{device_name}' を削除しました")
             else:
+                if not existed:
+                    # 設定に無い機器がツリーにだけ残っていた。案内だけで
+                    # 済ませると、何度試しても消せない（グループの削除と同じ）。
+                    # 保存に失敗しただけなら remove_device がメモリを戻して
+                    # いるので、ツリーは設定と一致したまま＝作り直さない
+                    self._load_devices()
                 QMessageBox.warning(self, "エラー", "機器の削除に失敗しました。")
     
     def _on_device_duplicate(self, group_name: str, device_data: dict):
@@ -632,7 +736,7 @@ class MainWindow(QMainWindow):
         if index >= 0:
             dialog.group_combo.setCurrentIndex(index)
         
-        if dialog.exec() == QDialog.DialogCode.Accepted:
+        if self._exec_dialog(dialog) == QDialog.DialogCode.Accepted:
             # 機器データを取得
             new_device_data = dialog.get_device_data()
             new_group_name = dialog.get_selected_group()
@@ -651,17 +755,22 @@ class MainWindow(QMainWindow):
             else:
                 QMessageBox.warning(self, "エラー", "機器の追加に失敗しました。")
     
-    def _on_device_moved(self, source_group_name: str, target_group_name: str, device_name: str):
+    def _on_device_moved(self, source_group_name: str, target_group_name: str,
+                         device_name: str, device_data: dict = None):
         """
         機器移動（ドラッグアンドドロップ）
-        
+
         Args:
             source_group_name: 移動元グループ名
             target_group_name: 移動先グループ名
             device_name: デバイス名
+            device_data: 掴んだ項目の機器データ（省略時は先頭の 1 件）
         """
-        # ConfigManagerで移動処理を実行
-        if self.config_manager.move_device(source_group_name, target_group_name, device_name):
+        # ConfigManagerで移動処理を実行。同じグループに同名が並んでいるときは、
+        # 掴んだ項目の接続先で 1 台に絞る（名前だけだと別の 1 台が動く）
+        if self.config_manager.move_device(
+                source_group_name, target_group_name, device_name,
+                endpoint=self._endpoint_of(device_data)):
             # ツリーを再読み込み
             self._load_devices()
             self.status_bar.showMessage(
@@ -678,7 +787,14 @@ class MainWindow(QMainWindow):
             device_data: 機器データ
         """
         device_name = device_data['name']
-        
+
+        # 名前が同じでも接続先が違う項目からは、そのセッションへ繋がせない。
+        # 繋ぐとログの記録先・再接続用の写し・タブが、別の接続先のもので
+        # 上書きされる（「ツール」と同じ判定で断る）
+        if self._session_target_conflict(device_name, device_data):
+            self._warn_session_target_conflict(device_name)
+            return
+
         # 既に接続中かチェック
         if device_name in self.connections:
             self.status_bar.showMessage(f"{device_name} は既に接続されています")
@@ -705,18 +821,31 @@ class MainWindow(QMainWindow):
             device_data: 機器データ
         """
         device_name = device_data['name']
-        
+        password = device_data.get('password', '')
+
+        # 読み込み時に復号できなかったパスワードは、暗号文のままメモリに
+        # 残っている。そのまま接続すると "DPAPI:..." を認証のパスワードと
+        # して機器へ送り、認証失敗になる。繋ぎ直すたびに同じ値で試すので、
+        # 機器側の認証失敗回数（AAA のロックアウトなど）にも数えられうる。
+        # 接続を始める前に断り、機器側へは何も送らない。
+        # Telnet は自動ログインをしないので対象外
+        if self.config_manager.has_undecryptable_password(device_name, password):
+            QMessageBox.warning(
+                self, "接続できません",
+                f"{device_name} のパスワードを復号できません。\n"
+                "機器の編集で入れ直してください。")
+            return
+
         # ステータスバーに接続メッセージを表示
         self.status_bar.showMessage(f"{device_name} に接続します...")
-        
+
         # 新しいターミナルタブを作成
         terminal = self.terminal_widget.create_terminal_tab(device_name)
-        
+
         # 接続情報を取得
         host = device_data.get('host', 'unknown')
         port = device_data.get('port', 22)
         username = device_data.get('username', '')
-        password = device_data.get('password', '')
         ssh_key = device_data.get('ssh_key', '')
         
         # SSH接続を作成
@@ -729,6 +858,7 @@ class MainWindow(QMainWindow):
         # 接続オブジェクトを束縛して渡す。機器名だけで辞書を引くと、
         # 接続中にタブを閉じて同名で繋ぎ直したあと、旧スレッドの遅れた
         # 通知（TCP タイムアウトは最大 20〜30 秒後）が新しい接続を捨てる
+        self._attach_read_gate(device_name, ssh)
         ssh.output_received.connect(
             lambda text, c=ssh: self._on_connection_output(device_name, text, c))
         ssh.connected.connect(
@@ -737,6 +867,7 @@ class MainWindow(QMainWindow):
             lambda c=ssh: self._on_connection_closed(device_name, c))
         ssh.error_occurred.connect(
             lambda error, c=ssh: self._on_connection_error(device_name, error, c))
+        self._notice_sources.add(ssh)
         
         # ターミナルのキー入力をSSHに送信（再接続時の蓄積を防ぐため既存接続を切断）
         try:
@@ -744,6 +875,7 @@ class MainWindow(QMainWindow):
         except TypeError:
             pass
         terminal.key_pressed.connect(ssh.send_command)
+        self._attach_send_backpressure(terminal, ssh)
         
         # 接続と機器情報を保存
         self.connections[device_name] = ssh
@@ -821,6 +953,7 @@ class MainWindow(QMainWindow):
             lambda c=serial_conn: self._on_connection_closed(device_name, c))
         serial_conn.error_occurred.connect(
             lambda error, c=serial_conn: self._on_connection_error(device_name, error, c))
+        self._notice_sources.add(serial_conn)
         
         # ターミナルのキー入力をシリアルに送信（再接続時の蓄積を防ぐため既存接続を切断）
         try:
@@ -828,6 +961,10 @@ class MainWindow(QMainWindow):
         except TypeError:
             pass
         terminal.key_pressed.connect(serial_conn.send_command)
+        # シリアルは送信スレッドが書く。書き終えるまで端末は次を渡さず、
+        # 未送信の分を端末の列に残す（マクロの停止などで取り消せるように）
+        terminal.set_send_backlog(serial_conn.has_pending_sends)
+        serial_conn.send_drained.connect(terminal.resume_send_queue)
         
         # 接続と機器情報を保存
         self.connections[device_name] = serial_conn
@@ -895,6 +1032,7 @@ class MainWindow(QMainWindow):
         # 接続オブジェクトを束縛して渡す。機器名だけで辞書を引くと、
         # 接続中にタブを閉じて同名で繋ぎ直したあと、旧スレッドの遅れた
         # 通知（TCP タイムアウトは最大 20〜30 秒後）が新しい接続を捨てる
+        self._attach_read_gate(device_name, telnet)
         telnet.output_received.connect(
             lambda text, c=telnet: self._on_connection_output(device_name, text, c))
         telnet.connected.connect(
@@ -903,6 +1041,7 @@ class MainWindow(QMainWindow):
             lambda c=telnet: self._on_connection_closed(device_name, c))
         telnet.error_occurred.connect(
             lambda error, c=telnet: self._on_connection_error(device_name, error, c))
+        self._notice_sources.add(telnet)
         
         # ターミナルのキー入力をTelnetに送信（再接続時の蓄積を防ぐため既存接続を切断）
         try:
@@ -910,6 +1049,7 @@ class MainWindow(QMainWindow):
         except TypeError:
             pass
         terminal.key_pressed.connect(telnet.send_command)
+        self._attach_send_backpressure(terminal, telnet)
         
         # 接続と機器情報を保存
         self.connections[device_name] = telnet
@@ -970,6 +1110,37 @@ class MainWindow(QMainWindow):
             print(f"[Connection] {device_name} の旧接続の後始末に失敗: {e}")
         self._release_object(conn)
 
+    def _attach_read_gate(self, device_name: str, conn) -> None:
+        """画面の描き待ちが多すぎる間、この接続の受信を止められるようにする
+
+        TCP で繋ぐ接続（SSH / Telnet）だけに渡す。読むのを止めると相手側は
+        ウィンドウが開くまで送るのを待つので、取りこぼしは起きない。
+        シリアルにはその折り返しが無く（止めれば取りこぼす）、速度も
+        描画が追いつかない域には届かないので渡さない。
+        """
+        setter = getattr(conn, "set_read_gate", None)
+        if setter is not None:
+            setter(self.terminal_widget.output_gate(device_name))
+
+    @staticmethod
+    def _attach_send_backpressure(terminal, conn) -> None:
+        """接続が待たずに書けるときだけ、端末が次の区切りを渡すようにする
+
+        SSH / Telnet は渡された区切りをその場で書く。読むのが遅い機器へ
+        大きく貼り付けると、受信ウィンドウや送信バッファが空かないまま
+        時間切れになり、送信エラーとして切断していた（実機の IOSv で 16KB が
+        途中で切れた）。接続の has_pending_sends を端末へ渡し、書けるように
+        なった知らせ（send_drained）で続きを渡させる。未送信の分は端末の列に
+        残るので、マクロの停止で取り消せ、再接続待ちでは捨てられる。
+        背圧の口を持たない接続（テストの偽物など）では、これまでどおり。
+        """
+        backlog = getattr(conn, "has_pending_sends", None)
+        drained = getattr(conn, "send_drained", None)
+        if backlog is None or drained is None:
+            return
+        terminal.set_send_backlog(backlog)
+        drained.connect(terminal.resume_send_queue)
+
     def _on_connection_output(self, device_name: str, text: str, conn=None):
         """受信出力をターミナルへ流す（置き換え済みの接続からは流さない）
 
@@ -982,7 +1153,7 @@ class MainWindow(QMainWindow):
         if (not self._is_current_connection(device_name, conn)
                 and self.connections.get(device_name) is not None):
             return
-        self.terminal_widget.append_output(device_name, text)
+        self.terminal_widget.queue_output(device_name, text)
 
     def _drop_sftp_manager(self, device_name: str) -> None:
         """機器の SFTP マネージャを切断して外し、表示中ならパネルも空にする"""
@@ -1009,6 +1180,9 @@ class MainWindow(QMainWindow):
         # 再接続に失敗したときに待ちが戻らず、画面に残る「Enterキーを
         # 押すと再接続します」の案内どおりに操作できなくなる
         terminal.set_reconnect_mode(False)
+        # 開いている途中に変えたボーレートをポートが拒んでいたら、ツリーと
+        # 再接続用の写しを実際の速度へ戻す
+        self._restore_serial_baudrate(device_name, conn)
         # グループの自動実行コマンドをGUIスレッドで送信する
         self.run_auto_commands_requested.emit(device_name)
         
@@ -1033,6 +1207,7 @@ class MainWindow(QMainWindow):
         sftp_manager.error_occurred.connect(
             lambda err, c=conn: self._on_sftp_error(device_name, err, c)
         )
+        self._notice_sources.add(sftp_manager)
 
         client = conn.client
 
@@ -1115,13 +1290,30 @@ class MainWindow(QMainWindow):
 
         self._show_terminal_size(device_name)
 
-    def _find_group_of_device(self, device_name: str):
-        """機器名から所属グループを返す(見つからなければNone)"""
-        for group in self.config_manager.get_groups():
-            for device in group.get("devices", []):
-                if device.get("name") == device_name:
-                    return group
-        return None
+    def _find_group_of_device(self, device_name: str, endpoint=None):
+        """機器名から所属グループを返す(見つからなければNone)
+
+        手編集・持ち込みの config では、別々のグループに同じ名前の機器が
+        並ぶ（読み込みは警告だけで残す）。名前だけで探すと必ず先頭の
+        グループに当たり、2 台目へ繋いでも 1 台目のグループの自動実行
+        コマンドがその機器へ流れていた（実測）。
+
+        その名前の機器が複数のグループにあるときは、endpoint（接続した
+        機器の device_endpoint() の戻り値）で 1 つに絞る。編集・削除・
+        移動で同名の機器を見分けるのと同じ読み方。それでも 1 つに
+        決まらなければ、どのグループの機器か分からないので None を返す。
+        1 つのグループにしか無い名前は、今までどおりそのグループを返す。
+        """
+        groups = [group for group in self.config_manager.get_groups()
+                  if any(device.get("name") == device_name
+                         for device in group.get("devices", []))]
+        if len(groups) <= 1:
+            return groups[0] if groups else None
+        matched = [group for group in groups
+                   if any(device.get("name") == device_name
+                          and self._endpoint_of(device) == endpoint
+                          for device in group.get("devices", []))]
+        return matched[0] if len(matched) == 1 else None
 
     def _is_autodetected_device(self, device_name: str) -> bool:
         """いま繋いでいるのが、自動検出したCOMポートかを返す
@@ -1134,6 +1326,55 @@ class MainWindow(QMainWindow):
         if not isinstance(device_data, dict):
             return False
         return device_data.get('source') == 'autodetect'
+
+    @staticmethod
+    def _endpoint_of(device_data):
+        """機器データが指す接続先を、比べられる形で返す（辞書でなければ None）
+
+        自動検出か登録か・プロトコル・ホストとポート（シリアルはポート名）。
+        _on_connect_requested と _connect_ssh / _connect_telnet /
+        _connect_serial が実際に使う値と同じ読み方をする。
+
+        ConfigManager も同名の機器を見分けるのに同じ組を使うので、読み方が
+        ずれないよう core 側の device_endpoint() をそのまま呼ぶ。
+        """
+        return device_endpoint(device_data)
+
+    def _tools_target_matches(self, device_name: str, device_data: dict) -> bool:
+        """「ツール」を開いた項目が、その名前のセッションと同じ接続先かを返す
+
+        「ツール」は機器名でセッションを引く。名前が同じでも接続先が違う
+        項目（後から挿した自動検出の COM3 と、登録機器の「COM3」など）から
+        操作させると、別の機器へマクロが送られる。セッションの接続先は、
+        接続したときの機器データの写し（device_info）で見る。
+        """
+        session = self.device_info.get(device_name)
+        return (session is not None
+                and self._endpoint_of(session) == self._endpoint_of(device_data))
+
+    def _session_target_conflict(self, device_name: str, device_data: dict) -> bool:
+        """その名前のセッションと、選んだ項目の接続先が食い違うかを返す
+
+        「ツール」と同じ照合を、接続・切断の入口にも使う。名前だけで
+        セッションを引くと、後から挿した自動検出の COM3 を選んで「切断」を
+        押したときに登録機器「COM3」の SSH セッションが切れ、切断済みで
+        タブだけ残っている「COM3」へ繋ぐとログの記録先と再接続用の写しが
+        乗っ取られる。
+
+        セッション（タブか接続）が無ければ、名前が空いているだけなので
+        通す。接続時の写しが無いときは接続先を比べられないので通す。
+        """
+        if not (self.terminal_widget.has_terminal(device_name)
+                or device_name in self.connections):
+            return False
+        if self.device_info.get(device_name) is None:
+            return False
+        return not self._tools_target_matches(device_name, device_data)
+
+    def _warn_session_target_conflict(self, device_name: str) -> None:
+        """接続先が食い違う項目から操作されたことを伝える"""
+        self.status_bar.showMessage(
+            f"{device_name}: 選んだ項目は、この名前のセッションの接続先と違います")
 
     def _on_serial_baudrate_changed(self, port: str, baudrate: int):
         """自動検出COMポートのボーレート変更を、開いている接続と再接続用の写しへ反映する
@@ -1169,10 +1410,34 @@ class MainWindow(QMainWindow):
             else:
                 # 接続は生きているので切らない。ポートが拒むのは、アダプタが
                 # その速度に対応していないか、抜かれた場合で、どちらも繋ぎ
-                # 直して直るとは限らないので、起きたことだけを伝える
+                # 直して直るとは限らないので、起きたことだけを伝える。
+                # ツリーと再接続用の写しは、接続が使っている値へ戻す
+                self._restore_serial_baudrate(device_name, conn)
                 self.status_bar.showMessage(
                     f"{device_name}: ボーレートを {baudrate} baud に変更できませんでした"
                     "（接続は元のボーレートのままです）")
+
+    def _restore_serial_baudrate(self, device_name: str, conn) -> None:
+        """自動検出の機器のツリーと再接続用の写しを、接続が使っている速度へ戻す
+
+        ポートがボーレートの変更を拒むと、接続は元の速度のまま（conn.baudrate
+        も元の値）なのに、ツリーのチェックと device_info は選んだ値のまま
+        残る。Enter の再接続はその値で開こうとして失敗する。開いている途中の
+        変更が拒まれた場合は、connect() が conn.baudrate を開いたときの値へ
+        戻しているので、接続できたときにも呼ぶ。
+
+        Args:
+            device_name: 機器名
+            conn: その機器の接続（baudrate を持たない接続では何もしない）
+        """
+        actual = getattr(conn, 'baudrate', None)
+        device_data = self.device_info.get(device_name)
+        if (actual is None or not isinstance(device_data, dict)
+                or device_data.get('source') != 'autodetect'
+                or device_data.get('baudrate') == actual):
+            return
+        device_data['baudrate'] = actual
+        self.device_tree.restore_baudrate(device_data.get('port'), actual)
 
     def _run_auto_commands(self, device_name: str):
         """接続先グループの自動実行コマンドを送信する(GUIスレッドで実行)"""
@@ -1183,11 +1448,25 @@ class MainWindow(QMainWindow):
         # シリアルコンソール（機器の素のCLI）へそのまま流れる
         if self._is_autodetected_device(device_name):
             return
-        group = self._find_group_of_device(device_name)
+        # 同名の機器が別のグループにもあるとき、繋いだ機器がどちらかは
+        # 接続したときの機器データの写しの接続先で見分ける
+        group = self._find_group_of_device(
+            device_name, self._endpoint_of(self.device_info.get(device_name)))
         if not group:
             return
         commands = group.get("auto_commands", [])
         if not commands:
+            return
+        # 送る直前にもう一度、文字列だけの list かを確かめる。読み込みと
+        # 保存の経路は同じ検査をしているが、そこを通らずにメモリへ入った
+        # 値（外部から config を差し替えられた場合など）をそのまま list()
+        # すると、文字列は 1 文字ずつ、辞書はキーだけが実機へ送られる
+        if not ConfigManager._is_valid_auto_commands(commands):
+            print(f"[WARNING] グループ '{group.get('name')}' の自動実行コマンドが"
+                  f"文字列の配列ではないため送信しません")
+            self.status_bar.showMessage(
+                f"{device_name}: グループの自動実行コマンドの形式が正しくない"
+                f"ため送信しません")
             return
         from PyQt6.QtCore import QTimer
         # シェルのプロンプトが出るまで少し待ってから送信する。待っている間に
@@ -1233,6 +1512,38 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"[Connection] {device_name} の後始末に失敗: {e}")
         self._release_object(conn)
+
+    # 接続・SFTP マネージャの知らせのうち、窓が lambda で受けているもの
+    _NOTICE_SIGNALS = ("output_received", "connected", "disconnected",
+                       "error_occurred")
+
+    @staticmethod
+    def _detach_notifications(obj) -> None:
+        """閉じた窓へ、接続・SFTP の知らせ（受信・接続・切断・エラー）が届かないようにする
+
+        これらは接続オブジェクトを既定値に束縛した lambda で受けている。窓を
+        閉じたあとも接続スレッドは知らせを出しうる（Enter で始めた再接続の
+        失敗など）。キュー接続なので配送待ちに残り、そのあと窓ごと GC に
+        回収されると、CPython は lambda の既定値と名前を空にする。それでも
+        PyQt の中継は配送待ちの知らせで空の lambda を呼ぶ（実測:
+        TypeError: () missing 1 required positional argument: 'c'。excepthook が
+        既定のままなら qFatal でプロセスが落ちる）。deleteLater では防げない
+        （削除より先に配送待ちが届く）。結び付きを外せば、残った知らせは
+        誰も呼ばない。
+        """
+        for name in MainWindow._NOTICE_SIGNALS:
+            # シグナルを引くところから守る。接続が失敗・切断して C++ 側が
+            # 破棄されても、再接続待ちの端末が has_pending_sends を握るので
+            # ラッパーは登録簿に残り、引くと RuntimeError になる（実測:
+            # closeEvent が途中で止まり、別ウィンドウのツールが閉じなかった）。
+            # C++ 側が消えていれば結び付きも一緒に消えているので、飛ばしてよい
+            try:
+                signal = getattr(obj, name, None)
+                if signal is None:
+                    continue
+                signal.disconnect()
+            except (TypeError, RuntimeError, AttributeError):
+                pass  # 結び付きが無い / 既に破棄済み / シグナルでない
 
     @staticmethod
     def _release_object(obj) -> None:
@@ -1354,6 +1665,12 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage(f"{device_name} は接続されていません")
             return
 
+        # 名前が同じでも接続先が違う項目からは切らない。「ツール」は同じ
+        # 判定で灰色になるのに、このボタンだけ無関係なセッションを切っていた
+        if self._session_target_conflict(device_name, device_data):
+            self._warn_session_target_conflict(device_name)
+            return
+
         self._on_tab_closed(device_name)
     
     def _on_terminal_resized(self, device_name: str, cols: int, rows: int):
@@ -1401,16 +1718,10 @@ class MainWindow(QMainWindow):
 
         # ダイアログ表示
         dialog = GroupDialog(self, existing_groups=existing_groups)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
+        if self._exec_dialog(dialog) == QDialog.DialogCode.Accepted:
             # グループ名と自動実行コマンドを取得
             group_name = dialog.get_group_name()
             auto_commands = dialog.get_auto_commands()
-
-            # add_group は save_config() の前に in-memory へ追加し、保存に
-            # 失敗しても巻き戻さない。「失敗しました」とだけ案内してツリーを
-            # 放置すると、実行中の設定とツリーが食い違ったまま残り、次の
-            # 無関係な保存でこの追加がそのまま永続化される
-            existed_before = self.config_manager.get_group(group_name) is not None
 
             # 設定に追加
             if self.config_manager.add_group(group_name, auto_commands):
@@ -1418,36 +1729,32 @@ class MainWindow(QMainWindow):
                 self._load_devices()
                 self.status_bar.showMessage(f"グループ '{group_name}' を追加しました")
             else:
-                # add_group は「同名が既にある」場合も False を返す。
-                # 実行中の設定に追加されたかどうかで見分ける
-                applied = (not existed_before
-                           and self.config_manager.get_group(group_name) is not None)
-                self._warn_change_failed("グループの追加", applied)
+                # add_group は「同名が既にある」場合も False を返す
+                self._warn_change_failed(
+                    "グループの追加", self.config_manager.last_save_failed)
 
-    def _warn_change_failed(self, what: str, applied_in_memory: bool):
+    def _warn_change_failed(self, what: str, save_failed: bool):
         """
         設定の変更に失敗したことを知らせる
 
-        ConfigManager の各 mutator は save_config() の前に in-memory の設定を
-        書き換えるため、戻り値の False だけでは「保存だけ失敗した（実行中の
-        状態は変更済み）」と「そもそも変更が適用されなかった」を区別できない。
-        呼び出し側が事後状態を見て判定し、ここへ渡す。
+        ConfigManager の各 mutator は、保存に失敗したら in-memory の設定も
+        元へ戻す（機器・マクロと同じ）。どちらの失敗でも実行中の設定は
+        変わっていないので、ツリーは作り直さない。作り直すと、設定は
+        変わっていないのに畳んでいたグループが開き直り、選択も外れる。
 
-        ツリーと実行中の設定が食い違うのは in-memory に適用された場合だけ
-        なので、ツリーの作り直しもその場合に限る。何も適用されていない失敗
-        （同名グループが既にある等）で作り直すと、設定は変わっていないのに
-        畳んでいたグループが開き直り、選択も外れてしまう。
+        戻り値の False だけでは「保存だけ失敗した」と「そもそも受け付け
+        られなかった（同名グループが既にある等）」を区別できないので、
+        ConfigManager.last_save_failed を渡してもらって文面を分ける。
 
         Args:
             what: 失敗した操作の名前（例: "グループ名の変更"）
-            applied_in_memory: 実行中の設定には変更が適用されているか
+            save_failed: 設定ファイルへの保存に失敗したか
         """
-        if applied_in_memory:
-            self._load_devices()
+        if save_failed:
             QMessageBox.warning(
                 self, "エラー",
                 f"{what}を設定ファイルへ保存できませんでした。\n"
-                "変更はこのセッション中のみ有効で、アプリを終了すると失われます。")
+                "保存できなかったので、変更は反映していません。")
         else:
             QMessageBox.warning(self, "エラー", f"{what}に失敗しました。")
 
@@ -1461,13 +1768,17 @@ class MainWindow(QMainWindow):
         # 既存のグループ名リストと、現在の自動実行コマンドを取得
         existing_groups = [g["name"] for g in self.config_manager.get_groups()]
         group = self.config_manager.get_group(group_name)
-        auto_commands = list(group.get("auto_commands", [])) if group else []
+        # 読み込み時にそろえてはいるが（ConfigManager の
+        # _normalize_optional_list）、ここで例外になるとこのグループは
+        # 編集で直せなくなるので、読み手側でもリスト以外は空として扱う
+        stored = group.get("auto_commands") if group else None
+        auto_commands = list(stored) if isinstance(stored, list) else []
 
         # ダイアログ表示
         dialog = GroupDialog(self, group_name=group_name,
                              existing_groups=existing_groups,
                              auto_commands=auto_commands)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        if self._exec_dialog(dialog) != QDialog.DialogCode.Accepted:
             return
 
         new_group_name = dialog.get_group_name()
@@ -1478,22 +1789,27 @@ class MainWindow(QMainWindow):
         if new_group_name != group_name:
             if not self.config_manager.rename_group(group_name, new_group_name):
                 # rename_group は「保存失敗」のほか「対象が無い」「新名が重複」でも
-                # False を返す。実行中の設定に改名が反映されているかで見分ける。
-                renamed = (self.config_manager.get_group(group_name) is None
-                           and self.config_manager.get_group(new_group_name) is not None)
-                self._warn_change_failed("グループ名の変更", renamed)
+                # False を返す。保存に失敗した分は巻き戻っているので、同じ
+                # ダイアログで変えた自動実行コマンドも当てずにここで止める
+                self._warn_change_failed(
+                    "グループ名の変更", self.config_manager.last_save_failed)
                 return
 
         # 自動実行コマンドは改名後の名前で保存する
         if not self.config_manager.set_group_auto_commands(new_group_name, new_auto_commands):
-            # こちらも「対象が無い」場合と「保存失敗」の両方で False になる。
-            group_now = self.config_manager.get_group(new_group_name)
-            # 元から同じ値なら、保存に失敗しても失われる変更は無い。
-            # 「セッション中のみ有効」と案内しないよう、値が実際に変わったかも見る。
-            applied = (auto_commands != new_auto_commands
-                       and group_now is not None
-                       and group_now.get("auto_commands") == new_auto_commands)
-            self._warn_change_failed("自動実行コマンドの保存", applied)
+            save_failed = self.config_manager.last_save_failed
+            if new_group_name != group_name:
+                # 改名は上の rename_group で保存できている。ツリーを旧名の
+                # まま残すと、そこからの機器の編集・削除・移動が旧名で
+                # グループを探して失敗するので、作り直してから知らせる
+                self._load_devices()
+                QMessageBox.warning(
+                    self, "エラー",
+                    "グループ名の変更は保存しました。\n"
+                    + ("自動実行コマンドは保存できなかったので、反映していません。"
+                       if save_failed else "自動実行コマンドの保存に失敗しました。"))
+                return
+            self._warn_change_failed("自動実行コマンドの変更", save_failed)
             return
 
         self._load_devices()
@@ -1536,10 +1852,14 @@ class MainWindow(QMainWindow):
                 self._load_devices()
                 self.status_bar.showMessage(f"グループ '{group_name}' を削除しました")
             else:
-                # remove_group も save_config() の前に in-memory から消す。
-                # 保存だけ失敗した場合は、実行中の設定から既に消えている
-                applied = self.config_manager.get_group(group_name) is None
-                self._warn_change_failed("グループの削除", applied)
+                # remove_group は「元からグループが無かった」場合も False
+                if group is None:
+                    # 設定に無いグループがツリーにだけ残っていた。案内だけで
+                    # 済ませると、何度試しても「失敗しました」が出るだけで、
+                    # 利用者は表示から消せない。設定に合わせて作り直す
+                    self._load_devices()
+                self._warn_change_failed(
+                    "グループの削除", self.config_manager.last_save_failed)
     
     def _on_save_log(self):
         """ログ保存メニューがクリックされたときの処理"""
@@ -1559,18 +1879,6 @@ class MainWindow(QMainWindow):
         if terminal is None:
             return
         terminal.copy()
-
-    def _on_paste(self):
-        """クリップボードの内容を現在のターミナルから機器へ送信する"""
-        from .terminal_widget import InteractiveTerminal
-
-        terminal = self.terminal_widget.get_current_terminal()
-        # ホームタブは読み取り専用の QTextEdit で送信先を持たない。
-        # 接続タブでも再接続待機中は送信できない（can_send_input が見分ける）。
-        if not isinstance(terminal, InteractiveTerminal) or not terminal.can_send_input():
-            self.status_bar.showMessage("ペーストできるのは接続中のターミナルタブだけです")
-            return
-        terminal.custom_paste()
 
     def _apply_terminal_settings_from_config(self):
         """config の settings.terminal をターミナルへ適用する"""
@@ -1629,7 +1937,7 @@ class MainWindow(QMainWindow):
         案内している。ここで塞ぐと復旧手段が無くなる。
         """
         dialog = SettingsDialog(self, config_manager=self.config_manager)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
+        if self._exec_dialog(dialog) == QDialog.DialogCode.Accepted:
             self._apply_terminal_settings_from_config()
             self.status_bar.showMessage("設定を保存しました")
 
@@ -1657,16 +1965,12 @@ class MainWindow(QMainWindow):
             keepalive_active=keepalive_active,
             command_list_active=command_list_active,
             config_manager=self.config_manager,
-            keepalive_interval=self.keepalive_intervals.get(current_tab_name, 60)
+            keepalive_interval=self.keepalive_intervals.get(current_tab_name, 60),
+            connected=current_tab_name in self.connections
         )
         
         # シグナル接続
-        dialog.keepalive_start_requested.connect(
-            lambda interval: self._start_keepalive(current_tab_name, interval)
-        )
-        dialog.keepalive_stop_requested.connect(
-            lambda: self._stop_keepalive(current_tab_name)
-        )
+        self._bind_keepalive_buttons(dialog, current_tab_name)
         dialog.command_list_start_requested.connect(
             lambda commands, delay: self.macro_manager.start_command_list(
                 current_tab_name, commands, delay
@@ -1676,23 +1980,78 @@ class MainWindow(QMainWindow):
             lambda: self.macro_manager.stop_command_list(current_tab_name)
         )
         
-        dialog.exec()
+        self._exec_dialog(dialog)
     
+    def _bind_keepalive_buttons(self, dialog, device_name: str):
+        """マクロ設定ダイアログの開始・停止を繋ぎ、表示を実状態で更新する
+
+        ダイアログへ渡す connected は開いた時点の値なので、開いている最中に
+        相手機器が切れても「開始」は有効のまま残る。押しても
+        _start_keepalive が断るのに、ダイアログが自分で
+        _update_keepalive_ui(True) まで進めていたため、「状態: 動作中」の
+        表示だけが進んでいた。表示は要求ではなく、macro_manager が実際に
+        タイマーを持っているかで進める。
+
+        Args:
+            dialog: 繋ぐマクロ設定ダイアログ
+            device_name: 機器名
+        """
+        def start(interval: int):
+            self._start_keepalive(device_name, interval)
+            dialog.show_keepalive_running(
+                self.macro_manager.is_keepalive_active(device_name))
+
+        def stop():
+            self._stop_keepalive(device_name)
+            dialog.show_keepalive_running(
+                self.macro_manager.is_keepalive_active(device_name))
+
+        dialog.keepalive_start_requested.connect(start)
+        dialog.keepalive_stop_requested.connect(stop)
+
     def _start_keepalive(self, device_name: str, interval: int):
-        """キープアライブを開始してUI更新"""
+        """キープアライブを開始してUI更新
+
+        入口は「ツール」・メニューバーのマクロ設定・タブのマクロ設定の
+        3 つで、どれも開いている間に切れうる（切断してもタブは残るので、
+        切断済みのタブ名でマクロ設定を開ける）。受け口ごとに確かめると
+        1 つ抜けるので、必ず通るここで見る。切断時の後始末は
+        macro_manager.cleanup_device を直接呼ぶため巻き込まない
+        """
+        if not self._session_is_live(device_name, "キープアライブを開始"):
+            return
         # 間隔を保存
         self.keepalive_intervals[device_name] = interval
-        
+
         self.macro_manager.start_keepalive(device_name, interval)
         self.terminal_widget.set_keepalive_status(device_name, True)
         self.status_bar.showMessage(f"{device_name}: キープアライブ開始（{interval}秒間隔）")
     
     def _stop_keepalive(self, device_name: str):
-        """キープアライブを停止してUI更新"""
+        """キープアライブを停止してUI更新
+
+        開始と同じ 3 つの入口を通る。切れていれば、切断時の後始末
+        （cleanup_device）で既に止まっている
+        """
+        if not self._session_is_live(device_name, "キープアライブを停止"):
+            return
         self.macro_manager.stop_keepalive(device_name)
         self.terminal_widget.set_keepalive_status(device_name, False)
         self.status_bar.showMessage(f"{device_name}: キープアライブ停止")
     
+    def _tools_state_for(self, device_name: str) -> dict:
+        """接続先リストの「ツール」に出す状態（マクロの一覧は開くたびに設定から取る）
+
+        端末は接続したときに渡されたマクロのリストを持ち続ける。プリセットを
+        削除すると ConfigManager はリストごと差し替えるので、端末の一覧は古い
+        ままになり、削除済みの項目が残って新しい項目が出ず、同じ名前で作り
+        直すと古い説明のまま新しい定義が実行されていた。
+        """
+        state = self.terminal_widget.tools_state_for(device_name)
+        if "macros" in state:
+            state["macros"] = list(self.config_manager.get_global_macros())
+        return state
+
     def _on_macro_execute_requested(self, device_name: str, macro_name: str):
         """
         右クリックメニューからマクロ実行が要求されたときの処理
@@ -1701,6 +2060,20 @@ class MainWindow(QMainWindow):
             device_name: 機器名
             macro_name: マクロ名
         """
+        # 同じ名前が複数あると、名前で引く get_macro_by_name は先頭の 1 件を
+        # 返すので、メニューで 2 件目を選んでも 1 件目のコマンドが機器へ
+        # 送られる（実測）。どれを送るか決められないので、何も送らずに断る
+        if count_macros_named(self.config_manager.get_global_macros(),
+                              macro_name) > 1:
+            QMessageBox.warning(
+                self,
+                "マクロ実行エラー",
+                f"同じ名前のマクロ '{macro_name}' が複数あるため、"
+                "どれを実行するか決められません。機器へは何も送っていません。\n"
+                "設定ファイル (config.json) で名前を変えてから実行してください。"
+            )
+            return
+
         # マクロ情報を取得
         macro = self.config_manager.get_macro_by_name(macro_name)
         if not macro:
@@ -1743,16 +2116,12 @@ class MainWindow(QMainWindow):
             keepalive_active=keepalive_active,
             command_list_active=command_list_active,
             config_manager=self.config_manager,
-            keepalive_interval=self.keepalive_intervals.get(device_name, 60)
+            keepalive_interval=self.keepalive_intervals.get(device_name, 60),
+            connected=device_name in self.connections
         )
         
         # シグナル接続（UI更新も行う）
-        dialog.keepalive_start_requested.connect(
-            lambda interval: self._start_keepalive(device_name, interval)
-        )
-        dialog.keepalive_stop_requested.connect(
-            lambda: self._stop_keepalive(device_name)
-        )
+        self._bind_keepalive_buttons(dialog, device_name)
         dialog.command_list_start_requested.connect(
             lambda commands, delay: self.macro_manager.start_command_list(
                 device_name, commands, delay
@@ -1762,27 +2131,51 @@ class MainWindow(QMainWindow):
             lambda: self.macro_manager.stop_command_list(device_name)
         )
         
-        dialog.exec()
+        self._exec_dialog(dialog)
     
+    def _session_is_live(self, device_name: str, what: str) -> bool:
+        """「ツール」から来た要求を、いまも繋がっているときだけ通す
+
+        メニューの項目の有効・無効は、メニューを作った時点の状態で決まる
+        （DeviceTree._add_tools_menu）。開いている間に相手機器が切れても
+        項目は有効なままなので、選ぶと切断済みの機器名で処理が走る。
+        キープアライブなら新しいタイマーが立ち、そのあと同じ名前で繋ぎ
+        直すと新しいセッションへ CR が飛ぶ。しかもその状態の「ツール」は
+        接続なしとして灰色になるため、ツリーからは止められない。
+
+        Args:
+            device_name: 機器名
+            what: できなかったことの名前（ステータスバーの文面に使う）
+
+        Returns:
+            bool: その機器の接続が残っていれば True
+        """
+        if device_name in self.connections:
+            return True
+        self.status_bar.showMessage(
+            f"{device_name}: 接続が切れているため{what}できません")
+        return False
+
     def _on_keepalive_start_requested(self, device_name: str):
         """
         右クリックメニューからキープアライブ開始が要求されたときの処理
-        
+
         Args:
             device_name: 機器名
         """
-        # 保存された間隔を使用（未設定の場合はデフォルト60秒）
+        # 保存された間隔を使用（未設定の場合はデフォルト60秒）。
+        # メニューを開いている間に切れていないかは _start_keepalive が見る
         interval = self.keepalive_intervals.get(device_name, 60)
         self._start_keepalive(device_name, interval)
-    
+
     def _on_keepalive_stop_requested(self, device_name: str):
         """
         右クリックメニューからキープアライブ停止が要求されたときの処理
-        
+
         Args:
             device_name: 機器名
         """
-        # キープアライブを停止
+        # キープアライブを停止（切れていないかは _stop_keepalive が見る）
         self._stop_keepalive(device_name)
     
     @property
@@ -2095,7 +2488,9 @@ for details.
         msg.setText(info_text)
         msg.setIcon(QMessageBox.Icon.Information)
         msg.setStandardButtons(QMessageBox.StandardButton.Ok)
-        msg.exec()
+        # 開くたびに作る親付きのダイアログなので、ほかの窓と同じく
+        # 閉じたあとの破棄を予約する（QMessageBox も QDialog）
+        self._exec_dialog(msg)
     
     def _on_check_for_updates(self):
         """手動で更新をチェック"""
@@ -2125,8 +2520,43 @@ for details.
         
         threading.Thread(target=check_thread, daemon=True).start()
     
+    def _closing_now(self) -> bool:
+        """終了処理に入っているか（更新チェックの知らせを出さない合図）
+
+        終了処理の途中で呼ばれたモーダルは、答えるまで終了を止める。その
+        時点でサーバも接続も止まっているので、開いても何もできない。
+        """
+        return getattr(self, "_shutting_down", False)
+
+    # 終了処理に入ったことを伝えるパネル。ここに挙げた受け手は、印が
+    # 立っている間 QMessageBox を開かない（表示とログへの記録は残す）
+    _PANELS_TOLD_WHEN_CLOSING = (
+        "sftp_panel",
+        "snmp_panel",
+        "tftp_server_panel",
+        "ftp_server_panel",
+        "sftp_server_panel",
+        "syslog_panel",
+    )
+
+    def _tell_panels_closing(self) -> None:
+        """各パネルへ「閉じている」印を渡す
+
+        終了処理は記録を救うために配送待ちのシグナルをその場で配るので
+        （_drain_output_before_log_finish）、転送・ワーカー・受信の各
+        スレッドが出したエラーの知らせもここで届く。受け手がモーダルを
+        開くと、答えるまで終了が止まる。そのとき接続もサーバも停止済みで、
+        開いても何もできない。配送そのものは変えず、受け手の側で開かない。
+        """
+        for name in self._PANELS_TOLD_WHEN_CLOSING:
+            panel = getattr(self, name, None)
+            if panel is not None:
+                panel._closing = True
+
     def _show_no_update_message(self):
         """最新版使用中メッセージを表示"""
+        if self._closing_now():
+            return
         try:
             from __version__ import __version__
             version = __version__
@@ -2142,6 +2572,8 @@ for details.
     
     def _show_update_check_error(self, error: str):
         """更新チェックエラーを表示"""
+        if self._closing_now():
+            return
         QMessageBox.warning(
             self,
             "更新確認エラー",
@@ -2333,7 +2765,8 @@ for details.
         # 確認のあとも updater.bat が開き直すまでには間があるので、確かめた
         # 写しを作り、updater.bat にはそのパスを渡す（stage_for_apply の
         # 説明を参照）
-        staged_path, problem = VersionManager().stage_for_apply(
+        version_mgr = VersionManager()
+        staged_path, problem = version_mgr.stage_for_apply(
             zip_path, expected_version)
         if problem:
             QMessageBox.warning(self, "エラー", problem)
@@ -2356,16 +2789,10 @@ for details.
         print(f"[MainWindow] updater.bat exists: {os.path.exists(updater_path)}")
         
         try:
-            import subprocess
-            from core.version_manager import updater_command, updater_env
-            # リストで渡すと、パスの , や = で引数が途中で切れる
-            # （updater_command の説明を参照）
-            subprocess.Popen(
-                updater_command(updater_path, staged_path, app_path),
-                creationflags=subprocess.CREATE_NEW_CONSOLE,
-                env=updater_env()
-            )
-            
+            # 起動できなければ、写しを片付けてから例外が戻ってくる
+            # （更新ダイアログと同じ VersionManager.launch_updater を通す）
+            version_mgr.launch_updater(updater_path, staged_path, app_path)
+
             # アプリケーションを終了する。ここは MainWindow.__init__
             # （起動時の未適用更新）から呼ばれることがあり、その時点では
             # app.exec() がまだ始まっていない。イベントループが回って
@@ -2373,8 +2800,10 @@ for details.
             # だけ起動してアプリは表示され続ける（updater.bat は 3 秒後に
             # ロック中の NetBelt.exe へ上書きを試みる）。singleShot(0) で
             # 予約すれば、exec() に入った直後に処理される
-            from PyQt6.QtWidgets import QApplication
-            QTimer.singleShot(0, QApplication.quit)
+            # 終わらせる前にこのウィンドウを閉じ、記録中のログを書き切って
+            # 閉じる後始末（closeEvent）を通す（quit_for_update）
+            from .dialogs.update_dialog import quit_for_update
+            QTimer.singleShot(0, lambda: quit_for_update(self))
         except Exception as e:
             QMessageBox.critical(
                 self,
@@ -2384,10 +2813,14 @@ for details.
     
     def _show_update_dialog(self, update_info: dict):
         """更新ダイアログを表示（メインスレッドで実行）"""
+        if self._closing_now():
+            # 終了処理の途中で配送された知らせ。ここで開くと、答えるまで
+            # 閉じられないうえ、「今すぐ更新」でダウンロードまで始まる
+            return
         from .dialogs.update_dialog import UpdateDialog
-        
+
         dialog = UpdateDialog(self, update_info)
-        result = dialog.exec()
+        result = self._exec_dialog(dialog)
         
         # 最終チェック時刻を更新
         self.config_manager.set_last_check_time(datetime.now().isoformat())
@@ -2397,6 +2830,28 @@ for details.
             self.config_manager.set_skipped_version(update_info.get('version'))
             self.status_bar.showMessage(f"バージョン {update_info.get('version')} をスキップしました")
     
+    def _drain_output_before_log_finish(self) -> None:
+        """記録を閉じる前に、配送待ちの受信通知を捌く
+
+        受信スレッドのシグナルは GUI スレッドのイベントキューへ積まれる。
+        emit 済みでもまだ配送されていない分は queue_output に届いておらず、
+        finish_log_recordings では救えない（実測: 受信スレッドから 200 行
+        emit してイベントループを回さずに閉じると、200 行とも記録に無い）。
+        終了処理はサーバの停止や MIB 読み込みの待機を通るので、時間が
+        かかるほどここに溜まる（実測: 0.5 秒かかる状況で 216 行が欠けた）。
+        接続を切って受信スレッドを止めたあとに一度だけ捌き、記録へ回す。
+
+        記録が開いていないときは何もしない。終了処理の途中で配送を始める
+        のは、記録を救うためだけの寄り道なので広げない。利用者の操作は
+        受け付けない（ExcludeUserInputEvents）。
+        """
+        if not self.terminal_widget.has_open_log_recordings():
+            return
+        from PyQt6.QtCore import QEventLoop
+        from PyQt6.QtWidgets import QApplication
+        QApplication.processEvents(
+            QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+
     def closeEvent(self, event):
         """
         アプリケーション終了時の処理
@@ -2404,6 +2859,19 @@ for details.
         Args:
             event: 終了イベント
         """
+        # 以降は終了処理。記録中の受信を取りこぼさないために、この先で
+        # 配送待ちのシグナルをその場で配る（_drain_output_before_log_finish と
+        # TerminalWidget._deliver_queued_output）。配られるのは受信だけでは
+        # なく、未配送のキュー接続すべてなので、別スレッドの更新チェックが
+        # 出した知らせもここで届く。受け手がモーダルを開くと、答えるまで
+        # 終了が止まる（実測: 記録中に閉じると更新ダイアログが開いた）。
+        # 更新チェック以外にも、SFTP 転送・SNMP・各サーバのエラーが同じ窓で
+        # モーダルを開くので、各パネルにも同じ印を渡す
+        self._shutting_down = True
+        self._tell_panels_closing()
+        # 機器一覧の定期確認（1 秒ごとのシリアルポート走査）を止める。
+        # 閉じたあとも鳴り続け、終了処理の途中で機器一覧を組み直す
+        self.device_tree.stop_serial_monitor()
         # レイアウト（スプリッター幅・選択タブ）を保存
         self._save_layout()
         # Syslogレシーバーを停止
@@ -2457,7 +2925,8 @@ for details.
         for device_name in list(self.connections.keys()):
             self.macro_manager.cleanup_device(device_name)
         
-        # すべてのSFTP接続を切断
+        # すべてのSFTP接続を切断。知らせを外すのは、配送待ちを配り切った後
+        closed = list(self.sftp_managers.values())
         for device_name, sftp_mgr in list(self.sftp_managers.items()):
             try:
                 sftp_mgr.disconnect()
@@ -2465,11 +2934,34 @@ for details.
                 pass
         self.sftp_managers.clear()
         
-        # すべての接続を切断（SSH/シリアル）
-        for device_name, conn in list(self.connections.items()):
-            conn.disconnect()
-        
+        # すべての接続を切断（SSH/シリアル）。記録を閉じるより先に切るのは、
+        # 受信スレッドを止めてからでないと記録し切れないため（下の
+        # _drain_output_before_log_finish）。conn.disconnect() ではなく
+        # _dispose_connection() を使う。disconnect() は disconnected を出し、
+        # その先の _on_connection_closed が切断バナーを端末へ書くので、
+        # まだ開いている記録へ終了時の案内が混ざる
+        closed.extend(self.connections.values())
+        for device_name in list(self.connections.keys()):
+            self._dispose_connection(device_name)
+
         self.connections.clear()
+
+        # 受信済みでまだ描いていない出力を記録し切ってから、記録を止めて
+        # ファイルを閉じる。記録へ書くのは描くときなので、ここで済ませないと
+        # 画面が流れている最中に閉じた分が記録から欠ける
+        self._drain_output_before_log_finish()
+        self.terminal_widget.finish_log_recordings()
+        # 配り切ったので、以後の知らせはこの窓へ届かないようにする。閉じる
+        # 前に辞書から外した接続・SFTP マネージャ（タブを閉じた・置き換えた）
+        # も、deleteLater はイベントループへ戻るまで処理されないので残り、
+        # 遅れた知らせを出しうる。控えておいたそれらも外す。窓の子を名前で
+        # 一律に拾うと、SNMP・Syslog の管理役まで外し、終了処理の最中に
+        # 届いたエラーがパネルの記録に残らなくなる
+        seen = set()
+        for obj in closed + list(self._notice_sources):
+            if id(obj) not in seen:
+                seen.add(id(obj))
+                self._detach_notifications(obj)
         
         # 別ウィンドウにしたツールを閉じる。開いたままだと可視のトップ
         # レベルが残り、quitOnLastWindowClosed が既定 True のためイベント

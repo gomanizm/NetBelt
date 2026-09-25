@@ -4,7 +4,6 @@
 
 import os
 import sys
-import subprocess
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QProgressBar, QTextEdit, QWidget, QMessageBox
@@ -12,14 +11,43 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QFont
 from core.version_manager import (
-    VersionManager, updater_command, updater_env, running_from_source,
-    SOURCE_RUN_MESSAGE)
+    VersionManager, running_from_source, SOURCE_RUN_MESSAGE)
 
 
 # 中止したダウンロードは、終わるまでここで生かしておく。実行中の QThread が
 # 破棄されると Qt はその場でプロセスを落とす（実測 0xC0000409）。ダイアログ
 # とその親の破棄に巻き込ませないよう、所有者をこちらへ移す。
 _RUNNING_DOWNLOADS = set()
+
+
+def quit_for_update(window=None) -> None:
+    """更新を当てるためにアプリを終わらせる（後始末を通してから）。
+
+    QApplication.quit() はウィンドウへ closeEvent を送らない。そのまま呼ぶと
+    MainWindow.closeEvent だけが通る後始末 — 接続の切断、配送待ちの受信の
+    取り込み、TerminalWidget.finish_log_recordings による記録の書き切りと
+    停止 — を飛ばして終わる。記録中のログはファイルを閉じられず、描き待ちの
+    受信はそのまま捨てられていた（実測: 記録を始めてから描き待ちを 19 文字
+    作って quit すると、その分が記録に残らない）。
+
+    先に閉じて通常の終了と同じ道を通す。window を渡さなければ、表示中の
+    トップレベルの窓をまとめて閉じる（更新ダイアログからの適用。呼ぶ側は
+    まだ exec() の中で、親を辿るより Qt に任せる方が確実）。起動時の適用は
+    メインウィンドウがまだ表示されていないことがあるので、その窓を渡す。
+
+    閉じる方に失敗しても updater.bat は既に起動していて、数秒後に実行中の
+    ファイルを置き換えに来るので、終わらせる方は必ず通す。
+    """
+    from PyQt6.QtWidgets import QApplication
+
+    try:
+        if window is not None:
+            window.close()
+        else:
+            QApplication.closeAllWindows()
+    except Exception as e:
+        print(f"[Update] 終了前の後始末に失敗: {e}")
+    QApplication.quit()
 
 
 def _release_when_finished(thread):
@@ -83,7 +111,14 @@ class DownloadThread(QThread):
             if zip_path:
                 self.download_completed.emit(zip_path)
             else:
+                # 理由が分かっているときは、それを伝える。一律に
+                # 「チェックサムが一致しない場合も含みます」と出していたため、
+                # 別の NetBelt が同じ更新を保存中でも、原因と違うことを
+                # 名指ししていた（凍結ビルドでは print はログファイル行きで、
+                # 画面には何も出ない）。
+                reason = getattr(self.version_mgr, "last_failure", None)
                 self.download_failed.emit(
+                    reason or
                     "ダウンロードに失敗しました"
                     "（チェックサムが一致しない場合も含みます）")
         
@@ -358,20 +393,6 @@ class UpdateDialog(QDialog):
             QMessageBox.information(self, "更新", SOURCE_RUN_MESSAGE)
             return
 
-        # 表示した版と同じものを渡す。ダウンロード先が版ごとに分かれる前は、
-        # 後から来た受信が、先に表示したダイアログの ZIP を置き換えられた。
-        # 適用時は存在確認しかしていなかったので、そのまま別の版が当たる。
-        # 同じ確認は起動時の適用経路（MainWindow._apply_pending_update）も
-        # 通る。片方だけ直る形にしないため VersionManager へまとめてある。
-        # 確認を通ってから updater.bat が ZIP を開き直すまでにも間があるので、
-        # 確かめた写しを作り、updater.bat にはそのパスを渡す
-        # （VersionManager.stage_for_apply の説明を参照）
-        staged_path, problem = VersionManager().stage_for_apply(
-            self.downloaded_zip_path, self.update_info.get('version'))
-        if problem:
-            QMessageBox.warning(self, "エラー", problem)
-            return
-
         # updater.batのパスを取得
         if getattr(sys, 'frozen', False):
             # PyInstallerでビルドされている場合
@@ -401,25 +422,40 @@ class UpdateDialog(QDialog):
                 f"updater.batが見つかりません。\n\nパス: {updater_path}"
             )
             return
-        
+
+        # 表示した版と同じものを渡す。ダウンロード先が版ごとに分かれる前は、
+        # 後から来た受信が、先に表示したダイアログの ZIP を置き換えられた。
+        # 適用時は存在確認しかしていなかったので、そのまま別の版が当たる。
+        # 同じ確認は起動時の適用経路（MainWindow._apply_pending_update）も
+        # 通る。片方だけ直る形にしないため VersionManager へまとめてある。
+        # 確認を通ってから updater.bat が ZIP を開き直すまでにも間があるので、
+        # 確かめた写しを作り、updater.bat にはそのパスを渡す
+        # （VersionManager.stage_for_apply の説明を参照）。
+        # 写しを作るのは updater.bat の存在を確かめた後。先に作っていたときは、
+        # 見つからずに戻るたびに写しが更新フォルダへ溜まっていた。
+        version_mgr = VersionManager()
+        staged_path, problem = version_mgr.stage_for_apply(
+            self.downloaded_zip_path, self.update_info.get('version'))
+        if problem:
+            QMessageBox.warning(self, "エラー", problem)
+            return
+
         # updater.batを起動
         try:
             # updater.bat <ZIPパス> <実行ファイルパス>
-            # リストで渡すと、パスの , や = で引数が途中で切れる
-            # （updater_command の説明を参照）
-            subprocess.Popen(
-                updater_command(updater_path, staged_path, app_path),
-                creationflags=subprocess.CREATE_NEW_CONSOLE,
-                env=updater_env()
-            )
-            
+            # 起動できなければ、写しを片付けてから例外が戻ってくる
+            version_mgr.launch_updater(updater_path, staged_path, app_path)
+
             # ダイアログを閉じる
             self.done(self.UPDATE_NOW)
-            
-            # アプリケーションを終了
-            from PyQt6.QtWidgets import QApplication
-            QApplication.quit()
-        
+
+            # アプリケーションを終了する。記録中のログを閉じずに終わらない
+            # よう、窓の closeEvent を通してから終わらせる（quit_for_update）。
+            # ここはまだ exec() の中なので、入れ子のループを抜けてから
+            # 後始末が走るように予約する
+            from PyQt6.QtCore import QTimer
+            QTimer.singleShot(0, quit_for_update)
+
         except Exception as e:
             QMessageBox.critical(
                 self,

@@ -50,9 +50,14 @@ class GroupDialog(QDialog):
 
         # 折り返しを切ると、ラベルのテキスト全長がダイアログの最小幅になり
         # resize() の指定が効かなくなる（実測で 500 指定に対し 790 になった）
+        # 送信先は _run_auto_commands（自動検出のポートだけ除外し、
+        # プロトコルは見ない）と合わせる。SSH / Telnet だけのように読めると、
+        # コンソールで繋いだ機器の素の CLI へ意図しない行が流れる
         self.auto_commands_help_label = QLabel(
-            "1行に1コマンド。このグループの機器へ SSH / Telnet で接続した直後に、"
-            "上から順に送信されます。空欄でも構いません。")
+            "1行に1コマンド。このグループの機器へ SSH / Telnet / コンソールで"
+            "接続した直後に、上から順に送信されます。自動検出された COM ポート"
+            "（「コンソール接続」）はどのグループにも属さないため、送信されません。"
+            "空欄でも構いません。")
         self.auto_commands_help_label.setWordWrap(True)
         layout.addWidget(self.auto_commands_help_label)
 

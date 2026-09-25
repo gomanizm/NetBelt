@@ -8,10 +8,16 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtGui import QFont
 from core.tftp_server import TFTPServerManager
 from datetime import datetime
-from ui import theme
+from ui import log_export, plain_log, theme
 
 class TFTPServerPanel(QWidget):
     """TFTPサーバー制御パネル"""
+
+    # アプリの終了処理に入ったか（MainWindow.closeEvent が立てる）。
+    # 立っている間はモーダルを開かない。終了処理は記録を救うために配送待ちの
+    # シグナルをその場で配るので、サーバのスレッドが出したエラーもそこで
+    # 届く。答えるまで終了が止まるうえ、そのときサーバは停止済み。
+    _closing = False
 
     # TFTP は認証が無く、存在しないファイルへの RRQ だけでもログと履歴が
     # 1行ずつ増える。上限が無いと遠隔から叩き続けるだけでメモリを食い潰せる。
@@ -58,11 +64,13 @@ class TFTPServerPanel(QWidget):
         root_layout = QHBoxLayout()
         self.root_dir_edit = QLineEdit()
         self.root_dir_edit.setText("./tftp_root")
-        root_layout.addWidget(self.root_dir_edit)
+        # 余った幅は入力欄だけが受け取り、参照ボタンは自分の幅を保つ。
+        # 以前は setMaximumWidth(60) でボタンの頭を押さえていたので、
+        # 自然な幅 80px に対していつも 60px へ潰れ、押しにくかった
+        root_layout.addWidget(self.root_dir_edit, 1)
         self.browse_btn = QPushButton("参照")
         self.browse_btn.clicked.connect(self._on_browse_directory)
-        self.browse_btn.setMaximumWidth(60)
-        root_layout.addWidget(self.browse_btn)
+        root_layout.addWidget(self.browse_btn, 0)
         settings_layout.addLayout(root_layout, 1, 1)
         settings_layout.addWidget(QLabel("転送許可:"), 2, 0)
         allow_layout = QHBoxLayout()
@@ -129,11 +137,19 @@ class TFTPServerPanel(QWidget):
         # 行数の上限。超えた分は Qt が先頭ブロックから捨てる
         self.log_text.document().setMaximumBlockCount(self.MAX_LOG_LINES)
         self.log_text.setStyleSheet("font-family: Consolas, monospace; font-size: 9pt;")
+        # ボタンはログのすぐ上に左寄せ1行（SNMP の Trap 受信と同じ形）。
+        # 行末の addStretch() が無いと、余った幅がボタン自身に配られて
+        # 横へ間延びする
+        log_btn_layout = QHBoxLayout()
+        self.export_log_btn = QPushButton("エクスポート")
+        self.export_log_btn.clicked.connect(self._on_export_log)
+        log_btn_layout.addWidget(self.export_log_btn)
+        self.clear_log_btn = QPushButton("クリア")
+        self.clear_log_btn.clicked.connect(self._on_clear_log)
+        log_btn_layout.addWidget(self.clear_log_btn)
+        log_btn_layout.addStretch()
+        log_layout.addLayout(log_btn_layout)
         log_layout.addWidget(self.log_text)
-        clear_log_btn = QPushButton("ログをクリア")
-        clear_log_btn.clicked.connect(self._on_clear_log)
-        clear_log_btn.setMaximumWidth(120)
-        log_layout.addWidget(clear_log_btn)
         log_group.setLayout(log_layout)
         layout.addWidget(log_group)
         # 説明文
@@ -219,7 +235,15 @@ class TFTPServerPanel(QWidget):
         self._add_log("[%s] %s" % (ip, msg))
 
     def _fmt_bytes(self, n):
-        """バイト数を読みやすい単位文字列に変換"""
+        """バイト数を読みやすい単位文字列に変換。
+
+        float へ直せないほど大きい値（相手が申告した tsize など）は「—」にする。
+        そのまま割ると OverflowError になり、履歴に空の行が残る
+        """
+        try:
+            n = float(n)
+        except (OverflowError, TypeError, ValueError):
+            return "—"
         for u in ("B", "KB", "MB", "GB"):
             if n < 1024 or u == "GB": return "%.1f%s" % (n, u)
             n /= 1024.0
@@ -286,14 +310,18 @@ class TFTPServerPanel(QWidget):
             st["row"] -= excess
 
     def _on_transfer_interrupted(self, ip: str, filename: str, direction: str):
-        """利用者が止めたことによる中断。エラーではないので行だけ確定させる。
+        """未完了で終わった転送。エラーではないので行だけ確定させる。
 
         確定させないと「転送中」の表示が残り続ける。ダイアログは出さない。
+
+        利用者が止めた場合と、機器が ERROR を送って打ち切った場合の
+        どちらもここへ来る。見分ける手がかりは通知に無いので、文言は
+        理由に踏み込まない（FTP パネルと同じ「転送中断」）。
         """
         st = self._active.pop((ip, filename, direction), None)
         if st is not None:
             self.history.setItem(st["row"], 5, QTableWidgetItem("中断"))
-        self._add_log("[%s] 停止により中断: %s" % (ip, filename))
+        self._add_log("[%s] 転送中断: %s" % (ip, filename))
 
     def _on_protocol_event(self, ip: str, filename: str, reason: str,
                            direction: str = ""):
@@ -322,6 +350,9 @@ class TFTPServerPanel(QWidget):
         転送ごとの事象は _on_protocol_event が扱う。
         """
         self._add_log(f"エラー: {error_message}")
+        if self._closing:
+            # 終了処理の途中。ログだけ残して戻る（_closing の説明を参照）
+            return
         QMessageBox.critical(self, "TFTPサーバー エラー", error_message)
 
     def _on_fw_allow(self):
@@ -332,13 +363,23 @@ class TFTPServerPanel(QWidget):
         self._add_log("ファイアウォール許可: %s (%s)" % ("完了" if ok else "未反映/失敗", msg))
 
     def _add_log(self, message: str):
-        """ログにメッセージを追加(自動スクロール付き)"""
-        self.log_text.append(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
-        self.log_text.verticalScrollBar().setValue(self.log_text.verticalScrollBar().maximum())
+        """ログにメッセージを追加(自動スクロール付き)
+
+        append() ではなく平文で積む。TFTP は認証が無いので、要求ファイル名に
+        <br> を入れるだけで偽の行を差し込めた（plain_log の説明を参照）。
+        """
+        plain_log.append_line(
+            self.log_text,
+            f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
 
     def _on_clear_log(self):
         """ログをクリア"""
         self.log_text.clear()
+
+    def _on_export_log(self):
+        """画面に出ているアクティビティログをファイルへ保存する"""
+        log_export.export_log_text(self, self.log_text.toPlainText(),
+                                   "tftp_log")
 
     def closeEvent(self, event):
         """パネルが閉じられる時の処理(実行中ならサーバーを停止)"""

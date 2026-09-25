@@ -47,7 +47,7 @@ class SnmpExportRespectsRecordingTest(unittest.TestCase):
             w.start_log_recording()
         self.assertIn("rtrA", w._log_files, "前提: 記録が始まっている")
         w.append_output("rtrA", "A1 show running-config\r\n")
-        self.addCleanup(lambda: w._stop_log_recording_for("rtrA", notify=False))
+        self.addCleanup(lambda: w._stop_log_recording_for("rtrA"))
         # 記録開始の「開始しました」通知を、エクスポートの結果と混ぜない
         self.info.reset_mock()
         self.warning.reset_mock()

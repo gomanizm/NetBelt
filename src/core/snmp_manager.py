@@ -138,6 +138,33 @@ def v3_password_error(auth_protocol: str, auth_password: str,
     return None
 
 
+# 「途中まで（… のため中断）」の理由に使う長さの上限。pysnmp の
+# dispatcher は poll error の本文へトレースバックを丸ごと入れるため
+# （実測 2097 バイト）、そのまま画面のステータスへ出すと読めない。
+PARTIAL_REASON_MAX_LENGTH = 120
+
+
+def short_failure_reason(error: BaseException) -> str:
+    """例外から、1 行の短い中断理由を作る
+
+    str(e) は複数行のことがあるので先頭行だけを使い、情報の無い
+    「Traceback (most recent call last):」は落とす。本文が空の例外
+    （OSError() など）もあるので、型名を必ず前に付ける。
+    """
+    text = str(error)
+    first_line = text.splitlines()[0].strip() if text else ""
+    header = "Traceback (most recent call last):"
+    if first_line.endswith(header):
+        first_line = first_line[:-len(header)].strip()
+    first_line = first_line.rstrip(":").strip()
+    name = type(error).__name__
+    if not first_line:
+        return name
+    if len(first_line) > PARTIAL_REASON_MAX_LENGTH:
+        first_line = first_line[:PARTIAL_REASON_MAX_LENGTH] + "…"
+    return f"{name}: {first_line}"
+
+
 class SNMPWorker(QThread):
     """SNMP操作を別スレッドで実行するワーカー"""
     
@@ -147,6 +174,9 @@ class SNMPWorker(QThread):
     # WALK が途中で途切れたときの理由。取れた分は result_ready で普通に
     # 渡すので、不完全であることはこちらで伝える
     partial_result = pyqtSignal(str)
+    # 取り消されて終わったときに、そこまでに取れた行を渡す。
+    # result_ready とはどちらか一方だけが出る
+    cancelled = pyqtSignal(object)
 
     def __init__(self, operation: str, params: dict):
         super().__init__()
@@ -154,7 +184,9 @@ class SNMPWorker(QThread):
         self.params = params
         self._cancelled = False
         self._partial_reason = None
-    
+        # 取り消されたときに渡す、そこまでに取れた行（WALK が貯めていく）
+        self._collected = []
+
     def run(self):
         """スレッドのメイン処理"""
         try:
@@ -169,18 +201,39 @@ class SNMPWorker(QThread):
                 self.result_ready.emit(False, f"不明な操作: {self.operation}")
                 return
             
-            if not self._cancelled:
+            if self._cancelled:
+                # 利用者が止めた。取れた分は途中までとして渡す
+                self.cancelled.emit(result)
+            else:
                 if self._partial_reason:
                     # 表には出すが、全部ではないことを先に伝える
                     self.partial_result.emit(self._partial_reason)
                 self.result_ready.emit(True, result)
-        
+
         except Exception as e:
-            if not self._cancelled:
+            if self._cancelled:
+                # 止めたあとの失敗（応答待ちのタイムアウト等）はエラーに
+                # しない。そこまでの行（GET なら空）を途中までとして渡す
+                self.cancelled.emit(list(self._collected))
+            elif self._collected:
+                # WALK の途中で例外（経路が落ちた、ソケットが閉じた）。
+                # errorIndication のときと同じく、取れた行は捨てずに
+                # 「途中まで」として渡す。ここで捨てると、直前までの
+                # 行は表にも書き出しにも出ないまま消える（実測）。
+                # 理由は 1 行に切り詰める（str(e) はトレースバックを
+                # 丸ごと抱えていることがある）
+                self.partial_result.emit(short_failure_reason(e))
+                self.result_ready.emit(True, list(self._collected))
+            else:
                 self.result_ready.emit(False, str(e))
-    
+
     def cancel(self):
-        """操作をキャンセル"""
+        """操作をキャンセル
+
+        待っている応答を切ることはできないので、効くのは次の応答を
+        受け取ったところ（応答しない機器では最大約 6 秒後）。
+        終わったら result_ready ではなく cancelled が出る。
+        """
         self._cancelled = True
     
     def _perform_get(self) -> List[Tuple[str, str, str]]:
@@ -232,8 +285,9 @@ class SNMPWorker(QThread):
         # 認証情報の準備
         auth_data = self._prepare_auth_data(version)
         
-        # SNMP WALK実行
-        results = []
+        # SNMP WALK実行。取り消されたときに run() がそこまでの行を
+        # 渡せるよう、self._collected へ直接貯める
+        results = self._collected
         count = 0
         
         for (errorIndication, errorStatus, errorIndex, varBinds) in nextCmd(
@@ -687,6 +741,9 @@ class SNMPManager(QObject):
     # WALK が途中で途切れたときの理由。結果は operation_completed で
     # 普通に届くので、不完全であることだけをこちらで伝える
     operation_partial = pyqtSignal(str)
+    # 利用者が止めた GET/WALK の、そこまでに取れた行。この操作では
+    # operation_completed は出ない
+    operation_cancelled = pyqtSignal(object)
     error_occurred = pyqtSignal(str)  # エラーメッセージ
     trap_received = pyqtSignal(dict)  # Trap受信
     trap_receiver_started = pyqtSignal()  # Trap受信開始
@@ -737,8 +794,9 @@ class SNMPManager(QObject):
         # processEvents() した時点で解放済みの C++ を叩いて落ちる（実測）。
         self.worker.progress_update.connect(self.progress_update)
         self.worker.partial_result.connect(self.operation_partial)
+        self.worker.cancelled.connect(self.operation_cancelled)
         self.worker.start()
-        
+
         self.operation_started.emit(f"SNMP GET: {host}")
         return True   # 受理した（実行中で断った場合は False）
     
@@ -767,11 +825,31 @@ class SNMPManager(QObject):
         self.worker.finished.connect(self._on_worker_finished)
         self.worker.progress_update.connect(self.progress_update)
         self.worker.partial_result.connect(self.operation_partial)
+        self.worker.cancelled.connect(self.operation_cancelled)
         self.worker.start()
-        
+
         self.operation_started.emit(f"SNMP WALK: {host} - {oid}")
         return True   # 受理した（実行中で断った場合は False）
-    
+
+    def request_cancel(self) -> bool:
+        """実行中の GET/WALK に取り消しを頼む（待たずに戻る）
+
+        画面の停止操作から呼ぶ。cancel_operation() は終了処理用で、
+        スレッドの終了を最大 5 秒待つので GUI が固まる。
+        取り消しは次の応答を受けたところで効き（応答しない機器では最大
+        約 6 秒）、そこまでに取れた行が operation_cancelled で届く。
+        それまでは self.worker を持ったままなので、新しい要求は実行中と
+        同じく断られる。
+
+        Returns:
+            頼めたら True。何も走っていない、または結果が既に配送待ちなら False
+        """
+        worker = self.worker
+        if worker is None or not worker.isRunning():
+            return False
+        worker.cancel()
+        return True
+
     def cancel_operation(self):
         """現在の操作をキャンセル
 
@@ -813,12 +891,15 @@ class SNMPManager(QObject):
         押したときだけ昇格する。
         """
         try:
-            from .firewall import ensure_inbound_allow, ensure_self_program_allow
+            from .firewall import (combine_results, ensure_inbound_allow,
+                                   ensure_self_program_allow)
             ok, msg = ensure_inbound_allow("SNMP Trap", "UDP", port)
             print(f"[SNMP] ファイアウォール: {msg}")
             ok2, msg2 = ensure_self_program_allow()
             print(f"[SNMP] ファイアウォール(自exe): {msg2}")
-            return (ok and ok2), msg
+            # 失敗した操作の理由を返す。最初の msg を決め打ちで返すと、
+            # 自exe の許可だけ失敗したとき成功の文言が出る
+            return combine_results([(ok, msg), (ok2, msg2)])
         except Exception as e:
             print(f"[SNMP] ファイアウォール設定エラー: {e}")
             return False, str(e)

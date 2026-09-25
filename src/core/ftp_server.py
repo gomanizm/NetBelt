@@ -1,4 +1,5 @@
 """FTP サーバー（pyftpdlib ラッパ）。UI 通知は Qt シグナル。"""
+import os
 import threading
 import time
 
@@ -45,32 +46,171 @@ class FTPServerManager(QObject):
         self._stop_event = threading.Event()
         self.is_running = False
         self.port = 0
-        # (ip, filename, direction) 単位の表示コアレス。機器が1回の copy で複数FTP接続を張っても
+        # (ip, path, direction) 単位の表示コアレス。機器が1回の copy で複数FTP接続を張っても
         # 論理転送1本=履歴1行にする（Cisco IOS は本転送前に接続→RETR→即切断のプローブを複数回行う）。
+        # path は実ファイルのパス（省略時は filename）、値はその転送の表示名。basename で
+        # 束ねると、別ディレクトリの同名ファイルの並行転送が1本にまとめられる
         self._tx = {}
+        # 同じ鍵で持つ行の状態: 開始を届けた（shown）／配送待ちの上限で
+        # 省いた（hidden）。_tx の値は表示名なので、そこへは混ぜられない
+        self._tx_row = {}
+        # GUI へ渡したまま、まだ処理されていない通知の件数の上限。
+        # 接続と切断のたびに 1 件出るので、認証の要らない相手が接続して即切断を
+        # 繰り返すと、GUI が他の処理で塞がっている間に Qt の配送キューへ際限なく
+        # 積み上がる（パネルのログの行数上限が効くのは配送の後）。TFTP の
+        # protocol_event と同じく、超過中は数えるだけにして、はけた時点で
+        # 省略した件数を 1 行だけ出す。数え違えないよう、この信号はすべて
+        # _emit_activity から出す。
+        # 転送の通知（開始・進捗・完了・中断）も同じカウンタに数える。
+        # 数えないと、機器が小さいファイルの RETR を連打するだけで、
+        # 接続・切断と同じようにキューへ積み上がる
+        self.max_pending_notices = 1000
+        self._notice_lock = threading.Lock()
+        self._pending_notices = 0
+        self._dropped_notices = 0
+        # 自分の信号を自分でも受ける。待受スレッドから emit した分はキュー経由で
+        # GUI スレッドへ届くので、呼ばれたことが「GUI が 1 件処理した」の合図
+        for signal in (self.client_activity, self.transfer_started,
+                       self.transfer_progress, self.transfer_complete,
+                       self.transfer_interrupted):
+            signal.connect(self._on_notice_delivered)
+        # 書き込み中の保存先の鍵（_upload_key）→ STOR を受けた制御接続。
+        # 同じ保存先へ 2 本の STOR が同時に走ると、どちらも 226 で終わるのに
+        # 中身が混ざる・片方が黙って消える（SFTP・TFTP と同じく後の方を断る）。
+        # 読み書きするのは待受スレッド（ioloop）だけ
+        self._uploads = {}
 
-    def _emit_started(self, ip, filename, total, direction):
-        key = (ip, filename, direction)
+    @staticmethod
+    def _upload_key(path):
+        """保存先を比べるための鍵（SFTP・TFTP と同じく realpath → normcase）"""
+        return os.path.normcase(os.path.realpath(path))
+
+    def _reserve_upload(self, handler, path):
+        """保存先を handler（制御接続）の STOR に予約する。
+
+        Returns:
+            None: 別の接続が書き込み中（断る）
+            True: 新しく予約した（STOR が失敗したら外す）
+            False: この接続が既に予約していた（外さない）
+        """
+        key = self._upload_key(path)
+        holder = self._uploads.get(key)
+        if holder is None:
+            self._uploads[key] = handler
+            return True
+        return False if holder is handler else None
+
+    def _release_uploads(self, handler, path=None):
+        """handler の予約を外す。path を渡したらその保存先の分だけ。
+
+        受信の完了・未完了では全部外す。データ接続は 1 本なので、その時点で
+        まだ持っている他の予約は、後の STOR で pyftpdlib が手放した分だけ
+        """
+        key = None if path is None else self._upload_key(path)
+        for k in [k for k, h in self._uploads.items()
+                  if h is handler and (key is None or k == key)]:
+            del self._uploads[k]
+
+    def _take_notice(self, force=False, count_drop=True):
+        """配送待ちを 1 件ぶん確保する。確保できたら True（呼び出し側が emit する）。
+
+        上限に達している間は False。count_drop なら省略件数へ足す（進捗は
+        次の進捗か完了で置き換わるので足さない）。force は上限を超えても
+        確保する（開始を届けた転送の行を閉じる通知。捨てると行が残る）
+        """
+        with self._notice_lock:
+            if not force and self._pending_notices >= self.max_pending_notices:
+                if count_drop:
+                    self._dropped_notices += 1
+                return False
+            self._pending_notices += 1
+            return True
+
+    def _take_closing_notice(self, row):
+        """完了・中断を渡すかを決める。
+
+        開始を届けた行を閉じる 1 件は必ず渡す。開始を省いた転送のものは
+        渡さずに省略件数へ足す。行の無いもの（台帳に無い＝束ねた相手が
+        先に閉じた）は上限の範囲でだけ渡す
+        """
+        if row == "shown":
+            return self._take_notice(force=True)
+        if row == "hidden":
+            with self._notice_lock:
+                self._dropped_notices += 1
+            return False
+        return self._take_notice()
+
+    def _emit_activity(self, ip, message):
+        """client_activity を 1 件渡す。配送待ちが上限に達している間は数えるだけ。"""
+        if self._take_notice():
+            self.client_activity.emit(ip, message)
+
+    def _on_notice_delivered(self, *_args):
+        """GUI が通知を 1 件処理したので配送待ちを戻す（GUI スレッドで動く）"""
+        with self._notice_lock:
+            if self._pending_notices > 0:
+                self._pending_notices -= 1
+            dropped = 0
+            if self._pending_notices == 0:
+                dropped, self._dropped_notices = self._dropped_notices, 0
+        if dropped:
+            self._emit_activity("", "表示が追いつかず %d 件の通知を省略しました" % dropped)
+
+    def _emit_started(self, ip, filename, total, direction, path=None, ftp_path=None):
+        """開始を通知し、この転送の表示名を返す（束ねたときは既存の行の表示名）。
+
+        接続側はこれを覚えて、後の進捗・完了・中断に display として渡す。
+        束ねた接続の片方が先に終わると台帳の鍵が外れるので、残った接続の
+        通知を basename に戻すと、別フォルダの同名ファイルの行へ付いてしまう
+        """
+        key = (ip, path or filename, direction)
         if key in self._tx:
-            return  # 既に行がある（機器の複数接続を1行に束ねる）
-        self._tx[key] = True
-        self.transfer_started.emit(ip, filename, int(total), direction)
+            return self._tx[key]  # 既に行がある（機器の複数接続を1行に束ねる）
+        # パネルは表示名で行を追跡する。同じ相手・同じ方向で別の場所の同名
+        # ファイルが転送中なら、取り違えないようルートからのパスで見せる
+        name = filename
+        if ftp_path and name in [v for (i, _, d), v in list(self._tx.items())
+                                 if i == ip and d == direction]:
+            name = ftp_path
+        self._tx[key] = name
+        shown = self._take_notice()
+        self._tx_row[key] = "shown" if shown else "hidden"
+        if shown:
+            self.transfer_started.emit(ip, name, int(total), direction)
+        return name
 
-    def _emit_progress(self, ip, filename, done, total, direction):
-        self.transfer_progress.emit(ip, filename, int(done), int(total), direction)
+    # 以下の display は、その接続が開始時に受け取った表示名（無ければ None）。
+    # 台帳に鍵が無いときは basename より先にこれを使う
+    def _emit_progress(self, ip, filename, done, total, direction, path=None,
+                       display=None):
+        key = (ip, path or filename, direction)
+        name = self._tx.get(key, display or filename)
+        # 開始を省いた転送の進捗は出さない（行が片側だけになる）。進捗は
+        # 次の進捗か完了で置き換わるので、省略件数には数えない
+        if self._tx_row.get(key) == "hidden":
+            return
+        if self._take_notice(count_drop=False):
+            self.transfer_progress.emit(ip, name, int(done), int(total), direction)
 
-    def _emit_complete(self, ip, filename, done, total, direction):
-        self._tx.pop((ip, filename, direction), None)  # 完了で解放し次の転送は新規行に
-        self.transfer_complete.emit(ip, filename, int(done), int(total), direction)
+    def _emit_complete(self, ip, filename, done, total, direction, path=None,
+                       display=None):
+        # 完了で解放し次の転送は新規行に
+        key = (ip, path or filename, direction)
+        name = self._tx.pop(key, display or filename)
+        if self._take_closing_notice(self._tx_row.pop(key, None)):
+            self.transfer_complete.emit(ip, name, int(done), int(total), direction)
 
-    def _emit_interrupted(self, ip, filename, direction):
+    def _emit_interrupted(self, ip, filename, direction, path=None, display=None):
         """未完了で終わった転送（ABOR・接続断・停止）を通知する。
 
         完了と同じく鍵を解放する。残したままにすると、進行中の表示が
         そのまま残り、同じファイルの再試行が開始として通知されない。
         """
-        self._tx.pop((ip, filename, direction), None)
-        self.transfer_interrupted.emit(ip, filename, direction)
+        key = (ip, path or filename, direction)
+        name = self._tx.pop(key, display or filename)
+        if self._take_closing_notice(self._tx_row.pop(key, None)):
+            self.transfer_interrupted.emit(ip, name, direction)
 
     # 匿名に与える権限。認証ユーザー用の "elradfmwMT" を使い回すと、
     # 資格情報なしでルート配下を上書き・削除・改名・フォルダ作成できる。
@@ -105,7 +245,7 @@ class FTPServerManager(QObject):
         os.makedirs(root_dir, exist_ok=True)
         # ファイアウォールは自動設定しない（3CDaemon 方式）。管理者昇格(UAC)を避けるため、
         # 制御21/passive の受信許可は Windows 標準の初回プロンプト／既存ルールに委ねる。
-        self.client_activity.emit("", "ファイアウォール: 自動設定なし（Windowsの許可に委ねます）")
+        self._emit_activity("", "ファイアウォール: 自動設定なし（Windowsの許可に委ねます）")
 
         try:
             authorizer = DummyAuthorizer()
@@ -147,6 +287,10 @@ class FTPServerManager(QObject):
                 super().handle_read()
                 try: self.cmd_channel._emit_tx_progress(self.get_transmitted_bytes())
                 except Exception: pass
+            # ioloop が呼ぶのは handle_read_event。DTPHandler はクラス定義時に
+            # handle_read_event = handle_read と別名を束縛しているので、上書き
+            # した handle_read にも付け直さないと呼ばれず、STOR の進捗が出ない
+            handle_read_event = handle_read
 
         class _Handler(FTPHandler):
             dtp_handler = _ProgressDTP
@@ -157,17 +301,49 @@ class FTPServerManager(QObject):
                     try: total = self.fs.getsize(file)
                     except Exception: total = 0
                     self._tx_name = os.path.basename(file); self._tx_total = int(total)
-                    self._tx_dir = "download"; self._tx_last = 0.0
-                    mgr._emit_started(self.remote_ip, self._tx_name, self._tx_total, "download")
+                    self._tx_dir = "download"; self._tx_last = 0.0; self._tx_path = file
+                    self._tx_display = mgr._emit_started(
+                        self.remote_ip, self._tx_name, self._tx_total, "download",
+                        file, self.fs.fs2ftp(file))
                 return result
 
             def ftp_STOR(self, file, mode="w"):
-                result = super().ftp_STOR(file, mode)
+                # APPE と REST 付きの STOR もここを通る。開く前に保存先を予約し、
+                # 別の接続が書き込み中なら断る（開くと 'wb' が相手の書きかけを
+                # 切り詰め、どちらも 226 で終わるのに中身が混ざる）
+                fresh = mgr._reserve_upload(self, file)
+                if fresh is None:
+                    # pyftpdlib は STOR / RETR のたびに REST の位置を読んで
+                    # 0 に戻す。ここで断ると super() を通らないので、戻さないと
+                    # 次の REST 無しの STOR / RETR が残った位置から始まる
+                    # （実測: 上書きが途中から書かれ、取得が先頭を欠く）
+                    self._restart_position = 0
+                    self.respond("450 File busy: another upload is writing it.")
+                    mgr._emit_activity(self.remote_ip,
+                                       "他の転送が書き込み中のため断りました: %s"
+                                       % self.fs.fs2ftp(file))
+                    return None
+                result = None
+                try:
+                    result = super().ftp_STOR(file, mode)
+                finally:
+                    if result is None and fresh:
+                        # 開けなかった（550 / 554）。残すと、この接続を閉じるまで
+                        # 同じ保存先へ誰も書けない
+                        mgr._release_uploads(self, file)
                 if result is not None:
                     self._tx_name = os.path.basename(file); self._tx_total = 0  # アップロードは総サイズ不明
-                    self._tx_dir = "upload"; self._tx_last = 0.0
-                    mgr._emit_started(self.remote_ip, self._tx_name, 0, "upload")
+                    self._tx_dir = "upload"; self._tx_last = 0.0; self._tx_path = file
+                    self._tx_display = mgr._emit_started(
+                        self.remote_ip, self._tx_name, 0, "upload",
+                        file, self.fs.fs2ftp(file))
                 return result
+
+            def _display_for(self, file):
+                """file の転送について開始時に受け取った表示名。別の転送なら None"""
+                if file is not None and getattr(self, "_tx_path", None) == file:
+                    return getattr(self, "_tx_display", None)
+                return None
 
             def _emit_tx_progress(self, done):
                 name = getattr(self, "_tx_name", None)
@@ -175,27 +351,57 @@ class FTPServerManager(QObject):
                 now = time.monotonic()
                 if now - getattr(self, "_tx_last", 0.0) < 0.2: return  # 約200msに間引き
                 self._tx_last = now
+                path = getattr(self, "_tx_path", None)
                 mgr._emit_progress(self.remote_ip, name, int(done),
-                                   int(getattr(self, "_tx_total", 0)), getattr(self, "_tx_dir", "download"))
+                                   int(getattr(self, "_tx_total", 0)), getattr(self, "_tx_dir", "download"),
+                                   path, self._display_for(path))
+
+            def _forget_tx(self):
+                """終わった転送を制御接続から降ろす。
+
+                進捗はデータチャネルの送受信ごとに出るが、ftp_STOR を
+                通らないデータ転送（名前をサーバが決める STOU、一覧の
+                LIST / NLST）もある。消さずに残すと、それらの進捗が
+                直前に終わった転送の名前・方向で出てしまう
+                """
+                self._tx_name = None; self._tx_path = None
 
             def on_file_sent(self, file):
                 try: total = os.path.getsize(file)
                 except OSError: total = 0
-                mgr._emit_complete(self.remote_ip, os.path.basename(file), total, total, "download")
+                mgr._emit_complete(self.remote_ip, os.path.basename(file), total, total, "download",
+                                   file, self._display_for(file))
+                self._forget_tx()
             def on_file_received(self, file):
+                mgr._release_uploads(self)   # 閉じ終えた（pyftpdlib は閉じてから呼ぶ）
                 try: total = os.path.getsize(file)
                 except OSError: total = 0
-                mgr._emit_complete(self.remote_ip, os.path.basename(file), total, total, "upload")
+                mgr._emit_complete(self.remote_ip, os.path.basename(file), total, total, "upload",
+                                   file, self._display_for(file))
+                self._forget_tx()
             # 未完了で終わったとき（ABOR・データ接続の切断・サーバ停止）。
             # pyftpdlib が DTP を閉じる際に必ずどちらかを呼ぶ
             def on_incomplete_file_sent(self, file):
-                mgr._emit_interrupted(self.remote_ip, os.path.basename(file), "download")
+                mgr._emit_interrupted(self.remote_ip, os.path.basename(file), "download",
+                                      file, self._display_for(file))
+                self._forget_tx()
             def on_incomplete_file_received(self, file):
-                mgr._emit_interrupted(self.remote_ip, os.path.basename(file), "upload")
+                mgr._release_uploads(self)
+                mgr._emit_interrupted(self.remote_ip, os.path.basename(file), "upload",
+                                      file, self._display_for(file))
+                self._forget_tx()
+            def close(self):
+                # STOR を受けたがデータ接続が来ないまま相手が去ると（受動ポートが
+                # 塞がれているなど）、pyftpdlib はファイルを閉じるだけで上の
+                # コールバックを呼ばない。予約が残ると同じ名前へ書けなくなる
+                try:
+                    super().close()
+                finally:
+                    mgr._release_uploads(self)
             def on_connect(self):
-                mgr.client_activity.emit(self.remote_ip, "接続")
+                mgr._emit_activity(self.remote_ip, "接続")
             def on_disconnect(self):
-                mgr.client_activity.emit(self.remote_ip, "切断")
+                mgr._emit_activity(self.remote_ip, "切断")
 
         _Handler.authorizer = authorizer
         _Handler.passive_ports = range(passive_ports[0], passive_ports[1] + 1)
@@ -224,6 +430,9 @@ class FTPServerManager(QObject):
             self._server = None
             return False
         self._stop_event = threading.Event()
+        # 前回の待受スレッドは終わっている（_await_previous_thread）ので、
+        # 閉じ損ねた接続の予約が残っていても持ち越さない
+        self._uploads = {}
         self._thread = threading.Thread(
             target=self._serve, args=(self._server, self._stop_event),
             daemon=True)
@@ -307,21 +516,23 @@ class FTPServerManager(QObject):
                 self._thread = thread
         self.is_running = False
         self._tx.clear()
+        self._tx_row.clear()
         self.stopped.emit()
 
     def fix_firewall(self, port=21, passive_ports=(50100, 50150)):
         """手動: Windows FW 受信許可を追加（制御/passive/自exe、管理者昇格/UAC）。
         3CDaemon 方式で通らない環境の復旧用。押した時だけ昇格する。"""
         try:
-            from .firewall import ensure_inbound_allow, ensure_self_program_allow
+            from .firewall import (combine_results, ensure_inbound_allow,
+                                   ensure_self_program_allow)
             ok, msg = ensure_inbound_allow("FTP Server", "TCP", port)
-            self.client_activity.emit("", "ファイアウォール(制御): %s" % msg)
+            self._emit_activity("", "ファイアウォール(制御): %s" % msg)
             lo, hi = passive_ports
             ok2, msg2 = ensure_inbound_allow("FTP Passive", "TCP", "%d-%d" % (lo, hi))
-            self.client_activity.emit("", "ファイアウォール(passive): %s" % msg2)
+            self._emit_activity("", "ファイアウォール(passive): %s" % msg2)
             ok3, msg3 = ensure_self_program_allow()
-            self.client_activity.emit("", "ファイアウォール(自exe): %s" % msg3)
-            return (ok and ok2 and ok3), msg
+            self._emit_activity("", "ファイアウォール(自exe): %s" % msg3)
+            return combine_results([(ok, msg), (ok2, msg2), (ok3, msg3)])
         except Exception as e:
             self.error_occurred.emit("ファイアウォール設定エラー: %s" % e)
             return False, str(e)

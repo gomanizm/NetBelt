@@ -84,9 +84,12 @@ class SnmpCsvBomTest(unittest.TestCase):
         self.panel._export_results_to_csv(path, RESULTS, "192.0.2.10", None)
         with io.open(path, encoding="utf-8-sig", newline="") as f:
             rows = list(csv.reader(f))
-        self.assertEqual(rows[0], ["OID", "Type", "Value"])
-        self.assertEqual(rows[1], RESULTS[0])
-        self.assertEqual(rows[2][2], "東京 第1機械室")
+        # 見出しの前には「# 対象ホスト:」の 1 行が入る（どの機器の結果かを
+        # CSV にも残すため。JSON の "host"・TXT の「対象ホスト:」と同じ）
+        self.assertEqual(rows[0], ["# 対象ホスト: 192.0.2.10"])
+        self.assertEqual(rows[1], ["OID", "Type", "Value"])
+        self.assertEqual(rows[2], RESULTS[0])
+        self.assertEqual(rows[3][2], "東京 第1機械室")
 
     def test_the_trap_csv_is_still_readable_as_csv(self):
         path = self._path("traps_read.csv")
@@ -104,7 +107,9 @@ class SnmpCsvBomTest(unittest.TestCase):
         with io.open(path, encoding="utf-8-sig") as f:
             lines = f.read().splitlines()
         self.assertTrue(lines[0].startswith("# 途中まで"), lines[0])
-        self.assertEqual(lines[1], "OID,Type,Value")
+        # 「# 対象ホスト:」も見出しの前に並ぶ
+        self.assertEqual(lines[1], "# 対象ホスト: 192.0.2.10")
+        self.assertEqual(lines[2], "OID,Type,Value")
 
     def test_the_text_and_json_exports_keep_no_bom(self):
         """Excel で開かない形式には BOM を足さないこと。"""

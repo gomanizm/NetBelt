@@ -204,8 +204,13 @@ class GroupEditWiringTest(unittest.TestCase):
             w._on_edit_group("既存コマンドあり")
         self.assertEqual(ctor.call_args.kwargs["auto_commands"], ["terminal monitor"])
 
-    def test_tree_is_refreshed_when_rename_fails(self):
-        """保存に失敗しても in-memory は変わるので、ツリーを実行中の状態へ合わせ直す。"""
+    def test_a_failed_rename_is_rolled_back(self):
+        """保存に失敗したら in-memory も戻すので、ツリーは作り直さない。
+
+        以前は in-memory に改名を残して「このセッション中のみ有効」と案内して
+        いたが、終了時のレイアウト保存がそれを書き出して再起動後も残っていた
+        （2026-09-20 の決定で巻き戻しに変更）。
+        """
         from unittest import mock
         from PyQt6.QtWidgets import QDialog
         w = self._window()
@@ -220,10 +225,12 @@ class GroupEditWiringTest(unittest.TestCase):
              mock.patch.object(w, "_load_devices") as reload_tree:
             w._on_edit_group("元の名前")
         warn.assert_called_once()
-        reload_tree.assert_called_once()
-        self.assertIn("セッション", warn.call_args[0][2])
+        reload_tree.assert_not_called()
+        self.assertIn("反映していません", warn.call_args[0][2])
+        self.assertIsNotNone(w.config_manager.get_group("元の名前"))
+        self.assertIsNone(w.config_manager.get_group("新しい名前"))
 
-    def test_tree_is_refreshed_when_saving_commands_fails(self):
+    def test_a_failed_command_save_is_rolled_back(self):
         """改名なしでコマンド保存だけ失敗した場合も同じ。"""
         from unittest import mock
         from PyQt6.QtWidgets import QDialog
@@ -239,8 +246,10 @@ class GroupEditWiringTest(unittest.TestCase):
              mock.patch.object(w, "_load_devices") as reload_tree:
             w._on_edit_group("保存失敗")
         warn.assert_called_once()
-        reload_tree.assert_called_once()
-        self.assertIn("セッション", warn.call_args[0][2])
+        reload_tree.assert_not_called()
+        self.assertIn("反映していません", warn.call_args[0][2])
+        self.assertEqual(
+            w.config_manager.get_group("保存失敗")["auto_commands"], [])
 
     def test_duplicate_name_is_not_reported_as_a_save_failure(self):
         """rename_group は重複名でも False。保存失敗と混同した案内をしないこと。"""

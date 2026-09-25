@@ -114,16 +114,23 @@ class MacroSendsThroughTerminalQueueTest(unittest.TestCase):
                          % [(len(s), s[:12]) for s in conn.sent])
 
     def test_a_keepalive_fired_mid_paste_waits_for_the_paste(self):
-        """キープアライブの CR が貼り付けの途中へ入らないこと。"""
+        """キープアライブの CR が貼り付けの途中へ入らないこと。
+
+        打ちかけ（最後の行送りより後ろに送った分がある）の間はキープアライブを
+        送らない（利用者の決定 2026-09-20）ので、行送りで終わる貼り付けにする。
+        """
         window, terminal, conn = self._connected_window()
         chunk = terminal.SEND_CHUNK
         window._start_keepalive("dev", 60)
-        self._start_long_paste(terminal, conn)
+        terminal.send_text("P" * (chunk * 2 - 1) + "\n")
+        self.assertEqual(conn.sent, ["P" * chunk],
+                         "前提: 最初のひと区切りだけが同期で送られる")
 
         window.macro_manager._send_keepalive("dev")     # タイマー発火を模す
         self._pump()
 
-        self.assertEqual(conn.sent, ["P" * chunk, "P" * chunk, "\r"],
+        self.assertEqual(conn.sent,
+                         ["P" * chunk, "P" * (chunk - 1) + "\r", "\r"],
                          "キープアライブが貼り付けのチャンク間に割り込んだ: %r"
                          % [(len(s), s[:12]) for s in conn.sent])
 

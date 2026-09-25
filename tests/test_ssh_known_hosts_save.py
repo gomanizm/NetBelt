@@ -74,13 +74,14 @@ class KnownHostsSaveTest(unittest.TestCase):
 
         _, client_b, policy_b = self._tofu()
 
-        def write_then_fail(filename):
+        def write_then_fail(hostkeys, preserved, tmp_path):
             """途中まで書いたところで力尽きる保存。"""
-            with open(filename, "w", encoding="utf-8") as f:
+            with open(str(tmp_path), "w", encoding="utf-8") as f:
                 f.write("192.0.2.2 ecdsa-sha2-nistp256 AAAA")
             raise OSError(28, "No space left on device")
 
-        with mock.patch.object(client_b, "save_host_keys", write_then_fail):
+        with mock.patch("core.ssh_connection._write_known_hosts_file",
+                        write_then_fail):
             policy_b.missing_host_key(client_b, "192.0.2.2",
                                       paramiko.ECDSAKey.generate())
 

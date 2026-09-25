@@ -2,12 +2,15 @@
 バージョン管理とアップデート機能
 """
 
+import contextlib
 import os
 import sys
 import json
 import shutil
+import subprocess
 import tempfile
 import threading
+import time
 import requests
 from typing import Optional, Dict, Callable
 from datetime import datetime
@@ -34,7 +37,8 @@ except ImportError:
 _CMD_UNSAFE = "&^%!"
 
 
-def updater_command(updater_path: str, zip_path: str, app_path: str) -> str:
+def updater_command(updater_path: str, zip_path: str, app_path: str,
+                    expected_sha256: Optional[str] = None) -> str:
     """updater.bat を起動するコマンド行を組み立てる
 
     subprocess にリストで渡すと、Windows の list2cmdline は空白かタブを
@@ -50,6 +54,10 @@ def updater_command(updater_path: str, zip_path: str, app_path: str) -> str:
     ValueError にする。呼び出し側はどちらも QMessageBox で理由を出せる。
     updater.bat 自身も同じ理由で ! を検出して中止する。
 
+    expected_sha256 を渡すと第4引数として付ける。updater.bat は展開の直前に
+    その値と ZIP のハッシュを突き合わせる（VersionManager.launch_updater の
+    説明を参照）。16進64桁しか渡さないので、引用符で包めば cmd は素通しする。
+
     Raises:
         ValueError: cmd が意味を変えてしまう文字がパスに含まれるとき
     """
@@ -60,7 +68,10 @@ def updater_command(updater_path: str, zip_path: str, app_path: str) -> str:
                 "パスに %s が含まれているため、更新を適用できません。\n"
                 "フォルダ名を変えるか、新しい ZIP を手で展開してください。\n"
                 "対象: %s" % (" ".join(found), path))
-    return '"{}" "{}" "{}"'.format(updater_path, zip_path, app_path)
+    command = '"{}" "{}" "{}"'.format(updater_path, zip_path, app_path)
+    if expected_sha256:
+        command += ' "{}"'.format(expected_sha256)
+    return command
 
 
 # ソース実行で更新を当てようとしたときに出す案内。
@@ -123,6 +134,196 @@ def sanitized_token(token: Optional[str]) -> Optional[str]:
     return cleaned
 
 
+# 最終名ごとの確定のロック（download_update の確定の手順を参照）。
+# 版ごとに 1 つ増えるだけなので、使い終えても消さない。
+_finalize_locks_guard = threading.Lock()
+_finalize_locks: Dict[str, threading.Lock] = {}
+
+
+def _finalize_lock(zip_path: str) -> threading.Lock:
+    """同じ最終名の確定を、同じプロセスの中で 1 本ずつにするロックを返す。"""
+    key = os.path.normcase(os.path.abspath(zip_path))
+    with _finalize_locks_guard:
+        lock = _finalize_locks.get(key)
+        if lock is None:
+            lock = _finalize_locks[key] = threading.Lock()
+        return lock
+
+
+# 別プロセスの NetBelt との重なりを避ける目印（download_update の確定の
+# 手順を参照）。目印が取れるまで待つ上限と、異常終了の置き土産とみなす
+# までの時間（秒）。確定は os.replace 数回ぶんなので、待つのは数秒でよい。
+FINALIZE_WAIT_SEC = 5.0
+FINALIZE_STALE_SEC = 60.0
+# 目印の中身（_finalize_token の印）を読むときの上限。印は pid・スレッド・
+# 時刻を '-' で並べた ASCII で、64 バイトを超えることはない。
+_FINALIZE_TOKEN_MAX = 64
+# 取れなかったときに利用者へ出す文言（利用者の決定 2026-09-20 / release-04）。
+# print だけだったときは、凍結ビルドではログファイル行きで画面に出ず、
+# ダイアログは『チェックサムが一致しない場合も含みます』と、原因と違う
+# ことを名指ししていた。
+FINALIZE_BUSY_MESSAGE = ('別の NetBelt が同じ更新を保存中です。'
+                         '先の保存が終わってから、もう一度お試しください。')
+
+
+def _finalize_token() -> bytes:
+    """この確定を他と見分ける印。
+
+    同じプロセスの中でも、同じスレッドが続けて呼んだときでも重ならない
+    よう、pid・スレッド・時刻を並べる（.part の名前と同じ考え方）。
+    """
+    return ('%d-%d-%d' % (os.getpid(), threading.get_ident(),
+                          time.monotonic_ns())).encode('ascii')
+
+
+def _drop_finalize_marker(marker: str, token: bytes) -> None:
+    """自分が置いた確定の目印だけを外す。
+
+    名前だけを見て消していたときは、引き取りが起きた後で同じ名前が
+    別の確定のものになっているのに、それを外していた。実測（検査役
+    cx5m-check-release の p23_finalize_marker.py、FINALIZE_STALE_SEC=0.2 /
+    FINALIZE_WAIT_SEC=2）: P1 の確定が古さの境を越えると P2 が引き取り、
+    そのあと P1 の後始末が P2 の目印を消して、待たされるはずの P3 が
+    0.00 秒で通った（同時に持つ数 = 2）。updater.bat 側が holder.txt で
+    避けている型の穴と同じ。
+
+    中身が自分の印のときだけ、引き取りと同じく一意な名前へ改名してから
+    消す（読んでから消すまでの窓を狭める）。改名先を引き取りと同じ .stale に
+    そろえておくと、残ったときの掃除の条件を 1 つにできる。
+    """
+    try:
+        with open(marker, 'rb') as f:
+            if f.read(len(token) + 1) != token:
+                return
+    except OSError:
+        return
+    dropped = '%s.%s.stale' % (marker, token.decode('ascii'))
+    try:
+        os.replace(marker, dropped)
+        os.remove(dropped)
+    except OSError as e:
+        print(f"[VersionManager] 確定の目印を外せませんでした: {e}")
+
+
+def _finalize_marker_is_alive(grabbed: str, seen: bytes) -> bool:
+    """掴んだ目印が、置き土産ではなく生きている確定のものか。
+
+    時刻が FINALIZE_STALE_SEC より新しいか、中身が見たときと違えば、
+    掴む前に別の確定が取り直したもの。読めない（もう無い）なら、
+    残しても意味が無いので生きていないものとして扱う。
+    """
+    try:
+        if time.time() - os.path.getmtime(grabbed) < FINALIZE_STALE_SEC:
+            return True
+        with open(grabbed, 'rb') as f:
+            return f.read(len(seen) + 1) != seen
+    except OSError:
+        return False
+
+
+def _take_over_abandoned_finalize(marker: str) -> None:
+    """異常終了で残った確定の目印を引き取る（つかんで、見直してから消す）。
+
+    見てから消すと、同時に「古い」と見た2つが両方とも消してしまい、
+    後から消したほうが相手の取り直した目印を消す。改名は同時に1つしか
+    通らないので、引き取れるのは片方だけになる。
+
+    掴めたことは「掴んだものが置き土産だ」とまでは言わない。見てから
+    掴むまでの間に別の NetBelt が同じ目印を引き取って自分の目印を作って
+    いれば、掴めるのはその生きている目印のほうになる。実測（検査役
+    cx7a-verify-release の p03_finalize_takeover.py、2/2）: B を
+    os.replace の直前で止め、A に引き取らせてから B を再開すると、B は
+    A の生きている目印を消し、続く os.open(O_CREAT|O_EXCL) が通って
+    A と B が同時に確定へ入った。自然な競走では 40 回中 0 回（負けた側の
+    隙間はマイクロ秒で、そこへ勝った側の 50 ms 以上が収まる必要がある）。
+
+    そこで updater.bat の :claim_lock と同じく、掴んでから見直す。
+    取り直された直後の目印は必ず FINALIZE_STALE_SEC より新しいので、
+    時刻と中身を読み直すだけで見分けられる。生きていたら消さずに
+    os.rename で名前を戻す。戻せない＝その間に誰かが新しい目印を作った
+    ときは、名前から外れた以上どの排他にもならないので捨てる
+    （updater.bat の :lock_put_back と同じ判断）。
+
+    中身を読むのは、古いと分かった後だけにする。待っている側はこの関数を
+    50 ms ごとに呼ぶので、先に読むと持ち主の生きている目印を開き続ける
+    ことになる。Windows の open() は FILE_SHARE_DELETE を含まないため、
+    その一瞬に持ち主の _drop_finalize_marker が走ると os.replace が
+    [WinError 32] で失敗し、目印が置き去りになる（実測: 検査役
+    cx7a-verify-release2 の r03_regression_read_handle.py /
+    p03_multiproc_stress.py、5 本 × 60 回 で 4/297・3/298 件）。置き去りの
+    目印は FINALIZE_STALE_SEC のあいだ、誰も保存していないのに
+    FINALIZE_BUSY_MESSAGE を出させる。
+    """
+    try:
+        if time.time() - os.path.getmtime(marker) < FINALIZE_STALE_SEC:
+            return
+        with open(marker, 'rb') as f:
+            seen = f.read(_FINALIZE_TOKEN_MAX)
+    except OSError:
+        return
+    grabbed = '%s.%d.stale' % (marker, os.getpid())
+    try:
+        os.replace(marker, grabbed)
+    except OSError:
+        return
+    if _finalize_marker_is_alive(grabbed, seen):
+        try:
+            # 空いている名前へだけ戻す。os.replace だと、その間に
+            # 作られた新しい目印を今度はこちらが消してしまう。
+            os.rename(grabbed, marker)
+            return
+        except OSError:
+            pass
+    try:
+        os.remove(grabbed)
+    except OSError:
+        pass
+
+
+@contextlib.contextmanager
+def _cross_process_finalize(zip_path: str):
+    """確定の手順を、別の NetBelt と 1 本ずつにする目印を取る。
+
+    更新フォルダ（%TEMP% の NetBeltUpdates）は全インスタンスで共通、最終名も
+    版ごとに固定なので、2 つの NetBelt が同じ新版を取れば同じ最終名を確定
+    しに行く。_finalize_lock はプロセスごとの辞書に載るため、そこには効かない。
+
+    実測（検査役 cx5j-check-release の p4_driver.py、別プロセス 2 本・60 回）:
+    2 回、片方が成功を返したのに最終名の ZIP が無く、控え 2 つだけが残った。
+    利用者から見ると「ダウンロード完了！」の直後に「更新ファイルが
+    見つかりません」になる。
+
+    取れたかを bool で返す。取れなかった側は嘘の成功を返さず失敗させる
+    （利用者の決定 2026-09-20 / release-04）。
+    """
+    marker = zip_path + '.finalizing'
+    token = _finalize_token()
+    owned = False
+    deadline = time.monotonic() + FINALIZE_WAIT_SEC
+    while True:
+        try:
+            fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            with os.fdopen(fd, 'wb') as f:
+                f.write(token)
+            owned = True
+            break
+        except FileExistsError:
+            pass
+        except OSError as e:
+            # 更新フォルダへ書けないなら、どのみち確定も通らない。
+            print(f"[VersionManager] 確定の目印を作れませんでした: {e}")
+            break
+        if time.monotonic() >= deadline:
+            break
+        _take_over_abandoned_finalize(marker)
+        time.sleep(0.05)
+    try:
+        yield owned
+    finally:
+        if owned:
+            _drop_finalize_marker(marker, token)
+
+
 class VersionManager:
     """バージョン管理とアップデート機能を提供するクラス"""
     
@@ -146,6 +347,10 @@ class VersionManager:
         self.github_token = sanitized_token(github_token)
         # 受信中の応答。中止の要求が来たら、これを閉じて読み取りを打ち切る
         self._response = None
+        # 直前の download_update が None を返した理由（画面へ出せる文言）。
+        # 分かっているときだけ入る。None のときは呼ぶ側がこれまでどおりの
+        # 一般的な文言を出す。
+        self.last_failure: Optional[str] = None
         # 更新用ディレクトリを作成。
         # ここで例外を外へ出さない。起動時の未適用更新チェックは同期で
         # VersionManager を作るだけなので、%TEMP%\NetBeltUpdates が通常
@@ -489,6 +694,8 @@ class VersionManager:
         """
         # 受信中に例外が出ても書きかけを残さないよう、外側でも掴んでおく
         part_path = None
+        # 前回の理由を残したままにしない
+        self.last_failure = None
         try:
             # ファイル名を生成（版ごとに分ける）
             filename = self._download_filename(url, version)
@@ -606,23 +813,76 @@ class VersionManager:
                 return None
 
             # 3つそろって初めて最終名にする。
-            # os.replace は宛先があっても置き換えるので、先に消さない。
             # 消してから改名していたときは、その隙に別の受信が失敗すると
             # 検証済みだった ZIP まで失われた。
-            try:
-                os.replace(part_path, zip_path)
-                os.replace(sha_part, zip_path + '.sha256')
-                if version:
-                    os.replace(ver_part, zip_path + '.version')
-            except Exception as e:
-                # 途中で失敗すると ZIP と控えが食い違う。中途半端な組は
-                # 「未適用の更新」として毎回弾かれ続けるだけなので残さない。
-                print(f"[VersionManager] 更新ファイルを確定できませんでした: {e}")
-                for leftover in (part_path, sha_part, ver_part, zip_path,
-                                 zip_path + '.sha256', zip_path + '.version'):
-                    self._discard(leftover)
-                return None
+            # 同じ版を取り直すときは、既にある組をいったん退避名へ移してから
+            # 置き換え、途中で失敗したら戻す。以前は失敗すると既存の組まで
+            # 無条件に消しており、既存のファイルに触れる前の失敗（最終名の
+            # ZIP を別の NetBelt がハッシュしている等）でも、使えていた
+            # 検証済みの更新が失われていた。退避名は .part で終え、
+            # 取り残されても cleanup_old_updates が拾えるようにする。
+            moves = [(part_path, zip_path), (sha_part, zip_path + '.sha256')]
+            if version:
+                moves.append((ver_part, zip_path + '.version'))
+            # 同じ版のダウンロード 2 本が同時にここへ来ると、互いの組を退避したり、
+            # 失敗の後始末で相手が置いた最終名を消したりする。実測では、片方が
+            # 成功を返したのに ZIP が無く控えだけが残った（同じプロセスの中で
+            # 600 回中 4 回、別プロセス 2 本で 60 回中 2 回）。同じプロセスの中は
+            # ロックで、別の NetBelt とは更新フォルダの目印で 1 本ずつにする。
+            with _finalize_lock(zip_path), \
+                    _cross_process_finalize(zip_path) as owned:
+                # ロックを待っている間に押された中止も拾う。手前の確認は
+                # ロックを取る前なので、待たされた分だけ見落としが生じる。
+                # 実測（tests/test_update_cancel_during_finalize_lock.py）:
+                # 待ちの間に中止しても最終名で公開され、次回起動時に
+                # 「未適用の更新」として提示された。まだ何も動かしていない
+                # ので、捨てるのは今回の .part 3 つだけでよい。
+                if cancel_check is not None and cancel_check():
+                    print("[VersionManager] ダウンロードを中止しました")
+                    self._discard(sha_part)
+                    self._discard(ver_part)
+                    self._discard(part_path)
+                    return None
 
+                # 別の NetBelt が同じ最終名を確定している間は、待っても
+                # 取れなければ失敗として返す。ここで進むと、両方が成功を
+                # 返したのに ZIP が残らない形になりうる。
+                if not owned:
+                    print(f"[VersionManager] {FINALIZE_BUSY_MESSAGE}")
+                    self.last_failure = FINALIZE_BUSY_MESSAGE
+                    self._discard(sha_part)
+                    self._discard(ver_part)
+                    self._discard(part_path)
+                    return None
+
+                stash = part_path[:-len('.part')] + '.prev.part'
+                saved = []   # (退避名, 元の名前)
+                placed = []  # 今回置いた最終名
+                try:
+                    for _, dst in moves:
+                        if os.path.exists(dst):
+                            kept = stash + dst[len(zip_path):]
+                            os.replace(dst, kept)
+                            saved.append((kept, dst))
+                    for src, dst in moves:
+                        os.replace(src, dst)
+                        placed.append(dst)
+                except Exception as e:
+                    # 中途半端な組は「未適用の更新」として毎回弾かれ続けるだけ
+                    # なので、今回の分は残さず、以前の組を元へ戻す。
+                    print(f"[VersionManager] 更新ファイルを確定できませんでした: {e}")
+                    for leftover in placed + [part_path, sha_part, ver_part]:
+                        self._discard(leftover)
+                    for kept, dst in saved:
+                        try:
+                            os.replace(kept, dst)
+                        except Exception as e2:
+                            print(f"[VersionManager] 以前の更新ファイルを戻せませんでした: {e2}")
+                            self._discard(kept)
+                    return None
+
+                for kept, _ in saved:
+                    self._discard(kept)
             return zip_path
         
         except Exception as e:
@@ -713,11 +973,10 @@ class VersionManager:
         かけ、通ったら写しのパスを updater.bat へ渡す。写している最中に
         元が差し替えられた場合は、写しと控えが食い違うのでここで止まる。
 
-        残る制限: 写しの置き場は元と同じ更新フォルダで、そこへ書ける相手
-        （＝同じ利用者の権限で既にコードを実行できている相手）は、フォルダを
-        列挙すれば写しの名前も知れる。窓を完全に閉じるには、展開の直前に
-        updater.bat 側でも受け取った期待値とハッシュを突き合わせる必要が
-        あり、それは updater.bat 側で別に追う。
+        写しの置き場は元と同じ更新フォルダで、そこへ書ける相手（＝同じ
+        利用者の権限で既にコードを実行できている相手）は、フォルダを列挙
+        すれば写しの名前も知れる。そのため updater.bat へは控えたハッシュも
+        渡し、展開の直前にもう一度突き合わせる（launch_updater の説明を参照）。
 
         元の ZIP はここでは消さない（updater.bat が消すのは渡した写しの
         ほう）。当たらなかったときに手元から失わせないためで、残ったぶんは
@@ -758,10 +1017,53 @@ class VersionManager:
             return None, problem
         return staged, None
 
+    @staticmethod
+    def recorded_sha256(zip_path: str) -> Optional[str]:
+        """傍らの .sha256 に控えた値を返す（無い・壊れていれば None）。"""
+        try:
+            with open(zip_path + '.sha256', encoding='ascii') as f:
+                value = (f.read() or '').strip().split()[0].lower()
+        except Exception:
+            return None
+        if len(value) != 64 or value.strip('0123456789abcdef'):
+            return None
+        return value
+
     def _discard_staged(self, staged: str) -> None:
         """用意しかけた写しを、控えごと片付ける。"""
         for suffix in ('', '.sha256', '.version'):
             self._discard(staged + suffix)
+
+    def launch_updater(self, updater_path: str, staged_path: str,
+                       app_path: str) -> None:
+        """stage_for_apply が作った写しを渡して updater.bat を起動する。
+
+        起動できなかったとき（updater_command がパスを拒んだ・Popen の失敗）は、
+        写しを控えごと片付けてから例外を投げ直す。以前は呼び出し側が理由を
+        表示して戻るだけで、失敗のたびに配布 ZIP 1 個分の写しが更新フォルダに
+        溜まり、検証記録つきの .zip として未適用の更新の候補にも並んでいた。
+        起動元の 2 箇所（更新ダイアログと起動時の未適用更新）が同じここを
+        通るので、片方だけ直る形にならない。
+
+        ダウンロード時に控えた SHA-256 も渡す。写しを作ってから updater.bat が
+        Expand-Archive で開き直すまでには間があり、更新フォルダへ書ける相手は
+        その写しも置き換えられる。実測（検査役 cx5j-check-release の
+        p5_staged_swap.py）: 写しだけを別の有効な ZIP へ置き換えると、
+        updater.bat は渡されたパスを開くだけだったので、控えと食い違う中身が
+        そのまま据わり「更新が完了しました」まで出た。控えが無い・壊れている
+        ときは渡さない（updater.bat はこれまでどおり展開する）。
+        """
+        try:
+            # リストで渡すと、パスの , や = で引数が途中で切れる
+            # （updater_command の説明を参照）
+            subprocess.Popen(
+                updater_command(updater_path, staged_path, app_path,
+                                self.recorded_sha256(staged_path)),
+                creationflags=subprocess.CREATE_NEW_CONSOLE,
+                env=updater_env())
+        except Exception:
+            self._discard_staged(staged_path)
+            raise
 
     def get_pending_update_files(self) -> list:
         """
@@ -821,20 +1123,57 @@ class VersionManager:
         # わけにはいかない（検証を通っていないものを適用してしまう）。
         # 掃除だけはここで面倒を見る。まだ書いている最中かもしれないので、
         # ZIP と同じく古くなったものだけを対象にする。
+        # 書きかけの傍らの控え（.part.sha256 / .part.version）と、取り直しの
+        # 退避名（.prev.part とその控え）も同じ扱い。確定の途中でプロセスが
+        # 終わると残り、'.part' だけを見ていた以前は控えが残り続けていた。
+        # 確定の目印（.finalizing）と、引き取り・後始末の改名先
+        # （.finalizing.<印>.stale）もここで見る。kill されると contextmanager の
+        # finally が走らず、どちらも 0 バイトのまま残る（実測: 48 時間前の
+        # 日付で置いても cleanup_old_updates(24) の消した数は 0）。同じ版を二度と
+        # 落とさなければ、そのまま居座り続ける。保持期間を過ぎたものだけなので、
+        # 今まさに確定している目印（数秒）には当たらない。
         try:
             for filename in os.listdir(self.UPDATE_DIR):
-                if not filename.endswith('.part'):
+                if not (filename.endswith(('.part', '.part.sha256',
+                                           '.part.version', '.finalizing'))
+                        or ('.finalizing.' in filename
+                            and filename.endswith('.stale'))):
                     continue
                 part_path = os.path.join(self.UPDATE_DIR, filename)
                 try:
                     if current_time - os.path.getmtime(part_path) > max_age_seconds:
                         os.remove(part_path)
-                        print(f"[VersionManager] 書きかけの更新ファイルを削除: {part_path}")
+                        print(f"[VersionManager] 置き去りの作業ファイルを削除: {part_path}")
                         deleted_count += 1
                 except Exception as e:
                     print(f"[VersionManager] ファイル削除エラー: {e}")
         except Exception as e:
             print(f"[VersionManager] 書きかけの確認エラー: {e}")
+
+        # 本体の ZIP を失った控え（<版>.zip.sha256 / .version）も片付ける。
+        # 確定の手順は、取り直しのときに既存の組をいったん退避名へ移す。
+        # ZIP だけを退避したところで終わると、控え 2 つが本体の無いまま
+        # 残る。名前が '.zip' でも '.part' でもないので、上のどちらの段でも
+        # 拾われない（実測: 退避の2回目で終わらせると、48時間前の日付でも
+        # <版>.zip.sha256 と <版>.zip.version が残り続けた）。
+        # 保持期間を過ぎたものだけを対象にする。確定の最中は、本体が
+        # 退避名へ移っている一瞬だけ控えが孤児に見えるため。
+        try:
+            for filename in os.listdir(self.UPDATE_DIR):
+                if not filename.endswith(('.zip.sha256', '.zip.version')):
+                    continue
+                side_path = os.path.join(self.UPDATE_DIR, filename)
+                if os.path.exists(side_path.rsplit('.', 1)[0]):
+                    continue
+                try:
+                    if current_time - os.path.getmtime(side_path) > max_age_seconds:
+                        os.remove(side_path)
+                        print(f"[VersionManager] 本体の無い検証記録を削除: {side_path}")
+                        deleted_count += 1
+                except Exception as e:
+                    print(f"[VersionManager] ファイル削除エラー: {e}")
+        except Exception as e:
+            print(f"[VersionManager] 検証記録の確認エラー: {e}")
 
         return deleted_count
     

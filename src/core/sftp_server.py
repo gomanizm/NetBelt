@@ -2,6 +2,7 @@
 import os
 import socket
 import threading
+import time
 import paramiko
 from paramiko import ServerInterface, SFTPServerInterface, SFTPServer, SFTPAttributes, SFTPHandle, SFTP_OK, SFTP_FAILURE
 from PyQt6.QtCore import QObject, pyqtSignal
@@ -9,14 +10,131 @@ import stat as stat_module
 from .sockets import set_exclusive_bind
 from .crypto import PasswordCrypto
 from .ftp_server import UNDECRYPTABLE_PASSWORD_MESSAGE
+# 停止のあとも書き込みが生き残っている間に、次の起動を断る理由の文言。
+# 生き残りは保存先のファイルを握ったままなので、TFTP と同じ扱いにする
+from .tftp_server import PREVIOUS_STOP_INCOMPLETE_MESSAGE
+
+
+class _OpenWriters:
+    """書き込み用に開いているハンドルと、それを扱う SFTP のスレッドの一覧。
+
+    停止のあとも保存先を握ったまま生き残ったスレッドを見分けるのに使う。
+    ハンドルは SFTP のスレッドが登録・解除し、マネージャが読む
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._entries = {}   # ハンドル -> (スレッド, 実パス)
+        # 書き込みで開いている保存先の鍵 -> 開いたスレッド（reserve を参照）
+        self._reserved = {}
+
+    @staticmethod
+    def _key(real_path):
+        """保存先を比べるための鍵（TFTPServer._target_key と同じ考え方）。
+
+        実パスは realpath 済み。Windows は大文字小文字を区別しないので
+        normcase で揃える（区切り文字も '\\' へ揃う）
+        """
+        return os.path.normcase(real_path)
+
+    def reserve(self, real_path):
+        """保存先を 1 本の書き込みに予約する。先客がいれば False。
+
+        開く前に取る。同じ保存先を 2 本が同時に書くと、後から開いた側の
+        O_TRUNC と先の側の書き込みが交互に効いて、どちらも成功で終わるのに
+        中身だけが混ざる。閉じないまま終わったスレッドの予約は先客に数えない
+        """
+        key = self._key(real_path)
+        with self._lock:
+            holder = self._reserved.get(key)
+            if holder is not None and holder.is_alive():
+                return False
+            self._reserved[key] = threading.current_thread()
+            return True
+
+    def release(self, real_path):
+        """開けなかった保存先・切り詰め終えた保存先の予約を外す"""
+        with self._lock:
+            self._reserved.pop(self._key(real_path), None)
+
+    def reserve_for_truncate(self, real_path):
+        """SETSTAT の切り詰めのために保存先を予約する。
+
+        確かめるだけで予約を取らないと、確かめてから切り詰めるまでの間に
+        別の接続の OPEN が予約を取って書き始め、その書きかけの先頭を
+        切り詰めてしまう（どちらも成功で終わる）。確認と予約を同じ錠の中で
+        済ませ、呼び出し側は切り詰め終えたら release で外す。
+
+        Returns:
+            None: 別の生きているスレッド（別の接続）が予約している（断る）
+            True: 新しく予約した（切り詰めのあとで外す）
+            False: このスレッドが書き込みで開いている（書いている本人の
+                切り詰めは通す。予約はハンドルのものなので外さない）
+        """
+        key = self._key(real_path)
+        me = threading.current_thread()
+        with self._lock:
+            holder = self._reserved.get(key)
+            if holder is me:
+                return False
+            if holder is not None and holder.is_alive():
+                return None
+            self._reserved[key] = me
+            return True
+
+    def add(self, handle, real_path):
+        with self._lock:
+            self._entries[handle] = (threading.current_thread(), real_path)
+
+    def discard(self, handle):
+        with self._lock:
+            entry = self._entries.pop(handle, None)
+            # 閉じ終えたので予約も外す（自分が取った予約だけ）
+            if entry is not None and \
+                    self._reserved.get(self._key(entry[1])) is entry[0]:
+                del self._reserved[self._key(entry[1])]
+
+    def alive(self):
+        """生きているスレッドが開いている分を (スレッド, 実パス) で返す。
+
+        閉じないまま終わったスレッドの分はここで落とす
+        """
+        with self._lock:
+            for handle, (thread, _path) in list(self._entries.items()):
+                if not thread.is_alive():
+                    del self._entries[handle]
+            return list(self._entries.values())
+
+
+class _WriteHandle(SFTPHandle):
+    """書き込み用のハンドル。閉じ終えたら _OpenWriters から外れる。
+
+    close() の中で止まっている間（共有フォルダへの書き出しなど）は
+    一覧に残るので、まだ保存先を握っていると分かる
+    """
+
+    def __init__(self, flags, open_writers):
+        super().__init__(flags)
+        self._open_writers = open_writers
+
+    def close(self):
+        try:
+            super().close()
+        finally:
+            self._open_writers.discard(self)
 
 
 class SFTPServerHandler(SFTPServerInterface):
     """SFTP サーバーハンドラー"""
     
-    def __init__(self, server, root_dir, *args, **kwargs):
+    def __init__(self, server, root_dir, *args, open_writers=None,
+                 notify=None, **kwargs):
         super().__init__(server, *args, **kwargs)
         self.root_dir = os.path.abspath(root_dir)
+        # 書き込み用に開いたハンドルを登録する先（SFTPServerManager の一覧）
+        self._open_writers = open_writers
+        # 利用者へ見せる出来事をパネルのログへ渡す口（1 行の文字列を受け取る）
+        self._notify = notify
         
     def _get_real_path(self, path):
         """SFTP のパスを実際のファイルシステムパスに変換する（chroot を模擬）。
@@ -149,7 +267,14 @@ class SFTPServerHandler(SFTPServerInterface):
         書き込み系を一律 'wb' で開くと、読み書き両用で開いた瞬間に既存ファイルが
         truncate され、部分書き換えを行うクライアントがデータを失う。
         O_EXCL（新規作成、存在したら失敗）も黙って上書きしてしまう。
+
+        同じ保存先を別の要求が書き込みで開いている間は、書き込みの open を
+        断る（_OpenWriters.reserve を参照）。O_TRUNC を伴う open も同じ扱いに
+        する（WRITE を立てない READ|CREATE|TRUNC でも、Windows の os.open() は
+        相手の書きかけを 0 バイトに切り詰める）。それ以外の読み取りの open は
+        妨げない。
         """
+        reserved = False
         try:
             real_path = self._get_real_path(path)
 
@@ -162,6 +287,19 @@ class SFTPServerHandler(SFTPServerInterface):
                 if dir_path and not os.path.exists(dir_path):
                     os.makedirs(dir_path)
 
+            # 予約するのは書き込みか切り詰めを伴う open。モードとハンドルの
+            # 選び方は writing のまま（切り詰めだけの open は読み取り専用）
+            tracked = ((writing or bool(flags & os.O_TRUNC))
+                       and self._open_writers is not None)
+            if tracked and not self._open_writers.reserve(real_path):
+                # 開くと O_TRUNC が相手の書きかけを切り詰め、双方が成功で
+                # 終わるのに中身が混ざる。TFTP の同名 WRQ と同じく断る
+                print(f"[SFTP Server] open refused, already open for writing: {real_path}")
+                if self._notify is not None:
+                    self._notify("他の転送が書き込み中のため断りました: %s" % path)
+                return SFTP_FAILURE
+            reserved = tracked
+
             fd = os.open(real_path, flags | getattr(os, "O_BINARY", 0))
             if flags & os.O_RDWR:
                 mode = 'a+b' if (flags & os.O_APPEND) else 'r+b'
@@ -171,7 +309,8 @@ class SFTPServerHandler(SFTPServerInterface):
                 mode = 'rb'
             f = os.fdopen(fd, mode)
 
-            fobj = SFTPHandle(flags)
+            fobj = (_WriteHandle(flags, self._open_writers) if tracked
+                    else SFTPHandle(flags))
             # モードに応じて片方だけ設定する。両方入れると、読み取り専用の
             # ハンドルが書き込み可能として応答してしまう。
             if flags & os.O_RDWR:
@@ -182,9 +321,15 @@ class SFTPServerHandler(SFTPServerInterface):
             else:
                 fobj.readfile = f
             fobj._real_path = real_path
+            if tracked:
+                # 閉じ終えるまで、このスレッドが保存先を握っていると覚える
+                self._open_writers.add(fobj, real_path)
 
             return fobj
         except Exception as e:
+            if reserved:
+                # 開けなかった。予約を残すと、その保存先へ二度と書けなくなる
+                self._open_writers.release(real_path)
             print(f"[SFTP Server] open error: {e}")
             return SFTP_FAILURE
 
@@ -242,7 +387,24 @@ class SFTPServerHandler(SFTPServerInterface):
         try:
             real_path = self._get_real_path(path)
             if attr.st_size is not None:
-                os.truncate(real_path, attr.st_size)
+                # 別の接続が書き込み中の保存先は切り詰めない。相手は成功で
+                # 終わるのに、切り詰めた先頭が 0 で埋まって中身が壊れる。
+                # 切り詰め終えるまで予約を持つ（reserve_for_truncate を参照）
+                reserved = False
+                if self._open_writers is not None:
+                    reserved = self._open_writers.reserve_for_truncate(real_path)
+                    if reserved is None:
+                        print(f"[SFTP Server] truncate refused, open for writing: {real_path}")
+                        if self._notify is not None:
+                            self._notify("他の転送が書き込み中のため断りました: %s" % path)
+                        return SFTP_FAILURE
+                try:
+                    os.truncate(real_path, attr.st_size)
+                finally:
+                    if reserved:
+                        # 失敗しても外す。残すと、この接続が切れるまで
+                        # その保存先へ誰も書けなくなる
+                        self._open_writers.release(real_path)
             atime = attr.st_atime
             mtime = attr.st_mtime
             if atime is not None or mtime is not None:
@@ -294,6 +456,7 @@ class SFTPServerManager(QObject):
     stopped = pyqtSignal()
     client_connected = pyqtSignal(str)  # クライアントIP
     client_disconnected = pyqtSignal(str)  # クライアントIP
+    client_activity = pyqtSignal(str, str)  # ip, message
     file_uploaded = pyqtSignal(str, str)  # クライアントIP, ファイル名
     file_downloaded = pyqtSignal(str, str)  # クライアントIP, ファイル名
     error_occurred = pyqtSignal(str)
@@ -309,6 +472,10 @@ class SFTPServerManager(QObject):
         self._client_sockets = set()
         self._client_lock = threading.Lock()
         self._stop_event = threading.Event()
+        # 書き込み用に開いているハンドルの一覧（SFTP のスレッドが登録する）と、
+        # 停止のあとも書き込みを抱えたまま生き残ったスレッド
+        self._open_writers = _OpenWriters()
+        self._unfinished = []
 
         # 同時に受け付けるクライアント接続の上限。認証前の接続でも
         # スレッドと Transport を 1 つずつ消費するので、上限が無いと
@@ -319,6 +486,38 @@ class SFTPServerManager(QObject):
         # 既定に頼らず明示して、枠が返る時間を上限側で決められるようにする
         self.banner_timeout_seconds = 15.0
         self.auth_timeout_seconds = 30.0
+        # 接続がこの秒数黙ったら keepalive を送る。回線断などで相手が黙って
+        # 消えると、TCP は送るものが無い限り気づけず、書き込みの予約
+        # （_OpenWriters）がサーバーを止めるまで残って同じ名前へのアップロードを
+        # 断り続ける。送れば TCP の再送が尽きたところで接続が切れ、予約が外れる。
+        # 生きている相手は読み捨てるだけなので、黙っている書き手の予約は外さない。
+        # 認証の期限と同じ桁にし、FTP のデータ接続の無通信期限（300 秒）より短くする
+        self.keepalive_seconds = 30.0
+
+        # GUI へ渡したまま、まだ処理されていない通知の件数の上限。
+        # 認証を通さない TCP 接続→即切断だけで接続と切断の両方が出るので、
+        # GUI が他の処理で塞がっている間に Qt の配送キューへ際限なく積み上がる
+        # （実測: 20 秒で 13130 件・約 11MB）。32 接続の上限は切断ごとに枠が
+        # 戻るので累積を止めない。パネルのログの行数上限が効くのは配送の後。
+        # FTP の max_pending_notices・TFTP の同名の仕掛けと同じく、超過中は
+        # 数えるだけにして、はけた時点で省略した件数を 1 行だけ出す。
+        # 書き込みを断った通知（client_activity）も同じカウンタに数える。
+        # 認証済みの相手が同じ名前への要求を繰り返すだけで、要求ごとに 1 件
+        # 出る（実測: 5 秒で 10642 件）。数え違えないよう、この信号はすべて
+        # _emit_activity から出す
+        self.max_pending_notices = 1000
+        self._notice_lock = threading.Lock()
+        self._pending_notices = 0
+        self._dropped_notices = 0
+        # 接続を届けたかを接続ごとに覚える（_client_lock の下で読み書きする）。
+        # 届けた接続の切断を省くと、パネルの「接続クライアント: N」が戻らない
+        self._notice_shown = {}
+        # 自分の信号を自分でも受ける。待受スレッド・ハンドラから emit した分は
+        # キュー経由で GUI スレッドへ届くので、呼ばれたことが
+        # 「GUI が 1 件処理した」の合図
+        for signal in (self.client_connected, self.client_disconnected,
+                       self.client_activity):
+            signal.connect(self._on_notice_delivered)
 
         # サーバー設定
         self.port = 2222
@@ -329,6 +528,53 @@ class SFTPServerManager(QObject):
         # ホストキーは start() で読み込む（起動を待たせないため遅延）
         self.host_key = None
     
+    def _take_notice(self, force=False):
+        """配送待ちを 1 件ぶん確保する。確保できたら True（呼び出し側が emit する）。
+
+        上限に達している間は False にして省略件数へ足す。force は上限を
+        超えても確保する（接続を届けた相手の切断。捨てると接続数が戻らない）
+        """
+        with self._notice_lock:
+            if not force and self._pending_notices >= self.max_pending_notices:
+                self._dropped_notices += 1
+                return False
+            self._pending_notices += 1
+            return True
+
+    def _take_closing_notice(self, shown):
+        """切断を渡すかを決める。
+
+        接続を届けた相手（shown が True）の切断は必ず渡す。接続を省いた相手
+        （False）のものは渡さずに省略件数へ足す。記録が無い（None）ものは
+        上限の範囲でだけ渡す
+        """
+        if shown:
+            return self._take_notice(force=True)
+        if shown is False:
+            with self._notice_lock:
+                self._dropped_notices += 1
+            return False
+        return self._take_notice()
+
+    def _emit_activity(self, ip, message):
+        """client_activity を 1 件渡す。配送待ちが上限に達している間は数えるだけ。"""
+        if self._take_notice():
+            self.client_activity.emit(ip, message)
+
+    def _on_notice_delivered(self, *_args):
+        """GUI が通知を 1 件処理したので配送待ちを戻す（GUI スレッドで動く）"""
+        with self._notice_lock:
+            if self._pending_notices > 0:
+                self._pending_notices -= 1
+            dropped = 0
+            if self._pending_notices == 0:
+                dropped, self._dropped_notices = self._dropped_notices, 0
+        if dropped:
+            # この 1 行も client_activity なので同じく数える（FTP と同じ）。
+            # 数えずに出すと、届いたときに他の通知の分まで戻してしまう
+            self._emit_activity(
+                "", "表示が追いつかず %d 件の通知を省略しました" % dropped)
+
     def _load_or_create_host_key(self):
         """ホストキーをユーザデータディレクトリから読み込む。無ければ生成して保存する。
 
@@ -355,6 +601,13 @@ class SFTPServerManager(QObject):
         """SFTPサーバーを起動"""
         if self.is_running:
             self.error_occurred.emit("サーバーは既に実行中です")
+            return False
+        # 前回の停止のあとも書き込みを抱えたスレッドが残っている間は起動しない。
+        # 生き残りは保存先のファイルを握ったままなので、新しい起動で同名の
+        # アップロードを受けると、後から戻った旧 write()/close() が中身を混ぜる。
+        # ここでは待たない（画面を固めない）。消えていれば通す（TFTP と同じ）
+        if not self._previous_stop_finished():
+            self.error_occurred.emit(PREVIOUS_STOP_INCOMPLETE_MESSAGE)
             return False
 
         # 空の資格情報でネットワークに晒さない。UI 側でも検証しているが、
@@ -409,9 +662,13 @@ class SFTPServerManager(QObject):
             return False
         self.server_socket = sock
 
-        # サーバースレッドを起動
-        self._stop_event.clear()
-        self.server_thread = threading.Thread(target=self._run_server, daemon=True)
+        # サーバースレッドを起動。停止フラグは起動ごとに作り直して渡す。
+        # 使い回して clear() すると、前回の stop() で抜けきらなかった
+        # 待受スレッドまで「停止していない」ことになり、新しいルート・
+        # 資格情報で接続を処理してしまう（FTP の _serve と同じ形）
+        self._stop_event = threading.Event()
+        self.server_thread = threading.Thread(
+            target=self._run_server, args=(sock, self._stop_event), daemon=True)
         self.server_thread.start()
         
         return True
@@ -424,12 +681,13 @@ class SFTPServerManager(QObject):
         押したときだけ昇格する。
         """
         try:
-            from .firewall import ensure_inbound_allow, ensure_self_program_allow
+            from .firewall import (combine_results, ensure_inbound_allow,
+                                   ensure_self_program_allow)
             ok, msg = ensure_inbound_allow("SFTP Server", "TCP", port)
             print(f"[SFTP Server] ファイアウォール: {msg}")
             ok2, msg2 = ensure_self_program_allow()
             print(f"[SFTP Server] ファイアウォール(自exe): {msg2}")
-            return (ok and ok2), msg
+            return combine_results([(ok, msg), (ok2, msg2)])
         except Exception as e:
             print(f"[SFTP Server] ファイアウォール設定エラー: {e}")
             return False, str(e)
@@ -437,15 +695,22 @@ class SFTPServerManager(QObject):
     # 待受スレッドの終了を待つ上限。accept は 1 秒でタイムアウトするので
     # 通常はそれ以内に抜ける
     STOP_TIMEOUT_SECONDS = 3.0
+    # 停止のとき、書き込み中のスレッドが抜けるのを待つ上限（全体で）。
+    # 切断に気づけば数ミリ秒で抜けるので、残るのは止まっている分だけ
+    WRITER_STOP_TIMEOUT_SECONDS = 1.0
 
     def stop(self):
-        """SFTPサーバーを停止"""
+        """SFTPサーバーを停止する。
+
+        書き込みを抱えたスレッドが残らず終われたかを返す（残っている間は
+        次の start() を断る。_previous_stop_finished を参照）
+        """
         thread = self.server_thread
         # is_running で判定しない。あのフラグを立てるのはワーカーの先頭で、
         # start() はスレッドを起こした直後に戻るため、start() の直後に
         # 呼ばれると「まだ立っていない」窓で空振りし、待受が生き残る
         if thread is None or not thread.is_alive():
-            return
+            return self._previous_stop_finished()
 
         print("[SFTP Server] Stopping server...")
         # 停止フラグは接続一覧と同じロックの下で立てる。待受ループは
@@ -494,17 +759,43 @@ class SFTPServerManager(QObject):
         # 解放済みオブジェクトへ届く（FTP と同じ構造）
         if thread is not threading.current_thread():
             thread.join(timeout=self.STOP_TIMEOUT_SECONDS)
+        # 接続はすべて閉じた。書き込み用のハンドルを開いたまま生きている
+        # スレッドは、切断に気づいて抜ける途中か、保存先への write()/close()
+        # の中で止まっている（共有フォルダの遅延・切断など）。前者を取り
+        # 違えないよう少しだけ待ち、それでも残った分を覚えて、消えるまで
+        # 次の start() を断る
+        deadline = time.monotonic() + self.WRITER_STOP_TIMEOUT_SECONDS
+        for writer, _path in self._open_writers.alive():
+            writer.join(timeout=max(0.0, deadline - time.monotonic()))
+        for writer, path in self._open_writers.alive():
+            print(f"[SFTP Server] Write still in progress after stop: {path}")
+            if writer not in self._unfinished:
+                self._unfinished.append(writer)
         self.stopped.emit()
         print("[SFTP Server] Server stopped")
+        return self._previous_stop_finished()
+
+    def _previous_stop_finished(self):
+        """前回の停止が終わっているか。今の状態だけを見て、待たない。
+
+        書き込みを抱えて生き残ったスレッドのうち、終わった分は落とす
+        """
+        self._unfinished = [t for t in self._unfinished if t.is_alive()]
+        return not self._unfinished
     
-    def _run_server(self):
-        """サーバーのメインループ"""
+    def _run_server(self, sock, stop_event):
+        """サーバーのメインループ
+
+        sock と stop_event はこの起動のもの。停止待ちが期限切れになった後で
+        起動し直されても、self の側（新しい起動）の停止フラグやソケットは
+        見ない。
+        """
         try:
             # ソケットは start() でバインド済み
 
             # start() の直後に stop() されていたら、ここで引き返す。
             # 進むと started が stopped の後に飛び、UI が「起動中」へ戻る
-            if self._stop_event.is_set():
+            if stop_event.is_set():
                 return
 
             self.is_running = True
@@ -513,19 +804,29 @@ class SFTPServerManager(QObject):
             print(f"[SFTP Server] Root directory: {self.root_dir}")
             print(f"[SFTP Server] Username: {self.username}")
             
-            while not self._stop_event.is_set():
+            while not stop_event.is_set():
                 try:
+                    # accept は従来どおり self.server_socket に対して行う
+                    # （テストが差し替えて accept の直後を止める）。ただし
+                    # 停止フラグと同じロックの下で読む。stop() はこのロックの
+                    # 下でフラグを立てるので、読めたのは必ずこの起動のソケットで、
+                    # 起動し直した後の新しいソケットではない
+                    with self._client_lock:
+                        if stop_event.is_set():
+                            break
+                        listener = self.server_socket
                     # クライアント接続を待つ
-                    client_socket, client_addr = self.server_socket.accept()
+                    client_socket, client_addr = listener.accept()
                     # 停止判定・ソケット登録・ハンドラの起動とスレッド一覧への
                     # 追加を、すべて同じロックの下で済ませる。どこかで一度でも
                     # ロックを離すと、その隙間に stop() が入った接続は誰にも
                     # 閉じられず join もされず、ハンドラが停止後に起きて
                     # 破棄済みかもしれないマネージャへ emit する
                     accepted = False
+                    notice = False
                     reject_reason = ""
                     with self._client_lock:
-                        if self._stop_event.is_set():
+                        if stop_event.is_set():
                             try:
                                 client_socket.close()
                             except OSError:
@@ -558,7 +859,20 @@ class SFTPServerManager(QObject):
                                 self.client_threads[:] = [t for t in self.client_threads
                                                           if t.is_alive()]
                                 self.client_threads.append(client_thread)
+                                # 配送枠はこのロックの下で決めて覚える。
+                                # ハンドラの後始末も同じロックを取るので、
+                                # 切断側がこの記録より先に読むことはない
+                                notice = self._take_notice()
+                                self._notice_shown[client_socket] = notice
                                 accepted = True
+                                if notice:
+                                    # 接続の知らせもこのロックの下で出す。
+                                    # 離してから出すと、その隙間に切れた相手の
+                                    # 切断の知らせ（ハンドラの finally も同じ
+                                    # ロックを取る）に追い越され、パネルの
+                                    # 「接続クライアント: N」が 1 件ずれたまま
+                                    # サーバを止めるまで戻らない
+                                    self.client_connected.emit(client_addr[0])
 
                     if not accepted:
                         try:
@@ -570,13 +884,12 @@ class SFTPServerManager(QObject):
                         continue
 
                     print(f"[SFTP Server] Client connected from {client_addr[0]}:{client_addr[1]}")
-                    self.client_connected.emit(client_addr[0])
 
                 except socket.timeout:
                     # タイムアウトは正常（停止チェックのため）
                     continue
                 except Exception as e:
-                    if self._stop_event.is_set():
+                    if stop_event.is_set():
                         break
                     print(f"[SFTP Server] Accept error: {e}")
                     
@@ -584,9 +897,14 @@ class SFTPServerManager(QObject):
             self.error_occurred.emit(f"サーバー起動エラー: {str(e)}")
             print(f"[SFTP Server] Server error: {e}")
         finally:
-            self.is_running = False
-            if self.server_socket:
-                self.server_socket.close()
+            # 後始末はこの起動の分だけ。起動し直されていたら is_running も
+            # self.server_socket も新しい起動のものなので触らない
+            if self._stop_event is stop_event:
+                self.is_running = False
+            try:
+                sock.close()
+            except OSError:
+                pass
     
     def _handle_client(self, client_socket, client_addr):
         """クライアント接続を処理"""
@@ -598,14 +916,20 @@ class SFTPServerManager(QObject):
             # 続けると、上限を入れても正規の接続が入れなくなる
             transport.banner_timeout = self.banner_timeout_seconds
             transport.auth_timeout = self.auth_timeout_seconds
+            # 黙って消えた相手のセッションを終わらせる（keepalive_seconds を参照）
+            transport.set_keepalive(self.keepalive_seconds)
             transport.add_server_key(self.host_key)
             
             # SFTP サブシステムを登録する。
             # paramiko の既定の ServerInterface.check_channel_subsystem_request は
             # ここで登録したハンドラを引いて起動する実装なので、登録しないと
             # クライアントの subsystem('sftp') 要求が拒否され、チャネルが閉じる。
+            # 断った書き込みなどは、相手の IP を添えてパネルのログへ出す
             transport.set_subsystem_handler(
-                'sftp', SFTPServer, SFTPServerHandler, root_dir=self.root_dir)
+                'sftp', SFTPServer, SFTPServerHandler, root_dir=self.root_dir,
+                open_writers=self._open_writers,
+                notify=lambda message, ip=client_addr[0]:
+                    self._emit_activity(ip, message))
             
             # SSHサーバーインターフェースを作成
             server = SSHServerInterface(self.username, self.password)
@@ -634,5 +958,9 @@ class SFTPServerManager(QObject):
             client_socket.close()
             with self._client_lock:
                 self._client_sockets.discard(client_socket)
-            self.client_disconnected.emit(client_addr[0])
+                shown = self._notice_shown.pop(client_socket, None)
+            # 接続を届けた相手の切断は必ず届ける。省くとパネルの
+            # 「接続クライアント: N」が減らないまま残る
+            if self._take_closing_notice(shown):
+                self.client_disconnected.emit(client_addr[0])
             print(f"[SFTP Server] Client disconnected from {client_addr[0]}")

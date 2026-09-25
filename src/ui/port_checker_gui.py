@@ -5,6 +5,8 @@
 TCP/UDPポートの状態を確認するGUIツール
 """
 
+import csv
+import io
 import sys
 import socket
 import subprocess
@@ -61,11 +63,28 @@ class PortCheckThread(QThread):
     """ポートチェックを別スレッドで実行"""
     result_ready = pyqtSignal(str)
     
+    # netstat / tasklist の終了を待つ上限（秒）。期限が無いと、子プロセスが
+    # 応答しないだけで結果も finished も来ず、確認ボタンが無効のまま残る
+    COMMAND_TIMEOUT_SECONDS = 15
+
     def __init__(self, port, check_type, protocol):
         super().__init__()
         self.port = port
         self.check_type = check_type
         self.protocol = protocol  # 'UDP' or 'TCP'
+
+    def _run_command(self, cmd: str) -> str:
+        """コマンドを期限付きで実行し、出力を返す。
+
+        shell を通さずに直接起動する。shell=True だと期限切れで止まるのは
+        cmd.exe だけで、孫プロセスがパイプを持ち続けるため、戻るのは孫が
+        終わってから（実測: timeout=2 で 14 秒）。shell=True が付けていた
+        「コンソール窓を隠す」は CREATE_NO_WINDOW で代える。
+        """
+        return subprocess.check_output(
+            cmd, text=True, stderr=subprocess.STDOUT,
+            timeout=self.COMMAND_TIMEOUT_SECONDS,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     
     def run(self):
         """チェックを実行し、どう転んでも result_ready を 1 回 emit する。
@@ -122,13 +141,24 @@ class PortCheckThread(QThread):
                 else:
                     result += f"  → サーバーアプリケーションを起動できます\n\n"
             except OSError as e:
-                # 10048: Address already in use。10013 (errno 13): 占有側が
-                # SO_REUSEADDR 無しで、こちらが SO_REUSEADDR 付きのときに
-                # 出る「アクセス許可で禁じられた方法」。どちらも使用中
-                if e.errno in (10048, 13) or getattr(e, "winerror", None) in (10048, 10013):
+                winerror = getattr(e, "winerror", None)
+                # 10048: Address already in use。排他 bind なので、実在の占有は
+                # TCP / UDP・占有側の SO_REUSEADDR の有無によらずこれになる
+                if e.errno == 10048 or winerror == 10048:
                     result += f"✗ ポート {self.port}/{self.protocol} は既に使用されています\n"
                     result += f"  → 別のプログラムがこのポートを使用中です\n"
                     result += f"  → 下記のプロセス情報を確認してください\n\n"
+                # 10013 / errno 13 (WSAEACCES): 占有とは限らない。OS の予約・
+                # 除外範囲（netsh の excludedportrange、Hyper-V / WSL の予約）
+                # でも出る。占有と断定すると、同じ画面の netstat 欄（使用して
+                # いる接続は見つかりませんでした）と矛盾する
+                elif e.errno == 13 or winerror == 10013:
+                    result += (f"✗ ポート {self.port}/{self.protocol} は"
+                               f"バインドできません（アクセスが拒否されました）\n")
+                    result += f"  → 別のプログラムが使用中か、OSが予約・除外しています\n"
+                    result += (f"  → 除外範囲は netsh int ipv4 show excludedportrange "
+                               f"protocol={self.protocol.lower()} で確認できます\n")
+                    result += f"  → 元のエラー: {e}\n\n"
                 else:
                     result += f"✗ エラー: {e}\n\n"
         
@@ -143,9 +173,9 @@ class PortCheckThread(QThread):
             # 区別が付かなくなり、確認できていないポートを「使用されていません」
             # と言い切ってしまうため
             try:
-                output = subprocess.check_output("netstat -ano", shell=True, text=True, 
-                                               stderr=subprocess.STDOUT)
-            except (subprocess.CalledProcessError, OSError) as e:
+                output = self._run_command("netstat -ano")
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+                    OSError) as e:
                 error, lines = e, []
             else:
                 error, lines = None, select_netstat_lines(output, self.port, self.protocol)
@@ -172,18 +202,19 @@ class PortCheckThread(QThread):
                     for pid in pids:
                         try:
                             cmd = f"tasklist /FI \"PID eq {pid}\" /FO CSV /NH"
-                            proc_info = subprocess.check_output(cmd, shell=True, 
-                                                               text=True, 
-                                                               stderr=subprocess.STDOUT)
-                            # CSVフォーマットをパース
-                            proc_info = proc_info.strip().replace('"', '')
-                            parts = proc_info.split(',')
+                            proc_info = self._run_command(cmd)
+                            # CSV として引用符を解釈して読む。引用符を消して
+                            # カンマで分けると、カンマを含む名前
+                            # （"net,agent.exe"）が途中で切れる
+                            parts = next(csv.reader(io.StringIO(proc_info.strip())), [])
                             if len(parts) >= 2:
                                 proc_name = parts[0]
                                 result += f"  PID {pid}: {proc_name}\n"
-                        except (subprocess.CalledProcessError, OSError):
-                            # tasklist を起動できない環境（OSError）でも、
-                            # 取れている netstat の結果ごと捨てない
+                        except (subprocess.CalledProcessError,
+                                subprocess.TimeoutExpired, OSError):
+                            # tasklist を起動できない環境（OSError）や応答しない
+                            # とき（期限切れ）でも、取れている netstat の結果ごと
+                            # 捨てない
                             result += f"  PID {pid}: プロセス情報取得失敗\n"
                     result += "\n"
         
@@ -195,8 +226,7 @@ class PortCheckThread(QThread):
             try:
                 # -p TCP は IPv4 だけなので、全体を取ってプロトコル列で選ぶ
                 cmd = "netstat -ano"
-                output = subprocess.check_output(cmd, shell=True, text=True,
-                                               stderr=subprocess.STDOUT)
+                output = self._run_command(cmd)
                 
                 # 指定ポートを待ち受けている行を探す。TCP は状態列が
                 # LISTENING のものだけ（ESTABLISHED だけの対は待ち受けではない）
@@ -214,9 +244,10 @@ class PortCheckThread(QThread):
                     for line in select_netstat_lines(output, None, self.protocol)[:20]:
                         result += line + "\n"
                 result += "\n"
-            except (subprocess.CalledProcessError, OSError) as e:
-                # netstat を起動できない環境（OSError）も失敗として扱う。
-                # netstat 経路と同じく、確認できていないことを明示する
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+                    OSError) as e:
+                # netstat を起動できない環境（OSError）や期限切れも失敗として
+                # 扱う。netstat 経路と同じく、確認できていないことを明示する
                 result += f"{self.protocol}接続情報の取得に失敗しました: {e}\n"
                 result += "→ このポートの使用状況は確認できていません\n\n"
         

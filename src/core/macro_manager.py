@@ -49,8 +49,12 @@ class MacroManager(QObject):
             callback: コマンド送信関数（引数: command文字列）
             command_callback: コマンドリスト専用の送信関数。省略時は callback を使う。
                 送信先が列に溜める作りなら、cancel_callback で取り消せるように
-                印を付けて積む版を渡す
-            cancel_callback: 送信待ちのコマンドを取り消す関数（引数なし）。
+                印を付けて積む版を渡す。引数は (command文字列, on_sent) で、
+                その行を実際に送り出したときに on_sent() を呼ぶこと（次の行
+                までの遅延はそこから数える）。キープアライブの CR もこれで
+                (CR, None, "keepalive") として積む
+            cancel_callback: 送信待ちのコマンドを取り消す関数。引数なしで
+                コマンドリストの、"keepalive" でキープアライブのぶんを取り消す。
                 停止したのに、列に残ったコマンドが後から機器へ届くのを防ぐ
         """
         self._send_callbacks[device_name] = callback
@@ -97,12 +101,18 @@ class MacroManager(QObject):
         """
         キープアライブを停止
         
+        発火した CR が、長い貼り付けの排出待ちなどでまだ送られずに列に
+        残っていることがある。停止したのに後から届き、改行なしで貼った行を
+        実行してしまうので、ここで取り消す。
+
         Args:
             device_name: 機器名
         """
         if device_name in self._keepalive_timers:
             self._keepalive_timers[device_name].stop()
             del self._keepalive_timers[device_name]
+            if device_name in self._cancel_callbacks:
+                self._cancel_callbacks[device_name]("keepalive")
     
     def is_keepalive_active(self, device_name: str) -> bool:
         """
@@ -123,7 +133,10 @@ class MacroManager(QObject):
         Args:
             device_name: 機器名
         """
-        if device_name in self._send_callbacks:
+        if device_name in self._command_send_callbacks:
+            # 空のエンターを、停止で取り消せるように印を付けて積む
+            self._command_send_callbacks[device_name]("\r", None, "keepalive")
+        elif device_name in self._send_callbacks:
             # 空のエンターを送信
             self._send_callbacks[device_name]("\r")
     
@@ -149,8 +162,10 @@ class MacroManager(QObject):
         self._command_indices[device_name] = 0
         self._command_delays[device_name] = delay_ms
         
-        # タイマーを作成
+        # タイマーを作成。1 回ずつ鳴らし、次の遅延は送った行を実際に送り
+        # 出した時点から数え直す（_on_command_sent）
         timer = QTimer()
+        timer.setSingleShot(True)
         timer.timeout.connect(lambda: self._execute_next_command(device_name))
         self._command_timers[device_name] = timer
         self.command_list_state_changed.emit(device_name, True)
@@ -178,7 +193,7 @@ class MacroManager(QObject):
         Args:
             device_name: 機器名
             cancel_pending: 送信待ちのコマンドも取り消すか。走り切った場合は
-                最後のコマンドがまだ列にいることがあるので取り消さない
+                全行を送り出し済みなので取り消さない
         """
         was_active = device_name in self._command_timers
         if was_active:
@@ -220,35 +235,33 @@ class MacroManager(QObject):
         commands = self._command_lists[device_name]
         index = self._command_indices[device_name]
         
-        # すべてのコマンドを実行した場合
+        # すべてのコマンドを実行した場合（最後の行は送り出し済み）
         if index >= len(commands):
             self.macro_finished.emit(device_name)
-            # 走り切った場合、最後のコマンドがまだ送信待ちのことがある。
-            # 停止と違って取り消してはいけない
             self._teardown_command_list(device_name, cancel_pending=False)
             return
 
         # コマンドを送信
         command = commands[index]
         if device_name in self._send_callbacks:
-            # コマンド送信（改行付き）
-            send = self._command_send_callbacks.get(
-                device_name, self._send_callbacks[device_name])
-            send(command + "\r")
-
-            # 送信が同期で失敗すると、このコールバックの中で切断の後始末
-            # （cleanup_device）まで走り、この機器の実行はすでに畳まれている。
-            # そのまま続けると消えた遅延を読んで KeyError になり、
-            # インデックスだけが作り直されて残る
-            if device_name not in self._command_lists:
-                return
-
-            # インデックスを進める
+            # インデックスは送る前に進める。送り出しの知らせ（on_sent）は
+            # 送信の中から同期で届くことがある。送信が同期で失敗すると、
+            # この中で切断の後始末（cleanup_device）まで走り、この機器の
+            # 実行はすでに畳まれている（後で進めるとインデックスだけが
+            # 作り直されて残る）
             self._command_indices[device_name] = index + 1
-            
-            # 次のコマンドのためにタイマーを設定
-            delay = self._command_delays[device_name]
-            self._command_timers[device_name].start(delay)
+            timer = self._command_timers[device_name]
+
+            def on_sent():
+                self._on_command_sent(device_name, timer)
+
+            # コマンド送信（改行付き）
+            if device_name in self._command_send_callbacks:
+                self._command_send_callbacks[device_name](command + "\r", on_sent)
+            else:
+                # 送り出しを知らせない送信先は、渡した時点で送り出したとみなす
+                self._send_callbacks[device_name](command + "\r")
+                on_sent()
         else:
             # コールバックが登録されていない場合はエラー
             self.macro_error.emit(
@@ -256,6 +269,17 @@ class MacroManager(QObject):
                 "コマンド送信コールバックが登録されていません"
             )
             self.stop_command_list(device_name)
+
+    def _on_command_sent(self, device_name: str, timer: QTimer):
+        """送った行が機器へ送り出された。ここから次の行までの遅延を数える
+
+        列に積んだ時点で数えると、長い貼り付けの後ろで待つ間に遅延が過ぎ、
+        送り出すときには行の間の待ちが消えていた。全行を積み終えると完了
+        扱いになり、その後の停止では残った行を取り消せなかった。
+        """
+        if self._command_timers.get(device_name) is not timer:
+            return   # 停止した（やり直した）実行の行
+        timer.start(self._command_delays[device_name])
     
     def cleanup_device(self, device_name: str):
         """

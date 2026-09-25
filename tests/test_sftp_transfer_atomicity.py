@@ -35,7 +35,9 @@ class SftpTransferAtomicityTest(unittest.TestCase):
         from core.sftp_manager import SFTPManager
         m = SFTPManager()
         m.is_connected = True
-        m.sftp_client = mock.Mock()
+        # 改名の期限切れでは接続を畳んで m.sftp_client を手放すので、
+        # 呼び出しの記録は控えたほうで見る
+        self.client = m.sftp_client = mock.Mock()
         m.sftp_client.normalize.side_effect = lambda p: p
         # リモートに同名は無い（stat が失敗する）。upload_file は overwrite を
         # 明示されない限り、送る直前に stat で既存を確かめるようになった
@@ -131,8 +133,13 @@ class SftpTransferAtomicityTest(unittest.TestCase):
         self.assertFalse(put_target.startswith("/"),
                          "相対名なのに一時名が絶対パス: %s" % put_target)
 
-    def test_two_downloads_to_the_same_local_path_both_succeed(self):
-        """同じ保存先へ続けて落としても、片方が誤って失敗にならないこと。"""
+    def test_two_downloads_to_the_same_local_path_do_not_both_run(self):
+        """同じ保存先へ続けて落とすと、2 件目は断られ、1 件目は誤って失敗しないこと。
+
+        以前は両方とも成功することを確かめていたが、両方を走らせると後から
+        終わった方の置き換えで先の方が確認なしに消える。利用者の決定
+        （2026-09-20）により、進行中の同じ保存先への 2 件目は断る。
+        """
         m = self._manager()
         local = os.path.join(self.dir, "backup.cfg")
 
@@ -145,8 +152,12 @@ class SftpTransferAtomicityTest(unittest.TestCase):
         m.download_file("/etc/one.cfg", local)
         m.download_file("/etc/two.cfg", local)
 
-        self.assertTrue(self._wait(lambda: len(self.done) + len(self.errors) >= 2))
-        self.assertEqual(self.errors, [], "同じ一時名の取り合いで誤って失敗している")
+        self.assertTrue(self._wait(lambda: self.done), "1 件目が終わらない: %s" % self.errors)
+        self.assertEqual(len(self.errors), 1, "2 件目の扱いが違う: %s" % self.errors)
+        self.assertIn("同じ保存先へのダウンロードが進行中です", self.errors[0],
+                      "同じ一時名の取り合いで誤って失敗している")
+        with io.open(local, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "/etc/one.cfg")
         self.assertEqual(os.listdir(self.dir), ["backup.cfg"], "一時ファイルが残っている")
 
     def test_the_fallback_renames_first_and_removes_only_when_needed(self):
@@ -194,6 +205,10 @@ class SftpTransferAtomicityTest(unittest.TestCase):
         「posix_rename が使えないサーバ」と同じ後始末へ落ちていた。一時名は
         既に無いので rename が失敗し、その復旧として最終名を remove する。
         置き換わったばかりの内容と、転送した写しの両方が消える。
+
+        overwrite=True で送るのは、posix_rename を使うのが上書きの確認を得た
+        送信だけになったため（利用者の決定 2026-09-20）。ここで見ているのは
+        置き換えの仕組みなので、意図どおり承認済みの送信にしてある。
         """
         m = self._manager()
         local = os.path.join(self.dir, "running.cfg")
@@ -203,17 +218,24 @@ class SftpTransferAtomicityTest(unittest.TestCase):
         # 機器側では置き換わっているので、一時名はもう無い
         m.sftp_client.rename.side_effect = IOError("No such file")
 
-        m.upload_file(local, "/flash/running.cfg")
+        m.upload_file(local, "/flash/running.cfg", overwrite=True)
 
         self.assertTrue(self._wait(lambda: self.errors), "失敗が通知されない")
-        removed = [c[0][0] for c in m.sftp_client.remove.call_args_list]
+        removed = [c[0][0] for c in self.client.remove.call_args_list]
         self.assertEqual(removed, [], "期限切れなのに消しにいっている: %s" % removed)
-        m.sftp_client.rename.assert_not_called()
+        self.client.rename.assert_not_called()
         self.assertIn(".running.cfg.netbelt-part", self.errors[0],
                       "機器側で確かめる一時名を知らせていない: %s" % self.errors)
 
     def test_a_fallback_rename_that_times_out_removes_neither_name(self):
-        """posix_rename の無いサーバで、代わりの rename が期限切れになった場合も同じ。"""
+        """posix_rename の無いサーバで、代わりの rename が期限切れになった場合も同じ。
+
+        overwrite=True で送るのは、posix_rename を使うのが上書きの確認を得た
+        送信だけになったため（利用者の決定 2026-09-20）。確認を経ていない送信
+        だと posix_rename が呼ばれず、「posix_rename の無い機器」という前提が
+        空振りになり、ここで期限切れになるのは 1 本目の rename になってしまう。
+        見たいのは代わりの rename の経路なので、承認済みの送信にしてある。
+        """
         m = self._manager()
         local = os.path.join(self.dir, "running.cfg")
         with io.open(local, "w", encoding="utf-8") as f:
@@ -221,21 +243,27 @@ class SftpTransferAtomicityTest(unittest.TestCase):
         m.sftp_client.posix_rename.side_effect = IOError("Operation unsupported")
         m.sftp_client.rename.side_effect = TimeoutError()
 
-        m.upload_file(local, "/flash/running.cfg")
+        m.upload_file(local, "/flash/running.cfg", overwrite=True)
 
         self.assertTrue(self._wait(lambda: self.errors), "失敗が通知されない")
-        removed = [c[0][0] for c in m.sftp_client.remove.call_args_list]
+        self.client.posix_rename.assert_called_once()   # 前提が生きていること
+        removed = [c[0][0] for c in self.client.remove.call_args_list]
         self.assertEqual(removed, [], "期限切れなのに消しにいっている: %s" % removed)
-        self.assertEqual(m.sftp_client.rename.call_count, 1,
+        self.assertEqual(self.client.rename.call_count, 1,
                          "期限切れのあとに rename をやり直している")
 
     def test_a_successful_upload_is_moved_into_place(self):
+        """置き換えの仕組み（一時名へ送ってから改名）を見る。
+
+        overwrite=True で送るのは、posix_rename を使うのが上書きの確認を得た
+        送信だけになったため（利用者の決定 2026-09-20）。
+        """
         m = self._manager()
         local = os.path.join(self.dir, "running.cfg")
         with io.open(local, "w", encoding="utf-8") as f:
             f.write("hostname R1")
 
-        m.upload_file(local, "/flash/running.cfg")
+        m.upload_file(local, "/flash/running.cfg", overwrite=True)
 
         self.assertTrue(self._wait(lambda: self.done), "完了が通知されない: %s" % self.errors)
         put_target = m.sftp_client.put.call_args[0][1]

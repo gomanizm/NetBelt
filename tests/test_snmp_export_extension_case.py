@@ -89,8 +89,10 @@ class SnmpExportExtensionCaseTest(unittest.TestCase):
     def test_results_saved_as_uppercase_csv_are_csv(self):
         panel = self._results_panel()
         text = self._export(panel, panel._on_export_clicked, "out.CSV")
-        self.assertTrue(text.startswith("OID,Type,Value"),
-                        "out.CSV が CSV になっていない: %r" % text[:40])
+        # 見出しの前には「# 対象ホスト:」の注記が入るので、先頭ではなく
+        # 見出しの行があるかで見る（TXT なら CSV の見出し行は現れない）
+        self.assertIn("OID,Type,Value", text.splitlines(),
+                      "out.CSV が CSV になっていない: %r" % text[:40])
 
     def test_results_saved_as_uppercase_json_are_json(self):
         panel = self._results_panel()
@@ -102,14 +104,14 @@ class SnmpExportExtensionCaseTest(unittest.TestCase):
     def test_results_saved_as_mixed_case_csv_are_csv(self):
         panel = self._results_panel()
         text = self._export(panel, panel._on_export_clicked, "out.Csv")
-        self.assertTrue(text.startswith("OID,Type,Value"),
-                        "out.Csv が CSV になっていない: %r" % text[:40])
+        self.assertIn("OID,Type,Value", text.splitlines(),
+                      "out.Csv が CSV になっていない: %r" % text[:40])
 
     def test_results_saved_as_lowercase_csv_still_are_csv(self):
         """小文字の従来どおりの経路を壊していないこと。"""
         panel = self._results_panel()
         text = self._export(panel, panel._on_export_clicked, "out.csv")
-        self.assertTrue(text.startswith("OID,Type,Value"))
+        self.assertIn("OID,Type,Value", text.splitlines())
 
     def test_results_saved_as_txt_still_are_text(self):
         """既定の txt（および未知の拡張子）はこれまでどおりテキスト。"""

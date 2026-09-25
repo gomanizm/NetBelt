@@ -8,25 +8,37 @@ from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QFont
 from core.sftp_server import SFTPServerManager
 from datetime import datetime
-from ui import theme
+from ui import log_export, plain_log, theme
 
 
 class SFTPServerPanel(QWidget):
     """SFTPサーバー制御パネル"""
 
+    # アプリの終了処理に入ったか（MainWindow.closeEvent が立てる）。
+    # 立っている間はモーダルを開かない。終了処理は記録を救うために配送待ちの
+    # シグナルをその場で配るので、サーバのスレッドが出したエラーもそこで
+    # 届く。答えるまで終了が止まるうえ、そのときサーバは停止済み。
+    _closing = False
+
     # 認証前の接続でもログは増える。上限が無いと遠隔から叩き続けるだけで
     # メモリを食い潰せるため、頭打ちにする。Syslog パネル（1000件）に合わせた。
     MAX_LOG_LINES = 1000
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, config_manager=None):
         """
         初期化
-        
+
         Args:
             parent: 親ウィジェット
+            config_manager: ログのエクスポート先（前回保存したフォルダ）の
+                出し入れに使う。FTP / TFTP と違い、無ければ新しく作らずに
+                None のまま持つ。このパネルは settings.sftp_server を読み
+                書きしないので作る理由が無く、作ると単体で組み立てただけで
+                利用者の config.json を掴んでしまう
         """
         super().__init__(parent)
-        
+
+        self.config_manager = config_manager
         self.sftp_server = SFTPServerManager(self)
         self.connected_clients = 0
         
@@ -67,11 +79,13 @@ class SFTPServerPanel(QWidget):
         root_layout = QHBoxLayout()
         self.root_dir_edit = QLineEdit()
         self.root_dir_edit.setText("./sftp_root")
-        root_layout.addWidget(self.root_dir_edit)
+        # 余った幅は入力欄だけが受け取り、参照ボタンは自分の幅を保つ。
+        # 以前は setMaximumWidth(60) でボタンの頭を押さえていたので、
+        # 自然な幅 80px に対していつも 60px へ潰れ、押しにくかった
+        root_layout.addWidget(self.root_dir_edit, 1)
         self.browse_btn = QPushButton("参照")
         self.browse_btn.clicked.connect(self._on_browse_directory)
-        self.browse_btn.setMaximumWidth(60)
-        root_layout.addWidget(self.browse_btn)
+        root_layout.addWidget(self.browse_btn, 0)
         settings_layout.addLayout(root_layout, 1, 1)
         
         # ユーザー名
@@ -140,14 +154,22 @@ class SFTPServerPanel(QWidget):
         # 行数の上限。超えた分は Qt が先頭ブロックから捨てる
         self.log_text.document().setMaximumBlockCount(self.MAX_LOG_LINES)
         self.log_text.setStyleSheet("font-family: Consolas, monospace; font-size: 9pt;")
+
+        # ボタンはログのすぐ上に左寄せ1行（SNMP の Trap 受信と同じ形）。
+        # 行末の addStretch() が無いと、余った幅がボタン自身に配られて
+        # 横へ間延びする
+        log_btn_layout = QHBoxLayout()
+        self.export_log_btn = QPushButton("エクスポート")
+        self.export_log_btn.clicked.connect(self._on_export_log)
+        log_btn_layout.addWidget(self.export_log_btn)
+        self.clear_log_btn = QPushButton("クリア")
+        self.clear_log_btn.clicked.connect(self._on_clear_log)
+        log_btn_layout.addWidget(self.clear_log_btn)
+        log_btn_layout.addStretch()
+        log_layout.addLayout(log_btn_layout)
+
         log_layout.addWidget(self.log_text)
-        
-        # ログクリアボタン
-        clear_log_btn = QPushButton("ログをクリア")
-        clear_log_btn.clicked.connect(self._on_clear_log)
-        clear_log_btn.setMaximumWidth(120)
-        log_layout.addWidget(clear_log_btn)
-        
+
         log_group.setLayout(log_layout)
         layout.addWidget(log_group)
         
@@ -169,6 +191,7 @@ class SFTPServerPanel(QWidget):
         self.sftp_server.stopped.connect(self._on_server_stopped)
         self.sftp_server.client_connected.connect(self._on_client_connected)
         self.sftp_server.client_disconnected.connect(self._on_client_disconnected)
+        self.sftp_server.client_activity.connect(self._on_activity_event)
         self.sftp_server.error_occurred.connect(self._on_error)
     
     def _on_browse_directory(self):
@@ -271,9 +294,16 @@ class SFTPServerPanel(QWidget):
         
         self._add_log(f"クライアント切断: {client_ip}")
     
+    def _on_activity_event(self, ip: str, message: str):
+        """サーバーからのお知らせ（省略した通知の件数など）をログへ出す"""
+        self._add_log("[%s] %s" % (ip, message) if ip else message)
+
     def _on_error(self, error_message: str):
         """エラー発生時の処理"""
         self._add_log(f"エラー: {error_message}")
+        if self._closing:
+            # 終了処理の途中。ログだけ残して戻る（_closing の説明を参照）
+            return
         QMessageBox.critical(self, "SFTPサーバー エラー", error_message)
     
     def _on_fw_allow(self):
@@ -288,18 +318,23 @@ class SFTPServerPanel(QWidget):
         self._add_log("ファイアウォール許可: %s (%s)" % ("完了" if ok else "未反映/失敗", msg))
 
     def _add_log(self, message: str):
-        """ログにメッセージを追加"""
+        """ログにメッセージを追加
+
+        append() ではなく平文で積む。届いた名前に <br> があると 1 件の通知が
+        2 行に割れ、偽の記録に見えた（plain_log の説明を参照）。
+        自動スクロールは append_line が行う。
+        """
         timestamp = datetime.now().strftime("%H:%M:%S")
-        log_message = f"[{timestamp}] {message}"
-        self.log_text.append(log_message)
-        
-        # 自動スクロール
-        scrollbar = self.log_text.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
+        plain_log.append_line(self.log_text, f"[{timestamp}] {message}")
     
     def _on_clear_log(self):
         """ログをクリア"""
         self.log_text.clear()
+    
+    def _on_export_log(self):
+        """画面に出ているアクティビティログをファイルへ保存する"""
+        log_export.export_log_text(self, self.log_text.toPlainText(),
+                                   "sftp_log")
     
     def closeEvent(self, event):
         """パネルが閉じられる時の処理"""

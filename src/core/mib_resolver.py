@@ -11,7 +11,7 @@ from typing import Dict, Optional
 # MIB 解析器の版。抽出・解決の規則を変えたら上げる。mib_cache.json は
 # この値も鍵にするので、古い解析器が作ったキャッシュがアプリの更新後に
 # そのまま使われることがなくなる。
-MIB_PARSER_VERSION = '2026-09-15.1'
+MIB_PARSER_VERSION = '2026-09-23.2'
 
 
 def app_dir() -> str:
@@ -61,6 +61,26 @@ def _custom_mibs_fingerprint() -> str:
         return ''
 
 
+def _mib_file_stamp(path: str) -> dict:
+    """mibs/ のファイルが変わったかを見るための印（mtime・大きさ・sha1）。
+
+    mtime だけだと、中身を差し替えても mtime が保たれたとき（固定日時で
+    作られた配布アーカイブを展開し直す、mtime を保つコピー）に古い
+    キャッシュが使われ続ける（実測）。中身の sha1 まで見る。費用は中身を
+    読む分（合成 MIB 45MB・150 ファイルで、キャッシュが効く起動が 0.075 秒
+    から 0.11 秒）で、読み込みはバックグラウンドのスレッドで動く。中身を
+    読めない（排他ロックなど）ときは sha1 を None にする。
+    """
+    import hashlib
+    stat = os.stat(path)
+    try:
+        with open(path, 'rb') as f:
+            sha1 = hashlib.sha1(f.read()).hexdigest()
+    except OSError:
+        sha1 = None
+    return {'mtime': stat.st_mtime, 'size': stat.st_size, 'sha1': sha1}
+
+
 class MIBResolver:
     """
     MIB解決クラス
@@ -71,6 +91,12 @@ class MIBResolver:
     def __init__(self):
         self.oid_to_name: Dict[str, str] = {}
         self.name_to_oid: Dict[str, str] = {}
+        # 直前の読み込みで mib_cache.json をそのまま使えたか。
+        # 読み込み件数の知らせに「（キャッシュ使用）」を付けるかを決める
+        self._mib_cache_used = False
+        # モジュール名→そのモジュールが宣言している名前。抽出のあいだに
+        # 貯めて解決で使う。詳しくは _MIB_LOCAL_NAME を見ること
+        self._module_local_names: Dict[str, set] = {}
         self._load_default_mibs()
         self._load_custom_mibs()
     
@@ -196,7 +222,14 @@ class MIBResolver:
 
         if os.path.exists(custom_mib_file):
             try:
-                with open(custom_mib_file, 'r', encoding='utf-8') as f:
+                # utf-8-sig: 利用者が手で書くファイルなので、Windows の
+                # 編集（メモ帳の「UTF-8 (BOM 付き)」・PowerShell 5.1 の
+                # Out-File -Encoding utf8）で BOM が付く。utf-8 のままだと
+                # json.load が 'Unexpected UTF-8 BOM' で落ち、下の except が
+                # コンソールへ出すだけなので、画面には何も出ないまま利用者が
+                # 登録した OID 名が全部消える（実測）。BOM が無ければ utf-8
+                # と同じ
+                with open(custom_mib_file, 'r', encoding='utf-8-sig') as f:
                     data = json.load(f)
                 custom_mibs = self._valid_custom_entries(
                     data.get('mibs', {}) if isinstance(data, dict) else {})
@@ -225,15 +258,25 @@ class MIBResolver:
                 for oid, name in cached_mibs.items():
                     self.name_to_oid[name] = oid
                 
-                print(f"[MIBResolver] MIBファイルから {len(cached_mibs)}件のOIDを読み込みました（キャッシュ使用）")
-    
+                # 「（キャッシュ使用）」は、本当にキャッシュをそのまま
+                # 使えたときだけ付ける。常に付けていたので、直前に
+                # 「キャッシュを保存できません…次の起動でも解析し直します」
+                # と出した後でもこれが続き、打ち消していた（実測）。
+                # 初回起動（全ファイルを解析した回）でも同じで、起動が
+                # 遅い理由を探している利用者に逆のことを伝えていた
+                note = '（キャッシュ使用）' if self._mib_cache_used else ''
+                print(f"[MIBResolver] MIBファイルから {len(cached_mibs)}件のOIDを読み込みました{note}")
+
     def _load_or_update_mib_cache(self, mibs_dir: str) -> dict:
         """
         MIBキャッシュを読み込むか、必要に応じて更新
-        
+
+        解析し直さずにキャッシュをそのまま使えたかを self._mib_cache_used に
+        残す（呼び出し側が知らせの文言に使う）。
+
         Args:
             mibs_dir: MIBファイルのディレクトリ
-        
+
         Returns:
             OID→名前の辞書
         """
@@ -266,9 +309,27 @@ class MIBResolver:
             cached_files = {}
             cache_needs_update = True
         
-        # MIBファイルのタイムスタンプをチェック
+        # MIBファイルの変更をチェック（mtime・大きさ・中身の sha1）
         current_files = {}
-        for filename in os.listdir(mibs_dir):
+        try:
+            filenames = os.listdir(mibs_dir)
+        except OSError as e:
+            # os.path.exists / os.path.isdir を通った直後でも、一覧その
+            # ものが失敗することがある（起動中の mibs/ の入れ替え、同期
+            # クライアント、一覧だけを拒否する ACL）。ここで素通りさせると
+            # OSError が MIBResolver.__init__ まで上がり、内蔵の標準 MIB
+            # まで 1 件も読めなくなる（実測: 画面には何も出ず、標準出力に
+            # 「バックグラウンドMIB読み込みエラー」が 1 行出るだけ）。
+            # 読めない MIB ファイルと同じように理由を 1 行残し、前回の
+            # 解析結果（読めていれば）で続ける。解析し直していないので
+            # キャッシュはそのまま、上書きもしない。
+            print(f"[MIBResolver] mibs フォルダの一覧を取得できません"
+                  f"（{e}）。今回は MIB ファイルを読み込まず、"
+                  f"キャッシュがあればその内容を使います（フォルダを"
+                  f"入れ替え中か、アクセス権が無い可能性があります）")
+            self._mib_cache_used = True
+            return cached_mibs
+        for filename in filenames:
             # 拡張子は大小を無視して判定する。Windows はファイル名の大小を
             # 保持するので、CASE.MIB のように大文字で配布された MIB が
             # 無言で解析からも監視対象からも外れていた（実測）。
@@ -276,11 +337,50 @@ class MIBResolver:
             # ファイルを開く経路は変えない。
             if filename.lower().endswith(('.mib', '.txt', '.my')):
                 filepath = os.path.join(mibs_dir, filename)
-                mtime = os.path.getmtime(filepath)
-                current_files[filename] = mtime
-                
+                # 名前が合っても通常のファイルでないもの（vendor.mib という
+                # フォルダなど）は外す。開けないので「読めなかったファイル」に
+                # なり、キャッシュに記録されないまま起動のたびに全ファイルを
+                # 解析し直していた（実測）
+                if not os.path.isfile(filepath):
+                    # os.path.isfile は壊れたリンクや MAX_PATH を超える
+                    # パスでも False になる。フォルダ以外の理由で外れた
+                    # ものは、名前が合っているのに黙って消えて見えるので
+                    # 名前を 1 行出す。フォルダは利用者にできることが
+                    # 無いので、これまでどおり黙って外す
+                    if not os.path.isdir(filepath):
+                        print(f"[MIBResolver] {filename} はファイルとして"
+                              f"開けないので読み込みから外します"
+                              f"（壊れたリンク、またはパスが長すぎる"
+                              f"可能性があります）")
+                    continue
+                try:
+                    stamp = _mib_file_stamp(filepath)
+                except OSError as e:
+                    # 一覧に出たあと os.stat までの間に消える・読めなく
+                    # なることがある（ウイルス対策の隔離、起動中の
+                    # mibs/ の入れ替え、同期クライアント）。ここで
+                    # 素通りさせると FileNotFoundError が
+                    # MIBResolver.__init__ まで上がり、生き残っている
+                    # MIB まで 1 件も読めなくなる（実測: 画面には何も
+                    # 出ず、標準出力に「バックグラウンドMIB読み込み
+                    # エラー」が 1 行出るだけ）。読めない MIB と同じ
+                    # ように理由を 1 行残して外し、残りで続ける
+                    print(f"[MIBResolver] {filename} の情報を取得でき"
+                          f"ません（{e}）。このファイルは読み込みから"
+                          f"外します（読み込み中に消えた、またはアクセス"
+                          f"できなくなった可能性があります）")
+                    continue
+                cached = cached_files.get(filename)
+                if (stamp['sha1'] is None and isinstance(cached, dict)
+                        and cached.get('mtime') == stamp['mtime']
+                        and cached.get('size') == stamp['size']):
+                    # 今は中身を読めない（排他ロックなど）が、日時と大きさは
+                    # 記録どおり。これまでどおり前回の解析結果を使う
+                    stamp = cached
+                current_files[filename] = stamp
+
                 # キャッシュと比較
-                if filename not in cached_files or cached_files[filename] != mtime:
+                if filename not in cached_files or cached != stamp:
                     cache_needs_update = True
         
         # ファイルが削除された場合もキャッシュ更新
@@ -298,6 +398,9 @@ class MIBResolver:
             # 1 ファイルずつ閉じて解決すると、そこにぶら下がる定義が全滅する。
             all_definitions = []
             per_file = {}
+            unread = set()
+            # 解析し直すたびに取り直す（前回の mibs/ の名前を残さない）
+            self._module_local_names = {}
             for filename in current_files.keys():
                 filepath = os.path.join(mibs_dir, filename)
                 try:
@@ -305,7 +408,17 @@ class MIBResolver:
                     per_file[filename] = definitions
                     all_definitions.extend(definitions)
                 except Exception as e:
-                    print(f"[MIBResolver] {filename} エラー: {str(e)}")
+                    # 読めなかったファイルは files に記録しない。記録すると
+                    # 次の起動で mtime が一致して欠けたキャッシュが使われる
+                    unread.add(filename)
+                    # 読めるようになったら取り戻すために毎回解析し直すので、
+                    # そのことと止め方を伝える
+                    print(f"[MIBResolver] {filename} を読めません（{e}）。"
+                          f"このファイルの定義は使われず、読めるようになるまで"
+                          f"起動のたびに MIB をすべて解析し直します。止めるには、"
+                          f"このファイルを読めるようにする（アクセス権や、"
+                          f"他のアプリがロックしていないかを確かめる）か、"
+                          f"mibs フォルダから取り除いてください")
 
             cached_mibs = self._resolve_definitions(all_definitions)
             resolved_names = set(cached_mibs.values())
@@ -318,15 +431,28 @@ class MIBResolver:
                 cache_data = {
                     'parser': MIB_PARSER_VERSION,
                     'custom': custom_fingerprint,
-                    'files': current_files,
+                    'files': {name: stamp
+                              for name, stamp in current_files.items()
+                              if name not in unread},
                     'mibs': cached_mibs
                 }
                 with open(cache_file, 'w', encoding='utf-8') as f:
                     json.dump(cache_data, f, indent=2, ensure_ascii=False)
                 print(f"[MIBResolver] キャッシュを更新しました")
             except Exception as e:
-                print(f"[MIBResolver] キャッシュ保存エラー: {str(e)}")
-        
+                # 読めない MIB ファイルと同じ考えで、何が起きているか・
+                # 次の起動でもやり直すこと・止め方を伝える。例外だけだと、
+                # 書き込めない場所へ Portable 版を置いた利用者に、起動が
+                # 毎回遅い理由も直し方も分からない
+                print(f"[MIBResolver] キャッシュを保存できません（{e}）。"
+                      f"解析した結果は今回の起動でしか使われず、次の起動でも"
+                      f"MIB をすべて解析し直します。止めるには、"
+                      f"{cache_file} へ書き込めるようにする（アクセス権や、"
+                      f"同じ名前のフォルダ・読み取り専用のファイルが無いかを"
+                      f"確かめる）か、書き込める場所へアプリを移してください")
+
+        # 解析し直したときは、保存できたかに関わらずキャッシュは使っていない
+        self._mib_cache_used = not cache_needs_update
         return cached_mibs
     
     # MIB から拾う定義。現代の MIB はモジュールの根を MODULE-IDENTITY で
@@ -356,27 +482,72 @@ class MIBResolver:
         r'|MODULE-IDENTITY|OBJECT-IDENTITY|OBJECT-GROUP|NOTIFICATION-GROUP'
         r'|MODULE-COMPLIANCE|AGENT-CAPABILITIES|TRAP-TYPE|TEXTUAL-CONVENTION)'
     )
+    # 名前と型キーワードの間の空白。実 MIB は名前だけを行に置くことが
+    # あるので、抽出の開始（`([\w-]+)\s+<キーワード>`）と同じく改行を
+    # 1 つ許す。ここだけ `[ \t]+` に狭めていたため、IMPORTS 節の直後の
+    # 根が改行で割れていると境界が見えず、IMPORTS から始まった一致が
+    # その根の `::=` まで伸びて偽の名前を登録していた（実測）。
+    # `\s+` にせず改行 1 つに限るのは、空行をまたいで別の定義まで
+    # 届かないようにするため。
+    _MIB_NAME_GAP = r'(?:[ \t]+|[ \t]*\r?\n[ \t]*)'
     _MIB_DEFINITION_BODY = (
-        r'(?:(?!::=)(?!\n[ \t]*(?![A-Z][A-Z0-9-]*[ \t])[\w-]+[ \t]+'
+        r'(?:(?!::=)(?!\n[ \t]*(?![A-Z][A-Z0-9-]*' + _MIB_NAME_GAP
+        + r')[\w-]+' + _MIB_NAME_GAP
         + _MIB_DEFINITION_KEYWORDS + r'\b).)*?'
     )
     _MIB_ASSIGNMENT = r'::=\s*\{\s*([\w-]+)\s+(\d+)\s*\}'
+    # 定義の名前。全部大文字の語は名前として認めない。ASN.1 の値参照は
+    # 小文字で始まるので、IMPORTS / EXPORTS のような節のキーワードが
+    # 定義の名前になること自体が誤り。起点を `([\w-]+)` のまま何でも
+    # 通していたため、IMPORTS 節の直後に根があり、名前と型キーワードが
+    # 2 行以上離れていると（間に空行や、まるごとコメントの行がある形）、
+    # `IMPORTS` から始まった一致がその根の `::=` まで伸びて、企業 OID に
+    # `IMPORTS` という名前が付いていた（実測）。名前と型キーワードの
+    # 間の許容（_MIB_NAME_GAP）を広げ続けるのではなくここで弾くので、
+    # 折り返しの形に依存しない。
+    # 大文字の規則だけでは足りない。正規表現は 1 文字ずつ位置を
+    # ずらして試すので、全部大文字の語を弾いたあとにその語の途中から
+    # 始め直し、切れ端を名前として登録していた（実測: PDU-1 が '-1'、
+    # SNMP-TARGET が '-TARGET'、IEEE8021-PAE が '8021-PAE'。親が解決
+    # できる形なら、企業 OID に切れ端の名前が実際に付く）。偽名の
+    # 経路も全部大文字の語に限らず、IMPORTS 節の `FROM SNMPv2-TC` の
+    # ように小文字を含むモジュール名はそのまま名前になっていた
+    # （実測）。そこで大文字の規則に頼らず、名前を行頭に錨で留める。
+    # 定義の名前は必ず行頭（字下げのみ可）から始まるので、語の途中
+    # や行の途中から始め直せなくなる。左の境界を `\b` ではなく
+    # `(?![\w-])` で見るのは、`-` の直後にも境界が立つため。
+    # 行頭の錨は re.MULTILINE が無いと死ぬ（_MIB_DEFINITION_PATTERNS
+    # の finditer には付いている。_MIB_LOCAL_NAME の findall 側にも
+    # 渡すこと）。
+    _MIB_NAME = r'^[ \t]*(?![A-Z][A-Z0-9-]*(?![\w-]))([\w-]+)'
     _MIB_DEFINITION_PATTERNS = (
-        r'([\w-]+)\s+OBJECT\s+IDENTIFIER\s*' + _MIB_ASSIGNMENT,
+        _MIB_NAME + r'\s+OBJECT\s+IDENTIFIER\s*' + _MIB_ASSIGNMENT,
         # 型キーワードから ::= までは「コロンを含まない並び」ではない。
         # 実 MIB はほぼ必ず DESCRIPTION を持ち、そこへ RFC 参照や URL を
         # 書くので、[^:]* にすると本文にコロンが出た時点で定義ごと
         # 取りこぼす。
-        r'([\w-]+)\s+OBJECT-TYPE\b' + _MIB_DEFINITION_BODY + _MIB_ASSIGNMENT,
-        r'([\w-]+)\s+NOTIFICATION-TYPE\b' + _MIB_DEFINITION_BODY
+        _MIB_NAME + r'\s+OBJECT-TYPE\b' + _MIB_DEFINITION_BODY
         + _MIB_ASSIGNMENT,
-        r'([\w-]+)\s+MODULE-IDENTITY\b' + _MIB_DEFINITION_BODY
+        _MIB_NAME + r'\s+NOTIFICATION-TYPE\b' + _MIB_DEFINITION_BODY
+        + _MIB_ASSIGNMENT,
+        _MIB_NAME + r'\s+MODULE-IDENTITY\b' + _MIB_DEFINITION_BODY
         + _MIB_ASSIGNMENT,
         # ベンダー MIB は中間ノードを OBJECT-IDENTITY で置くことが多い。
         # 拾わないと、その節も配下も丸ごと解決できない。
-        r'([\w-]+)\s+OBJECT-IDENTITY\b' + _MIB_DEFINITION_BODY
+        _MIB_NAME + r'\s+OBJECT-IDENTITY\b' + _MIB_DEFINITION_BODY
         + _MIB_ASSIGNMENT,
     )
+    # そのモジュールが宣言している名前。上の抽出は `::= { 親 添字 }` の形
+    # しか拾わないので、実 MIB にある複数添字の右辺（`::= { aRoot 0 1 }`）
+    # で宣言された名前は定義の一覧から落ちる。落ちた名前を「このモジュール
+    # には無い」とみなすと、全モジュール共通の表にある別モジュールの同名が
+    # 親になり、その子がよその名前空間へ入る（実測: A-MIB の aAlarm が
+    # B-MIB の 1.3.6.1.4.1.2222.1 に登録され、B ベンダーの OID で来た Trap に
+    # 他社の名前が出た）。OID を決められなくても「名前 + 型キーワード」の
+    # 並びは残るので、そちらから宣言の有無だけを拾う。
+    _MIB_LOCAL_NAME = (_MIB_NAME + r'\s+(?:OBJECT\s+IDENTIFIER|OBJECT-TYPE'
+                       r'|NOTIFICATION-TYPE|MODULE-IDENTITY'
+                       r'|OBJECT-IDENTITY)\b')
 
     @staticmethod
     def _blank_comments_and_strings(text: str) -> str:
@@ -420,8 +591,120 @@ class MIBResolver:
                 i += 1
         return ''.join(out)
 
-    # モジュール名。`FOO-MIB DEFINITIONS ::= BEGIN` の FOO-MIB
-    _MIB_MODULE_HEADER = r'^[ \t]*([\w-]+)\s+DEFINITIONS\b'
+    @staticmethod
+    def _ends_with_end(text: str, pos: int) -> bool:
+        """text の pos の直前が（空白と BOM を除いて）`END` で終わるか。
+
+        コメントの中の BOM を連結の区切りとみなしてよいかの判定に使う。
+        text はコメント・文字列を空白にしたもの（位置は元のまま）なので、
+        由来を書いたコメントの直前は `STATUS current` などで終わって END に
+        ならず、連結の境目だけが END で終わる。
+
+        以前は「直前の BOM からこの位置までに END があるか」を区間で
+        見ていたため、2 方向に外れていた（どちらも実測）。1 ファイルに
+        並んだ 2 つ目以降のモジュールの中に由来コメントがあると、前の
+        モジュールの END が区間に入って区切ってはいけない場所で区切り、
+        区切りの BOM が 2 つ続くと区間が空になって区切れなかった。
+        pos には呼び出し側が「空白でも BOM でもない最後の文字の次の
+        位置」を渡す（_normalize_module_boms が前へ進めるカーソル）。
+        そこまで来ていれば直前は必ず実テキストなので、ここでの歩きは
+        0 歩で終わる。生の BOM の位置を渡すと、コメントが空白に
+        なっているファイルでは 1 個あたり O(n) 歩き、全体が O(n^2)
+        になる（実測: 215KB・BOM 4000 個で 16.5 秒）。
+        """
+        bom = chr(0xFEFF)
+        j = pos
+        while j > 0 and (text[j - 1].isspace() or text[j - 1] == bom):
+            j -= 1
+        # END の手前が語の続き（fooEND）でないことまで見る
+        return (j >= 3 and text[j - 3:j] == 'END'
+                and (j == 3 or not (text[j - 4].isalnum()
+                                    or text[j - 4] in '_-')))
+
+    @classmethod
+    def _normalize_module_boms(cls, raw: str) -> str:
+        """本文に残る BOM（U+FEFF）を、1 文字ずつ改行か空白へ置き換えて返す。
+
+        BOM 付きの MIB を `copy /b A.my+B.my` のように生のまま連結すると、
+        A.my に末尾の改行が無ければ `END` の直後に次の BOM が来る。見出しを
+        探す正規表現は行頭の BOM しか読み飛ばせないので、そのままでは
+        モジュールを区切れず、同じ名前が後勝ちで混ざる（実測: A の Trap が
+        B の enterprise の下に付いた）。そこで、直後にモジュールの見出しが
+        続く BOM を改行へ置き換える。
+
+        ただし置き換えを本文の見た目だけで決めると、`--` コメントの中の
+        `<BOM>NAME DEFINITIONS` でコメントが切れ、その残りが生きたコードに
+        なる（実測: 由来を書いたコメントの中の見出しで、直後の定義が区間
+        ごと打ち切られて解決できなくなった）。コメント・文字列の中の BOM は、
+        その行の残りがモジュールの見出しちょうど（連結したファイルの先頭が
+        そのまま続く形）で、かつ「その BOM の直前の実テキストが END で
+        終わっている」ときだけ区切りとして扱う。連結の境目は必ず直前の
+        ファイルの END の後ろに空白とコメントしか無いのに対し、由来を書いた
+        コメントはモジュールの途中にあるので、この 1 点で分けられる。
+
+        見出しにならない BOM は空白にする。どちらも 1 文字→1 文字なので、
+        あとで位置を使う処理がずれない。
+        """
+        import re
+
+        bom = chr(0xFEFF)
+        positions = [m.start() for m in re.finditer(bom, raw)]
+        if not positions:
+            return raw
+        # コメント・文字列の中身は空白になるので、ここに BOM が残っていれば
+        # 「コメントの外の BOM」。先頭の 1 つだけなら調べるまでもない
+        masked = (raw if positions == [0]
+                  else cls._blank_comments_and_strings(raw))
+        # コメントの外: 見出しを探す _MIB_MODULE_HEADER と同じ広さで見る
+        outside = re.compile(r'[ \t' + bom + r']*[\w-]+[\s' + bom
+                             + r']+DEFINITIONS\b')
+        # コメント・文字列の中: 行の残りが見出しちょうどのときだけ。
+        # 広さはコメントの外と揃える。ここだけ 1 行に収まる見出ししか
+        # 認めていなかったので、見出しを折り返した MIB が末尾コメントの
+        # 後ろに連結されると区切れず、全部が 1 つのモジュールに混ざった
+        # （実測: B-MIB の Trap が C-MIB の配下に付いた）。行末ちょうどの
+        # 縛りだけは残すので、`::= { bogus 9 }` が続く幽霊の見出しは弾ける
+        inside = re.compile(
+            r'[ \t]*[\w-]+[\s' + bom + r']+DEFINITIONS\s*::=\s*BEGIN'
+            r'[ \t]*(?:--[^\r\n]*)?\r?$', re.MULTILINE)
+        out = []
+        prev = 0
+        # 空白でも BOM でもない最後の文字の次の位置。positions は
+        # 昇順なので、masked を 1 回だけ前へ進めながらこれを覚えて
+        # おけば、BOM ごとに後ろへ歩き直さずに済む。後ろ向きに歩いて
+        # いたときは、BOM 入りの由来コメントの間に実テキストが無い
+        # ファイル（コメントは空白になっている）で 1 個あたり O(n) に
+        # なり、全体が O(n^2) だった（実測: 215KB・BOM 4000 個で
+        # 16.5 秒。BOM の間に実テキストがある同じ大きさの形は 0.027 秒）
+        solid = 0
+        scan = 0
+        for i in positions:
+            while scan < i:
+                ch = masked[scan]
+                if not (ch.isspace() or ch == bom):
+                    solid = scan + 1
+                scan += 1
+            if masked[i] == bom:
+                split = outside.match(raw, i + 1) is not None
+            else:
+                # 直前のモジュールが閉じているか。詳しくは
+                # _ends_with_end と docstring を見ること
+                split = (inside.match(raw, i + 1) is not None
+                         and cls._ends_with_end(masked, solid))
+            out.append(raw[prev:i])
+            out.append('\n' if split else ' ')
+            prev = i + 1
+        out.append(raw[prev:])
+        return ''.join(out)
+
+    # モジュール名。`FOO-MIB DEFINITIONS ::= BEGIN` の FOO-MIB。
+    # 行頭の BOM（U+FEFF）も空白と同じく読み飛ばす。BOM 付きの MIB を
+    # 連結すると各モジュールの先頭に BOM が残り、見出しを見落として
+    # 複数のモジュールが 1 つに混ざる（実測）。utf-8-sig で開いても
+    # 消えるのはファイル先頭の BOM だけなので、ここで許す。
+    # 読み込み時に BOM は改行へ正規化してあるので、ここに残る BOM は
+    # もう無いはずだが、この式だけを使う経路が増えても壊れないよう残す。
+    _MIB_MODULE_HEADER = r'^[ \t\ufeff]*([\w-]+)\s+DEFINITIONS\b'
 
     def _extract_mib_definitions(self, filepath: str) -> list:
         """
@@ -430,7 +713,8 @@ class MIBResolver:
         ここでは OID へ解決しない。親が別のファイルで定義されていることが
         普通にあるため、解決は全ファイルを読み終えてからまとめて行う。
 
-        モジュール名は `X DEFINITIONS ::= BEGIN` の X。無いファイルは
+        モジュール名は `X DEFINITIONS ::= BEGIN` の X（見出しが複数ある
+        ファイルは、その定義が書かれた区間の X）。無いファイルは
         ファイル名をモジュール名の代わりにする（ファイル単位の名前空間）。
 
         Args:
@@ -438,23 +722,59 @@ class MIBResolver:
 
         Returns:
             (名前, 親の名前, 添字, モジュール名) のリスト
+
+        Raises:
+            OSError: ファイルを読めなかったとき
         """
         import re
 
         definitions = []
         try:
             with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-                content = self._blank_comments_and_strings(f.read())
-            header = re.search(self._MIB_MODULE_HEADER, content, re.MULTILINE)
-            module = header.group(1) if header else os.path.basename(filepath)
-            for pattern in self._MIB_DEFINITION_PATTERNS:
-                # DOTALL が要る。定義は複数行にまたがるので、`.` が改行を
-                # 拾わないと型キーワードから ::= まで届かない
-                for match in re.finditer(pattern, content,
-                                         re.MULTILINE | re.DOTALL):
-                    definitions.append(
-                        (match.group(1), match.group(2), match.group(3),
-                         module))
+                raw = f.read()
+            # 本文に残る BOM（U+FEFF）を、連結の区切り（改行）か無害な
+            # 空白へ振り分ける。詳しくは _normalize_module_boms を見ること
+            raw = self._normalize_module_boms(raw)
+            content = self._blank_comments_and_strings(raw)
+            # 1 ファイルに複数のモジュールを連結して配る MIB があるので、
+            # 見出しの位置ごとに本文を区切り、区間ごとにそのモジュール名を
+            # 付ける。ファイル全体に最初の見出しの名前を付けると、2 つの
+            # モジュールが同じ名前を定義したとき同じモジュールの同名として
+            # 後勝ちになり、片方の子がもう一方の親に付く（実測）。最初の
+            # 見出しより前は、これまでどおり最初のモジュールに含める。
+            headers = list(re.finditer(self._MIB_MODULE_HEADER, content,
+                                       re.MULTILINE))
+            if headers:
+                bounds = ([0] + [h.start() for h in headers[1:]]
+                          + [len(content)])
+                sections = [(h.group(1), content[bounds[i]:bounds[i + 1]])
+                            for i, h in enumerate(headers)]
+            else:
+                sections = [(os.path.basename(filepath), content)]
+            # そのモジュールが宣言している名前。抽出できた定義だけでは
+            # なく「名前 + 型キーワード」の並びからも集める。詳しくは
+            # _MIB_LOCAL_NAME を見ること
+            local_names = getattr(self, '_module_local_names', None)
+            if local_names is None:
+                # __init__ を通さずに作った（検証用の __new__）ときの保険
+                local_names = self._module_local_names = {}
+            for module, text in sections:
+                local_names.setdefault(module, set()).update(
+                    re.findall(self._MIB_LOCAL_NAME, text,
+                               re.MULTILINE))
+                for pattern in self._MIB_DEFINITION_PATTERNS:
+                    # DOTALL が要る。定義は複数行にまたがるので、`.` が改行を
+                    # 拾わないと型キーワードから ::= まで届かない
+                    for match in re.finditer(pattern, text,
+                                             re.MULTILINE | re.DOTALL):
+                        definitions.append(
+                            (match.group(1), match.group(2), match.group(3),
+                             module))
+        except OSError:
+            # 読めなかった（排他ロック・ACL など）ことは空の結果にせず、
+            # 呼び出し側へ返す。空で返すと解析済みとして mtime ごと
+            # キャッシュに記録され、読めるようになっても再解析されない。
+            raise
         except Exception as e:
             print(f"[MIBResolver] MIBファイル解析エラー: {str(e)}")
 
@@ -476,6 +796,48 @@ class MIBResolver:
         同名を使わずに次の回を待つ。同じモジュールに無い親（IMPORTS）は
         これまでどおりモジュールをまたいで探す。
 
+        「次の回を待つ」は、1 件も進まない回が来るまで続ける。そこで
+        初めて 1 回だけよその同名を借りることを許し、進んだらまた自分の
+        モジュール優先へ戻す。借用を遅らせずに 1 回目から許すと、抽出の
+        順（_MIB_DEFINITION_PATTERNS が種類ごとに finditer するので
+        ファイル内の順とは違う）しだいで、自分のモジュールの親がまだ
+        未解決のうちに内蔵表の同名で子が確定してしまう。確定した子は
+        本当の親が決まっても再計算されない（実測: ベンダーの alarm が
+        1.3.6.1.4.1.65001.1.99 ではなく標準 system 配下の
+        1.3.6.1.2.1.1.99 に入り、mib_cache.json にも残った）。
+
+        借用を許した回の中でも、その回に残っている定義が親になる名前は
+        借りない。1 回の回は残りをリストの順に 1 パスするだけなので、
+        これが無いと同じ誤確定がその 1 回の中で起きる（実測: 深さ 2 の鎖
+        mib-2 → vendorRoot → system → alarm で、根の vendorRoot が借用
+        待ちのあいだに alarm が内蔵の system を借り、
+        1.3.6.1.2.1.9999.1.99 ではなく 1.3.6.1.2.1.1.99 になった）。
+        借りるのは鎖の根——残りのどれも親にならない側——だけで、進んだら
+        借用をまた禁じるので、残りは次の回に自分のモジュールの親で決まる。
+        同じパスの中で先に親が決まった子はそのまま解決するので、回数は
+        増えない。
+
+        「同じモジュールにあるか」は、抽出できた定義だけでなく
+        _MIB_LOCAL_NAME で集めた宣言も見る。そのモジュールの宣言が抽出から
+        落ちていると（複数添字の右辺など）、よその同名が親になって子が別
+        ベンダーの名前空間へ入るため（実測）。宣言はあるが OID が決まらない
+        親の子は、最後まで解決しないまま残る。利用者の決定（2026-09-20）に
+        より、どのモジュールの親か確定できないときは名前を付けず OID の
+        まま出す。諦めた件数は標準出力へ 1 行知らせる。
+
+        諦めるのは「よそのモジュールが同名を宣言している」＝本当に
+        曖昧なときだけ。宣言があって自分のモジュールで決まらないだけで
+        止めると、決定の範囲を超えて曖昧でない親まで捨てる。宣言の有無は
+        _MIB_LOCAL_NAME で見るので、抽出できない右辺（複数添字の
+        `::= { aRoot 0 1 }`、ラベル付きフルパスの
+        `::= { iso(1) org(3) ... 65001 }`）で宣言された節がこの網に入り、
+        実 MIB がそのまま当たっていた（実測: SMI 自身の internet が
+        抽出から落ちて directory / transmission / snmpDomains が消え、
+        custom_mibs.json にベンダー根を置いた一式ではベンダーの木が
+        丸ごと消えて、Trap の名前が 'alarmRaised' から 'acme.2.4.2' に
+        なった）。曖昧でなければ標準表 / custom_mibs.json / IMPORTS の
+        値をこれまでどおり使う。
+
         残る制限: 2 つのモジュールが同じ名前を定義し、第三のモジュールが
         その一方を IMPORTS しているとき、IMPORTS を見ていないのでどちらを
         指すか決められず、後に解決した方になる。「後に解決した方」は
@@ -496,18 +858,59 @@ class MIBResolver:
         declared = {}
         for name, _, _, module in definitions:
             declared.setdefault(module, set()).add(name)
+        # 抽出から落ちた宣言（複数添字の右辺など）も「そのモジュールの
+        # 宣言」として数える。詳しくは _MIB_LOCAL_NAME を見ること
+        local_names = getattr(self, '_module_local_names', {})
+        for module in declared:
+            declared[module] |= local_names.get(module, set())
+        # 名前→その名前を宣言しているモジュールの数。「よそのモジュールも
+        # 同じ名前を宣言しているか」を、declared の全モジュールを走らずに
+        # 引けるようにする。走査していたときは
+        # 回数 x 未解決の定義数 x モジュール数 になり、実 MIB の書き方
+        # （親が後ろにある＝1 回目の回では未解決）でそのまま効いた
+        # （実測: 400 モジュール 24400 定義の解決が 11.2 秒、3000
+        # モジュールの mibs/ の冷えた解析が 8.3 秒）。下の 2 か所は
+        # どちらも `parent in declared[module]` が真の場所なので、
+        # 件数 2 以上＝よそのモジュールも宣言している、と同値
+        declaring = {}
+        for _module_names in declared.values():
+            for _declared_name in _module_names:
+                declaring[_declared_name] = (
+                    declaring.get(_declared_name, 0) + 1)
         in_module = {}
         resolved = {}
         pending = list(definitions)
+        # よそのモジュール・内蔵表の同名を親にしてよい回か。
+        # 自分のモジュールの親が決まる見込みがある間は False
+        borrow = False
 
         while pending:
             still_pending = []
             progressed = False
+            # 借用を許す回でも、この回に残っている定義が親になる名前は
+            # 借りない。1 回の回は pending をリストの順に 1 パスするだけ
+            # なので、これが無いと、パスの後ろで決まる自モジュールの親を
+            # 待たずに、前の方の子が内蔵の同名で確定する（実測: 深さ 2 の
+            # 鎖の根が借用待ちのとき、alarm が 1.3.6.1.2.1.9999.1.99 では
+            # なく標準 system 配下の 1.3.6.1.2.1.1.99 に入った）。鎖の根
+            # ——残りのどれも親にならない側——だけが借り、進んだら borrow を
+            # また禁じるので、残りは次の回に自分のモジュールの親で決まる
+            awaiting = set()
+            if borrow:
+                for _pending_name, _, _, _pending_module in pending:
+                    awaiting.add((_pending_module, _pending_name))
             for name, parent, index, module in pending:
                 if parent == 'enterprises':
                     parent_oid = '1.3.6.1.4.1'
                 elif parent in declared[module]:
                     parent_oid = in_module.get(module, {}).get(parent)
+                    if (parent_oid is None and borrow
+                            and (module, parent) not in awaiting
+                            and declaring.get(parent, 0) < 2):
+                        # よそのモジュールに同名が無い＝曖昧ではない。
+                        # 標準表 / custom_mibs.json / IMPORTS の値を
+                        # これまでどおり使う
+                        parent_oid = known.get(parent)
                 else:
                     parent_oid = known.get(parent)
                 if parent_oid is None:
@@ -519,9 +922,33 @@ class MIBResolver:
                 resolved[oid] = name
                 progressed = True
             if not progressed:
+                if not borrow:
+                    # 自分のモジュールの親はもう決まらない。ここで
+                    # 初めて、よその同名を借りることを許す
+                    borrow = True
+                    pending = still_pending
+                    continue
                 # これ以上どれも解決できない（親がどこにも無い）
                 break
+            # 進んだ＝自分のモジュールの親が決まりつつある。
+            # 借用はまた禁じて、次の回も自モジュールを優先する
+            borrow = False
             pending = still_pending
+
+        # 残ったもののうち、よそのモジュールの同名を親にすれば解決できた
+        # ものの数。利用者の決定（2026-09-20）により、どのモジュールの親か
+        # 確定できないときは名前を付けずに OID のまま出すので、ここは
+        # 「黙って捨てた件数」になる。判断に使った条件と件数を 1 行残す
+        gave_up = sum(1 for _, parent, _, module in pending
+                      if parent != 'enterprises' and parent in declared[module]
+                      and parent in known
+                      and declaring.get(parent, 0) > 1)
+        if gave_up:
+            print(f"[MIBResolver] 親の名前を自分のモジュールで解決できない"
+                  f"定義が {gave_up}件ありました。同じ名前が別のモジュールに"
+                  f"もありますが、どちらの親か決められないので、この定義は"
+                  f"解決せず OID のまま表示します（よその名前が付くのを"
+                  f"避けるため）")
 
         return resolved
 

@@ -6,7 +6,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt
 from typing import Dict, List, Optional
-from core.config_manager import is_reserved_device_name
+from core.config_manager import is_reserved_device_name, is_readable_macro
 from core.crypto import PasswordCrypto
 
 class DeviceDialog(QDialog):
@@ -123,6 +123,20 @@ class DeviceDialog(QDialog):
         
         layout.addLayout(button_layout)
     
+    @staticmethod
+    def _as_text(value, default=""):
+        """設定の値を、入力欄へ入れられる文字列にする。
+
+        読み込み時にそろえてはいるが（ConfigManager の
+        _quarantine_invalid_devices）、ConfigManager を通らない device_data
+        もある。ここで QLineEdit.setText / QComboBox.findText が TypeError に
+        なると、その機器は編集で直せなくなる（パスワードの入れ直しも
+        できない）ので、読み手側でも文字列にしてから渡す。
+        """
+        if value is None:
+            return default
+        return value if isinstance(value, str) else str(value)
+
     def _load_data(self):
         """データを読み込み（編集モード時）"""
         if not self.is_edit_mode:
@@ -135,16 +149,16 @@ class DeviceDialog(QDialog):
         self.name_edit.setText(self.device_data.get("name", ""))
         self.host_edit.setText(self.device_data.get("host", ""))
         self.port_edit.setText(str(self.device_data.get("port", 22)))
-        self.username_edit.setText(self.device_data.get("username", ""))
-        self.password_edit.setText(self.device_data.get("password", ""))
-        self.ssh_key_edit.setText(self.device_data.get("ssh_key", ""))
+        self.username_edit.setText(self._as_text(self.device_data.get("username")))
+        self.password_edit.setText(self._as_text(self.device_data.get("password")))
+        self.ssh_key_edit.setText(self._as_text(self.device_data.get("ssh_key")))
         
         # プロトコル設定。コンボの初期選択は index 0 の "ssh" なので、
         # 保存値が telnet / console のときだけ currentTextChanged が発火し、
         # 既定ポートで上書きされていた（telnet 2323 が 23 に戻る）。
         # 信号を止めるだけでは秘密鍵欄の有効/無効まで飛ぶので、
         # UI の同期は明示的に呼ぶ。
-        protocol = self.device_data.get("protocol", "ssh")
+        protocol = self._as_text(self.device_data.get("protocol"), "ssh")
         index = self.protocol_combo.findText(protocol)
         if index >= 0:
             self.protocol_combo.blockSignals(True)
@@ -152,9 +166,13 @@ class DeviceDialog(QDialog):
             self.protocol_combo.blockSignals(False)
         self._sync_protocol_ui(self.protocol_combo.currentText())
         
-        # マクロ読み込み
-        for macro in self.device_data.get("macros", []):
-            self.macro_list.addItem(macro.get("name", ""))
+        # マクロ読み込み。読み込み時にそろえてはいるが（ConfigManager の
+        # _normalize_optional_list）、ここで例外になるとこの機器は編集で
+        # 直せなくなるので、読み手側でも読めない値は黙って飛ばす
+        macros = self.device_data.get("macros")
+        for macro in macros if isinstance(macros, list) else []:
+            if is_readable_macro(macro):
+                self.macro_list.addItem(macro.get("name", ""))
     
     def _on_protocol_changed(self, protocol: str):
         """プロトコルを選び直したときの処理（利用者の操作）"""

@@ -13,6 +13,25 @@ rem "could not copy the updater", which points at the wrong cause.
 set "BANG="
 echo."%~f0" "%~1" "%~2" "%TEMP%"| findstr /C:"!" >nul && set "BANG=1"
 
+rem This run stops without writing anything into the install folder, so the
+rem copy NetBelt made for it (the update folder's NetBelt-apply-*.zip and
+rem its .sha256 / .version) is dead weight: the original ZIP is still there,
+rem and the copy would otherwise be offered as a pending update of its own.
+rem Do it here, while delayed expansion is still off - below this point a
+rem '!' in the path is eaten before del could ever see it. The routine at
+rem the end of the file does the same thing, but cannot be called from this
+rem half: everything above :run must stay ASCII (see the note at the top).
+rem The message and the exit stay further down, after the re-entry check.
+if not defined BANG goto :bang_checked
+if "%~3"=="--utf8" goto :bang_checked
+set "ZIP_NAME=x"
+for %%z in ("%~1") do set "ZIP_NAME=%%~nxz"
+if /i not "%ZIP_NAME:~0,14%"=="NetBelt-apply-" goto :bang_checked
+del "%~1" 2>nul
+del "%~1.sha256" 2>nul
+del "%~1.version" 2>nul
+:bang_checked
+
 setlocal enabledelayedexpansion
 if "%~3"=="--utf8" goto :run
 rem Stop here, not after :run. With '!' in the path the re-entry itself
@@ -32,6 +51,11 @@ chcp 65001 >nul
 set "SELF=%~f0"
 set "A1=%~1"
 set "A2=%~2"
+rem The SHA-256 NetBelt verified. Empty when run by hand, or by a
+rem NetBelt that predates this argument. The re-entry below fills %3
+rem with --utf8, so the child is handed this as %6 instead.
+rem (ASCII only above :run - see the note at the top of the file.)
+set "A3=%~3"
 rem Where to install. Taken here, because the run below happens from a
 rem copy in TEMP, where %~dp0 would point at TEMP, not the install folder.
 rem The trailing backslash is dropped so that a quoted "...\" does not
@@ -77,9 +101,19 @@ rem the exit code survives; split across lines, nothing after the child
 rem runs at all, which would leak the work folder in TEMP.
 rem (An earlier comment here claimed the opposite. It was wrong: the
 rem experiment behind it never replaced the parent file.)
-cmd /d /c ""!TMPRUNNER!" "!A1!" "!A2!" --utf8 "!HOME_DIR!" "!WORK_DIR!"" & set "RC=!errorlevel!" & rd /s /q "!WORK_DIR!" >nul 2>&1 & exit /b !RC!
+cmd /d /c ""!TMPRUNNER!" "!A1!" "!A2!" --utf8 "!HOME_DIR!" "!WORK_DIR!" "!A3!"" & set "RC=!errorlevel!" & rd /s /q "!WORK_DIR!" >nul 2>&1 & exit /b !RC!
 
 :nowork
+rem Nothing in the install folder has been written, so drop the apply copy
+rem (see the note beside the '!' check above for why it is spelled out here
+rem instead of calling :drop_apply_copy).
+set "ZIP_NAME=x"
+for %%z in ("!A1!") do set "ZIP_NAME=%%~nxz"
+if /i "!ZIP_NAME:~0,14!"=="NetBelt-apply-" (
+    del "!A1!" 2>nul
+    del "!A1!.sha256" 2>nul
+    del "!A1!.version" 2>nul
+)
 echo ERROR: could not create a work folder in TEMP.
 echo   Twenty names were tried, so TEMP is most likely full, read-only
 echo   or missing. The update has not been applied. Fix TEMP, or
@@ -89,6 +123,14 @@ exit /b 1
 
 :nocopy
 rd /s /q "!WORK_DIR!" 2>nul
+rem Same as :nowork: nothing in the install folder has been written yet.
+set "ZIP_NAME=x"
+for %%z in ("!A1!") do set "ZIP_NAME=%%~nxz"
+if /i "!ZIP_NAME:~0,14!"=="NetBelt-apply-" (
+    del "!A1!" 2>nul
+    del "!A1!.sha256" 2>nul
+    del "!A1!.version" 2>nul
+)
 echo ERROR: could not copy the updater to TEMP.
 echo   The update has not been applied. Free some space in TEMP, or
 echo   extract the new ZIP over this folder by hand.
@@ -111,9 +153,10 @@ REM ================================================================
 REM 引数:
 REM   %1 = ダウンロードしたZIPファイルのパス
 REM   %2 = アプリケーション実行ファイルのパス
-REM   %3 = --utf8（コードページ設定後の再入を示す内部用）
+REM   %3 = 期待する SHA-256（省略可。再入のときは --utf8 が入る）
 REM   %4 = インストール先（内部用。TEMP の写しでは %~dp0 が使えない）
 REM   %5 = 親が確保した作業フォルダ（内部用。展開先の親になる）
+REM   %6 = 期待する SHA-256（内部用。再入のときに %3 から移したもの）
 REM ================================================================
 
 echo ================================================
@@ -122,19 +165,28 @@ echo ================================================
 echo.
 
 REM 引数チェック
+REM 第1引数が無いときは、消すべき写しの在り処そのものが分からないので、
+REM ここだけは何も消さずに止まる（NetBelt は必ず ZIP のパスを渡す）。
 if "%~1"=="" (
     echo エラー: ZIPファイルパスが指定されていません
     pause
     exit /b 1
 )
 
+REM ZIP_FILE は第2引数の検査より前に決める。この中止もインストール先へ
+REM 何も書かずに終わるので、他の中止と同じく :drop_apply_copy へ写しの
+REM 在り処を渡せるようにしておく。実測（検査役 cx5g-verify-release の
+REM p3_nocopy_and_args.py）: 以前はここだけが呼ばずに止まり、更新フォルダに
+REM NetBelt-apply-*.zip と控え 2 つが残っていた。
+set "ZIP_FILE=%~1"
+
 if "%~2"=="" (
     echo エラー: アプリケーションパスが指定されていません
+    call :drop_apply_copy
     pause
     exit /b 1
 )
 
-set "ZIP_FILE=%~1"
 set "APP_PATH=%~2"
 REM インストール先。TEMP の写しから走るので %~dp0 は当てにならない。
 REM 呼び出し元が第4引数で渡してくる（手で直接実行されたときだけ %~dp0）。
@@ -162,6 +214,9 @@ if not "!STAMP_FROM!"=="" for %%w in ("!STAMP_FROM!") do set "STAMP=%%~nxw"
 set "STAGED_NAME=NetBelt.exe.!STAMP!.new"
 set "STAGED_PATH=!APP_DIR!!STAGED_NAME!"
 
+REM NetBelt が確かめた ZIP の SHA-256。展開の直前に突き合わせる。
+set "ZIP_SHA=%~6"
+
 echo [1/6] 更新情報
 echo   ZIPファイル: !ZIP_FILE!
 echo   アプリパス: !APP_PATH!
@@ -172,6 +227,7 @@ REM ZIPファイルの存在確認
 if not exist "!ZIP_FILE!" (
     echo エラー: ZIPファイルが見つかりません
     echo   パス: !ZIP_FILE!
+    call :drop_apply_copy
     pause
     exit /b 1
 )
@@ -190,6 +246,7 @@ if /i not "!EXE_NAME!"=="NetBelt.exe" (
     echo   進めても !EXE_NAME! は旧版のまま残り、別名の NetBelt.exe が
     echo   増えるだけになるため、更新を当てずに中止しました。
     echo   名前を NetBelt.exe へ戻すか、新しい ZIP を手で展開してください。
+    call :drop_apply_copy
     pause
     exit /b 1
 )
@@ -207,6 +264,7 @@ echo [3/6] 一時ディレクトリを作成中...
 mkdir "!TEMP_DIR!" 2>nul
 if not exist "!TEMP_DIR!" (
     echo エラー: 一時ディレクトリの作成に失敗しました
+    call :drop_apply_copy
     pause
     exit /b 1
 )
@@ -215,17 +273,69 @@ echo.
 
 REM ZIPファイルを展開
 echo [4/6] ZIPファイルを展開中...
+REM 展開する前に、NetBelt が確かめたバイト列と同じものかを見る。
+REM NetBelt は検証した ZIP の写しを作って渡してくるが（version_manager.py の
+REM stage_for_apply）、写しの置き場は元と同じ更新フォルダで、そこへ書ける
+REM 相手はフォルダを列挙すれば写しの名前も知れる。実測（検査役
+REM cx5j-check-release の p5_staged_swap.py）: 写しだけを別の有効な ZIP へ
+REM 置き換えると、渡されたパスを Expand-Archive で開くだけだったため、
+REM 控えと食い違う中身がそのまま据わり「更新が完了しました」まで出た。
+REM
+REM 照合と展開は 1 つの powershell で、ZIP を掴んだまま済ませる。以前は
+REM 照合と展開で powershell を 2 回に分けていたので、照合したのはバイト列、
+REM 開き直すのは名前、という窓が空いていた。実測（検査役
+REM cx7a-verify-release の p01_zip_swap_after_hash.py と
+REM p01b_window_size.py、f4cad23）: 窓は平均 1571 ms（最小 841 / 最大
+REM 1986、powershell の起動 1 回ぶん）あり、そこで別の有効な ZIP へ
+REM 置き換えると rc=0・『更新が完了しました！』で EXE_FROM_EVIL が据わった。
+REM 書き込みを拒む共有モード（FileShare::Read）で開いたまま
+REM Get-FileHash -InputStream で照合し、同じハンドルのまま Expand-Archive
+REM まで進めれば、その間の差し替えは拒まれる（実測 e1_hold_share.py:
+REM copyfile / os.replace / rename / 書き込み open のすべてが
+REM PermissionError、Expand-Archive は成功）。
+REM
 REM PowerShell の '...' に生のパスを埋めると、パスに ' が入っただけで
 REM 文字列が閉じて壊れる。環境変数で渡せば引用符の問題が起きない。
+REM 期待値が空になるのは、この引数を知らない古い NetBelt から呼ばれた
+REM ときと、切り分けのために手で叩いたときだけ。そのときは照合せず展開
+REM する（ZIP_SHA が未定義なら set は PS_SHA を消すので $env:PS_SHA は
+REM $null になる）。
+REM 終了コード: 0=展開まで成功 / 2=ハッシュ不一致 / 1=それ以外の失敗。
+REM
+REM 展開先は、Expand-Archive へ渡す直前に [ ] ` の前へ ` を付けてから渡す。
+REM Windows PowerShell 5.1 の Expand-Archive は、展開先があるかを中で
+REM Test-Path -Path（ワイルドカードとして読む）で確かめる。TEMP に角括弧が
+REM あると、上の mkdir で作った展開先を「無い」と判定し、同じフォルダを
+REM 作ろうとして止まっていた（実測 release-01: TEMP=...\Temp[lab] で
+REM 「An item with the specified name ... already exists.」、閉じない [ では
+REM 「wildcard character pattern is not valid」。TEMP を変えない限り毎回失敗）。
+REM [WildcardPattern]::Escape は 5.1 では ` をエスケープせず、TEMP が
+REM ...\a`] のとき展開先が a``] という別のフォルダになったので使わない。
+REM 置き換えは照合の後・Expand-Archive の直前で行う。ZIP を掴んだまま
+REM 展開まで進む形は変えていない。
 set "PS_ZIP=!ZIP_FILE!"
 set "PS_DEST=!TEMP_DIR!"
-powershell -NoProfile -ExecutionPolicy Bypass -Command "try { Expand-Archive -LiteralPath $env:PS_ZIP -DestinationPath $env:PS_DEST -Force; exit 0 } catch { Write-Host 'エラー:' $_.Exception.Message; exit 1 }"
-if errorlevel 1 (
-    echo エラー: ZIPファイルの展開に失敗しました
-    rd /s /q "!TEMP_DIR!" 2>nul
-    pause
-    exit /b 1
-)
+set "PS_SHA=!ZIP_SHA!"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$rc = 1; try { $fs = [IO.File]::Open($env:PS_ZIP, 'Open', 'Read', 'Read') } catch { Write-Host 'エラー:' $_.Exception.Message; exit 1 }; try { if ($env:PS_SHA) { if ((Get-FileHash -InputStream $fs -Algorithm SHA256 -ErrorAction Stop).Hash -ne $env:PS_SHA) { exit 2 } }; $env:PS_DEST = $env:PS_DEST -replace '([\[\]`])', '`$1'; Expand-Archive -LiteralPath $env:PS_ZIP -DestinationPath $env:PS_DEST -Force; $rc = 0 } catch { Write-Host 'エラー:' $_.Exception.Message } finally { $fs.Close() }; exit $rc"
+if errorlevel 2 goto :zip_sha_mismatch
+if errorlevel 1 goto :zip_expand_failed
+goto :zip_expanded
+:zip_sha_mismatch
+echo エラー: 更新ファイルの中身が、確認した時点から変わっています
+echo   展開の直前に計算した SHA-256 が、NetBelt が確かめた値と違いました。
+echo   インストール先のファイルは何も変えていません。
+echo   もう一度ダウンロードしてから、更新をやり直してください。
+rd /s /q "!TEMP_DIR!" 2>nul
+call :drop_apply_copy
+pause
+exit /b 1
+:zip_expand_failed
+echo エラー: ZIPファイルの展開に失敗しました
+rd /s /q "!TEMP_DIR!" 2>nul
+call :drop_apply_copy
+pause
+exit /b 1
+:zip_expanded
 echo   展開完了
 echo.
 
@@ -272,7 +382,205 @@ REM 事実と違う失敗を出していた。
 REM 残る制限: 同梱の他のファイルは名前を変えられない（配布物の
 REM 一部そのもの）ため、同じインストール先へ同時に更新をかけると、
 REM どちらの版のファイルが残るかは混ざったままになる。
-if exist "!SOURCE_DIR!\NetBelt.exe" ren "!SOURCE_DIR!\NetBelt.exe" "!STAGED_NAME!"
+REM 更新に実行ファイルが入っているかは、インストール先へ何か書く前に
+REM 確かめる。見るのはコピー先ではなくコピー元。コピー先を見ると、
+REM 前回の更新が改名の直前で止まって残した一時名の exe が条件を
+REM 満たしてしまう。以前はこの判定を xcopy の後に置いていたため、
+REM exe の無い更新でも同梱の他のファイルだけが置き換わっていた。
+if not exist "!SOURCE_DIR!\NetBelt.exe" (
+    echo エラー: 更新ファイルに NetBelt.exe が含まれていません
+    echo   場所: !SOURCE_DIR!
+    echo   インストール先のファイルは何も変えていません。
+    rd /s /q "!TEMP_DIR!" 2>nul
+    call :drop_apply_copy
+    pause
+    exit /b 1
+)
+REM 改名の結果は必ず確かめる。展開した exe をウイルス対策ソフトや
+REM インデクサが削除共有なしで開いていると、ren だけが失敗する。
+REM 確かめずに進んだ以前の版は、xcopy が元の名前のまま exe を
+REM インストール先へ直接上書きし、途中で止まると起動できない exe
+REM だけが残った（実測）。そのうえ「含まれていません」と事実と逆の
+REM 報告をしていた。走査は短いので少し待ってやり直し、それでも
+REM 移せなければ、インストール先へ何も書かずに止める。
+set "REN_TRY=0"
+:stage_exe
+set /a REN_TRY+=1
+ren "!SOURCE_DIR!\NetBelt.exe" "!STAGED_NAME!" >nul 2>&1
+if exist "!SOURCE_DIR!\!STAGED_NAME!" goto :staged
+if !REN_TRY! lss 5 (
+    ping -n 2 127.0.0.1 >nul 2>&1
+    goto :stage_exe
+)
+echo エラー: 展開した NetBelt.exe を一時名へ移せませんでした
+echo   ウイルス対策ソフトなど、別のプログラムが展開したファイルを
+echo   開いている可能性があります。インストール先のファイルは
+echo   何も変えていません。しばらく待ってから、もう一度更新してください。
+rd /s /q "!TEMP_DIR!" 2>nul
+call :drop_apply_copy
+pause
+exit /b 1
+:staged
+
+REM ここから先はインストール先を書き換える。その前に、同じインストール先を
+REM 指す別の更新と重ならないよう、インストール先に目印フォルダを作って
+REM 排他を取る。md は既にある名前で失敗するので、これが排他になる。
+REM TEMP の作業場所は既に md で確保しているが、守られているのは TEMP 側
+REM だけだった。実測（cx5b-release の r02_shared_appdir.py）: A を move の
+REM 直後で止めて B を最後まで走らせると、A は A の版を承認したのに [6/6] で
+REM 起動したのは B の exe で、両方が「更新が完了しました！」を出した。
+REM 自然に重ねた試験では A の exe と B の同梱ファイルが混在し、B は
+REM 「NetBelt.exe は旧版のまま」と事実と違う案内を出していた。
+REM 目印は :release_lock で必ず外す（成功・失敗・中止のどれでも）。
+REM 目印の中へ holder.txt を書くので、フォルダの更新日時＝確保した時刻に
+REM なる。異常終了（コンソールを閉じられた等）で残った目印は、10分より
+REM 古ければ取り除いて続ける。
+REM その回収は「古いか見てから消す」ではなく「ren でつかんでから消す」。
+REM 実測（検査役 cx5j-check-release の p2_stale_lock_race.py）: 古い目印を
+REM 二つの更新がともに「古い」と判定すると、先に消したほうが取り直した
+REM 新しい目印を、後から来たほうの削除が消してしまい、両方が排他を持って
+REM 両方が「更新が完了しました！」を出した。ren は同時に 1 つしか成功
+REM しないので、負けた側は何も消せずに中止できる。
+REM つかんだ後にもう一度古さを見るのは、見てから掴むまでの間に別の更新が
+REM 取り直しているかもしれないため。そのときは元の名前へ戻して譲る。
+REM 目印を作れない理由には、重なり以外（インストール先へ書けない）もある。
+REM どちらもここで中止するが、待てば直るものかどうかが違うので、下の
+REM probe で見分けて案内を変える。
+set "LOCK_DIR=!APP_DIR!NetBelt-update-lock"
+set "LOCK_OLD_NAME=NetBelt-update-lock.!STAMP!.old"
+set "LOCK_OLD=!APP_DIR!!LOCK_OLD_NAME!"
+set "TAKEOVER_DIR=!APP_DIR!NetBelt-update-takeover"
+set "TAKEOVER_OLD_NAME=NetBelt-update-takeover.!STAMP!.old"
+set "TAKEOVER_OLD=!APP_DIR!!TAKEOVER_OLD_NAME!"
+set "TAKEOVER_HELD="
+set "TAKEOVER_TRY="
+set "LOCK_HELD="
+set "LOCK_STAMPED="
+set "LOCK_TRY=0"
+:claim_lock
+set /a LOCK_TRY+=1
+md "!LOCK_DIR!" 2>nul
+if not errorlevel 1 goto :lock_claimed
+REM md が失敗する理由は 2 つある。同じ名前が既にある（＝同じインストール先
+REM への更新が重なった）か、そのフォルダへそもそも書けないか。両方を重なりと
+REM して扱っていたため、書けない場所（Program Files 配下など）へ置いた利用者
+REM には、待っても直らないものを待たせていた。実測（8d316a7、
+REM tests/test_updater_appdir_unwritable.py と同じ小さな作り物で、インストール
+REM 先の書き込みを icacls で拒否）: 「エラー: 別の更新が進行中です」で exit 1。
+REM 誰とも重ならない名前（目印と同じ STAMP を借りる）で作ってみれば、どちらの
+REM 理由かが分かる。作れたときは片付けて、これまでどおり重なりとして扱う。
+set "PROBE_DIR=!APP_DIR!NetBelt-update-probe.!STAMP!"
+md "!PROBE_DIR!" 2>nul
+if not exist "!PROBE_DIR!" goto :lock_nowrite
+rd /s /q "!PROBE_DIR!" 2>nul
+REM 名前が取られている理由が「更新の目印」以外のこともある。実測（検査役
+REM cx5j-check-release の p1_stale_lock_content.py）: 同じ名前のフォルダへ
+REM 利用者が memo.txt と switch-config\core1.cfg を置いていると、更新日時が
+REM 10分より古いというだけで目印とみなして丸ごと消し、そのまま完走していた
+REM （伝えたのは「前の更新が残した目印を取り除きました」の 1 行だけ）。
+REM 同じ名前のファイルでも、ren でつかんでから rd に失敗し、事実と違う
+REM 「別の更新が進行中です」で止まっていた。
+REM 更新が作る目印は「md の直後（空）」か「holder.txt 入り」のどちらかに
+REM しかならない。それ以外＝ファイル、または holder.txt の無い中身つき
+REM フォルダは、古さを見るより先に、消さずに中止する（利用者の決定
+REM 2026-09-20 / release-01）。
+set "PS_LOCK=!LOCK_DIR!"
+call :lock_is_foreign
+if not errorlevel 1 goto :lock_foreign
+if !LOCK_TRY! geq 2 goto :lock_busy
+call :lock_is_stale
+if errorlevel 1 goto :lock_busy
+REM ここから先（古さの見直し・ren・rd）は、同じインストール先への
+REM 取り直しを 1 本ずつにする。古いと見てから ren するまでの間に
+REM 別の更新が回収を終えて新しい目印を作っていると、ここの ren が
+REM 掴むのはその生きている目印になり、正規名が一瞬空く。実測
+REM （検査役 cx7a-verify-release の p02_lock_putback_third.py、
+REM 2/2）: その窓で 3 本目が md を通し、戻しは名前が塞がって失敗、
+REM 続く rd が持ち主の目印を消して、2 本が同時にインストール先を
+REM 書けた（両方が「更新が完了しました！」を出し、先に始めたほうが
+REM 承認した版とは別の exe が据わった）。取り直し用の目印を取って
+REM から古さを見直せば、その間は誰も回収できないので、見たものと
+REM 掴むものが必ず同じになる（利用者の決定 2026-09-23 /
+REM release-02）。
+call :claim_takeover
+if errorlevel 1 goto :lock_busy
+set "PS_LOCK=!LOCK_DIR!"
+call :lock_is_stale
+if errorlevel 1 goto :lock_busy
+ren "!LOCK_DIR!" "!LOCK_OLD_NAME!" 2>nul
+if not exist "!LOCK_OLD!" goto :lock_busy
+set "PS_LOCK=!LOCK_OLD!"
+call :lock_is_stale
+if errorlevel 1 goto :lock_put_back
+rd /s /q "!LOCK_OLD!" 2>nul
+if exist "!LOCK_OLD!" goto :lock_put_back
+call :release_takeover
+echo   前の更新が残した目印を取り除きました
+goto :claim_lock
+
+REM つかんだのは生きている目印だった（見てから掴むまでの間に別の更新が
+REM 取り直した）か、片付けられなかった。元の名前へ戻して譲る。戻せない
+REM のは、その間に別の更新が新しい目印を作ったときで、名前から外れた以上
+REM もう誰の排他にもならないので、置き去りにせず消す。
+:lock_put_back
+ren "!LOCK_OLD!" "NetBelt-update-lock" 2>nul
+if exist "!LOCK_OLD!" rd /s /q "!LOCK_OLD!" 2>nul
+goto :lock_busy
+
+:lock_busy
+call :release_takeover
+echo エラー: 別の更新が進行中です
+echo   同じインストール先への更新が既に動いています。インストール先の
+echo   ファイルは何も変えていません。先の更新が終わるのを待ってから、
+echo   もう一度お試しください。
+rd /s /q "!TEMP_DIR!" 2>nul
+call :drop_apply_copy
+pause
+exit /b 1
+
+:lock_nowrite
+echo エラー: インストール先へ書き込めません
+echo   場所: !APP_DIR!
+echo   このフォルダへ書き込む権限が無いため、更新を当てられません。
+echo   インストール先のファイルは何も変えていません。書き込める場所へ
+echo   NetBelt を置き直すか、管理者に権限を確かめてもらってください。
+rd /s /q "!TEMP_DIR!" 2>nul
+call :drop_apply_copy
+pause
+exit /b 1
+
+:lock_foreign
+echo エラー: NetBelt-update-lock という名前のものがありますが、更新が作った目印ではないようです。
+echo   中身を確かめて名前を変えるか移動してください。
+echo   場所: !LOCK_DIR!
+echo   インストール先のファイルは何も変えていません。
+rd /s /q "!TEMP_DIR!" 2>nul
+call :drop_apply_copy
+pause
+exit /b 1
+
+:lock_claimed
+set "LOCK_HELD=1"
+REM 誰の目印かを中へ書く。:release_lock は中身が自分の識別子のときだけ
+REM 外す。識別子は親が md で確保した作業フォルダの名前（STAMP）。
+REM 括弧で囲むのは、STAMP が数字で終わると echo の直前の 1 桁が
+REM リダイレクト先のハンドル番号として読まれてしまうため。
+(echo !STAMP!)>"!LOCK_DIR!\holder.txt" 2>nul
+if exist "!LOCK_DIR!\holder.txt" set "LOCK_STAMPED=1"
+
+REM 前の実行が置き去りにした一時名の exe を片付ける。差し替えが 5 回とも
+REM 失敗すると、後始末の del も同じ理由（削除共有なしで掴まれている）で
+REM 失敗する。実測（cx5c-verify-release の a_leftover_staged.py）: exit 1 の
+REM あともインストール先に NetBelt.exe.NetBeltUpdate_1_697.new が残り、
+REM 掴みを手放しても誰も消さなかった。一時名は実行ごとに変わるので、
+REM 失敗のたびに配布物 1 個ぶんが積まれていく。
+REM 自分の一時名はまだ展開先（TEMP）にあり、目印を持っている間は他の更新が
+REM インストール先へ置くこともないので、ここにあるのは前の実行のぶんだけ。
+REM 掴まれたままのものは消せないが、黙って飛ばして続ける（次の更新が拾う）。
+REM 拡張子を見直すのは、ワイルドカードが 8.3 形式の短い名前にも当たるため。
+for %%s in ("!APP_DIR!NetBelt.exe.*.new") do (
+    if /i "%%~xs"==".new" del "%%~fs" 2>nul
+)
 
 REM ファイルをコピー（上書き）
 xcopy "!SOURCE_DIR!\*" "!APP_DIR!" /E /I /Y /Q >nul 2>&1
@@ -283,41 +591,39 @@ if errorlevel 1 (
     echo   一部またはすべてが新しい版に置き換わっている場合があります。
     del "!STAGED_PATH!" 2>nul
     rd /s /q "!TEMP_DIR!" 2>nul
+    call :release_lock
     pause
     exit /b 1
 )
-
-REM 更新に実行ファイルが入っていたかを確かめる。xcopy の戻り値
-REM だけでは分からない。見るのはコピー先ではなくコピー元。上の改名を
-REM 実行できたときだけ一時名の exe ができるから。コピー先を
-REM 見ると、前回の更新が改名の直前で止まって残した
-REM 一時名の exe が条件を満たし、exe を含まない zip でも
-REM 動いている exe をその残骸で上書きしてしまう。
-if not exist "!SOURCE_DIR!\!STAGED_NAME!" (
-    echo エラー: 更新ファイルに NetBelt.exe が含まれていません
-    echo   場所: !SOURCE_DIR!
-    echo   NetBelt.exe は旧版のままですが、同梱の他のファイルは
-    echo   既に新しい版へ置き換わっています。
-    rd /s /q "!TEMP_DIR!" 2>nul
-    pause
-    exit /b 1
-)
+REM 差し替えも ren と同じく待ってやり直す。xcopy が置いたばかりの
+REM 一時名の exe も、ウイルス対策ソフトなどが削除共有なしで短く開く。
+REM 1 回きりだった以前の版は、走査が 1.5 秒で終わる場合でも失敗し、
+REM 同梱の他のファイルだけが新しい版になった状態で止まっていた（実測）。
+set "MOVE_TRY=0"
+:swap_exe
+set /a MOVE_TRY+=1
 move /y "!STAGED_PATH!" "!APP_DIR!NetBelt.exe" >nul 2>&1
-if errorlevel 1 (
-    echo エラー: NetBelt.exe を差し替えられませんでした
-    echo   アプリがまだ起動したままだと、差し替えられません
-    echo   NetBelt.exe は旧版のままですが、同梱の他のファイルは
-    echo   既に新しい版へ置き換わっています。アプリを終了してから
-    echo   もう一度更新してください。
-    del "!STAGED_PATH!" 2>nul
-    rd /s /q "!TEMP_DIR!" 2>nul
-    pause
-    exit /b 1
+if not errorlevel 1 goto :swapped
+if !MOVE_TRY! lss 5 (
+    ping -n 2 127.0.0.1 >nul 2>&1
+    goto :swap_exe
 )
+echo エラー: NetBelt.exe を差し替えられませんでした
+echo   アプリがまだ起動したままだと、差し替えられません
+echo   NetBelt.exe は旧版のままですが、同梱の他のファイルは
+echo   既に新しい版へ置き換わっています。アプリを終了してから
+echo   もう一度更新してください。
+del "!STAGED_PATH!" 2>nul
+rd /s /q "!TEMP_DIR!" 2>nul
+call :release_lock
+pause
+exit /b 1
+:swapped
 if not exist "!APP_DIR!NetBelt.exe" (
     echo エラー: 更新後の NetBelt.exe が見つかりません
     echo   場所: !APP_DIR!
     rd /s /q "!TEMP_DIR!" 2>nul
+    call :release_lock
     pause
     exit /b 1
 )
@@ -338,6 +644,7 @@ if not exist "!APP_PATH!" (
     echo エラー: 実行ファイルが見つかりません
     echo   パス: !APP_PATH!
     rd /s /q "!TEMP_DIR!" 2>nul
+    call :release_lock
     pause
     exit /b 1
 )
@@ -358,6 +665,9 @@ REM 当て直す材料も、何を当てたのかを確かめる材料も無く�
 echo クリーンアップ中...
 ping -n 2 127.0.0.1 >nul 2>&1
 rd /s /q "!TEMP_DIR!" 2>nul
+REM 目印はここで外す。下の LAUNCH_FAILED の道は pause で止まるので、
+REM その手前で外しておかないと、次の更新が読まれるまで待たされる。
+call :release_lock
 if not defined LAUNCH_FAILED del "!ZIP_FILE!" 2>nul
 if not defined LAUNCH_FAILED del "!ZIP_FILE!.sha256" 2>nul
 if not defined LAUNCH_FAILED del "!ZIP_FILE!.version" 2>nul
@@ -381,3 +691,178 @@ if defined LAUNCH_FAILED (
 ping -n 4 127.0.0.1 >nul 2>&1
 
 exit /b 0
+
+REM ================================================================
+REM 適用用の写しを片付ける（call で呼ぶ）
+REM ================================================================
+REM NetBelt は適用の直前に、検証した ZIP の写し（更新フォルダの
+REM NetBelt-apply-*.zip）と控え（.sha256 / .version）を作り、写しを
+REM 渡してくる。元の ZIP は更新フォルダに残っているので、写しは当て直しの
+REM 材料にもならない。以前は更新を当て終えたときしか消しておらず、
+REM インストール先へ何も書く前に中止するたびに、配布 ZIP 1 個分の写しが
+REM 検証記録つきの .zip として溜まり、未適用の更新の候補にも並んでいた。
+REM インストール先へ何か書く前の中止だけがここを呼ぶ。消すのは、渡された
+REM ZIP の名前が NetBelt-apply- で始まるときだけ（手で渡した ZIP は消さない）。
+:drop_apply_copy
+for %%z in ("!ZIP_FILE!") do set "ZIP_NAME=%%~nxz"
+if /i not "!ZIP_NAME:~0,14!"=="NetBelt-apply-" exit /b 0
+del "!ZIP_FILE!" 2>nul
+del "!ZIP_FILE!.sha256" 2>nul
+del "!ZIP_FILE!.version" 2>nul
+exit /b 0
+
+REM ================================================================
+REM インストール先の目印を外す（call で呼ぶ）
+REM ================================================================
+REM 自分が確保したときだけ外す。目印を取れずに中止した側がここを通っても、
+REM 動いているほうの目印を消してしまわないようにするため。
+REM 確保したはずの目印が、走っている間に別の更新のものへ入れ替わることも
+REM ある（上の :claim_lock の注を参照）。LOCK_HELD だけを見て消していた
+REM ときは、そこで他人の排他まで外していた。中身の識別子で確かめる。
+REM 識別子を書けなかったときだけ、以前と同じ無条件の削除にする。自分の
+REM 目印を外せないほうが、次の更新を 10 分待たせる分だけ悪いため。
+:release_lock
+if not defined LOCK_HELD exit /b 0
+set "LOCK_HELD="
+if not defined LOCK_STAMPED goto :release_lock_rd
+set "LOCK_PASS=0"
+goto :release_lock_sweep
+:release_lock_rd
+rd /s /q "!LOCK_DIR!" 2>nul
+exit /b 0
+
+REM 自分の目印を片付ける。別の更新が回収しようと .old へ改名した直後
+REM かもしれないので、名前ではなく中身で自分のぶんを探す。
+REM 「つかむための改名」は、生きている目印を一瞬だけ正規名から消す。その窓の
+REM 中で持ち主が終わると、名前だけを見ていた以前はこうなった（実測: 検査役
+REM cx5j-check-release の p11_lock_resurrection.py / p12_grabber_dies.py）:
+REM   (a) 改名した側が「まだ新しい」と気づいて元の名前へ戻すため、誰も持って
+REM       いない目印が復活し、次の更新が約10分のあいだ弾かれ続けた。
+REM   (b) 改名した側がその窓の中で死ぬと、.old がインストール先に置き去りに
+REM       なった（次の更新も名前が違うので拾わない）。
+REM 正規名を一度見て分岐するだけでは (a) が残る。見てから掃くまでの間に
+REM 改名を戻されると、.old はもう無く、正規名は見た後なので、どちらにも
+REM 引っかからない（実測: 検査役 cx5m-check-release の
+REM p21_release_lock_window.py と cx5m-check-release-2 の b1_putback_vs_sweep.py、
+REM どちらも 2/2）。鏡像（見た直後・rd の手前で改名される）も同じ
+REM 2 文のあいだにある。
+REM そこで「正規名 → .old」を 2 周する。つかんだ側の戻しは 1 回きり
+REM （:lock_put_back は :lock_busy へ抜けて終わる）なので、目印がどちらの
+REM 名前にあるかの移り変わりも 1 回しか起きない。4 回見れば、その 1 回が
+REM どこで起きても必ずどちらかで捕まる。待ちを挟まないので、余分に
+REM かかるのは読み取り数回ぶんだけ。
+REM 消すのは holder.txt が自分の識別子と一致するものだけなので、動いている
+REM 別の更新の目印にも、利用者が置いたものにも当たらない。
+:release_lock_sweep
+set /a LOCK_PASS+=1
+set "LOCK_OWNER="
+set /p LOCK_OWNER=<"!LOCK_DIR!\holder.txt" 2>nul
+if "!LOCK_OWNER!"=="!STAMP!" rd /s /q "!LOCK_DIR!" 2>nul
+for /d %%o in ("!APP_DIR!NetBelt-update-lock.*.old") do call :release_lock_old "%%~fo"
+if !LOCK_PASS! lss 2 goto :release_lock_sweep
+exit /b 0
+
+:release_lock_old
+set "LOCK_OWNER="
+set /p LOCK_OWNER=<"%~1\holder.txt" 2>nul
+if "!LOCK_OWNER!"=="!STAMP!" rd /s /q "%~1" 2>nul
+exit /b 0
+
+REM ================================================================
+REM 古い目印の取り直しを 1 本ずつにする目印（call で呼ぶ）
+REM ================================================================
+REM 取れたら errorlevel 0、取れなければ 1。インストール先の目印
+REM （NetBelt-update-lock）は動いている更新が 1 本ずつ持つためのもので、
+REM 持ち主が死んだ後の「回収」までは束ねられない。回収の側だけを分けて
+REM 直列化する（利用者の決定 2026-09-23 / release-02）。
+REM 取れなかった側は待たずに中止する。回収は powershell 数回と rd だけで
+REM 終わるので、待っても得るものが無く、「更新が進行中」の案内を遅らせる
+REM だけになるため。
+REM この目印も異常終了（コンソールを閉じられた等）で残ることがある。
+REM 扱いはインストール先の目印と同じで、10分より古ければ回収してよい。
+REM 回収の仕方も同じく「ren でつかんでから消す」。ren は同時に 1 つしか
+REM 成功しないので、二重に回収されない。
+REM 利用者が同じ名前のものを置いていたときは、古さを見るより先に中止する
+REM （:lock_is_foreign。消さないほうを選ぶ＝release-01 と同じ判断）。
+:claim_takeover
+md "!TAKEOVER_DIR!" 2>nul
+if not errorlevel 1 goto :takeover_claimed
+if defined TAKEOVER_TRY exit /b 1
+set "TAKEOVER_TRY=1"
+set "PS_LOCK=!TAKEOVER_DIR!"
+call :lock_is_foreign
+if not errorlevel 1 exit /b 1
+call :lock_is_stale
+if errorlevel 1 exit /b 1
+ren "!TAKEOVER_DIR!" "!TAKEOVER_OLD_NAME!" 2>nul
+if not exist "!TAKEOVER_OLD!" exit /b 1
+set "PS_LOCK=!TAKEOVER_OLD!"
+call :lock_is_stale
+if errorlevel 1 goto :takeover_put_back
+rd /s /q "!TAKEOVER_OLD!" 2>nul
+if exist "!TAKEOVER_OLD!" goto :takeover_put_back
+goto :claim_takeover
+
+REM つかんだのは生きている取り直しだった（見てから掴むまでの間に別の
+REM 更新が取り直した）か、片付けられなかった。元の名前へ戻して譲る。
+REM 戻せないのはその間に別の更新が新しい目印を作ったときで、名前から
+REM 外れた以上もう誰の排他にもならないので、置き去りにせず消す
+REM （:lock_put_back と同じ判断）。
+:takeover_put_back
+ren "!TAKEOVER_OLD!" "NetBelt-update-takeover" 2>nul
+if exist "!TAKEOVER_OLD!" rd /s /q "!TAKEOVER_OLD!" 2>nul
+exit /b 1
+
+:takeover_claimed
+set "TAKEOVER_HELD=1"
+REM 誰の目印かを中へ書く（:lock_claimed と同じ形。理由は :release_takeover）。
+REM holder.txt 入りのフォルダは :lock_is_foreign が更新の目印と見るので、
+REM 置き土産の回収の判定は変わらない。
+set "TAKEOVER_STAMPED="
+(echo !STAMP!)>"!TAKEOVER_DIR!\holder.txt" 2>nul
+if exist "!TAKEOVER_DIR!\holder.txt" set "TAKEOVER_STAMPED=1"
+exit /b 0
+
+REM ================================================================
+REM 取り直し用の目印を外す（call で呼ぶ）
+REM ================================================================
+REM 自分が確保したときだけ外す。持っている時間はふだん powershell 数回
+REM ぶんだが、休止・スリープや遅い共有フォルダで 10 分を越えて止まると、
+REM その間に別の更新が古いとみなして回収し、同じ名前で自分のぶんを
+REM 作り直す。名前だけを見て消していた以前は、再開した側がそれを消して
+REM いた。実測（検査役 cx7c-release の t2_release_takeover_steals.py）:
+REM B が取り直しの最中なのに名前が空き、3 本目が :claim_takeover を
+REM 通れる状態になった。:release_lock と同じく中身の識別子で確かめ、
+REM 書けなかったときだけ以前と同じ無条件の削除にする。
+:release_takeover
+if not defined TAKEOVER_HELD exit /b 0
+set "TAKEOVER_HELD="
+if defined TAKEOVER_STAMPED goto :release_takeover_owned
+rd /s /q "!TAKEOVER_DIR!" 2>nul
+exit /b 0
+:release_takeover_owned
+set "LOCK_OWNER="
+set /p LOCK_OWNER=<"!TAKEOVER_DIR!\holder.txt" 2>nul
+if "!LOCK_OWNER!"=="!STAMP!" rd /s /q "!TAKEOVER_DIR!" 2>nul
+exit /b 0
+
+REM ================================================================
+REM 目印が古い（＝異常終了の置き土産）かを見る（call で呼ぶ）
+REM ================================================================
+REM PS_LOCK に見るフォルダを入れて呼ぶ。古ければ errorlevel 0、そうで
+REM なければ 1。フォルダの更新日時は holder.txt を書いた時刻＝確保した
+REM 時刻になる。回収では 2 回呼ぶ（つかむ前と、つかんだ後）。
+:lock_is_stale
+powershell -NoProfile -ExecutionPolicy Bypass -Command "try { $d = Get-Item -LiteralPath $env:PS_LOCK -Force -ErrorAction Stop; if ($d.LastWriteTime -lt (Get-Date).AddMinutes(-10)) { exit 0 } } catch { }; exit 1"
+exit /b !errorlevel!
+
+REM ================================================================
+REM その名前が、更新の目印でないものに使われていないかを見る（call で呼ぶ）
+REM ================================================================
+REM PS_LOCK に見るものを入れて呼ぶ。更新が作った目印に見えなければ
+REM errorlevel 0、見えれば 1。目印は md の直後なら空、holder.txt を
+REM 書いた後ならそれが入っている。ファイル、または holder.txt の無い
+REM 中身つきフォルダは、利用者が置いたものとして扱う。
+:lock_is_foreign
+powershell -NoProfile -ExecutionPolicy Bypass -Command "try { $i = Get-Item -LiteralPath $env:PS_LOCK -Force -ErrorAction Stop; if (-not $i.PSIsContainer) { exit 0 }; if (Test-Path -LiteralPath (Join-Path $i.FullName 'holder.txt')) { exit 1 }; if (@(Get-ChildItem -LiteralPath $i.FullName -Force -ErrorAction SilentlyContinue).Count -gt 0) { exit 0 } } catch { }; exit 1"
+exit /b !errorlevel!

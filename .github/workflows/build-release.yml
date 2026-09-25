@@ -68,18 +68,25 @@ jobs:
       run: |
         python -m PyInstaller --clean NetBelt.spec
         
+    # cmd はステップの終了コードとして最後のコマンドの値しか返さない。
+    # 途中の copy が失敗しても最後の xcopy が通れば成功になり、exe の無い
+    # ZIP とその正しい SHA-256 を公開してしまう。1 つずつ止める。
     - name: Create portable package
       run: |
-        mkdir portable
-        copy dist\NetBelt.exe portable\
-        copy README.md portable\README.txt
-        copy LICENSE portable\LICENSE.txt
-        copy THIRD-PARTY-NOTICES.txt portable\
-        copy updater.bat portable\
-        copy CHANGELOG.md portable\CHANGELOG.txt
-        
+        mkdir portable || exit /b 1
+        copy dist\NetBelt.exe portable\ || exit /b 1
+        copy README.md portable\README.txt || exit /b 1
+        copy LICENSE portable\LICENSE.txt || exit /b 1
+        copy THIRD-PARTY-NOTICES.txt portable\ || exit /b 1
+        copy updater.bat portable\ || exit /b 1
+        copy CHANGELOG.md portable\CHANGELOG.txt || exit /b 1
+
         REM MIBファイルもコピー
-        xcopy /E /I mibs portable\mibs
+        xcopy /E /I mibs portable\mibs || exit /b 1
+
+        REM 更新に欠かせない 2 つが入ったことを、ZIP を作る前に確かめる
+        if not exist portable\NetBelt.exe (echo ::error::portable\NetBelt.exe is missing & exit /b 1)
+        if not exist portable\updater.bat (echo ::error::portable\updater.bat is missing & exit /b 1)
       shell: cmd
         
     - name: Create ZIP archive
@@ -120,6 +127,11 @@ jobs:
           if ($null -ne $start -and $lines[$i].StartsWith('## [')) { $end = $i; break }
         }
         if ($null -eq $start) { throw "CHANGELOG.md に [$version] の節がありません" }
+        # 範囲を作る前に弾く。$end は次の見出しの位置か $lines.Count なので、
+        # $start -ge $end は「本文が 1 行も無い」と同値。PowerShell の
+        # $lines[3..2] は空配列ではなく逆順の 2 要素を返すので、先に見ないと
+        # 下の空チェックを素通りし、見出し 2 本が逆順で本文として載る
+        if ($start -ge $end) { throw "[$version] の節が空です" }
         $section = ($lines[$start..($end - 1)] -join "`n").Trim()
         if (-not $section) { throw "[$version] の節が空です" }
 

@@ -15,7 +15,13 @@ from ui import theme
 
 class SFTPPanel(QWidget):
     """SFTPファイルブラウザパネル"""
-    
+
+    # アプリの終了処理に入ったか（MainWindow.closeEvent が立てる）。
+    # 立っている間はモーダルを開かない。終了処理は記録を救うために配送待ちの
+    # シグナルをその場で配るので、転送スレッドが出したエラーもそこで届く。
+    # 答えるまで終了が止まるうえ、そのとき接続は既に切ってある。
+    _closing = False
+
     # settings.sftp の既定値。src/resources/default_config.json に合わせてある
     SFTP_SETTING_DEFAULTS = {
         "default_download_path": "./downloads",
@@ -107,6 +113,12 @@ class SFTPPanel(QWidget):
 
     NO_TARGET_TEXT = "接続先: なし"
 
+    # SFTP のチャンネルだけが切れたときの表示（利用者の決定 2026-09-23）。
+    # SSH セッションは生きているので機器のタブはそのまま残り、パネルだけが
+    # 使えなくなる。何が起きたのか出さないと、操作するたびに理由の違う
+    # エラーが返るだけになる
+    DROPPED_TEXT = "SFTP は切断されました（機器へ接続し直してください）"
+
     # サーバが属性を返さなかったときの表示。0 や 1970-01-01 に丸めると
     # 「空のファイル」「1970年更新」という別の嘘になり、転送の判断を誤らせる。
     UNKNOWN_TEXT = "不明"
@@ -143,6 +155,9 @@ class SFTPPanel(QWidget):
         
         # ファイルリストビュー
         self.tree_view = QTreeView()
+        # セルの直接編集は機器へ反映されない（表示だけが変わり、改名や権限の
+        # 変更が効いたように見える）。改名・権限変更は右クリックメニューから
+        self.tree_view.setEditTriggers(QTreeView.EditTrigger.NoEditTriggers)
         self.tree_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree_view.customContextMenuRequested.connect(self._show_context_menu)
         self.tree_view.doubleClicked.connect(self._on_item_double_clicked)
@@ -242,6 +257,7 @@ class SFTPPanel(QWidget):
             (self.sftp_manager.transfer_progress, self._update_progress),
             (self.sftp_manager.transfer_complete, self._on_transfer_complete),
             (self.sftp_manager.error_occurred, self._on_error),
+            (self.sftp_manager.disconnected, self._on_sftp_disconnected),
         ):
             try:
                 signal.disconnect(slot)
@@ -271,13 +287,13 @@ class SFTPPanel(QWidget):
         # 前の機器の file_info と新しい機器の組み合わせで削除できてしまう
         self.tree_view.clearSelection()
         self.model.removeRows(0, self.model.rowCount())
-        self.status_label.setText("一覧を取得しています...")
         
         # シグナル接続
         self.sftp_manager.file_list_ready.connect(self._update_file_list)
         self.sftp_manager.transfer_progress.connect(self._update_progress)
         self.sftp_manager.transfer_complete.connect(self._on_transfer_complete)
         self.sftp_manager.error_occurred.connect(self._on_error)
+        self.sftp_manager.disconnected.connect(self._on_sftp_disconnected)
         
         # どの機器を見ているかを出す。出さないと、送り先が違っても気づけない。
         if target:
@@ -287,6 +303,14 @@ class SFTPPanel(QWidget):
         else:
             self.target_label.setText(self.NO_TARGET_TEXT)
         self._update_path_label(self.sftp_manager.current_path)
+
+        # 既に切れている相手へ一覧を頼まない。タブを戻すたびに
+        # _on_terminal_tab_changed がここを通るので、頼むと戻すたびに
+        # 「SFTP接続がありません」の警告が出る（利用者の決定 2026-09-23）
+        if not self._manager_is_live():
+            self.status_label.setText(self.DROPPED_TEXT)
+            return
+        self.status_label.setText("一覧を取得しています...")
 
         # 初期ディレクトリ一覧を取得
         self.sftp_manager.list_directory()
@@ -327,7 +351,42 @@ class SFTPPanel(QWidget):
         (2) は落ちない代わりに別の機器へ送ってしまう。
         None 判定だけでは (2) を防げないので、同一性まで見る。
         """
-        return manager is not None and self.sftp_manager is manager
+        return (manager is not None and self.sftp_manager is manager
+                and self._manager_is_live())
+
+    def _manager_is_live(self) -> bool:
+        """いま繋いでいる SFTP のチャンネルがまだ使えるかを返す。
+
+        SFTP だけが切れても SSH セッションは生きているので、パネルは
+        マネージャを持ったまま残る。属性を持たない差し替えでも止まらない
+        よう、分からないときは使えるものとして扱う。
+        """
+        if self.sftp_manager is None:
+            return False
+        return bool(getattr(self.sftp_manager, "is_connected", True))
+
+    def _refuse_if_dropped(self, what: str) -> bool:
+        """SFTP が切れているのに操作されたら、断って True を返す。
+
+        利用者の決定 2026-09-23: SFTP のチャンネルだけが死んだときは、
+        一覧の表示は残して操作だけ止める。ここで止めずにマネージャへ
+        渡すと、削除の確認ダイアログまで開いたうえで「SFTP接続が
+        ありません」になり、消したつもりの相手が残る。
+        """
+        if self.sftp_manager is None or self._manager_is_live():
+            return False
+        self.status_label.setText("%sはできません。%s" % (what, self.DROPPED_TEXT))
+        return True
+
+    def _on_sftp_disconnected(self):
+        """SFTP のチャンネルが切れたときの表示（利用者の決定 2026-09-23）
+
+        機器ごと切れたときは MainWindow が clear() まで面倒を見る。ここは
+        SFTP だけが落ちた場合で、画面を空にすると何を見ていたのか分からなく
+        なるうえ、切断を知らせるモーダルが開いている最中に一覧が消える。
+        行はそのまま残し、切れたことだけ出す。
+        """
+        self.status_label.setText(self.DROPPED_TEXT)
 
     def _begin(self):
         """操作を始めた時点の「相手」と「場所」を控える。
@@ -365,7 +424,12 @@ class SFTPPanel(QWidget):
 
         ここでモーダルを出すと、ドロップした件数ぶん出てしまう。
         ステータス欄に出すだけにする。
+
+        ダイアログを開いている間に SFTP だけが切れることもあるので、
+        そのときは理由をそちらに合わせる（接続先は変わっていない）。
         """
+        if self._refuse_if_dropped(what):
+            return
         self.status_label.setText("接続先が変わったため、%sを取りやめました" % what)
 
     def _update_file_list(self, file_list: list):
@@ -430,7 +494,12 @@ class SFTPPanel(QWidget):
             # 行を追加
             self.model.appendRow([name_item, size_item, perm_item, time_item])
         
-        self.status_label.setText(f"{len(file_list)} 項目")
+        # 一覧の変換はロックの外なので、届く前に SFTP が切れていることがある。
+        # 行は並べたまま（利用者の決定 2026-09-23）、切れた表示は残す
+        if self._manager_is_live():
+            self.status_label.setText(f"{len(file_list)} 項目")
+        else:
+            self.status_label.setText(self.DROPPED_TEXT)
     
     def _reset_progress(self):
         """進捗バーを片付ける
@@ -497,6 +566,9 @@ class SFTPPanel(QWidget):
         """
         self.progress_bar.setVisible(False)
         self.status_label.setText(f"エラー: {error_message}")
+        if self._closing:
+            # 終了処理の途中。表示だけ残して戻る（_closing の説明を参照）
+            return
         QMessageBox.warning(self, "SFTP エラー", error_message)
     
     def _on_item_double_clicked(self, index: QModelIndex):
@@ -506,7 +578,7 @@ class SFTPPanel(QWidget):
         Args:
             index: クリックされたインデックス
         """
-        if not self.sftp_manager:
+        if not self.sftp_manager or self._refuse_if_dropped("ディレクトリの移動"):
             return
         
         # ファイル情報を取得
@@ -528,6 +600,8 @@ class SFTPPanel(QWidget):
         """
         manager, base_path = self._pinned_or_begin(pinned)
         if not manager or not file_info or not file_info.get('is_dir'):
+            return
+        if self._refuse_if_dropped("ディレクトリの移動"):
             return
         if not self._still_on(manager):
             self._abandon("ディレクトリの移動")
@@ -612,24 +686,24 @@ class SFTPPanel(QWidget):
 
     def _on_refresh(self):
         """更新ボタンがクリックされた"""
-        if self.sftp_manager:
+        if self.sftp_manager and not self._refuse_if_dropped("一覧の取得"):
             self.sftp_manager.list_directory()
     
     def _on_go_up(self):
         """親ディレクトリへ移動"""
-        if self.sftp_manager:
+        if self.sftp_manager and not self._refuse_if_dropped("ディレクトリの移動"):
             parent_path = self.sftp_manager.get_parent_directory()
             self.sftp_manager.change_directory(parent_path)
     
     def _on_go_home(self):
         """ホームディレクトリへ移動"""
-        if self.sftp_manager:
+        if self.sftp_manager and not self._refuse_if_dropped("ディレクトリの移動"):
             self.sftp_manager.change_directory(".")
     
     def _on_upload(self, pinned=None):
         """アップロードボタンがクリックされた"""
         manager, base_path = self._pinned_or_begin(pinned)
-        if not manager:
+        if not manager or self._refuse_if_dropped("アップロード"):
             return
 
         # ファイル選択ダイアログ
@@ -657,6 +731,8 @@ class SFTPPanel(QWidget):
             manager, base_path = self._begin()
             if manager is None:
                 return
+        if self._refuse_if_dropped("アップロード"):
+            return
         name = os.path.basename(file_path)
         confirm = self._get_sftp_setting(
             "confirm_overwrite", self.SFTP_SETTING_DEFAULTS["confirm_overwrite"])
@@ -728,7 +804,7 @@ class SFTPPanel(QWidget):
             file_info: ファイル情報
         """
         manager, base_path = self._pinned_or_begin(pinned)
-        if not manager:
+        if not manager or self._refuse_if_dropped("ダウンロード"):
             return
 
         # 保存先を選択（settings.sftp.default_download_path を初期位置に使う）
@@ -754,7 +830,7 @@ class SFTPPanel(QWidget):
     def _on_create_directory(self, pinned=None):
         """新規ディレクトリ作成"""
         manager, base_path = self._pinned_or_begin(pinned)
-        if not manager:
+        if not manager or self._refuse_if_dropped("フォルダの作成"):
             return
 
         # ディレクトリ名を入力
@@ -792,7 +868,7 @@ class SFTPPanel(QWidget):
             file_info: ファイル情報
         """
         manager, base_path = self._pinned_or_begin(pinned)
-        if not manager:
+        if not manager or self._refuse_if_dropped("削除"):
             return
 
         # 確認ダイアログ（settings.sftp.confirm_delete）
@@ -825,7 +901,7 @@ class SFTPPanel(QWidget):
             file_info: ファイル情報
         """
         manager, base_path = self._pinned_or_begin(pinned)
-        if not manager:
+        if not manager or self._refuse_if_dropped("名前の変更"):
             return
 
         # 新しい名前を入力
@@ -851,23 +927,40 @@ class SFTPPanel(QWidget):
             file_info: ファイル情報
         """
         manager, base_path = self._pinned_or_begin(pinned)
-        if not manager:
+        if not manager or self._refuse_if_dropped("パーミッションの変更"):
             return
+
+        # chmod はリンクをたどって先へ効くが、一覧の mode はリンク自身
+        # （多くは 0777）。それを初期値にすると、何も変えずに OK しただけで
+        # リンク先が 0777 になる。リンクはリンク先の値を初期値にし、適用先を
+        # ダイアログに出す。読めなければ変更しない（理由はマネージャが通知）
+        mode = file_info['mode']
+        applies_to = ""
+        is_link = bool(file_info.get('is_link'))
+        if is_link:
+            found = manager.inspect_link_target(
+                self._remote_path(base_path, file_info['name']))
+            if found is None:
+                return
+            mode, target = found
+            applies_to = ("リンク先 %s に適用されます\n" % target if target
+                          else "'%s' のリンク先に適用されます\n" % file_info['name'])
 
         # 現在のパーミッションを8進数で表示。サーバが permissions を
         # 返さなかった項目は None なので、既定値は空にする。
         # setuid / setgid / sticky を含む 4 桁で出す（& 0o777 で切ると、
         # 何も書き換えずに OK を押しただけで特殊ビットが落ちる）
-        if file_info['mode'] is None:
+        if mode is None:
             current_mode_str = ""
         else:
-            current_mode = file_info['mode'] & 0o7777
+            current_mode = mode & 0o7777
             current_mode_str = format(current_mode, '04o')  # 0o1777 -> '1777'
 
         # 新しいパーミッションを入力
         new_mode_str, ok = QInputDialog.getText(
             self,
             "パーミッション変更",
+            applies_to +
             "新しいパーミッションを8進数で入力してください:\n"
             "（例: 0755, 0644。先頭の桁は setuid/setgid/sticky で、\n"
             "3桁で入力するとこれらは落ちます）",
@@ -878,6 +971,8 @@ class SFTPPanel(QWidget):
             try:
                 # 8進数として解釈
                 new_mode = int(new_mode_str, 8)
+                if is_link and new_mode == current_mode:
+                    return   # リンク先の初期値のまま。何も送らない
                 if not self._still_on(manager):
                     self._abandon("パーミッションの変更")
                     return

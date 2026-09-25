@@ -12,9 +12,11 @@ from PyQt6.QtGui import QAction, QStandardItemModel, QStandardItem
 from contextlib import contextmanager
 from datetime import datetime
 import json
+import math
 import os
 import re
 import tempfile
+from core import save_defaults
 from core.mib_resolver import get_resolver, MIBResolver
 from core.snmp_manager import v3_password_error
 
@@ -135,6 +137,13 @@ class MIBLoaderThread(QThread):
 class SNMPPanel(QWidget):
     """SNMPパネル"""
 
+    # アプリの終了処理に入ったか（MainWindow.closeEvent が立てる）。
+    # 立っている間はモーダルを開かない。終了処理は記録を救うために配送待ちの
+    # シグナルをその場で配るので、ワーカーや Trap 受信のスレッドが出した
+    # エラーもそこで届く。答えるまで終了が止まるうえ、そのとき SNMP は
+    # 停止済みで、開いても何もできない。
+    _closing = False
+
     # 保持する Trap の件数。上限が無いと、受信を張りっぱなしにする常用で
     # メモリが単調に増え続ける（VarBind 3件の Trap あたり約 12KB、
     # 100,000 件で約 1.2GB。クリアするまで解放されない）。
@@ -203,15 +212,16 @@ class SNMPPanel(QWidget):
         
         # メインタブ
         main_tabs = QTabWidget()
-        
+        self.main_tabs = main_tabs
+
         # GET/WALKタブ
         get_walk_widget = self._create_get_walk_tab()
         main_tabs.addTab(get_walk_widget, "GET / WALK")
-        
+
         # Trap受信タブ
         trap_widget = self._create_trap_tab()
         main_tabs.addTab(trap_widget, "Trap受信")
-        
+
         layout.addWidget(main_tabs)
         self.setLayout(layout)
     
@@ -223,19 +233,25 @@ class SNMPPanel(QWidget):
         # 接続設定
         conn_group = QGroupBox("接続設定")
         conn_layout = QGridLayout()
+        # ホスト・ポート・バージョンを 1 列に縦へ並べる。ポートをホストの
+        # 右隣に置くと、横に伸びるホスト欄に押されてポートだけが右へ出て
+        # いき（実測: 幅 520 でホストの右端より 113px 右）、窓を狭めた場面で
+        # 最初に切れて見えなくなる
         conn_layout.addWidget(QLabel("ホスト:"), 0, 0)
         self.host_edit = QLineEdit()
         conn_layout.addWidget(self.host_edit, 0, 1)
-        conn_layout.addWidget(QLabel("ポート:"), 0, 2)
+        conn_layout.addWidget(QLabel("ポート:"), 1, 0)
         self.port_spinbox = QSpinBox()
         self.port_spinbox.setRange(1, 65535)
         self.port_spinbox.setValue(161)
-        conn_layout.addWidget(self.port_spinbox, 0, 3)
-        conn_layout.addWidget(QLabel("バージョン:"), 1, 0)
+        # 1 列ぶんに間延びさせない（FTP/TFTP/SFTP のポート欄と同じ幅）
+        self.port_spinbox.setMaximumWidth(100)
+        conn_layout.addWidget(self.port_spinbox, 1, 1)
+        conn_layout.addWidget(QLabel("バージョン:"), 2, 0)
         self.version_combo = QComboBox()
         self.version_combo.addItems(["v2c", "v1", "v3"])
         self.version_combo.currentTextChanged.connect(self._on_version_changed)
-        conn_layout.addWidget(self.version_combo, 1, 1)
+        conn_layout.addWidget(self.version_combo, 2, 1)
         conn_group.setLayout(conn_layout)
         layout.addWidget(conn_group)
         
@@ -328,13 +344,21 @@ class SNMPPanel(QWidget):
         self.walk_button = QPushButton("WALK")
         self.walk_button.clicked.connect(self._on_walk_clicked)
         btn_layout.addWidget(self.walk_button)
-        btn_layout.addStretch()
+        # GET/WALK の実行中だけ出す（Trap 受信の停止ボタンと同じ出し方）。
+        # GET・WALK は押せるままにして、実行中の要求はマネージャが断る
+        self.stop_button = QPushButton("停止")
+        self.stop_button.clicked.connect(self._on_stop_clicked)
+        self.stop_button.setVisible(False)
+        btn_layout.addWidget(self.stop_button)
         self.export_button = QPushButton("エクスポート")
         self.export_button.clicked.connect(self._on_export_clicked)
         btn_layout.addWidget(self.export_button)
         self.clear_button = QPushButton("クリア")
         self.clear_button.clicked.connect(self._on_clear_clicked)
         btn_layout.addWidget(self.clear_button)
+        # 余った幅は行末の空きへ。ボタンの間に空きを挟むとエクスポートと
+        # クリアだけが右端へ飛ばされ、画面ごとに置き場所が変わってしまう
+        btn_layout.addStretch()
         layout.addLayout(btn_layout)
         
         # 結果テーブル
@@ -343,8 +367,11 @@ class SNMPPanel(QWidget):
         self.result_table.setAlternatingRowColors(True)
         layout.addWidget(self.result_table)
         
-        # ステータス
+        # ステータス。「途中まで: N件（… のため中断。全部ではありません）」
+        # のような長い文面が入るので折り返す。折り返さないと、その文面が
+        # 出た瞬間にタブの最小幅が伸び、窓を縮められなくなる
         self.status_label = QLabel("準備完了")
+        self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
         
         widget.setLayout(layout)
@@ -404,10 +431,14 @@ class SNMPPanel(QWidget):
         self.trap_v3_engine_ids_edit.setPlaceholderText("8000000001020304")
         trap_layout.addWidget(self.trap_v3_engine_ids_edit, 6, 1, 1, 3)
 
-        trap_layout.addWidget(QLabel(
+        # 折り返さないと、この 1 行ぶんの幅がタブの最小幅になり（実測
+        # 796px）、窓をそこまでしか縮められない。はみ出した右側のボタンは
+        # 窓の外へ出て押せなくなる
+        engine_id_note = QLabel(
             "v3 Trap は送信元機器の EngineID を登録しないと受信できません。"
-            "1行に1つ、16進で入力してください（Cisco IOS なら show snmp engineID）。"),
-            7, 0, 1, 4)
+            "1行に1つ、16進で入力してください（Cisco IOS なら show snmp engineID）。")
+        engine_id_note.setWordWrap(True)
+        trap_layout.addWidget(engine_id_note, 7, 0, 1, 4)
 
         trap_group.setLayout(trap_layout)
         layout.addWidget(trap_group)
@@ -438,6 +469,9 @@ class SNMPPanel(QWidget):
         trap_status_group = QGroupBox("受信状態")
         trap_status_layout = QVBoxLayout()
         self.trap_status_label = QLabel("🔴 停止中")
+        # ファイアウォール許可の結果など長い文面が入るので折り返す（理由は
+        # GET/WALK の status_label と同じ）
+        self.trap_status_label.setWordWrap(True)
         self.trap_status_label.setStyleSheet("color: #f44336; font-weight: bold; font-size: 14px;")
         trap_status_layout.addWidget(self.trap_status_label)
         trap_status_group.setLayout(trap_status_layout)
@@ -457,6 +491,9 @@ class SNMPPanel(QWidget):
         self.trap_clear_button = QPushButton("クリア")
         self.trap_clear_button.clicked.connect(self._on_trap_clear_clicked)
         btn_layout.addWidget(self.trap_clear_button)
+        # 余った幅は行末の空きへ。無いとボタン自身が横へ間延びする
+        # （実測: 幅 1100 で 1 個あたり 264px）
+        btn_layout.addStretch()
         layout.addLayout(btn_layout)
         
         # TrapツリーView
@@ -644,10 +681,14 @@ class SNMPPanel(QWidget):
 
         params = self._collect_request_params()
         # 受理された要求のホストだけを記録する。実行中で断られた要求の
-        # ホストまで記録すると、いま走っている要求の結果に別のホストが付く
-        if self.snmp_manager.snmp_get(host, oids, **params):
-            self._request_host = host
+        # ホストまで記録すると、いま走っている要求の結果に別のホストが付く。
+        # 断られたら表示にも触れない。断りの警告を開いている間に前の操作の
+        # 完了が届くので、閉じた後に「実行中」で上書きすることになる
+        if not self.snmp_manager.snmp_get(host, oids, **params):
+            return
+        self._request_host = host
         self.status_label.setText("GET実行中...")
+        self._show_stop_button(True)
     
     def _on_walk_clicked(self):
         if not self.snmp_manager:
@@ -664,11 +705,32 @@ class SNMPPanel(QWidget):
             return
 
         params = self._collect_request_params()
-        # 受理された要求のホストだけを記録する（GET と同じ理由）
-        if self.snmp_manager.snmp_walk(host, oid, **params):
-            self._request_host = host
+        # 受理された要求のホストだけを記録し、断られたら表示にも触れない
+        # （GET と同じ理由）
+        if not self.snmp_manager.snmp_walk(host, oid, **params):
+            return
+        self._request_host = host
         self.status_label.setText("WALK実行中...")
-    
+        self._show_stop_button(True)
+
+    def _show_stop_button(self, running: bool):
+        """停止ボタンを、GET/WALK の実行中だけ押せる状態で出す"""
+        self.stop_button.setVisible(running)
+        self.stop_button.setEnabled(True)
+
+    def _on_stop_clicked(self):
+        """実行中の GET/WALK を止める
+
+        待っている応答は切れないので、取り消しは次の応答を受けたところで
+        効く（応答しない機器では最大約 6 秒）。それまでは「停止中…」と出し、
+        新しい要求は実行中と同じくマネージャが断る。止まると、そこまでに
+        取れた行が operation_cancelled で届く。
+        """
+        if not self.snmp_manager or not self.snmp_manager.request_cancel():
+            return   # 結果が既に届く途中。そのまま完了として表示される
+        self.stop_button.setEnabled(False)
+        self.status_label.setText("停止中…（次の応答を待ってから止まります）")
+
     def _refuse_if_recording(self, title: str, file_path: str) -> bool:
         """保存先が端末のログ記録に使われていたら断る（断ったら True）
 
@@ -739,12 +801,20 @@ class SNMPPanel(QWidget):
             QMessageBox.information(self, "情報", "エクスポートするデータがありません。")
             return
         default_name = "snmp_result_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".txt"
-        file_path, _ = QFileDialog.getSaveFileName(
+        file_path, selected_filter = QFileDialog.getSaveFileName(
             self,
             "SNMP結果をエクスポート",
-            default_name,
-            "テキストファイル (*.txt);;CSVファイル (*.csv);;JSONファイル (*.json)"
+            save_defaults.initial_path(self.config_manager, default_name),
+            save_defaults.TABLE_FILTERS
         )
+        if not file_path:
+            return
+        # 選んだ種類に合わせて拡張子を付け替える（中身は拡張子で決まるので、
+        # ここで揃えないと CSV を選んでもテキストが書かれる）。付け替えた先が
+        # 既にあれば、ダイアログが訊いていない上書きなのでここで確認する
+        file_path = save_defaults.apply_filter_suffix_confirmed(
+            self, "SNMP結果をエクスポート", file_path, selected_filter,
+            default_name)
         if not file_path:
             return
         if self._refuse_if_recording("SNMP結果をエクスポート", file_path):
@@ -760,6 +830,8 @@ class SNMPPanel(QWidget):
                 self._export_results_to_json(file_path, results, host, reason)
             else:
                 self._export_results_to_txt(file_path, results, host, reason)
+            # 書き終えてから覚える（取り消し・失敗では変えない）
+            save_defaults.remember(self.config_manager, file_path)
             QMessageBox.information(self, "成功", "SNMP結果をエクスポートしました:\n" + file_path)
         except Exception as e:
             QMessageBox.critical(self, "エラー",
@@ -770,12 +842,25 @@ class SNMPPanel(QWidget):
 
         config.json は手で編集できるので、数でない値や 0 以下が来る。
         そのまま使うと上限が消えたり、1件も残らなくなる。
+
+        非有限（±inf）にも気をつける。JSON の 1e309 や Infinity を
+        json.load は float の無限大として読み、int() はそこで
+        OverflowError を送出する。これは ArithmeticError 系なので
+        ValueError の網に掛からず、SNMPPanel のコンストラクタから
+        MainWindow の初期化まで抜けて、画面が出ないまま終了していた
+        （実測）。値は config.json に残るので、直すまで毎回起動に失敗
+        する。NaN は int(nan) が ValueError なので元から既定値へ落ちる。
         """
         try:
             settings = self.config_manager.config.get("settings", {})
-            value = int(settings.get("snmp", {}).get(
-                "max_traps", self.DEFAULT_MAX_TRAPS))
-        except (AttributeError, TypeError, ValueError):
+            raw = settings.get("snmp", {}).get(
+                "max_traps", self.DEFAULT_MAX_TRAPS)
+            # int() へ渡す前に非有限を弾く。捕捉だけでは、下の
+            # `value > 0` が inf でも真になるため素通りしてしまう
+            if isinstance(raw, float) and not math.isfinite(raw):
+                return self.DEFAULT_MAX_TRAPS
+            value = int(raw)
+        except (AttributeError, OverflowError, TypeError, ValueError):
             return self.DEFAULT_MAX_TRAPS
         return value if value > 0 else self.DEFAULT_MAX_TRAPS
 
@@ -846,10 +931,19 @@ class SNMPPanel(QWidget):
         import csv
         # BOM 付き（utf-8-sig）。日本語版 Excel は BOM の無い UTF-8 の CSV を
         # cp932 として開くため、見出しも機器から来た日本語も文字化けする
+        # 注記の改行は csv.writer に合わせて CRLF。newline="" で開いている
+        # ので LF はそのまま出て、注記の行だけが LF・結果の行が CRLF という
+        # 1 ファイル内の混在になる。CRLF だけを行の区切りとする厳しめの
+        # パーサは、注記行と見出し行を 1 行と見なしうる（実測）
         with atomic_text_write(file_path, newline="", encoding="utf-8-sig") as f:
             if reason:
                 # 途中までの結果であることを、見出しの前に残す
-                f.write("# 途中まで: %s のため中断。全部ではありません\n" % reason)
+                f.write("# 途中まで: %s のため中断。全部ではありません\r\n" % reason)
+            if host:
+                # どの機器から採った結果かを、見出しの前に残す。JSON の
+                # "host"・TXT の「対象ホスト:」に当たるものが CSV だけ
+                # 抜けていて、ファイルを並べると取り違えても気づけなかった
+                f.write("# 対象ホスト: %s\r\n" % host)
             writer = csv.writer(f)
             writer.writerow(["OID", "Type", "Value"])
             for row in results:
@@ -1084,13 +1178,21 @@ class SNMPPanel(QWidget):
             return
 
         # ファイル保存ダイアログ
+        default_name = f"trap_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
         file_path, selected_filter = QFileDialog.getSaveFileName(
             self,
             "Trapログをエクスポート",
-            f"trap_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-            "テキストファイル (*.txt);;CSVファイル (*.csv);;JSONファイル (*.json)"
+            save_defaults.initial_path(self.config_manager, default_name),
+            save_defaults.TABLE_FILTERS
         )
-        
+
+        if not file_path:
+            return
+
+        # 選んだ種類に合わせて拡張子を付け替える（結果のエクスポートと同じ）
+        file_path = save_defaults.apply_filter_suffix_confirmed(
+            self, "Trapログをエクスポート", file_path, selected_filter,
+            default_name)
         if not file_path:
             return
 
@@ -1106,7 +1208,9 @@ class SNMPPanel(QWidget):
                 self._export_to_json(file_path, traps)
             else:  # .txt or other
                 self._export_to_txt(file_path, traps)
-            
+
+            # 書き終えてから覚える（取り消し・失敗では変えない）
+            save_defaults.remember(self.config_manager, file_path)
             QMessageBox.information(self, "成功", f"Trapログをエクスポートしました:\n{file_path}")
         except Exception as e:
             QMessageBox.critical(self, "エラー",
@@ -1205,6 +1309,7 @@ class SNMPPanel(QWidget):
         if self.snmp_manager:
             self.snmp_manager.operation_completed.connect(self._on_operation_completed)
             self.snmp_manager.operation_partial.connect(self._on_operation_partial)
+            self.snmp_manager.operation_cancelled.connect(self._on_operation_cancelled)
             self.snmp_manager.trap_received.connect(self._on_trap_received)
             self.snmp_manager.trap_receiver_started.connect(self._on_trap_receiver_started)
             self.snmp_manager.trap_receiver_stopped.connect(self._on_trap_receiver_stopped)
@@ -1233,7 +1338,29 @@ class SNMPPanel(QWidget):
         """
         self._partial_reason = reason
 
+    # 利用者が止めた結果の、途中までの理由。書き出しの partial_reason にも入る
+    USER_CANCEL_REASON = "利用者が中断"
+
+    def _on_operation_cancelled(self, rows):
+        """利用者が止めた GET/WALK の、そこまでに取れた行を受け取る
+
+        途中で切れた WALK と同じく、全部ではないことを表示と書き出しに
+        残す。0 行でも表を置き換える。前の結果を残すと、それにこの
+        操作の「途中まで」とホストが付いて保存される。
+        """
+        self._show_stop_button(False)
+        rows = list(rows)
+        self.result_model.set_results(rows)
+        self._result_host = self._request_host
+        self._partial_reason = None
+        self._last_partial_reason = self.USER_CANCEL_REASON
+        self.status_label.setText(
+            "途中まで（%s）: %d件（全部ではありません）"
+            % (self.USER_CANCEL_REASON, len(rows)))
+
     def _on_operation_completed(self, success: bool, result):
+        # 失敗の通知（モーダル）を開く前に隠す
+        self._show_stop_button(False)
         if success:
             self.result_model.set_results(result)
             # 表の結果がどのホストのものかを、要求時の値で固定する
@@ -1253,7 +1380,9 @@ class SNMPPanel(QWidget):
             else:
                 self.status_label.setText(f"完了: {len(result)}件")
         else:
-            QMessageBox.critical(self, "エラー", str(result))
+            if not self._closing:
+                # 終了処理の途中なら開かない（_closing の説明を参照）
+                QMessageBox.critical(self, "エラー", str(result))
             self.status_label.setText("エラー")
     
     def _on_trap_received(self, trap_data: dict):
@@ -1351,4 +1480,8 @@ class SNMPPanel(QWidget):
         self._show_trap_stopped()
     
     def _on_error_occurred(self, error: str):
+        if self._closing:
+            # 終了処理の途中。黙って捨てずに記録だけ残す（_closing の説明を参照）
+            print(f"[SNMPPanel] 終了処理中のエラー通知: {error}")
+            return
         QMessageBox.warning(self, "警告", error)

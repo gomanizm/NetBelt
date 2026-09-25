@@ -397,18 +397,20 @@ class SyslogReceiver(QObject):
         押したときだけ昇格する。稼働中のプロトコルぶんだけ足す。
         """
         try:
-            from .firewall import ensure_inbound_allow, ensure_self_program_allow
+            from .firewall import (combine_results, ensure_inbound_allow,
+                                   ensure_self_program_allow)
             if not self._servers:
                 return False, "受信していません"
             results = []
             for proto, server in list(self._servers.items()):
                 ok, msg = ensure_inbound_allow("Syslog", proto, server.get("port"))
                 print("[Syslog] ファイアウォール(%s): %s" % (proto, msg))
-                results.append(ok)
+                results.append((ok, msg))
             ok2, msg2 = ensure_self_program_allow()
             print("[Syslog] ファイアウォール(自exe): %s" % msg2)
-            results.append(ok2)
-            return all(results), msg2
+            results.append((ok2, msg2))
+            # すべて成功したときの文言は従来どおり自exe の結果
+            return combine_results(results, success_message=msg2)
         except Exception as e:
             print("[Syslog] ファイアウォール設定エラー: %s" % e)
             return False, str(e)
@@ -538,23 +540,54 @@ class SyslogReceiver(QObject):
     # PRI（"<"）で始まるので、改行区切りの行が数字で始まる場合と区別できる
     _OCTET_COUNT_RE = re.compile(rb"^(\d{1,9}) <")
 
+    @staticmethod
+    def _find_line_end(buffer):
+        """改行区切りの終端（LF と NUL の早い方）の位置を返す。無ければ -1。
+
+        NUL は RFC 6587 3.4.2 が触れている非透過フレーミングの終端で、
+        Python 標準の SysLogHandler(socktype=SOCK_STREAM) は LF の代わりに
+        これを付ける。NUL は次の LF の手前までだけ探す（行ごとに受信
+        バッファの末尾まで走査しない）。
+        """
+        lf = buffer.find(b"\n")
+        nul = buffer.find(b"\x00", 0, len(buffer) if lf == -1 else lf)
+        return lf if nul == -1 else nul
+
     def _emit_tcp_line(self, line, client_ip, listen_port, octet_counted=False):
         """TCP で切り出した 1 メッセージを配信する（空行は捨てる）
 
         octet_counted=True（RFC 6587 §3.4.1）は宣言された長さぶんがそのまま
         本文なので、末尾の空白・タブ・NEL(U+0085)・NBSP(U+00A0) も原文のまま
         残す。両端を落とすと raw_message が受信原文と一致しなくなる。
-        改行区切り（§3.4.2）は終端の CR/LF を落とす必要があるので、そちらは
-        従来どおり strip する。
+        改行区切り（§3.4.2）の終端（LF / NUL）は切り出しの時点で落ちているので、落とすのは
+        CRLF の CR 1 個だけにし、本文末尾の空白は残す。先頭の空白は、PRI の
+        解釈を変えないよう従来どおり落とす。
         """
         decoded = self._decode_bytes(line)
         # 空行かどうかの判定だけは、どちらの方式でも strip 済みの値で行う
         if not decoded.strip():
             return
-        message_str = decoded if octet_counted else decoded.strip()
+        if octet_counted:
+            message_str = decoded
+        else:
+            if decoded.endswith("\r"):
+                decoded = decoded[:-1]
+            message_str = decoded.lstrip()
         self._emit_message(
             SyslogMessage(message_str, client_ip, "TCP", listen_port))
         self.message_count += 1
+
+    def _flush_tcp_residual(self, buffer, client_ip, listen_port):
+        """受信バッファに残った終端なしの 1 行を配信する（後始末の共通処理）。
+
+        改行区切りは終端（LF / NUL）が来るまで行を配信しないので、終端を
+        付けずに黙る送り手の最後の 1 件は、この接続を畳むときに配信しないと
+        消える。長さは受信のたびに上限（max_line_bytes）と照合済みなので、
+        上限を超えた行はここまで来ない。宣言した長さに足りない
+        octet-counting のフレームは、欠けた本文なので配信しない。
+        """
+        if buffer and not self._OCTET_COUNT_RE.match(buffer):
+            self._emit_tcp_line(buffer, client_ip, listen_port)
 
     def _handle_tcp_client(self, client_socket, client_ip, stop_event, listen_port=None):
         """TCPクライアントからのメッセージを処理
@@ -563,6 +596,11 @@ class SyslogReceiver(QObject):
         どちらかはバッファ先頭で判定し、混在も許す。
 
         最後に受信してから tcp_idle_timeout_seconds を過ぎた接続は切断する。
+
+        相手が閉じた・相手が RST で打ち切った・無通信で切った・停止要求で
+        抜けた、のいずれで終わる場合も、残った終端なしの 1 行を配信してから
+        畳む。1 行が上限を超えて切断した場合だけは配信しない（切り捨てた
+        ことを通知した直後に、その切れ端を 1 件として出すことになるため）。
         """
         try:
             client_socket.settimeout(1.0)
@@ -572,7 +610,11 @@ class SyslogReceiver(QObject):
                 try:
                     data = client_socket.recv(4096)
                     if not data:
-                        break
+                        # 相手が閉じた。LF の無い最後の 1 行も 1 件として配信する
+                        # （捨てると、終端を付けずに閉じる送り手の最後の 1 件が
+                        # 消える）
+                        self._flush_tcp_residual(buffer, client_ip, listen_port)
+                        return
                     last_activity = time.monotonic()
                     buffer += data
                     too_long = False
@@ -598,7 +640,8 @@ class SyslogReceiver(QObject):
                         # 「改行がまだ来ていないとき」に限ると、上限を超えた行が
                         # 終端の改行ごと 1 回の recv で届いた場合に素通りする。
                         # 見るのは受信バッファ全体ではなく、次の改行までの長さ。
-                        newline_at = buffer.find(b"\n")
+                        # 終端は LF と NUL の早い方（_find_line_end）
+                        newline_at = self._find_line_end(buffer)
                         if newline_at == -1:
                             current_line = len(buffer)
                             # LF がまだ届いていないだけの CRLF も同じ扱いにする。
@@ -618,7 +661,7 @@ class SyslogReceiver(QObject):
                             break
                         if newline_at == -1:
                             break
-                        line, buffer = buffer.split(b"\n", 1)
+                        line, buffer = buffer[:newline_at], buffer[newline_at + 1:]
                         self._emit_tcp_line(line, client_ip, listen_port)
                     if too_long:
                         # 一覧に並ぶので、機器からの行と同じ RFC 3164 の形で
@@ -632,18 +675,40 @@ class SyslogReceiver(QObject):
                                self.max_line_bytes),
                             client_ip, "TCP", listen_port))
                         self.message_count += 1
-                        break
+                        # 切り捨てた残りは配信しない（切断を伝えた直後に
+                        # 切れ端を 1 件として出すことになる）
+                        return
                 except socket.timeout:
                     # 無通信のまま上限を過ぎた接続は切って枠を返す
                     idle = self.tcp_idle_timeout_seconds
                     if idle and time.monotonic() - last_activity > idle:
                         print("[Syslog] TCP client idle for %ds, closing: %s"
                               % (idle, client_ip))
-                        break
+                        self._flush_tcp_residual(buffer, client_ip, listen_port)
+                        return
                     continue
-                except Exception as e:
+                except OSError as e:
+                    # 相手が RST で打ち切った（SO_LINGER 0 での close。
+                    # Windows では WSAECONNRESET）。FIN と違って recv は空を
+                    # 返さず例外になるので、ここでも残りを配信しないと、
+                    # 機器の reload や経路のセッション切断のたびに終端なしの
+                    # 最後の 1 行が消える。
+                    # 配信そのものが投げた例外もこの枝に来うるので、配信は
+                    # 包んでおく（同じ例外をもう一度踏まないため）
                     print("[Syslog] TCP receive error: %s" % e)
-                    break
+                    try:
+                        self._flush_tcp_residual(buffer, client_ip, listen_port)
+                    except Exception as flush_error:
+                        print("[Syslog] TCP flush error: %s" % flush_error)
+                    return
+                except Exception as e:
+                    # 通信以外の異常。何が壊れたか分からないので、従来どおり
+                    # 残りは配信せずに畳む
+                    print("[Syslog] TCP receive error: %s" % e)
+                    return
+            # 停止要求で待受ループを抜けた。相手は閉じていないので、
+            # ここでも残りを配信してから畳む
+            self._flush_tcp_residual(buffer, client_ip, listen_port)
         finally:
             try:
                 client_socket.close()

@@ -21,7 +21,7 @@
 - **マクロ** — よく使うコマンド列を登録して一括実行
 - **自動実行コマンド** — グループごとに登録したコマンドを、接続直後に自動投入（`terminal length 0` など）。ツリーでグループを右クリック →「グループを編集」から設定します。SSH / Telnet が対象です。**config.json に平文で保存されるため、パスワードは書かないでください**
 - **セッションログ** — 画面の内容をファイルへ保存
-- **コピー / ペースト** — `Ctrl+Shift+C` / `Ctrl+Shift+V`。ターミナルの `Ctrl+C` は機器への中断送信（0x03）に使うため、端末ソフトの慣習に合わせています。ペーストは接続中のタブでのみ動きます
+- **コピー / ペースト** — マウスで範囲を選ぶと、その時点でクリップボードへコピーされます（`Ctrl+Shift+C` でもコピーできます。ターミナルの `Ctrl+C` は機器への中断送信（0x03）に使うため、端末ソフトの慣習に合わせています）。貼り付けはターミナルの右クリックで、接続中のタブでのみ動きます。改行を含む内容（行ごとにコマンドとして実行されます）や、`Ctrl+Z` などの制御文字（タブを除く）を含む内容は、送る前に確認ダイアログで中身を表示します（既定のボタンは「キャンセル」）。貼り付けにキーボードのショートカットはありません
 - **フォントサイズ変更** — 表示メニューから 6〜32pt。開いているタブすべてに即反映され、以降に開くタブにも引き継ぎます
 
 ### 受信サーバ / 転送
@@ -71,6 +71,25 @@ v3 の認証情報は保存されません。アプリを起動するたびに�
 - パスワードは **Windows DPAPI** で暗号化して保存（OS・ユーザーアカウントに紐付け）
 - SSH ホストキーの **TOFU**（Trust On First Use）検証
 - GitHub Releases を見に行く**自動更新チェック** — ダウンロードした ZIP は SHA-256 で照合し、一致しなければ適用しません
+
+> **1.2.0 以前から更新する場合の注意**
+> 更新を当てるのは、いま入っている版に同梱された `updater.bat` です。そのため
+> 1.2.0 以前から上げるときは、そちらの古い不具合がそのまま出ます（実物の
+> 配布物で確認済み）。
+> - **NetBelt を終了してから更新してください。** 起動したままだと実行ファイルを
+>   置き換えられず、1.1.x では失敗を繰り返します。
+> - 1.2.0 からの更新では、途中で英語のエラー（`ERROR: could not create a work
+>   folder in TEMP` など）が出ることがありますが、最後に「更新が完了しました！」が
+>   出ていれば**当たっています**。
+> - 1.1.x からの更新では、最後まで英語のエラーで終わることがあります。この場合も
+>   実行ファイルは置き換わっているので、`NetBelt.exe` を手で起動して版を確かめて
+>   ください（ヘルプ → バージョン情報）。
+> - 1.3.0 以降どうしの更新では、これらは起きません。
+
+> **TEMP のパスに `[` や `]` がある場合**
+> 1.3.0 以前からの自動更新は、ZIP の展開で止まります（「ZIPファイルの展開に失敗しました」。
+> 元の版はそのまま残ります）。その 1 回だけ、Releases の ZIP を手で展開して NetBelt の
+> フォルダへ上書きすれば、1.3.1 以降は自動更新で当たります。
 
 ## 動作環境
 
@@ -204,7 +223,7 @@ application and a set of daemons.
   The client rides the terminal's SSH session, so it becomes available once you
   connect to a device — provided that device supports SFTP.
 - **Auto commands** — commands registered per group are sent right after connecting (e.g. `terminal length 0`). Configure them by right-clicking a group in the tree and choosing 「グループを編集」 ("Edit group"). Applies to SSH and Telnet. They are stored in plain text in `config.json`, so do not put passwords there.
-- **Copy / paste** — `Ctrl+Shift+C` / `Ctrl+Shift+V`, following terminal-emulator convention: `Ctrl+C` in a terminal tab is left free to send an interrupt (0x03) to the device. Paste only works on a connected tab.
+- **Copy / paste** — selecting text with the mouse copies it to the clipboard right away (`Ctrl+Shift+C` also copies, following terminal-emulator convention: `Ctrl+C` in a terminal tab is left free to send an interrupt (0x03) to the device). Right-click in the terminal to paste; this only works on a connected tab. If the text contains a line break (each line would run as a command) or a control character such as `Ctrl+Z` (tabs excepted), a confirmation dialog shows it before anything is sent, with Cancel as the default. There is no keyboard shortcut for paste.
 - **SNMP GET / WALK** — v1/v2c/v3 with USM; fetch or walk arbitrary OIDs, export results as CSV / JSON / text
 - **Port checker** — checks whether a port on this PC is free (Tools → ポートチェッカー). It attempts a real bind, and when the port is taken it identifies the owning process via `netstat` and `tasklist`. Meant for troubleshooting why a receiving server (Syslog, TFTP, SNMP Trap, …) will not start. It is not a port scanner for remote devices.
 - **Settings** — terminal colors and font, SFTP client behavior, and the startup update check (Tools → 設定)

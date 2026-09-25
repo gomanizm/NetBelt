@@ -3,7 +3,11 @@
 どちらも Qt の既定動作がそのまま露出していた。
 
   ドロップ  : 落としたテキストが画面へ直接挿入され、機器は何も受け取って
-              いないのに入力済みに見える（実測で確認）。
+              いないのに入力済みに見える（実測で確認）。その後、落とした
+              テキストを機器へ送るように変えたが、選択範囲をうっかり
+              ドラッグしただけで改行ごと送られ、各行が実行される誤操作の
+              元になった（利用者報告）。いまはドロップを受け付けない
+              （2026-09-17 の利用者判断。他のアプリからのドロップも止める）。
   Ctrl+ホイール: QTextEdit の組込みズームが働き、config へ保存されず、
               6〜32pt の制限も受けず、設定を再適用すると失われる。
 """
@@ -40,11 +44,36 @@ class TerminalDropTest(unittest.TestCase):
         terminal.key_pressed.disconnect()
         return sent
 
-    def test_dropped_text_goes_to_the_device(self):
-        """落としたテキストは機器へ送られること。"""
+    def test_dropped_text_is_not_sent_to_the_device(self):
+        """落としたテキストを機器へ送らないこと（接続中でも）。"""
         w, terminal = self._terminal()
-        sent = self._drop(terminal, "show version")
-        self.assertEqual("".join(sent), "show version")
+        sent = self._drop(terminal, "show version\nreload\n")
+        self.assertEqual(sent, [], "落としたテキストが機器へ送られた")
+
+    def test_the_terminal_refuses_drops(self):
+        """ドラッグが入ってきても受け取らないこと（落とす先にならない）。"""
+        from PyQt6.QtCore import QMimeData, QPoint, QPointF, Qt
+        from PyQt6.QtGui import QDragEnterEvent, QDropEvent
+        from PyQt6.QtWidgets import QApplication
+        w, terminal = self._terminal()
+        self.assertFalse(terminal.acceptDrops(), "ドロップを受け付ける設定のまま")
+        mime = QMimeData()
+        mime.setText("show clock\nreload\n")
+        actions = Qt.DropAction.CopyAction | Qt.DropAction.MoveAction
+        sent = []
+        terminal.key_pressed.connect(sent.append)
+
+        enter = QDragEnterEvent(QPoint(20, 10), actions, mime,
+                                Qt.MouseButton.LeftButton,
+                                Qt.KeyboardModifier.NoModifier)
+        QApplication.sendEvent(terminal.viewport(), enter)
+        drop = QDropEvent(QPointF(20, 10), actions, mime,
+                          Qt.MouseButton.LeftButton,
+                          Qt.KeyboardModifier.NoModifier)
+        QApplication.sendEvent(terminal.viewport(), drop)
+
+        self.assertFalse(enter.isAccepted(), "ドラッグを受け入れた")
+        self.assertEqual(sent, [], "ドロップで機器へ送られた")
 
     def test_dropped_text_is_not_written_straight_to_the_screen(self):
         """機器を経由せず画面へ書かないこと。
@@ -65,12 +94,6 @@ class TerminalDropTest(unittest.TestCase):
         sent = self._drop(terminal, "show version")
         self.assertEqual(sent, [])
         self.assertEqual(terminal.toPlainText(), before)
-
-    def test_newlines_in_a_drop_are_sent_as_carriage_returns(self):
-        """複数行を落としたとき、改行は端末と同じ CR で送ること。"""
-        w, terminal = self._terminal()
-        sent = self._drop(terminal, "conf t\nhostname R1\n")
-        self.assertEqual("".join(sent), "conf t\rhostname R1\r")
 
 
 class TerminalWheelTest(unittest.TestCase):

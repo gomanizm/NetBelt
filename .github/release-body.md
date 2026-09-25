@@ -16,14 +16,17 @@ ZIP 内の `THIRD-PARTY-NOTICES.txt` を参照してください。
 
 ### 📦 パッケージ内容
 - `NetBelt.exe` - アプリケーション本体
+- `updater.bat` - 自動更新が使うスクリプト（削除しないでください）
 - `README.txt` - 使い方ガイド
 - `LICENSE.txt` - NetBelt のライセンス（GPL-3.0）
 - `THIRD-PARTY-NOTICES.txt` - 同梱した第三者パッケージのライセンス表示
 - `CHANGELOG.txt` - この版で変わったこと
-- `.sha256` - ZIP のチェックサム。自動更新がダウンロード後に照合し、
-  一致しなければ更新を中止します（破損の検知が目的で、GitHub 自体が
-  侵害された場合の改ざんは検知できません）
 - `mibs/` - MIB ファイルの配置先（既定では空。README を参照）
+
+ZIP のチェックサムは ZIP の中ではなく、本リリースに別添えの
+`NetBelt-{{TAG}}-Windows-Portable.zip.sha256` です。自動更新がダウンロード後に
+照合し、一致しなければ更新を中止します（破損の検知が目的で、GitHub 自体が
+侵害された場合の改ざんは検知できません）。
 
 ### 🚀 インストール方法
 1. ZIPファイルをダウンロード

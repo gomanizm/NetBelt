@@ -201,9 +201,29 @@ class LogSaveProgressDialog(QDialog):
     def exec(self) -> bool:
         """
         ダイアログを表示して保存処理を実行
-        
+
         Returns:
             bool: 保存が成功した場合True
         """
         result = super().exec()
         return self._success
+
+    def release(self) -> None:
+        """使い終わったダイアログを手放す
+
+        親（端末）はアプリと同じ寿命なので、閉じただけでは保存のたびに
+        子として積み上がる。ただしワーカーを持ったまま捨てると、実行中の
+        QThread への参照が消えてプロセスごと落ちる。成功で閉じた直後も
+        run() は戻り切っていない（完了の通知は run() の中から出る）ので、
+        終わっていなければ reject() と同じく預けてから捨てる。
+        """
+        if self.worker is not None and not self.worker.isFinished():
+            # 捨てたダイアログへ通知が届かないよう切り離してから手放す
+            try:
+                self.worker.progress.disconnect(self._on_progress)
+                self.worker.finished.disconnect(self._on_finished)
+            except TypeError:
+                pass    # すでに切れている
+            _abandon_worker(self.worker)
+        self.setParent(None)
+        self.deleteLater()

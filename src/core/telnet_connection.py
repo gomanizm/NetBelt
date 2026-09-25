@@ -4,7 +4,10 @@ import socket
 import threading
 import time
 from typing import Optional
-from PyQt6.QtCore import QObject, pyqtSignal
+from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
+
+from .send_backpressure import DrainWatcher, socket_writable, wait_writable
+from .sockets import tcp_port_number
 
 
 class TelnetConnection(QObject):
@@ -15,6 +18,9 @@ class TelnetConnection(QObject):
     connected = pyqtSignal()  # 接続成功
     disconnected = pyqtSignal()  # 切断
     error_occurred = pyqtSignal(str)  # エラー発生
+    # 待たずに書けなかったソケットが、また書けるようになった（端末の
+    # resume_send_queue へ繋ぐ）。見張りのスレッドから出すのでキュー接続で届く
+    send_drained = pyqtSignal()
     
     def __init__(self, host: str, port: int, username: str = "", password: str = "", 
                  parent=None):
@@ -42,7 +48,51 @@ class TelnetConnection(QObject):
         self.is_connected = False
         self._read_thread: Optional[threading.Thread] = None
         self._stop_reading = False
-    
+        # dispose() 済み（このオブジェクトは捨てられた）ことを覚えておく印。
+        # _stop_reading と違い connect() の入口で戻さないので、接続スレッドが
+        # 動き出す前に着地した dispose() でも消えない（SSH・シリアルと同じ）
+        self._disposed = False
+        # 画面の描き待ちが多すぎる間、受信を止めておくための関所
+        # （TerminalWidget.output_gate。set_read_gate で受け取る）
+        self._read_gate = None
+        # ソケットへの書き込み（送信と交渉の応答）を直列にする錠。受信
+        # スレッドの応答が、送っている区切りの途中へ割り込んで分かれないように。
+        # GUI スレッドはこの錠を待たない（_write_pending）
+        self._write_lock = threading.Lock()
+        # 送信の背圧（has_pending_sends）。接続が成立したときに、その
+        # ソケットに束縛して作る
+        self._drain_watcher: Optional[DrainWatcher] = None
+        # 送る列: 交渉の応答（_out_replies）と、渡された送信（_out_data）のうち、
+        # まだソケットへ書いていない分。応答を先に書く。錠が取れない・待たずに
+        # 書けないときはここに残し、書けるようになったら（send_drained）
+        # GUI スレッドで書き出す。_out_lock は列を触る間だけ持つ
+        self._out_replies = bytearray()
+        self._out_data = bytearray()
+        self._out_lock = threading.Lock()
+        self.send_drained.connect(self._write_pending_when_drained)
+
+    def set_read_gate(self, gate) -> None:
+        """受信を止める合図（threading.Event）を受け取る
+
+        set されている間だけソケットから読む。閉じている間は読まないので
+        OS の受信バッファが埋まり、TCP のウィンドウが閉じて機器側が送るのを
+        待つ。捨てずに待たせるので、記録には全量が残る。
+        """
+        self._read_gate = gate
+
+    def _wait_while_gated(self) -> bool:
+        """受信を止められていれば少し待つ。待ったなら True
+
+        待ちは短く区切る。止められている間も、停止（_stop_reading）や
+        切断に気づけるようにするため。
+        """
+        gate = self._read_gate
+        if gate is None or gate.is_set():
+            return False
+        gate.wait(0.05)
+        return True
+
+
     def connect(self) -> bool:
         """
         Telnet接続を開始
@@ -51,6 +101,26 @@ class TelnetConnection(QObject):
             bool: 接続成功時True
         """
         try:
+            if self._disposed:
+                # 接続スレッドが動き出す前にタブが閉じられ、dispose() が先に
+                # 走った。ここで印を無視して進むと、TCP は最後まで張られる
+                # のに参照しているものが誰もいない状態になり、閉じる経路が
+                # 無いまま機器の vty 枠を掴んだままになる
+                return False
+
+            # 手編集の config.json などで "23" と文字列になっていると、
+            # socket.connect は原因の分からない英語の例外で失敗し、true は
+            # 1 番へ繋ぎに行く。SSH と同じ読み方で整数へそろえ、使えない値
+            # なら機器へは何も繋がずに止める
+            port = tcp_port_number(self.port)
+            if port is None:
+                self.error_occurred.emit(
+                    "ポート番号 %r は使えないため、接続しませんでした。"
+                    "機器の編集で 1〜65535 の整数を設定してください。"
+                    % (self.port,))
+                return False
+            self.port = port
+
             # ソケット作成
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.socket.settimeout(10)
@@ -60,6 +130,13 @@ class TelnetConnection(QObject):
             
             # タイムアウトを短く設定（ノンブロッキング読み取り用）
             self.socket.settimeout(0.1)
+            
+            # 背圧の見張りは、このソケットに束縛する（後の接続のソケットを見ない）
+            sock = self.socket
+            self._drop_pending()
+            self._drain_watcher = DrainWatcher(
+                lambda: self._send_backlogged(sock), self._announce_drained,
+                wait=lambda: wait_writable(sock, 0.05))
             
             self.is_connected = True
             self.connected.emit()
@@ -92,9 +169,23 @@ class TelnetConnection(QObject):
 
         機器側都合の切断やエラーを受けたあとの後始末で使う。ここで
         disconnected を出すと、いま処理中の切断処理が再入する。
+
+        これを呼んだあとの connect() は、何もせず False を返す。呼び出し元
+        （MainWindow._close_connection / _dispose_connection）は dispose() の
+        前に接続辞書からこのオブジェクトを外しており、以後この接続を使う人は
+        いないため。同じオブジェクトで繋ぎ直す場合は disconnect() を使う。
         """
+        self._disposed = True
         self._stop_reading = True
         self.is_connected = False
+
+        # 送信の背圧の見張りを止める。相手が読まないまま詰まっていても、
+        # ここで終わる（以後は send_drained を出さない）
+        watcher, self._drain_watcher = self._drain_watcher, None
+        if watcher is not None:
+            watcher.stop()
+        # 書き残しは捨てる（繋ぎ直した先へ古い残りを書かない）
+        self._drop_pending()
 
         if self._read_thread and self._read_thread.is_alive():
             self._read_thread.join(timeout=2)
@@ -107,8 +198,12 @@ class TelnetConnection(QObject):
             self.socket = None
 
     def disconnect(self):
-        """Telnet接続を切断"""
+        """Telnet接続を切断（同じオブジェクトで繋ぎ直せる）"""
         self.dispose()
+        # dispose() の印は「このオブジェクトは捨てた」意味なので、利用者が
+        # 明示的に切断しただけの場合は消す。残すと次の connect() が
+        # 取り消し扱いになり、繋ぎ直せなくなる
+        self._disposed = False
         self.disconnected.emit()
     
     def send_command(self, command: str):
@@ -131,18 +226,151 @@ class TelnetConnection(QObject):
         try:
             # キー入力をそのまま送信
             # Enterキーは'\r'として送られてくる
-            # send は送れたバイト数を返すだけで、渡した全部を送ったとは
-            # 限らない。貼り付けをまとめて渡すようになったので、
-            # 残りを送り切る sendall を使う。
-            self.socket.sendall(command.encode('utf-8'))
+            # 送る列の後ろへ足してから書く（書き残しを後の打鍵が追い越さない）。
+            # 背圧の判定のあとで受信スレッドが錠を取って書けずにいても、
+            # GUI スレッドはその錠を待たない（待つと GUI 全体が固まり、
+            # 切断の操作もできなくなる）。書けなかった分は列に残る
+            data = command.encode('utf-8')
+            with self._out_lock:
+                self._out_data += data
+            self._write_pending()
         except socket.error as e:
-            self.error_occurred.emit(f"送信エラー: {str(e)}")
-            if self.is_connected:
-                self.is_connected = False
-                self.disconnected.emit()
+            self._report_send_error(e)
         except Exception as e:
             self.error_occurred.emit(f"送信エラー: {str(e)}")
-    
+
+    def _report_send_error(self, e):
+        """送信の失敗を知らせて切断として扱う（GUI スレッドから呼ぶ）"""
+        self.error_occurred.emit(f"送信エラー: {str(e)}")
+        if self.is_connected:
+            self.is_connected = False
+            self.disconnected.emit()
+
+    # 1 回の send に渡す上限
+    WRITE_PIECE = 16384
+    # 書き出せずに溜めておく交渉の応答の上限（超えたら受信を止める）。
+    # 普通の機器の応答は数十バイトで収まる
+    MAX_PENDING_REPLIES = 64 * 1024
+
+    def _write_pending(self) -> bool:
+        """送る列を、待たずに書ける分だけ書く。書き残したら True（見張りが知らせる）
+
+        書き込みの錠は待たずに取る。取れなければ書かない（いま書いている側が
+        続けて書くか、錠が空いたら見張りが知らせる）。錠を持っている間も
+        ソケットを待たない（書ける間だけ書く）。相手が本当に閉じたなどの
+        失敗は OSError のまま投げる（列は捨てる）。
+        """
+        while True:
+            # 見張りを先に読む。後始末（dispose）は is_connected を先に
+            # 落とすので、見張りが無いのに接続中と読み違えない
+            watcher, sock = self._drain_watcher, self.socket
+            if not self.is_connected or sock is None:
+                self._drop_pending()
+                return False
+            if not (self._out_replies or self._out_data):
+                return False
+            if watcher is None:
+                # 見張りが無い（接続の手順を通っていない）: 待たずに書けるかを
+                # 調べられないので、これまでどおり全部を sendall で書く
+                with self._write_lock:
+                    with self._out_lock:
+                        data = bytes(self._out_replies + self._out_data)
+                        self._out_replies, self._out_data = bytearray(), bytearray()
+                    sock.sendall(data)
+                return False
+            if self._write_lock.acquire(blocking=False):
+                try:
+                    self._write_nowait(sock)
+                except OSError:
+                    self._drop_pending()   # どこへ届いたか分からない残りは書かない
+                    raise
+                finally:
+                    self._write_lock.release()
+                if not (self._out_replies or self._out_data):
+                    return False
+            if watcher.check():
+                return True
+            # 錠が空いて書けるようになった。もう一度書く
+
+    def _write_nowait(self, sock):
+        """錠を持った状態で、ソケットへ待たずに書ける間だけ送る列を書く
+
+        応答を先に書く。応答が残っている間は送信を書かないので、途中まで
+        書いた IAC の列の間へデータが入らない。後から積まれた応答は、書き
+        残した送信の前へ出る（送信は UTF-8 なので 0xFF を含まず、データの
+        どのバイトの間へ IAC の列が入っても相手は読み分けられる）。
+        """
+        while True:
+            with self._out_lock:
+                buf = self._out_replies or self._out_data
+                head = bytes(buf[:self.WRITE_PIECE])
+            if not head or not socket_writable(sock):
+                return
+            try:
+                # send は送れたバイト数を返す。その分だけ列を進める
+                sent = sock.send(head)
+            except socket.timeout:
+                return   # 書けると出たのに入らなかった。残りは見張りに任せる
+            with self._out_lock:
+                del buf[:sent]
+
+    def _drop_pending(self):
+        """送る列を捨てる（切断・後始末・繋ぎ直し）"""
+        with self._out_lock:
+            self._out_replies, self._out_data = bytearray(), bytearray()
+
+    @pyqtSlot()
+    def _write_pending_when_drained(self):
+        """見張りが書けるようになったと知らせた（GUI スレッドで受ける）
+
+        最後の区切りが書き切れず、端末に渡す物が無くなっていると、端末は
+        続きを呼ばない。送る列の残りはここで書く。
+        """
+        try:
+            self._write_pending()
+        except OSError as e:
+            self._report_send_error(e)
+
+    def has_pending_sends(self) -> bool:
+        """いま区切りを渡されても、待たずには書けないか（端末の set_send_backlog 用）
+
+        相手の読むのが遅いと OS の送信バッファが空かず、sendall は
+        ソケットの時間切れ（0.1 秒）で途中までしか送れずに失敗する。どこまで
+        送れたかは分からないので、切断として扱うしかなかった。先に送る列を
+        書き、それが残るか、待たずに書けない間は端末に次を渡させず、未送信の
+        分を端末の列に残す。書けるようになったら send_drained で知らせる。
+        """
+        watcher = self._drain_watcher
+        if watcher is None:
+            return False
+        try:
+            if self._write_pending():
+                return True
+        except OSError as e:
+            self._report_send_error(e)
+            return False
+        return watcher.check()
+
+    def _send_backlogged(self, sock) -> bool:
+        """sock へ待たずに書けないなら True（見張りの判定）
+
+        錠が取られている（ほかのスレッドが書いている）間も True にする。
+        空いたら知らせ、GUI スレッドが送る列の続きを書く。
+        閉じたとき・判定できないときは False（送らせれば送信エラーとして知らせる）。
+        """
+        if not self.is_connected:
+            return False
+        if self._write_lock.locked():
+            return True
+        return not socket_writable(sock)
+
+    def _announce_drained(self):
+        """見張りのスレッドから、また書けるようになったことを知らせる"""
+        try:
+            self.send_drained.emit()
+        except RuntimeError:
+            pass   # 捨てられた接続（C++ 側が消えている）
+
     def _read_output(self):
         """バックグラウンドで出力を読み取る"""
         # UTF-8 の途中で切れた分はデコーダの中に残り、次の受信と繋がる。
@@ -153,6 +381,14 @@ class TelnetConnection(QObject):
 
         while not self._stop_reading and self.is_connected:
             try:
+                if self._wait_while_gated():
+                    continue
+                if len(self._out_replies) > self.MAX_PENDING_REPLIES:
+                    # 書き出せない交渉の応答が溜まりすぎた（相手が読まずに
+                    # 交渉だけを送り続けている）。書き出されるまで受信を止め、
+                    # TCP で相手を待たせる。錠は持たないので送信・切断は止まらない
+                    time.sleep(0.05)
+                    continue
                 if self.socket:
                     try:
                         data = self.socket.recv(4096)
@@ -357,17 +593,26 @@ class TelnetConnection(QObject):
         交渉の応答は3バイトで1つの意味を持つ。send は送れたバイト数を
         返すだけなので、途中までしか出ないと相手から見て交渉が成立せず、
         残りは次の送信にくっついて本文として届く（WONT と DONT が
-        ff ff ＝エスケープされた 0xFF 1バイトに化ける）。send_command と
-        揃えて sendall で送り切る。
+        ff ff ＝エスケープされた 0xFF 1バイトに化ける）。送れたバイト数で
+        位置を進めて送り切る。
+
+        受信スレッド（唯一の読み手）から呼ばれるので、書けるまで待たない。
+        貼り付けの途中などで送信バッファが埋まっているときに送り切るまで
+        送り直すと、その間は受信が止まる。出力を書き終えてから次の入力を
+        読む相手とは互いの受信を待ち合い、接続中のまま送受信が止まった。
+        応答は送る列（送信の持ち越しより先）へ積み、待たずに書ける分だけ
+        ここで書く。残りは書けるようになったら GUI スレッドが書く。
 
         Args:
             command: 送信するコマンド
         """
         if self.socket and self.is_connected:
+            with self._out_lock:
+                self._out_replies += command
             try:
-                self.socket.sendall(command)
+                self._write_pending()
             except OSError as e:
                 # 裸の except は KeyboardInterrupt まで飲む。送信の失敗は
-                # OSError（socket.error / socket.timeout を含む）だけを
-                # 捕まえ、黙って落とさず操作者へ知らせる。
+                # OSError（socket.error を含む。書けないだけなら列に残る）
+                # だけを捕まえ、黙って落とさず操作者へ知らせる。
                 self.error_occurred.emit(f"Telnet交渉の応答を送信できませんでした: {str(e)}")
