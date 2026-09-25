@@ -298,6 +298,18 @@ class FTPServerManager(QObject):
         class _Handler(FTPHandler):
             dtp_handler = _ProgressDTP
 
+            def pre_process_command(self, line, cmd, arg):
+                # REST の位置を 0 に戻すのは pyftpdlib の ftp_STOR / ftp_RETR の
+                # 先頭だけ。権限で断る 550（ftp_* を呼ばずに戻る）や APPE / STOU
+                # の 450 は位置を残し、次の REST 無しの STOR / RETR が途中から
+                # 書く・返していた（実測）。REST は直後の転送コマンドにだけ効く
+                # （RFC 959）ので、転送コマンドを終えたら結果によらず戻す
+                try:
+                    return super().pre_process_command(line, cmd, arg)
+                finally:
+                    if cmd in ("STOR", "APPE", "STOU", "RETR"):
+                        self._restart_position = 0
+
             def ftp_RETR(self, file):
                 result = super().ftp_RETR(file)  # 成功時はftpパスを返す
                 if result is not None:
