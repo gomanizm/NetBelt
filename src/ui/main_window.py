@@ -613,8 +613,11 @@ class MainWindow(QMainWindow):
             # マクロの実行状態は古い名前のまま残り、接続先リストの「ツール」は
             # 新しい名前で引くので、そのセッションのマクロやキープアライブを
             # 止められなくなる。名前以外の変更はそのまま通す
-            session_open = (self.terminal_widget.has_terminal(old_device_name)
-                            or old_device_name in self.connections)
+            # （接続先が違えば同名の別の機器＝手編集の config のセッションなので通す）
+            session_open = ((self.terminal_widget.has_terminal(old_device_name)
+                             or old_device_name in self.connections)
+                            and not self._session_target_conflict(
+                                old_device_name, device_data))
             if new_name != old_device_name and session_open:
                 QMessageBox.warning(
                     self, "機器の編集",
