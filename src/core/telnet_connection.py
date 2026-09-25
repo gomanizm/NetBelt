@@ -615,4 +615,10 @@ class TelnetConnection(QObject):
                 # 裸の except は KeyboardInterrupt まで飲む。送信の失敗は
                 # OSError（socket.error を含む。書けないだけなら列に残る）
                 # だけを捕まえ、黙って落とさず操作者へ知らせる。
-                self.error_occurred.emit(f"Telnet交渉の応答を送信できませんでした: {str(e)}")
+                # 相手が RST で消えたあとは、同じ受信に入っていた交渉の応答を
+                # 書くたびに同じ失敗になる（1 回の受信で最大約 1,365 件）。
+                # 接続を落としてから 1 回だけ知らせる。以後の応答は書かず、
+                # 受信ループも次の周で抜ける
+                if self.is_connected:
+                    self.is_connected = False
+                    self.error_occurred.emit(f"Telnet交渉の応答を送信できませんでした: {str(e)}")
