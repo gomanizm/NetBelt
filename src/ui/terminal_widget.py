@@ -772,6 +772,9 @@ class TerminalWidget(QWidget):
     # ここまで減らしてから再開する。上限の直下で開け閉めを繰り返さない
     PENDING_LOW_WATER = 2 * 1024 * 1024
 
+    # アプリを閉じるとき、記録先が詰まった記録の書き終わりを待つ上限（秒）
+    LOG_FINISH_WAIT = 5.0
+
     # タブが閉じられたときのシグナル（機器名を送信）
     tab_closed = pyqtSignal(str)
     # 表示中のタブが変わったことを知らせる（機器名。タブが無ければ空文字）。
@@ -1728,6 +1731,25 @@ class TerminalWidget(QWidget):
             self._log_pending_on_close(device_name)
             if device_name in self._log_files:
                 self._stop_log_recording_for(device_name)
+        # 記録先が詰まっていて閉じ終わらない記録は、合わせて LOG_FINISH_WAIT
+        # 秒まで待つ。書き切れなければ、途中までかもしれないと知らせて閉じる
+        # （利用者の決定。書き切るまで待つと、閉じられない時間が続きうる）
+        if not self._closing_writers:
+            return
+        import time
+        from PyQt6.QtWidgets import QMessageBox
+        deadline = time.monotonic() + self.LOG_FINISH_WAIT
+        for _, handle, _, _ in list(self._closing_writers):
+            handle.wait(max(0.0, deadline - time.monotonic()))
+        self._check_log_writers()
+        left, self._closing_writers = self._closing_writers, []
+        if left:
+            QMessageBox.warning(
+                self, "ログ記録",
+                "記録先が応答しないため、次のログ記録を書き終えられないまま"
+                "閉じます:\n%s\n\n記録が途中までの可能性があります。"
+                % "\n".join("%s: %s" % (name, path)
+                            for name, _, path, _ in left))
 
     def queue_output(self, device_name: str, text: str) -> None:
         """受信した出力を溜め、イベントループへ戻ってから描く
