@@ -2131,7 +2131,13 @@ class MainWindow(QMainWindow):
         
         # マクロを実行
         self.macro_manager.start_command_list(device_name, commands, 1000)
-        self.status_bar.showMessage(f"マクロ '{macro_name}' を実行中...")
+        # 「ツール」を開いている間に切れていると、送り先が無く最初の行で
+        # 止まる（macro_error は誰も聞いていない）。始まったときだけ実行中と出す
+        if self.macro_manager.is_command_list_active(device_name):
+            self.status_bar.showMessage(f"マクロ '{macro_name}' を実行中...")
+        else:
+            self.status_bar.showMessage(
+                f"{device_name}: 接続が切れているためマクロを実行できません")
     
     def _on_macro_settings_from_context(self, device_name: str):
         """
