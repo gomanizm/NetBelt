@@ -405,8 +405,9 @@ class Screen(object):
                 # 時点で折り返しが無効なら捨てて右端へ重ねる
                 self._pending_wrap = False
             if self._pending_wrap:      # 右端の 1 文字あとの折り返し
+                wrap_col = self.cursor_col
                 self.cursor_col = 0
-                self._linefeed(from_wrap=True)
+                self._linefeed(from_wrap=True, wrap_col=wrap_col)
                 from_wrap = True
             if width == 2 and self.cursor_col + 1 >= self.cols:
                 # 全角が右端の 1 セルに収まらない。xterm と同じく右端は
@@ -487,8 +488,9 @@ class Screen(object):
             if self._pending_wrap and not self.autowrap:
                 self._pending_wrap = False  # 戻した折り返し待ち (_print_chars)
             if self._pending_wrap:      # 右端の 1 文字あとの折り返し
+                wrap_col = self.cursor_col
                 self.cursor_col = 0
-                self._linefeed(from_wrap=True)
+                self._linefeed(from_wrap=True, wrap_col=wrap_col)
                 entry_row = None        # 行が変わった (巻き上げも含む)
             elif self.cursor_col == 0 and self.cursor_row:
                 # 行頭から書き始めた。前の行の古い印を落とす (_print_chars)
@@ -577,7 +579,8 @@ class Screen(object):
             self._charset = "("
         # BEL・NUL などは何もしない
 
-    def _linefeed(self, from_wrap=False):
+    def _linefeed(self, from_wrap=False, wrap_col=None):
+        """改行する。wrap_col は折り返し待ちから折り返したときの、待っていた桁。"""
         self._pending_wrap = False
         self._printed_at_last_col = False       # 行が変わる (_join_previous)
         # 折り返しで送られたのか、機器が改行を送ったのかを覚える
@@ -590,7 +593,16 @@ class Screen(object):
             # おくと 1 行の途中へ古い文字や空白の塊が差し込まれる。
             # 「行の長さ = 折り返し位置」という前提をここで回復する。
             # 機器が送った改行 (from_wrap=False) では触らない。
-            del self.lines[self.cursor_row][self.cols:]
+            line = self.lines[self.cursor_row]
+            end = self.cols
+            # 復元で戻した待ち (右端で保存 → 窓を広げる → 復元) は右端より
+            # 手前で立つ。その右が広げたときの埋め草の空白だけなら、待って
+            # いた桁の次で切る。残すと 1 本の行の途中へ空白の塊が入る。
+            # 広げたあとに受信した文字が右にあれば消さない (今までどおり)
+            if (wrap_col is not None and wrap_col + 1 < end
+                    and _is_blank(line[wrap_col + 1:end])):
+                end = wrap_col + 1
+            del line[end:]
         if self.cursor_row == self.scroll_bottom:
             self._scroll_up(1, from_wrap=from_wrap)
         elif self.cursor_row + 1 < self.rows:
