@@ -1,5 +1,6 @@
 """SFTP サーバー実装"""
 import contextlib
+import logging
 import os
 import socket
 import threading
@@ -72,6 +73,30 @@ _diag_log = _LogLimiter()
 def _log_limited(kind, text):
     """要求ごとに出る診断行を出す（_LogLimiter で種類ごとに間引く）"""
     _diag_log.log(kind, text)
+
+
+# サーバー側の Transport だけが使うロガー名（_handle_client で付け替える）。
+# 既定の paramiko.transport のままだと、バナーの前に切られるたびに
+# トレースバックが 1 行ずつ root へ上がり、logging.lastResort が stderr
+# （exe では上限の無いログファイル）へ書く。認証なしの接続→即切断だけで
+# 1 接続あたり約 1.8KB 出た。SSH クライアント側のロガーは変えない
+_PARAMIKO_SERVER_LOG = "paramiko.transport.sftp_server"
+
+
+class _LimitedLogHandler(logging.Handler):
+    """サーバー側の paramiko の記録を _log_limited へ渡す"""
+
+    def emit(self, record):
+        try:
+            _log_limited("paramiko", "[SFTP Server] paramiko %s: %s"
+                         % (record.levelname, record.getMessage()))
+        except Exception:
+            self.handleError(record)
+
+
+_paramiko_server_logger = logging.getLogger(_PARAMIKO_SERVER_LOG)
+_paramiko_server_logger.addHandler(_LimitedLogHandler(logging.WARNING))
+_paramiko_server_logger.propagate = False
 
 
 class _OpenWriters:
@@ -1011,6 +1036,8 @@ class SFTPServerManager(QObject):
         try:
             # SSHトランスポートを作成
             transport = paramiko.Transport(client_socket)
+            # サーバー側のログは間引き口へ流す（_PARAMIKO_SERVER_LOG を参照）
+            transport.set_log_channel(_PARAMIKO_SERVER_LOG)
             # 認証前の接続に期限を持たせる。黙り込んだ相手が枠を占有し
             # 続けると、上限を入れても正規の接続が入れなくなる
             transport.banner_timeout = self.banner_timeout_seconds
