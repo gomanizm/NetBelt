@@ -199,6 +199,10 @@ class SNMPPanel(QWidget):
         # 後者を使う。保存時の入力欄を使うと、A の結果が B の記録になる
         self._request_host = ""
         self._result_host = ""
+        # ポートも同じ持ち方をする。同じホストの別ポートから採った結果を、
+        # 書き出したファイルで区別できるようにする
+        self._request_port = None
+        self._result_port = None
         
         self._init_ui()
         
@@ -689,6 +693,7 @@ class SNMPPanel(QWidget):
         if not self.snmp_manager.snmp_get(host, oids, **params):
             return
         self._request_host = host
+        self._request_port = params['port']
         self.status_label.setText("GET実行中...")
         self._show_stop_button(True)
     
@@ -712,6 +717,7 @@ class SNMPPanel(QWidget):
         if not self.snmp_manager.snmp_walk(host, oid, **params):
             return
         self._request_host = host
+        self._request_port = params['port']
         self.status_label.setText("WALK実行中...")
         self._show_stop_button(True)
 
@@ -791,13 +797,14 @@ class SNMPPanel(QWidget):
 
     def _on_export_clicked(self):
         """GET/WALK 結果をエクスポート（Trap と同じく txt/csv/json）"""
-        # 行・ホスト・途中までの理由は、ダイアログを開く前にまとめて固定し、
+        # 行・ホスト・ポート・途中までの理由は、ダイアログを開く前にまとめて固定し、
         # 書き出しへ引数で渡す。モーダルダイアログはネストしたイベント
         # ループで queued シグナルを処理するので、開いている間に次の WALK が
         # 完走すると self は次の結果に変わる。行だけ先に取ってホストと理由を
         # 後から self で読むと、前の途中までの行に「完走」と次のホストが付く
         results = self.result_model.get_all_results()
         host = self._result_host
+        port = self._result_port
         reason = self._last_partial_reason
         if not results:
             QMessageBox.information(self, "情報", "エクスポートするデータがありません。")
@@ -827,11 +834,14 @@ class SNMPPanel(QWidget):
             # _export_format と同じ）
             fmt = self._export_format(file_path)
             if fmt == "csv":
-                self._export_results_to_csv(file_path, results, host, reason)
+                self._export_results_to_csv(file_path, results, host, reason,
+                                            port=port)
             elif fmt == "json":
-                self._export_results_to_json(file_path, results, host, reason)
+                self._export_results_to_json(file_path, results, host, reason,
+                                             port=port)
             else:
-                self._export_results_to_txt(file_path, results, host, reason)
+                self._export_results_to_txt(file_path, results, host, reason,
+                                            port=port)
             # 書き終えてから覚える（取り消し・失敗では変えない）
             save_defaults.remember(self.config_manager, file_path)
             QMessageBox.information(self, "成功", "SNMP結果をエクスポートしました:\n" + file_path)
@@ -924,11 +934,12 @@ class SNMPPanel(QWidget):
         return "'" + text
 
     def _export_results_to_csv(self, file_path: str, results, host: str,
-                               reason):
+                               reason, port=None):
         """CSV形式で GET/WALK 結果を書き出す
 
-        host / reason は呼び出し側が結果と同時に固定した値。ここで self を
-        読むと、ダイアログを開いている間に届いた次の結果のものになる
+        host / reason / port は呼び出し側が結果と同時に固定した値。ここで
+        self を読むと、ダイアログを開いている間に届いた次の結果のものになる。
+        port が None なら（渡されなければ）ポートの行は書かない
         """
         import csv
         # BOM 付き（utf-8-sig）。日本語版 Excel は BOM の無い UTF-8 の CSV を
@@ -946,18 +957,24 @@ class SNMPPanel(QWidget):
                 # "host"・TXT の「対象ホスト:」に当たるものが CSV だけ
                 # 抜けていて、ファイルを並べると取り違えても気づけなかった
                 f.write("# 対象ホスト: %s\r\n" % host)
+            if port is not None:
+                # 同じホストの別ポートから採った結果を区別できるよう、host
+                # とは別の行に残す（既定の 161 でも書く）
+                f.write("# 対象ポート: %d\r\n" % port)
             writer = csv.writer(f)
             writer.writerow(["OID", "Type", "Value"])
             for row in results:
                 writer.writerow([self._csv_safe(cell) for cell in row])
 
     def _export_results_to_json(self, file_path: str, results, host: str,
-                                reason):
-        """JSON形式で GET/WALK 結果を書き出す（host / reason は CSV と同じ）"""
+                                reason, port=None):
+        """JSON形式で GET/WALK 結果を書き出す（host / reason / port は CSV と同じ）"""
         import json
         data = {
             "exported_at": datetime.now().isoformat(),
             "host": host,
+            # ポートは host とは別のキー（host の意味は変えない）
+            **({"port": port} if port is not None else {}),
             "count": len(results),
             # 途中までの結果かどうか。機械で読む側が見落とさないよう明示する
             "complete": reason is None,
@@ -970,12 +987,14 @@ class SNMPPanel(QWidget):
             json.dump(data, f, ensure_ascii=False, indent=2)
 
     def _export_results_to_txt(self, file_path: str, results, host: str,
-                               reason):
-        """テキスト形式で GET/WALK 結果を書き出す（host / reason は CSV と同じ）"""
+                               reason, port=None):
+        """テキスト形式で GET/WALK 結果を書き出す（host / reason / port は CSV と同じ）"""
         with atomic_text_write(file_path, encoding="utf-8") as f:
             f.write("SNMP GET/WALK 結果\n")
             f.write("エクスポート日時: " + datetime.now().strftime("%Y-%m-%d %H:%M:%S") + "\n")
             f.write("対象ホスト: " + host + "\n")
+            if port is not None:
+                f.write("対象ポート: %d\n" % port)
             f.write("件数: " + str(len(results)) + "\n")
             if reason:
                 f.write("注意: 途中まで（%s のため中断。全部ではありません）\n" % reason)
@@ -1354,6 +1373,7 @@ class SNMPPanel(QWidget):
         rows = list(rows)
         self.result_model.set_results(rows)
         self._result_host = self._request_host
+        self._result_port = self._request_port
         self._partial_reason = None
         self._last_partial_reason = self.USER_CANCEL_REASON
         self.status_label.setText(
@@ -1365,8 +1385,9 @@ class SNMPPanel(QWidget):
         self._show_stop_button(False)
         if success:
             self.result_model.set_results(result)
-            # 表の結果がどのホストのものかを、要求時の値で固定する
+            # 表の結果がどのホスト・ポートのものかを、要求時の値で固定する
             self._result_host = self._request_host
+            self._result_port = self._request_port
             # 直前に「途中で切れた」と知らされていれば、そう書く。
             # 一度使ったら忘れる（次の完走に持ち越さない）
             reason = getattr(self, "_partial_reason", None)
