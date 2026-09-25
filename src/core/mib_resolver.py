@@ -612,6 +612,17 @@ class MIBResolver:
     _MIB_LOCAL_NAME = (_MIB_NAME + r'\s+(?:OBJECT\s+IDENTIFIER|OBJECT-TYPE'
                        r'|NOTIFICATION-TYPE|MODULE-IDENTITY'
                        r'|OBJECT-IDENTITY)\b')
+    # 前の定義を閉じる `}` と同じ行から始まる定義（実 MIB の DS3-MIB.my:
+    # `ds3Conformance 1 } ds3Compliances OBJECT`）。名前は行頭に錨で
+    # 留めてあるので、そのままでは拾えない（1.3.1 で v1.3.0 から後退した。
+    # 実測: ds3Compliances と、同じ書き方の MIB ではその配下が名前なし）。
+    # 錨を外すと語の途中や `FROM SNMPv2-TC` からの始め直しが戻り、正規
+    # 表現も重くなるので、この `}` の後ろにだけ改行を差し込んでから抽出
+    # する。起点は `}` だけで、全部大文字の語は _MIB_NAME と同じく弾く
+    _MIB_DEFINITION_AFTER_BRACE = (
+        r'\}(?=[ \t]*(?![A-Z][A-Z0-9-]*(?![\w-]))[\w-]+\s+'
+        r'(?:OBJECT\s+IDENTIFIER|OBJECT-TYPE|NOTIFICATION-TYPE'
+        r'|MODULE-IDENTITY|OBJECT-IDENTITY|TRAP-TYPE)\b)')
 
     @staticmethod
     def _blank_comments_and_strings(text: str) -> str:
@@ -823,6 +834,9 @@ class MIBResolver:
                 # __init__ を通さずに作った（検証用の __new__）ときの保険
                 local_names = self._module_local_names = {}
             for module, text in sections:
+                # `}` の直後から始まる定義を行頭へ。詳しくは
+                # _MIB_DEFINITION_AFTER_BRACE を見ること
+                text = re.sub(self._MIB_DEFINITION_AFTER_BRACE, '}\n', text)
                 local_names.setdefault(module, set()).update(
                     re.findall(self._MIB_LOCAL_NAME, text,
                                re.MULTILINE))
