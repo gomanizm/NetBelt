@@ -2374,10 +2374,18 @@ class MainWindow(QMainWindow):
         そのまま終了すると「表示メニューを押しても何も起きない」
         （実際には一度隠してから出し直している）ように見える。
         幅が無いものは隠れていると見なす。
+
+        表示中の窓では、隠れている間の sizes() がこのリストに 0 を返す。
+        そのまま判断すると、隠していただけのリストも既定幅で戻し、Qt が
+        覚えている幅（利用者が決めた幅）を上書きする。出した直後に
+        並べ直させ、覚えている幅を見てから決める。
         """
         sizes = self.main_splitter.sizes()
         hidden = self.device_tree.isHidden() or (sizes and sizes[0] < 40)
         self.device_tree.setVisible(hidden)
+        if hidden:
+            self.main_splitter.refresh()
+            sizes = self.main_splitter.sizes()
         if hidden and sizes and sizes[0] < 40:
             spare = max(sizes[1] - self.DEVICE_LIST_WIDTH, 100)
             self.main_splitter.setSizes(
