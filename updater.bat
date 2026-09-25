@@ -552,6 +552,13 @@ if errorlevel 1 goto :lock_busy
 set "PS_LOCK=!LOCK_DIR!"
 call :lock_is_stale
 if errorlevel 1 goto :lock_busy
+rem A run that stalled for over ten minutes while holding the take-over
+rem marker may have lost it to another run meanwhile. Only the current
+rem holder may grab the install marker: otherwise this run went on to
+rem reclaim and write its own marker, which the real holder then grabbed
+rem as stale, and two updates wrote the install folder at once.
+call :takeover_is_mine
+if errorlevel 1 goto :lock_busy
 ren "!LOCK_DIR!" "!LOCK_OLD_NAME!" 2>nul
 if not exist "!LOCK_OLD!" goto :lock_busy
 set "PS_LOCK=!LOCK_OLD!"
@@ -892,6 +899,15 @@ set "LOCK_OWNER="
 set /p LOCK_OWNER=<"!TAKEOVER_DIR!\holder.txt" 2>nul
 if "!LOCK_OWNER!"=="!STAMP!" rd /s /q "!TAKEOVER_DIR!" 2>nul
 exit /b 0
+
+rem errorlevel 0 while the take-over marker is still this run's. Without
+rem a holder.txt there is nothing to check, as in :release_takeover.
+:takeover_is_mine
+if not defined TAKEOVER_STAMPED exit /b 0
+set "LOCK_OWNER="
+(set /p LOCK_OWNER=<"!TAKEOVER_DIR!\holder.txt") 2>nul
+if "!LOCK_OWNER!"=="!STAMP!" exit /b 0
+exit /b 1
 
 REM ================================================================
 REM 目印が古い（＝異常終了の置き土産）かを見る（call で呼ぶ）
