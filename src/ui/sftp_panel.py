@@ -565,7 +565,13 @@ class SFTPPanel(QWidget):
             error_message: エラーメッセージ
         """
         self.progress_bar.setVisible(False)
-        self.status_label.setText(f"エラー: {error_message}")
+        if self._manager_is_live():
+            self.status_label.setText(f"エラー: {error_message}")
+        else:
+            # 畳んだあとに届いた失敗（ロック待ちだった転送など）。届く順は
+            # disconnected と前後するので、ここで書くと切断の表示が消える。
+            # 理由は下の警告で出す（_update_file_list の遅れた一覧と同じ扱い）
+            self.status_label.setText(self.DROPPED_TEXT)
         if self._closing:
             # 終了処理の途中。表示だけ残して戻る（_closing の説明を参照）
             return
