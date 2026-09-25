@@ -776,7 +776,9 @@ REM 別の更新の目印にも、利用者が置いたものにも当たらな�
 :release_lock_sweep
 set /a LOCK_PASS+=1
 set "LOCK_OWNER="
-set /p LOCK_OWNER=<"!LOCK_DIR!\holder.txt" 2>nul
+rem In parentheses: on the second pass the folder is usually gone, and
+rem a failed input redirection is reported before the trailing nul redirect.
+(set /p LOCK_OWNER=<"!LOCK_DIR!\holder.txt") 2>nul
 if "!LOCK_OWNER!"=="!STAMP!" rd /s /q "!LOCK_DIR!" 2>nul
 for /d %%o in ("!APP_DIR!NetBelt-update-lock.*.old") do call :release_lock_old "%%~fo"
 if !LOCK_PASS! lss 2 goto :release_lock_sweep
