@@ -13,8 +13,10 @@ Trap のバイト列を組み立てるヘルパもここに置く。複数のテ
 ModuleNotFoundError になる。conftest は pytest が必ず import できる。
 """
 import os
+import shutil
 import socket
 import sys
+import tempfile
 import threading
 
 import pytest
@@ -28,6 +30,57 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 _font_dir = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
 if os.path.isdir(_font_dir):
     os.environ.setdefault("QT_QPA_FONTDIR", _font_dir)
+
+
+# テストが作る一時フォルダは、セッションごとの 1 つのフォルダの中へ置き、
+# 終わりに丸ごと消す。mkdtemp の後始末を書いていないテストが多く（285 ファイル）、
+# 全件を 1 回流すと %TEMP% に 1,300〜1,700 個残っていた。MainWindow を作る
+# テストは、インストール済みの NetBelt と共用の %TEMP%\NetBeltUpdates にも
+# 触っていた（VersionManager.UPDATE_DIR は import の時点で決まるので、テストの
+# 収集より先に動く pytest_configure で切り替える）。
+# すでに %TEMP% にある物には触らない。止め損ねたスレッドや子プロセスが掴んで
+# いるファイルは消せずに残る（そのフォルダだけが残る）。
+_TEMP_VARS = ("TEMP", "TMP", "TMPDIR")
+_temp_session = None
+
+
+def _enter_temp_session():
+    """いまの一時フォルダの下に netbelt-tests-* を作り、以後の置き場にする。
+
+    子プロセスも同じ場所を使うよう、環境変数も向ける。戻り値は
+    _leave_temp_session に渡す。
+    """
+    path = tempfile.mkdtemp(prefix="netbelt-tests-")
+    state = {"dir": path, "tempdir": tempfile.tempdir,
+             "env": {key: os.environ.get(key) for key in _TEMP_VARS}}
+    for key in _TEMP_VARS:
+        os.environ[key] = path
+    tempfile.tempdir = path
+    return state
+
+
+def _leave_temp_session(state):
+    """_enter_temp_session の前へ戻し、作ったフォルダを中身ごと消す。"""
+    for key, value in state["env"].items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+    tempfile.tempdir = state["tempdir"]
+    shutil.rmtree(state["dir"], ignore_errors=True)
+
+
+def pytest_configure(config):
+    global _temp_session
+    if _temp_session is None:
+        _temp_session = _enter_temp_session()
+
+
+def pytest_unconfigure(config):
+    global _temp_session
+    if _temp_session is not None:
+        state, _temp_session = _temp_session, None
+        _leave_temp_session(state)
 
 
 @pytest.fixture(scope="session", autouse=True)
