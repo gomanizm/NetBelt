@@ -189,6 +189,19 @@ def _has_utf8_bom(path):
         return f.read(len(codecs.BOM_UTF8)) == codecs.BOM_UTF8
 
 
+def _hashed_names_need_own_loader(path):
+    """ハッシュ化名（|1|salt|hash）の行があり、自前のローダで読むべきか。
+
+    バイト列に "|1|" があるかだけを見る。コメントや注釈欄に偶然含まれて
+    いても、自前のローダで読むだけなので害は無い。CR だけの改行を含む
+    ファイルは今までどおり paramiko に任せる。自前のローダは LF で行を
+    分けるので、paramiko（text モードで CR でも分ける）と違って 2 行目
+    以降を読み落とし、それらの機器が黙って「未知」に戻る。
+    """
+    raw = Path(str(path)).read_bytes()
+    return b"|1|" in raw and b"\r" not in raw.replace(b"\r\n", b"")
+
+
 def _load_known_hosts_into_client(client, path, broken):
     """known_hosts を client へ読み込む。
 
@@ -211,10 +224,16 @@ def _load_known_hosts_into_client(client, path, broken):
     なる（実測）。行ごとの点検は bytes で読むので「読めない行」は 0 件で、
     行番号も出ない。デコードだけは受け止めて、読める行を取り込む。
 
+    ハッシュ化名の行があるファイルも自前で読む。paramiko の HostKeys.load は
+    1 行ごとに check() で、それまでに読んだハッシュ化行すべてに hash_host を
+    掛け直すので、ハッシュ化行の後ろに平文行が続くと行数の 2 乗で重くなる
+    （実測: 交互に 2,000 行で 6.5 秒。この間 known_hosts の錠を握ったまま）。
+
     Args:
         broken: unreadable_known_hosts_lines() の戻り値
     """
-    if broken or _has_utf8_bom(path):
+    if (broken or _has_utf8_bom(path)
+            or _hashed_names_need_own_loader(path)):
         client._host_keys_filename = None
         load_known_hosts(client.get_host_keys(), path)
         return
