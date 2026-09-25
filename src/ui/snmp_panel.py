@@ -654,7 +654,9 @@ class SNMPPanel(QWidget):
         if version == 'v3':
             params.update(self._collect_v3_params())
         else:
-            params['community'] = self.community_edit.text()
+            # 前後の空白は落とす。Trap 受信は登録時に落としている
+            # （_clean_communities）ので、同じ入力がタブで別の値にならない
+            params['community'] = self.community_edit.text().strip()
         return params
     
     def _on_preset_changed(self, preset: str):
