@@ -1,5 +1,6 @@
 """FTP サーバー（pyftpdlib ラッパ）。UI 通知は Qt シグナル。"""
 import os
+import socket
 import threading
 import time
 
@@ -24,6 +25,23 @@ PREVIOUS_STOP_INCOMPLETE_MESSAGE = (
     "前回の停止が完了していません（待受スレッドが終了しておらず、"
     "ポートが解放されていない可能性があります）。"
     "しばらく待ってからもう一度お試しください")
+
+# データ接続の TCP keepalive。この秒数黙ったら、この間隔で相手を確かめる
+# （Windows は 10 回で諦めて切る）。SFTP の keepalive_seconds と揃える
+DATA_KEEPALIVE_SECONDS = 30
+DATA_KEEPALIVE_INTERVAL_SECONDS = 5
+
+
+def _enable_keepalive(sock):
+    """データ接続に TCP keepalive を掛ける。掛けられない環境では何もしない。"""
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        if hasattr(socket, "SIO_KEEPALIVE_VALS"):
+            sock.ioctl(socket.SIO_KEEPALIVE_VALS,
+                       (1, DATA_KEEPALIVE_SECONDS * 1000,
+                        DATA_KEEPALIVE_INTERVAL_SECONDS * 1000))
+    except (AttributeError, OSError, ValueError):
+        pass
 
 
 class FTPServerManager(QObject):
@@ -281,6 +299,14 @@ class FTPServerManager(QObject):
 
         class _ProgressDTP(DTPHandler):
             """データチャネルの送受信ごとに進捗を発火（TFTPと同じ見た目にするため）。"""
+            def __init__(self, sock, cmd_channel):
+                # 回線断などで黙って消えた書き手は、送るものの無いこちらの TCP
+                # では気づけず、予約が無通信の期限（DTPHandler.timeout = 300 秒）
+                # まで残って同じ名前へのアップロードを断り続けた。keepalive を
+                # 送れば確かめが尽きたところで切れ、未完了として予約が外れる。
+                # 生きている相手は応答するだけなので、黙っている転送は切らない
+                _enable_keepalive(sock)
+                super().__init__(sock, cmd_channel)
             def send(self, data):
                 result = super().send(data)
                 try: self.cmd_channel._emit_tx_progress(self.get_transmitted_bytes())
