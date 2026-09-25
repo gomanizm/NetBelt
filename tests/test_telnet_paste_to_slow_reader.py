@@ -179,6 +179,9 @@ class TelnetPasteToSlowReaderTest(unittest.TestCase):
 
     def test_a_large_paste_reaches_a_slow_reader_whole_and_in_order(self):
         server, conn, _, term = self._session()
+        # 送信バッファの大きさを OS に任せない（Windows は自動で大きくし、そうなると
+        # 詰まらずに素通りする。GitHub のランナーで前提が崩れた）
+        conn.socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
         body = _paste_body(160 * 1024)
         expected = _wire_bytes(body)
         stamps = self._ticker()
@@ -249,6 +252,9 @@ class TelnetPasteToSlowReaderTest(unittest.TestCase):
         """送信バッファが埋まっていても、交渉の応答は待って送り切り、切断にしないこと。"""
         server, conn, _, term = self._session()
         server.reading.clear()
+        # 送信バッファの大きさを OS に任せない（Windows は自動で大きくし、そうなると
+        # 詰まらずに素通りする。GitHub のランナーで前提が崩れた）
+        conn.socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
         # 相手が読まない間に、送信バッファと相手の受信バッファを埋める
         filled = bytearray()
         piece = b"F" * 4096

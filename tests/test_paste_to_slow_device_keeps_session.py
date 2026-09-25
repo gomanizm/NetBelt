@@ -304,6 +304,9 @@ class PasteToSlowDeviceKeepsSessionTest(unittest.TestCase):
         server = SlowTCPServer()
         self.addCleanup(server.close)
         conn = self._connect("telnet", server.port)
+        # 送信バッファの大きさを OS に任せない（Windows は自動で大きくし、そうなると
+        # 詰まらずに素通りする。GitHub のランナーで前提が崩れた）
+        conn.socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
         expected = _wire_bytes(_paste_body(160 * 1024))
         stamps = self._ticker()
 
