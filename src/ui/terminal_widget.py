@@ -8,6 +8,7 @@ from itertools import groupby
 from operator import itemgetter
 from typing import Dict, Optional
 
+from core.log_writer import LogWriter
 from core.terminal import parser as vt
 from core.terminal.attrs import DEFAULT
 from core.terminal.screen import Screen, BLANK
@@ -794,9 +795,9 @@ class TerminalWidget(QWidget):
         # 記録（機器名 -> [[ハンドル, パス, 残りの文字数], ...]、停止した順）。
         # 各項目の文字数は、描き待ちの先頭から前の項目のぶんに続く区間
         self._closing_logs: Dict[str, list] = {}
-        # 記録中のファイルへ、始めてから書いたファイル上のバイト数
-        # （機器名 -> バイト数）。記録中ダイアログの表示に使う
-        self._log_bytes: Dict[str, int] = {}
+        # 記録先が詰まっていて、閉じ終わりを待っている記録
+        # （[(機器名, ハンドル, パス, 閉じる失敗の知らせ先), ...]）
+        self._closing_writers: list = []
         self._log_dialogs: Dict[str, object] = {}  # 機器名 -> ログ記録ダイアログ
         # ターミナルの外観設定。_create_terminal が参照するので _create_ui より先に持つ
         self._terminal_settings = dict(self.DEFAULT_TERMINAL_SETTINGS)
@@ -823,6 +824,10 @@ class TerminalWidget(QWidget):
         self._output_timer.setSingleShot(True)
         self._output_timer.setInterval(0)
         self._output_timer.timeout.connect(self._flush_pending_output)
+        # 記録先が詰まっている間だけ、書き込みスレッドを見回る（_check_log_writers）
+        self._log_watch = QTimer(self)
+        self._log_watch.setInterval(100)
+        self._log_watch.timeout.connect(self._check_log_writers)
         self._create_ui()
     
     def _create_ui(self):
@@ -1593,10 +1598,6 @@ class TerminalWidget(QWidget):
             try:
                 handle.write(logged)
                 handle.flush()
-                if target is None:
-                    self._log_bytes[device_name] = (
-                        self._log_bytes.get(device_name, 0)
-                        + self._file_byte_count(logged))
             except Exception as e:
                 if target is None:
                     self._abort_log_recording(device_name, e)
@@ -1617,39 +1618,80 @@ class TerminalWidget(QWidget):
         for handle, path, error in failed:
             self._close_stopped_log(device_name, handle, path, error)
 
-    @staticmethod
-    def _file_byte_count(text: str) -> int:
-        """text を記録へ書いたときに、ファイルの上で増えるバイト数
-
-        記録は open(path, 'w', encoding='utf-8') のテキストモードなので、
-        LF は os.linesep（Windows では CRLF）へ直されてから UTF-8 で
-        符号化される。記録中ダイアログは os.path.getsize を GUI スレッドで
-        呼ばない（共有フォルダだと 1 回で数秒止まる）ので、書いた側で
-        数えたこの値を見せる。
-        """
-        import os
-        return len(text.replace("\n", os.linesep).encode("utf-8"))
-
     def recorded_bytes(self, device_name: str) -> int:
-        """その機器の記録中のファイルへ、始めてから書いたバイト数"""
-        return self._log_bytes.get(device_name, 0)
+        """その機器の記録中のファイルへ、始めてから書けたバイト数
+
+        数えるのは書き込みスレッド（LogWriter.written_bytes）。記録先が
+        詰まっている間は、まだ書けていない分を数えない。
+        """
+        handle = self._log_files.get(device_name)
+        return handle.written_bytes if isinstance(handle, LogWriter) else 0
 
     def _close_stopped_log(self, device_name: str, handle, path,
                            error=None) -> None:
         """停止した記録のファイルを閉じ、使用中の登録を外す。"""
         from PyQt6.QtWidgets import QMessageBox
-        from core import log_recording
-        log_recording.stop(device_name, path)
-        try:
-            handle.close()
-        except Exception as e:
-            error = error or e
-        if error is not None:
+
+        def report(error):
             QMessageBox.warning(
                 self, "ログ記録",
                 "%s の停止したログ記録の、停止より前に受信した分を書き終えられ"
                 "ませんでした:\n%s\n\n記録は失敗する前の行までです。"
                 % (device_name, error))
+        self._close_log_file(device_name, handle, path, report, error)
+
+    def _close_log_file(self, device_name: str, handle, path,
+                        report=None, error=None) -> None:
+        """記録ファイルを閉じ、閉じ終えてから使用中の登録を外す。
+
+        記録先が詰まっていて閉じ終わらないときは、閉じ終わりを見回り
+        （_check_log_writers）に任せる。先に登録を外すと、同じファイルへ
+        始めた次の記録が、前の記録の書き込みと混ざる。
+        report(error) は閉じられなかった（書き終えられなかった）ときに呼ぶ。
+        """
+        from core import log_recording
+        try:
+            if handle is not None:
+                handle.close()
+        except Exception as e:
+            error = error or e
+        if isinstance(handle, LogWriter) and handle.busy:
+            # 失敗を知らせるのは 1 回だけ（ここで知らせたら、閉じ終わりでは知らせない）
+            self._closing_writers.append(
+                (device_name, handle, path, None if error else report))
+            self._log_watch.start()
+        else:
+            log_recording.stop(device_name, path)
+        if error is not None and report is not None:
+            report(error)
+
+    def _check_log_writers(self) -> None:
+        """記録先が詰まっている間、書き込みスレッドを見回る。
+
+        スレッドで起きた書き込みの失敗を、次の受信を待たずに知らせる
+        （知らせないと、利用者は記録できていると思って作業を続ける）。
+        閉じ終えた記録の使用中の登録を外す。見回るものが無くなったら止まる。
+        警告はモーダルで、出ている間にここへ入り直すことがある。
+        """
+        from core import log_recording
+        for name in list(self._log_files):
+            handle = self._log_files.get(name)
+            if isinstance(handle, LogWriter) and handle.failure is not None:
+                self._abort_log_recording(name, handle.failure)
+        for item in list(self._closing_writers):
+            name, handle, path, report = item
+            if handle.busy or item not in self._closing_writers:
+                continue
+            self._closing_writers.remove(item)
+            log_recording.stop(name, path)
+            if handle.failure is not None and report is not None:
+                report(handle.failure)
+        handles = list(self._log_files.values()) + [
+            entry[0] for entries in self._closing_logs.values()
+            for entry in entries]
+        if not self._closing_writers and not any(
+                isinstance(h, LogWriter) and h.busy for h in handles):
+            self._log_watch.stop()
 
     def has_open_log_recordings(self) -> bool:
         """まだ閉じていない記録があるか（記録中と、停止して書き終えていない分）
@@ -1828,16 +1870,11 @@ class TerminalWidget(QWidget):
         """
         from PyQt6.QtWidgets import QMessageBox
 
-        from core import log_recording
         handle = self._log_files.pop(device_name, None)
-        self._log_bytes.pop(device_name, None)
-        # 停止して書き終えていない前の記録の登録は残す
-        log_recording.stop(device_name, getattr(handle, "name", None))
-        if handle is not None:
-            try:
-                handle.close()
-            except Exception:
-                pass   # 壊れたハンドルは閉じるのも失敗しうる
+        # 停止して書き終えていない前の記録の登録は残す。壊れたハンドルは
+        # 閉じるのも失敗しうるが、知らせるのは下の 1 回だけ
+        self._close_log_file(device_name, handle,
+                             getattr(handle, "name", None))
         terminal = self._terminals.get(device_name)
         if isinstance(terminal, InteractiveTerminal):
             terminal._is_recording = False
@@ -2220,8 +2257,11 @@ class TerminalWidget(QWidget):
                 return
 
             try:
-                # ファイルを開く
-                log_file = open(file_path, 'w', encoding='utf-8', buffering=1)  # 行バッファリング
+                # ファイルを開く。書き込みは記録ごとのスレッドで行う（記録先が
+                # 応答しない間に GUI を止めない。core/log_writer.py）
+                log_file = LogWriter(
+                    open(file_path, 'w', encoding='utf-8', buffering=1),  # 行バッファリング
+                    on_stall=self._log_watch.start)
                 # 記録していなかった間に受信して、まだ描いていない分を
                 # 取り置く。停止側と同じ式で「どの停止した記録の区間にも
                 # 割り当てられていない文字数」を出し、ハンドルを持たない
@@ -2235,7 +2275,6 @@ class TerminalWidget(QWidget):
                     self._closing_logs.setdefault(tab_name, []).append(
                         [None, None, skipped])
                 self._log_files[tab_name] = log_file
-                self._log_bytes[tab_name] = 0   # 'w' で切り詰めたので 0 から
                 from core import log_recording
                 log_recording.start(tab_name, file_path)
                 # 開けたところまで来たら覚える（開けなければ except へ抜ける）
@@ -2302,8 +2341,6 @@ class TerminalWidget(QWidget):
             # ハンドルと「記録中」ダイアログが残り、記録を始め直そうとしても
             # 「既にログ記録中です。」で断られる（止める手段が無くなる）。
             handle = self._log_files.pop(tab_name)
-            self._log_bytes.pop(tab_name, None)
-            from core import log_recording
             # 停止より前に受信して、まだ描いていない分がある（受信が描画を
             # 上回って溜まっている最中の停止）。受信した分は記録に入れるので、
             # 描き進んでそこへ届くまで閉じずに預ける（_write_logs が書いて
@@ -2313,8 +2350,6 @@ class TerminalWidget(QWidget):
             if waiting > 0:
                 self._closing_logs.setdefault(tab_name, []).append(
                     [handle, getattr(handle, "name", None), waiting])
-            else:
-                log_recording.stop(tab_name, getattr(handle, "name", None))
 
             # ターミナルの記録フラグをクリア
             if isinstance(current_widget, InteractiveTerminal):
@@ -2328,15 +2363,14 @@ class TerminalWidget(QWidget):
 
             if waiting > 0:
                 return
-            try:
-                handle.close()
-            except Exception as e:
-                QMessageBox.warning(
+            # 使用中の登録を外すのは閉じ終えてから（_close_log_file）
+            self._close_log_file(
+                tab_name, handle, getattr(handle, "name", None),
+                lambda e: QMessageBox.warning(
                     self,
                     "エラー",
                     f"ログファイルを閉じる際にエラーが発生しました:\n{str(e)}"
-                )
-                return
+                ))
     
     def _on_current_tab_changed(self, index: int) -> None:
         """表示中のタブが変わったことを知らせる"""
