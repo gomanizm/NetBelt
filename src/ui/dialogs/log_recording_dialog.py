@@ -1,5 +1,6 @@
 from PyQt6.QtWidgets import QDialog, QVBoxLayout, QLabel, QPushButton, QHBoxLayout
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer
+from PyQt6.QtGui import QKeySequence
 from datetime import datetime
 from ui import theme
 
@@ -27,6 +28,8 @@ class LogRecordingDialog(QDialog):
         self.file_path = file_path
         self.size_provider = size_provider
         self.start_time = datetime.now()
+        # 停止の要求を出したか（閉じるときに重ねて出さない）
+        self._stop_sent = False
         
         self.setWindowTitle("ログ記録中")
         self.setModal(False)  # ノンモーダル
@@ -119,11 +122,34 @@ class LogRecordingDialog(QDialog):
 
     def _on_stop(self):
         """停止ボタンクリック時の処理"""
+        self._stop_sent = True
         self.timer.stop()
         self.stop_requested.emit(self.device_name)
         self.close()
+
+    def keyPressEvent(self, event):
+        """Esc では閉じない（記録中であることを示す表示はこれしか無い）
+
+        QDialog の既定では Esc で隠れ、記録は続いたまま記録中だと分からなく
+        なる。記録を止めずに隠す操作は受け付けない。
+        """
+        if event.matches(QKeySequence.StandardKey.Cancel):
+            event.accept()
+            return
+        super().keyPressEvent(event)
     
     def closeEvent(self, event):
-        """ダイアログを閉じる時の処理"""
+        """ダイアログを閉じる時の処理
+
+        × や Alt+F4 で閉じたら「記録停止」と同じく記録を止める（見えている
+        ときだけ記録中、を崩さない）。閉じる要求は断らない。断ると「今すぐ
+        更新」の QApplication.closeAllWindows() がそこで止まり、主窓の
+        closeEvent（記録の書き切り）を通らずアプリも終わらない。記録を
+        止める後始末の経路から閉じたときも出るが、記録はもう外れている
+        ので受け手は何もしない。
+        """
         self.timer.stop()
+        if not self._stop_sent:
+            self._stop_sent = True
+            self.stop_requested.emit(self.device_name)
         super().closeEvent(event)

@@ -2415,6 +2415,12 @@ class TerminalWidget(QWidget):
                 dialog.stop_requested.connect(self.stop_log_recording)
                 dialog.show()
                 self._log_dialogs[tab_name] = dialog
+                # show() はダイアログを活性化し、フォーカスが「記録停止」へ
+                # 移る。端末へ打つつもりの Enter・Space で記録が止まり、Esc
+                # も端末へ届かないので、キーの行き先を端末へ戻す
+                self.window().activateWindow()
+                if isinstance(current_widget, InteractiveTerminal):
+                    current_widget.setFocus()
                 
                 # 開始の知らせは出さない。記録中ダイアログが出れば分かり、
                 # 複数の機器を記録するときに毎回 OK を押させることになる
