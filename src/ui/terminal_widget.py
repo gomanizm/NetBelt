@@ -121,8 +121,53 @@ class InteractiveTerminal(QTextEdit):
     resized = pyqtSignal()
 
     def resizeEvent(self, event):
-        super().resizeEvent(event)
+        self._keep_top_row(super().resizeEvent, event)
         self.resized.emit()
+
+    def changeEvent(self, event):
+        if event.type() == QEvent.Type.FontChange:
+            self._keep_top_row(super().changeEvent, event)
+        else:
+            super().changeEvent(event)
+
+    def _row_of(self, cursor):
+        """カーソルの載る表示行の (上端, 高さ)。そこまでの組版を先に済ませる。"""
+        block = cursor.block()
+        top = self.document().documentLayout().blockBoundingRect(block).top()
+        line = block.layout().lineForTextPosition(cursor.positionInBlock())
+        if not line.isValid():
+            return int(top), 0
+        return int(top + line.y()), int(line.height())
+
+    def _keep_top_row(self, relayout, event):
+        """組み直し（幅・文字の大きさの変更）の前後で、上端に見えていた行を保つ。
+
+        Qt は組み直しの前後でスクロールバーの値（ピクセル）をそのまま保つ。
+        上へスクロールして過去の出力を読んでいるときに長い行が折り返し
+        直されると、上端に別の行が来る（実測: 幅を半分にすると line 000149
+        が line 000049 に）。そこで、上端の表示行の先頭の文字と行内のずれを
+        控え、組み直しの後でその文字が載る表示行へ戻す。最下部を見ている
+        ときは、格子の更新が最下部へ寄せるので何もしない。
+        """
+        if getattr(self, "_follow_output", True):
+            relayout(event)
+            return
+        from PyQt6.QtCore import QPoint
+        bar = self.verticalScrollBar()
+        # 0 ピクセル目は、行の境目にあると一つ上の行の末尾に当たる
+        top = self.cursorForPosition(QPoint(0, 1))
+        within = bar.value() - self._row_of(top)[0]
+        relayout(event)
+        row_top, height = self._row_of(top)
+        target = row_top + max(0, min(within, height - 1))
+        if target > bar.maximum():
+            # 組版が遅れて進むあいだ、スクロールバーの最大値は組み終えた分の
+            # 高さのまま残り、値がそこで切られて最下部（追従）扱いになる
+            # （実測: 3000 行で文字を大きくすると最下部へ飛んだ）。Qt が少し
+            # 後で出す大きさの知らせを先に出して、範囲を合わせてから戻す
+            layout = self.document().documentLayout()
+            layout.documentSizeChanged.emit(layout.documentSize())
+        bar.setValue(target)
 
     def __init__(self, parent=None):
         super().__init__(parent)
