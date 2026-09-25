@@ -323,12 +323,21 @@ class MIBResolver:
             # 読めない MIB ファイルと同じように理由を 1 行残し、前回の
             # 解析結果（読めていれば）で続ける。解析し直していないので
             # キャッシュはそのまま、上書きもしない。
+            # ただし解析器の版や custom_mibs.json が変わって無効になった
+            # キャッシュは使わない（利用者の決定 2026-09-20）。使うと、
+            # 古い解析器の誤対応や、直す前の custom_mibs.json の親で決めた
+            # 名前が戻る（実測）
+            usable = not cache_needs_update
+            stale = bool(cached_mibs) and not usable
             print(f"[MIBResolver] mibs フォルダの一覧を取得できません"
                   f"（{e}）。今回は MIB ファイルを読み込まず、"
-                  f"キャッシュがあればその内容を使います（フォルダを"
-                  f"入れ替え中か、アクセス権が無い可能性があります）")
-            self._mib_cache_used = True
-            return cached_mibs
+                  + ("キャッシュも古い（アプリの更新か custom_mibs.json の"
+                     "変更の後）ので使いません" if stale else
+                     "キャッシュがあればその内容を使います")
+                  + "（フォルダを入れ替え中か、アクセス権が無い可能性が"
+                  "あります）")
+            self._mib_cache_used = usable
+            return cached_mibs if usable else {}
         for filename in filenames:
             # 拡張子は大小を無視して判定する。Windows はファイル名の大小を
             # 保持するので、CASE.MIB のように大文字で配布された MIB が
