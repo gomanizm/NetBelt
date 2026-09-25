@@ -3,7 +3,7 @@
 このファイルの形式は [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) に、
 バージョン番号は [Semantic Versioning](https://semver.org/lang/ja/) に従います。
 
-## [Unreleased]
+## [1.3.1] - 2026-09-25
 
 外部レビューと、修正ごとの再検査を重ねて見つかった不具合を直しました。
 
