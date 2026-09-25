@@ -863,6 +863,18 @@ class SFTPManager(QObject):
                         timed_out_note[0] = "（%s）" % unknown_outcome_note()
                         return
                     except (AttributeError, IOError) as first_error:
+                        if not overwrite and self._channel_closed():
+                            # 機器が SFTP のチャンネルを閉じていた。閉じた
+                            # チャンネルの OSError('Socket is closed') は送る前に
+                            # 上がるので、改名の要求は届いていない。「既にある」と
+                            # 推して上書きへ誘わず、閉じたことを伝えて畳む
+                            keep_tmp[0] = True
+                            raise _DroppedConnection(
+                                "リモートの '%s' へ置き換える前に SFTP のチャンネルが"
+                                "閉じられました。最終名には触れていません。転送した"
+                                "内容は機器の一時名 %s に残っています: %s"
+                                % (remote_name, tmp_remote,
+                                   str(first_error) or first_error.__class__.__name__))
                         if not overwrite:
                             # 非 posix の rename が断る理由の筆頭は
                             # 「既にある」。上書きの確認を経ていない送信で
