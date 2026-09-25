@@ -250,7 +250,8 @@ class SyslogTableModel(QAbstractTableModel):
         """
         try:
             return len(self.messages) >= int(self.max_messages)
-        except (TypeError, ValueError):
+        except (OverflowError, TypeError, ValueError):
+            # OverflowError は無限大（json の 1e309 / Infinity）
             return False
 
     def add_message(self, msg: SyslogMessage):
@@ -393,7 +394,9 @@ class SyslogPanel(QWidget):
             return SyslogPanel.DEFAULT_MAX_MESSAGES
         try:
             limit = int(value)
-        except (TypeError, ValueError):
+        except (OverflowError, TypeError, ValueError):
+            # json は 1e309 / Infinity を float の inf に読み、int() は
+            # OverflowError を投げる。受けないとパネル（MainWindow）の構築が失敗する
             return SyslogPanel.DEFAULT_MAX_MESSAGES
         return limit if limit >= 1 else SyslogPanel.DEFAULT_MAX_MESSAGES
 
