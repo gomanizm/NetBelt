@@ -477,7 +477,8 @@ class MIBResolver:
     # 止まれずに次の定義の ::= まで伸びて、隣の OID を黙って奪ったうえ
     # 隣の定義を消す。IMPORTS の直後に並ぶ MODULE-IDENTITY も
     # 「名前 MODULE-IDENTITY」に見えるので、同じ理由で根を飲み込む。
-    # 右辺が { 名前 数字 } ちょうどでない定義は、その定義だけ落とす。
+    # 右辺を読めない定義（_parse_oid_value を見ること）は、その定義だけ
+    # 落とす。
     #
     # ただし「別の定義が始まる行」に節キーワードの行を混ぜてはいけない。
     # `SYNTAX OBJECT IDENTIFIER` は「名前 OBJECT IDENTIFIER」の形なので、
@@ -504,7 +505,54 @@ class MIBResolver:
         + r')[\w-]+' + _MIB_NAME_GAP
         + _MIB_DEFINITION_KEYWORDS + r'\b).)*?'
     )
-    _MIB_ASSIGNMENT = r'::=\s*\{\s*([\w-]+)\s+(\d+)\s*\}'
+    # 右辺 `{ … }` の中身。`{ 親 添字 }` だけでなく、複数添字
+    # （`{ aRoot 0 1 }`）とラベル付きフルパス（`{ iso(1) org(3) …
+    # 65001 }`）も読む（_parse_oid_value）。`{ 親 添字 }` しか読まずに
+    # いたので、実 MIB にあるこれらの宣言は OID が決まらず、その子が
+    # 内蔵表・custom_mibs.json・よそのモジュールの同名を親にして、標準や
+    # 他社の OID に自社の名前が付いた（実測: 自社の木に置いた system の
+    # 子が標準 sysName の 1.3.6.1.2.1.1.5 に付いた）
+    _MIB_ASSIGNMENT = r'::=\s*\{([^{}]*)\}'
+    # 右辺の添字 1 つぶん: ラベル付きの `iso(1)`・裸の数字・裸の名前
+    _MIB_OID_COMPONENT = (r'\s*(?:([A-Za-z][\w-]*)\s*\(\s*(\d+)\s*\)'
+                          r'|(\d+)|([A-Za-z][\w-]*))')
+    # 先頭にラベル付きで来たときだけ、OID の根からの数字とみなすラベル
+    _MIB_ROOT_LABELS = ('iso', 'ccitt', 'itu-t', 'joint-iso-ccitt',
+                        'joint-iso-itu-t')
+
+    @classmethod
+    def _parse_oid_value(cls, text: str):
+        """右辺 `{ … }` の中身を (親の名前, 添字) にする。読めなければ None。
+
+        { aRoot 0 1 } → ('aRoot', '0.1')、{ mib-2 x(26) 4 } → ('mib-2',
+        '26.4')、{ iso(1) org(3) 6 } → ('', '1.3.6')。親 '' は「根から
+        数字だけで書いた OID」。2 つ目以降に裸の名前が来る形（{ a b 1 }）は
+        OID にならないので読まない（これまでどおり、その定義だけ落とす）。
+        """
+        import re
+
+        component = re.compile(cls._MIB_OID_COMPONENT)
+        parent, numbers, pos = '', [], 0
+        text = text.rstrip()
+        while pos < len(text):
+            match = component.match(text, pos)
+            if match is None:
+                return None
+            label, labeled, number, bare = match.groups()
+            if labeled is not None and not (
+                    pos == 0 and label not in cls._MIB_ROOT_LABELS):
+                numbers.append(labeled)
+            elif number is not None:
+                numbers.append(number)
+            elif pos == 0:
+                parent = label or bare
+            else:
+                return None
+            pos = match.end()
+        if not numbers:
+            return None
+        return parent, '.'.join(numbers)
+
     # 定義の名前。全部大文字の語は名前として認めない。ASN.1 の値参照は
     # 小文字で始まるので、IMPORTS / EXPORTS のような節のキーワードが
     # 定義の名前になること自体が誤り。起点を `([\w-]+)` のまま何でも
@@ -552,14 +600,15 @@ class MIBResolver:
     # 'acme.0.7' のように番号のまま出る（実測）
     _MIB_TRAP_TYPE = (_MIB_NAME + r'\s+TRAP-TYPE\s+ENTERPRISE\s+([\w-]+)'
                       + _MIB_DEFINITION_BODY + r'::=\s*(\d+)')
-    # そのモジュールが宣言している名前。上の抽出は `::= { 親 添字 }` の形
-    # しか拾わないので、実 MIB にある複数添字の右辺（`::= { aRoot 0 1 }`）
-    # で宣言された名前は定義の一覧から落ちる。落ちた名前を「このモジュール
-    # には無い」とみなすと、全モジュール共通の表にある別モジュールの同名が
-    # 親になり、その子がよその名前空間へ入る（実測: A-MIB の aAlarm が
-    # B-MIB の 1.3.6.1.4.1.2222.1 に登録され、B ベンダーの OID で来た Trap に
-    # 他社の名前が出た）。OID を決められなくても「名前 + 型キーワード」の
-    # 並びは残るので、そちらから宣言の有無だけを拾う。
+    # そのモジュールが宣言している名前。上の抽出は右辺を読めない宣言
+    # （`::= { a b 1 }` のように 2 つ目以降に裸の名前がある形。1.3.1 までは
+    # 複数添字の `::= { aRoot 0 1 }` もここに入った）を定義の一覧から
+    # 落とす。落ちた名前を「このモジュールには無い」とみなすと、全
+    # モジュール共通の表にある別モジュールの同名が親になり、その子が
+    # よその名前空間へ入る（実測: A-MIB の aAlarm が B-MIB の
+    # 1.3.6.1.4.1.2222.1 に登録され、B ベンダーの OID で来た Trap に他社の
+    # 名前が出た）。OID を決められなくても「名前 + 型キーワード」の並びは
+    # 残るので、そちらから宣言の有無だけを拾う。
     _MIB_LOCAL_NAME = (_MIB_NAME + r'\s+(?:OBJECT\s+IDENTIFIER|OBJECT-TYPE'
                        r'|NOTIFICATION-TYPE|MODULE-IDENTITY'
                        r'|OBJECT-IDENTITY)\b')
@@ -782,9 +831,10 @@ class MIBResolver:
                     # 拾わないと型キーワードから ::= まで届かない
                     for match in re.finditer(pattern, text,
                                              re.MULTILINE | re.DOTALL):
-                        definitions.append(
-                            (match.group(1), match.group(2), match.group(3),
-                             module))
+                        value = self._parse_oid_value(match.group(2))
+                        if value is not None:
+                            definitions.append(
+                                (match.group(1), value[0], value[1], module))
                 for match in re.finditer(self._MIB_TRAP_TYPE, text,
                                          re.MULTILINE | re.DOTALL):
                     definitions.append((match.group(1), match.group(2),
@@ -838,7 +888,7 @@ class MIBResolver:
 
         「同じモジュールにあるか」は、抽出できた定義だけでなく
         _MIB_LOCAL_NAME で集めた宣言も見る。そのモジュールの宣言が抽出から
-        落ちていると（複数添字の右辺など）、よその同名が親になって子が別
+        落ちていると（右辺を読めない宣言）、よその同名が親になって子が別
         ベンダーの名前空間へ入るため（実測）。宣言はあるが OID が決まらない
         親の子は、最後まで解決しないまま残る。利用者の決定（2026-09-20）に
         より、どのモジュールの親か確定できないときは名前を付けず OID の
@@ -855,7 +905,9 @@ class MIBResolver:
         custom_mibs.json にベンダー根を置いた一式ではベンダーの木が
         丸ごと消えて、Trap の名前が 'alarmRaised' から 'acme.2.4.2' に
         なった）。曖昧でなければ標準表 / custom_mibs.json / IMPORTS の
-        値をこれまでどおり使う。
+        値をこれまでどおり使う。1.3.2 からはこれらの右辺も読む
+        （_parse_oid_value）ので、その宣言の OID は自分の右辺で決まり、
+        よその同名を借りる場面そのものが無い。
 
         残る制限: 2 つのモジュールが同じ名前を定義し、第三のモジュールが
         その一方を IMPORTS しているとき、IMPORTS を見ていないのでどちらを
@@ -868,7 +920,8 @@ class MIBResolver:
         ここは直らない。曖昧になったこと自体も知らせていない。
 
         Args:
-            definitions: (名前, 親の名前, 添字, モジュール名) のリスト
+            definitions: (名前, 親の名前, 添字, モジュール名) のリスト。
+                親の名前が '' のものは、添字が根からの OID
 
         Returns:
             解決できた OID→名前 の辞書（同名でも別 OID なら両方残る）
@@ -921,6 +974,9 @@ class MIBResolver:
             for name, parent, index, module in pending:
                 if parent == 'enterprises':
                     parent_oid = '1.3.6.1.4.1'
+                elif parent == '':
+                    # 根から数字だけで書いた右辺（ラベル付きフルパスなど）
+                    parent_oid = ''
                 elif parent in declared[module]:
                     parent_oid = in_module.get(module, {}).get(parent)
                     if (parent_oid is None and borrow
@@ -935,7 +991,7 @@ class MIBResolver:
                 if parent_oid is None:
                     still_pending.append((name, parent, index, module))
                     continue
-                oid = f"{parent_oid}.{index}"
+                oid = f"{parent_oid}.{index}" if parent_oid else index
                 known[name] = oid
                 in_module.setdefault(module, {})[name] = oid
                 resolved[oid] = name
