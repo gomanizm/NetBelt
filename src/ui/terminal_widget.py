@@ -767,6 +767,7 @@ class TerminalWidget(QWidget):
     # 色付きでも 4 秒ぶんの描き待ちを飲み込めるので、通常の操作では
     # ここまで届かない。届くのは 127.0.0.1 級の速さで流し続けたとき
     # （実測: 上限が無いと 27.5 秒で 21.3 MB まで単調に増えた）。
+    # 記録先が詰まったときの、記録の書き込み待ちの上限にも使う（同じく待たせる）
     PENDING_HIGH_WATER = 8 * 1024 * 1024
     # ここまで減らしてから再開する。上限の直下で開け閉めを繰り返さない
     PENDING_LOW_WATER = 2 * 1024 * 1024
@@ -798,6 +799,8 @@ class TerminalWidget(QWidget):
         # 記録先が詰まっていて、閉じ終わりを待っている記録
         # （[(機器名, ハンドル, パス, 閉じる失敗の知らせ先), ...]）
         self._closing_writers: list = []
+        # 記録の書き込み待ちが溜まって、描くのと受信を止めている機器
+        self._log_throttled = set()
         self._log_dialogs: Dict[str, object] = {}  # 機器名 -> ログ記録ダイアログ
         # ターミナルの外観設定。_create_terminal が参照するので _create_ui より先に持つ
         self._terminal_settings = dict(self.DEFAULT_TERMINAL_SETTINGS)
@@ -1686,10 +1689,17 @@ class TerminalWidget(QWidget):
             log_recording.stop(name, path)
             if handle.failure is not None and report is not None:
                 report(handle.failure)
+        # 書き込み待ちが減った機器は、描くのと受信を再開する
+        for name in list(self._log_throttled):
+            if self._log_backlog(name) <= self.PENDING_LOW_WATER:
+                self._log_throttled.discard(name)
+                self._update_output_gate(name)
+                if self._pending_output.get(name):
+                    self._output_timer.start()
         handles = list(self._log_files.values()) + [
             entry[0] for entries in self._closing_logs.values()
             for entry in entries]
-        if not self._closing_writers and not any(
+        if not self._closing_writers and not self._log_throttled and not any(
                 isinstance(h, LogWriter) and h.busy for h in handles):
             self._log_watch.stop()
 
@@ -1758,10 +1768,17 @@ class TerminalWidget(QWidget):
         if gate is None:
             return
         waiting = len(self._pending_output.get(device_name, ()))
-        if waiting >= self.PENDING_HIGH_WATER:
+        if (waiting >= self.PENDING_HIGH_WATER
+                or device_name in self._log_throttled):
             gate.clear()
         elif waiting <= self.PENDING_LOW_WATER:
             gate.set()
+
+    def _log_backlog(self, device_name: str) -> int:
+        """その機器の記録（記録中と、停止して書き終えていない分）の書き込み待ちの文字数"""
+        handles = [self._log_files.get(device_name)] + [
+            entry[0] for entry in self._closing_logs.get(device_name, ())]
+        return sum(h.backlog for h in handles if isinstance(h, LogWriter))
 
     def _flush_pending_output(self) -> None:
         """溜めた出力を機器ごとに OUTPUT_SLICE 文字まで描き、残りは次の回へ回す"""
@@ -1776,6 +1793,17 @@ class TerminalWidget(QWidget):
                 if not pending or device_name not in self._terminals:
                     self._pending_output.pop(device_name, None)
                     continue
+                # 記録先が詰まって書き込み待ちが上限を超えたら、この機器だけ
+                # 描くのを止めて受信の関所を閉じる。機器側が待つので記録も
+                # 画面も欠けず、書き込み待ちがメモリに積み上がり続けない
+                # （利用者の決定）。減ったら _check_log_writers が再開させる
+                if (device_name in self._log_throttled
+                        or self._log_backlog(device_name)
+                        >= self.PENDING_HIGH_WATER):
+                    self._log_throttled.add(device_name)
+                    self._update_output_gate(device_name)
+                    self._log_watch.start()
+                    continue
                 text = pending.take(self.OUTPUT_SLICE)
                 if not pending:
                     # 描き残しがあれば残しておく。描いている最中（警告の
@@ -1789,7 +1817,9 @@ class TerminalWidget(QWidget):
                     self._flushing_device = None
                     self._update_output_gate(device_name)
         finally:
-            if self._pending_output:
+            # 止めている機器の分だけが残っているなら掛け直さない（0ms で空回りする）
+            if any(name not in self._log_throttled
+                   for name in self._pending_output):
                 self._output_timer.start()
 
     def _draw_pending_now(self, device_name: str) -> None:
@@ -1972,6 +2002,7 @@ class TerminalWidget(QWidget):
         if tab_name in self._terminals:
             del self._terminals[tab_name]
         self._pending_output.pop(tab_name, None)
+        self._log_throttled.discard(tab_name)
         # 受信を止めたまま閉じない。開けてから外さないと、まだ動いている
         # 受信スレッドが待ち続ける（切断の検知もその先にある）
         gate = self._output_gates.pop(tab_name, None)
