@@ -399,6 +399,8 @@ class MainWindow(QMainWindow):
             config_manager=self.config_manager)
         self.tftp_server_panel = TFTPServerPanel(config_manager=self.config_manager)
         self.ftp_server_panel = FTPServerPanel(config_manager=self.config_manager)
+        for _label, _panel, _server in self._file_servers():
+            _server.started.connect(self._warn_shared_server_root)
         self.syslog_panel = SyslogPanel(config_manager=self.config_manager)
         self.syslog_receiver.message_received.connect(self.syslog_panel.add_message)
         self.syslog_panel.set_syslog_receiver(self.syslog_receiver)
@@ -2385,7 +2387,44 @@ class MainWindow(QMainWindow):
     def _on_ftp_server_dock_visibility_changed(self, visible: bool):
         """FTPサーバードックの表示状態が変更されたときの処理"""
         self.ftp_server_panel_action.setChecked(visible)
-    
+
+    def _file_servers(self):
+        """内蔵ファイルサーバーの (表示名, パネル, マネージャ) の組"""
+        return (("FTP", self.ftp_server_panel, self.ftp_server_panel.ftp_server),
+                ("SFTP", self.sftp_server_panel, self.sftp_server_panel.sftp_server),
+                ("TFTP", self.tftp_server_panel, self.tftp_server_panel.tftp_server))
+
+    def _warn_shared_server_root(self):
+        """起動したサーバーのルートが、動いている別のサーバーと同じか入れ子なら警告する。
+
+        書き込み中の保存先の予約は FTP / SFTP / TFTP がそれぞれ別に持つので、
+        プロトコルをまたいだ同じ名前への同時アップロードは断れず、どれも成功と
+        報告されたまま中身が混ざる（実測）。共通の予約にするのは大きいので、
+        起動は断らずに、起動したパネルのログへ知らせるだけにする。
+        比べ方は予約の鍵と同じ（realpath → normcase）
+        """
+        def key(panel):
+            return os.path.normcase(os.path.realpath(panel.root_dir_edit.text().strip()))
+        servers = self._file_servers()
+        started = [s for s in servers if s[2] is self.sender()]
+        if not started:
+            return
+        _label, panel, server = started[0]
+        mine = key(panel)
+        for label, other_panel, other in servers:
+            if other is server or not other.is_running:
+                continue
+            theirs = key(other_panel)
+            try:
+                common = os.path.commonpath([mine, theirs])
+            except ValueError:
+                continue    # ドライブが違う
+            if common in (mine, theirs):
+                panel._add_log(
+                    "注意: ルートが %s サーバーのルート（%s）と同じか入れ子です。"
+                    "両方から同じファイルへ同時に書き込むと、断られずに中身が"
+                    "混ざることがあります" % (label, other_panel.root_dir_edit.text().strip()))
+
     def _toggle_syslog_panel(self):
         """Syslog タブを別ウィンドウにデタッチ/タブに戻す（単一インスタンスを付け替え）。"""
         if getattr(self, "_detached", {}).get("syslog"):
