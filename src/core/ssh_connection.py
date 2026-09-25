@@ -569,6 +569,8 @@ class SSHConnection(QObject):
         # 送信ウィンドウに入り切らず、まだ書いていない分（_write_carry）。
         # 端末に渡す物が無くても、書けるようになったらここで書き出す
         self._carry = b""
+        # まだ機器へ伝えていない端末の大きさがあるか（_send_terminal_size）
+        self._size_unsent = False
         self.send_drained.connect(self._write_carry_when_drained)
 
     def set_read_gate(self, gate) -> None:
@@ -1035,6 +1037,7 @@ class SSHConnection(QObject):
             watcher.stop()
         # 書き残しは捨てる（繋ぎ直した先へ古い残りを書かない）
         self._carry = b""
+        self._size_unsent = False
 
         if self._read_thread and self._read_thread.is_alive():
             self._read_thread.join(timeout=2)
@@ -1112,9 +1115,11 @@ class SSHConnection(QObject):
         """見張りが書けるようになったと知らせた（GUI スレッドで受ける）
 
         最後の区切りが入り切らず、端末に渡す物が無くなっていると、端末は
-        続きを呼ばない。書き残しはここで書く。
+        続きを呼ばない。書き残しはここで書く。詰まっている間に変わった
+        端末の大きさも、ここで送る。
         """
         self._write_carry()
+        self._send_terminal_size()
 
     def has_pending_sends(self) -> bool:
         """いま区切りを渡されても、待たずには書けないか（端末の set_send_backlog 用）
@@ -1167,10 +1172,49 @@ class SSHConnection(QObject):
         self.term_rows = rows
         if not self.is_connected or not self.channel:
             return
+        self._size_unsent = True
+        self._send_terminal_size()
+
+    def _send_terminal_size(self):
+        """覚えている大きさを送る。いま書くと待たされるなら送らずに残す（GUI スレッドから呼ぶ）
+
+        paramiko は window-change を Transport へ書くとき、書けるまで戻らない
+        （時間切れを無限に再試行する）。相手が TCP まで受け取りを止めている間や
+        鍵交換中に GUI スレッドから書くと、その間画面が止まっていた（実測
+        7 秒。相手が受け取らないままなら無期限）。その間は大きさだけを覚えて
+        見張りを起こし、書けるようになった知らせ（send_drained）で最後の
+        大きさを送る。見張りが無い（接続の手順を通っていない）ときは待てない
+        ので、これまでどおりその場で送る。
+        """
+        channel, watcher = self.channel, self._drain_watcher
+        if not self._size_unsent or not self.is_connected or channel is None:
+            return
+        if (watcher is not None and self._transport_backlogged(channel)
+                and watcher.check()):
+            return   # 書けるようになったら send_drained でここへ戻ってくる
+        self._size_unsent = False
         try:
-            self.channel.resize_pty(width=cols, height=rows)
+            channel.resize_pty(width=self.term_cols, height=self.term_rows)
         except Exception:
             pass
+
+    @staticmethod
+    def _transport_backlogged(channel) -> bool:
+        """channel の Transport へいま書くと待たされるなら True（鍵交換中・TCP へ書けない）
+
+        チャネルの窓は見ない（window-change は窓と関係なく書ける）。
+        判定できないとき・閉じたときは False（書かせれば paramiko が失敗を
+        返す）。状態を読むだけで書かない。
+        """
+        try:
+            if channel.closed:
+                return False
+            transport = channel.get_transport()
+            if not transport.clear_to_send.is_set():
+                return True
+            return not socket_writable(transport.sock)
+        except Exception:
+            return False
 
     def _read_output(self):
         """バックグラウンドで出力を読み取る"""
