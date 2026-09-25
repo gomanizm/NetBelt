@@ -401,6 +401,25 @@ class FTPServerManager(QObject):
                     super().close()
                 finally:
                     mgr._release_uploads(self)
+            def flush_account(self):
+                # REIN と認証済みの USER は、データ接続を待っている STOR / APPE
+                # （待ち行列）を捨てるが、pyftpdlib はそのファイルを閉じず、
+                # 上の未完了のコールバックも呼ばない。予約が制御接続を閉じるまで
+                # 残って同じ保存先へ誰も書けず、行も開始のまま残っていた（実測）。
+                # 捨てた分だけ閉じて未完了として片付ける。進行中の転送は
+                # RFC 959 どおり最後まで続くので、その予約には触れない
+                queued = self._in_dtp_queue
+                super().flush_account()
+                if queued is None or queued[1] not in ("STOR", "APPE"):
+                    return
+                file = queued[0].name
+                try: queued[0].close()
+                except Exception: pass
+                mgr._release_uploads(self, file)
+                mgr._emit_interrupted(self.remote_ip, os.path.basename(file), "upload",
+                                      file, self._display_for(file))
+                if getattr(self, "_tx_path", None) == file:
+                    self._forget_tx()
             def on_connect(self):
                 mgr._emit_activity(self.remote_ip, "接続")
             def on_disconnect(self):
