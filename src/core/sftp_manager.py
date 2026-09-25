@@ -77,6 +77,8 @@ class SFTPManager(QObject):
         # （list_directory は転送スレッドからも呼ばれるのでロックで守る）
         self._listing_seq = 0
         self._listing_seq_lock = threading.Lock()
+        # 最後に頼んだ一覧の場所（_refresh_listing が使う。_listing_seq_lock で守る）
+        self._listing_path = None
         self._listing_done.connect(self._on_listing_done)
     
     # GUI スレッドから直接呼ぶ操作が、転送の終わりを待つ最大時間。
@@ -332,6 +334,7 @@ class SFTPManager(QObject):
         with self._listing_seq_lock:
             self._listing_seq += 1
             seq = self._listing_seq
+            self._listing_path = path
 
         def list_thread():
             import stat as stat_mod
@@ -414,10 +417,27 @@ class SFTPManager(QObject):
                 self._listing_done.emit(seq, path, file_list)
                 
             except Exception as e:
+                # 最新の要求が失敗したら控えを外す。失敗した移動先を、
+                # 自動更新が頼み続けないように（今の場所へ戻る）
+                with self._listing_seq_lock:
+                    if seq == self._listing_seq:
+                        self._listing_path = None
                 self._fail("ディレクトリ一覧取得エラー", e)
         
         # バックグラウンドスレッドで実行
         threading.Thread(target=list_thread, daemon=True).start()
+    
+    def _refresh_listing(self):
+        """変更のあとの自動更新。最後に頼んだ場所の一覧を取り直す
+
+        current_path は一覧が GUI に届いたときにしか変わらない。移動の一覧が
+        届く前に current_path を頼み直すと、一覧は最後に頼んだ分だけを採る
+        ので、古い場所の一覧が移動先を追い越して移動を黙って取り消す。
+        控えが無ければ（最後の要求が失敗した）今の場所を取り直す。
+        """
+        with self._listing_seq_lock:
+            path = self._listing_path
+        self.list_directory(path)
     
     # _remote_probe が返す、送る直前のリモートの状態
     _REMOTE_MISSING = "missing"
@@ -948,7 +968,7 @@ class SFTPManager(QObject):
                 self.transfer_complete.emit(f"アップロード完了: {os.path.basename(local_path)}")
                 
                 # ディレクトリ一覧を更新
-                self.list_directory(self.current_path)
+                self._refresh_listing()
                 
             except Exception as e:
                 # 送りかけの一時ファイルを機器に残さない（できる範囲で。切断後は
@@ -1169,7 +1189,7 @@ class SFTPManager(QObject):
             return
         self.transfer_complete.emit(f"ディレクトリ作成: {os.path.basename(path)}")
         # ディレクトリ一覧を更新（ロックを離してから）
-        self.list_directory(self.current_path)
+        self._refresh_listing()
     
     def delete_item(self, path: str, is_dir: bool = False):
         """
@@ -1203,7 +1223,7 @@ class SFTPManager(QObject):
             return
         self.transfer_complete.emit(f"削除完了: {os.path.basename(path)}")
         # ディレクトリ一覧を更新（ロックを離してから）
-        self.list_directory(self.current_path)
+        self._refresh_listing()
     
     def rename_item(self, old_path: str, new_path: str):
         """
@@ -1231,7 +1251,7 @@ class SFTPManager(QObject):
             return
         self.transfer_complete.emit(f"名前変更完了: {os.path.basename(new_path)}")
         # ディレクトリ一覧を更新（ロックを離してから）
-        self.list_directory(self.current_path)
+        self._refresh_listing()
     
     def change_permissions(self, path: str, mode: int):
         """
@@ -1259,7 +1279,7 @@ class SFTPManager(QObject):
             return
         self.transfer_complete.emit(f"パーミッション変更完了: {os.path.basename(path)}")
         # ディレクトリ一覧を更新（ロックを離してから）
-        self.list_directory(self.current_path)
+        self._refresh_listing()
 
     def inspect_link_target(self, path: str):
         """シンボリックリンクの先の mode と名前を読む（GUI スレッドから呼ぶ）
