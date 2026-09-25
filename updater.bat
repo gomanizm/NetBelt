@@ -284,9 +284,13 @@ REM Microsoft.PowerShell.Archive が選ばれる（tests/test_updater_psmodulepa
 REM PowerShell 7 のターミナルから NetBelt を起動した利用者も同じ道を通る。
 REM そこで 5.1 の標準の置き場所だけにする。利用者が足した置き場所も使わない
 REM （Archive の別の版が選ばれると、下の角括弧の逃がし方の前提が崩れる）。
-REM 呼び出し元の値は控えておき、[6/6] で NetBelt を起動し直す前に戻す。
-set "CALLER_PSMODULEPATH=!PSModulePath!"
-set "PSModulePath=%SystemRoot%\system32\WindowsPowerShell\v1.0\Modules"
+rem Only the three powershell calls get that path, each inside its own
+rem setlocal, and the caller's value is left alone for the restarted
+rem NetBelt. It used to be saved with a set line and put back before the
+rem restart, but cmd silently skips a line longer than 8191 characters
+rem after expansion: a long PSModulePath was dropped from the restarted
+rem NetBelt. setlocal and endlocal copy the environment without a
+rem command line, and the powershell exit code survives endlocal.
 
 REM ZIPファイルを展開
 echo [4/6] ZIPファイルを展開中...
@@ -333,7 +337,10 @@ REM 展開まで進む形は変えていない。
 set "PS_ZIP=!ZIP_FILE!"
 set "PS_DEST=!TEMP_DIR!"
 set "PS_SHA=!ZIP_SHA!"
+setlocal
+set "PSModulePath=%SystemRoot%\system32\WindowsPowerShell\v1.0\Modules"
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$rc = 1; try { $fs = [IO.File]::Open($env:PS_ZIP, 'Open', 'Read', 'Read') } catch { Write-Host 'エラー:' $_.Exception.Message; exit 1 }; try { if ($env:PS_SHA) { if ((Get-FileHash -InputStream $fs -Algorithm SHA256 -ErrorAction Stop).Hash -ne $env:PS_SHA) { exit 2 } }; $env:PS_DEST = $env:PS_DEST -replace '([\[\]`])', '`$1'; Expand-Archive -LiteralPath $env:PS_ZIP -DestinationPath $env:PS_DEST -Force; $rc = 0 } catch { Write-Host 'エラー:' $_.Exception.Message } finally { $fs.Close() }; exit $rc"
+endlocal
 if errorlevel 2 goto :zip_sha_mismatch
 if errorlevel 1 goto :zip_expand_failed
 goto :zip_expanded
@@ -665,9 +672,6 @@ if not exist "!APP_PATH!" (
     pause
     exit /b 1
 )
-REM PSModulePath を呼び出し元の値へ戻す（[4/6] の手前の注を参照）。
-REM 起動し直す NetBelt の環境は、更新の前と変えない。
-set "PSModulePath=!CALLER_PSMODULEPATH!"
 cmd /d /c exit 0
 start "" "!APP_PATH!"
 if errorlevel 1 set "LAUNCH_FAILED=1"
@@ -875,6 +879,8 @@ REM PS_LOCK に見るフォルダを入れて呼ぶ。古ければ errorlevel 0�
 REM なければ 1。フォルダの更新日時は holder.txt を書いた時刻＝確保した
 REM 時刻になる。回収では 2 回呼ぶ（つかむ前と、つかんだ後）。
 :lock_is_stale
+setlocal
+set "PSModulePath=%SystemRoot%\system32\WindowsPowerShell\v1.0\Modules"
 powershell -NoProfile -ExecutionPolicy Bypass -Command "try { $d = Get-Item -LiteralPath $env:PS_LOCK -Force -ErrorAction Stop; if ($d.LastWriteTime -lt (Get-Date).AddMinutes(-10)) { exit 0 } } catch { }; exit 1"
 exit /b !errorlevel!
 
@@ -886,5 +892,7 @@ REM errorlevel 0、見えれば 1。目印は md の直後なら空、holder.txt
 REM 書いた後ならそれが入っている。ファイル、または holder.txt の無い
 REM 中身つきフォルダは、利用者が置いたものとして扱う。
 :lock_is_foreign
+setlocal
+set "PSModulePath=%SystemRoot%\system32\WindowsPowerShell\v1.0\Modules"
 powershell -NoProfile -ExecutionPolicy Bypass -Command "try { $i = Get-Item -LiteralPath $env:PS_LOCK -Force -ErrorAction Stop; if (-not $i.PSIsContainer) { exit 0 }; if (Test-Path -LiteralPath (Join-Path $i.FullName 'holder.txt')) { exit 1 }; if (@(Get-ChildItem -LiteralPath $i.FullName -Force -ErrorAction SilentlyContinue).Count -gt 0) { exit 0 } } catch { }; exit 1"
 exit /b !errorlevel!
