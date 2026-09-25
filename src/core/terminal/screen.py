@@ -336,8 +336,14 @@ class Screen(object):
         # 桁」で行を切って、右端の外に書かれていた 旧桁 - 新桁 文字が
         # 画面からも文書からも消える。持ち越しが要るのは、直したかった
         # 「右端の 1 文字が上書きされる」が起きる行数だけの変更
-        self._pending_wrap = (self._pending_wrap and logical_col >= cols
-                              and cols >= was_cols)
+        keep_wait = logical_col >= cols and cols >= was_cols
+        if self._pending_wrap and not keep_wait:
+            # 待ちを解いたカーソルは、印字した右端のセルにはもう居ない
+            # (広げると 1 つ右、狭めると右端の外に残ったセルより左)。
+            # 最終桁へ印字した覚えを残すと、1 桁だけ広げたときに結合文字
+            # が足した空白へ付く (_join_previous)
+            self._printed_at_last_col = False
+        self._pending_wrap = self._pending_wrap and keep_wait
         self.dirty = set(range(rows))
         self._reflowed = True
 
@@ -508,13 +514,15 @@ class Screen(object):
         右端で折り返し待ちなら今のセル、そうでなければ 1 つ左のセル。
         折り返しが無効 (ESC[?7l) なら右端で印字してもカーソルが動かず
         折り返し待ちも立たないので、直前の印字が最終桁へ届いていたとき
-        だけ今のセルを選ぶ。最終桁に居るだけ (手前まで印字して進んだ・
-        TAB で止まった・CUP で来た) なら、そこはまだ空白なので 1 つ左。
+        だけ今のセルを選ぶ。その覚えは、あとで ESC[?7h で折り返しを戻し
+        ても使う (xterm も最後に書いたセルへ付ける)。最終桁に居るだけ
+        (手前まで印字して進んだ・TAB で止まった・CUP で来た) なら、そこは
+        まだ空白なので 1 つ左。
         そこが全角の継続セルなら、その全角本体へ繋げる。前に文字が無い
         (行頭) ときと、セルが MAX_CELL_TEXT まで伸びているときは捨てる。
         """
         line = self.lines[self.cursor_row]
-        at_last_col = (not self.autowrap and self._printed_at_last_col
+        at_last_col = (self._printed_at_last_col
                        and self.cursor_col == self.cols - 1)
         i = (self.cursor_col if self._pending_wrap or at_last_col
              else self.cursor_col - 1)
