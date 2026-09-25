@@ -110,8 +110,12 @@ class TftpConcurrentUploadRefusedTest(unittest.TestCase):
         a, a_tid = self._establish("cfg.txt", b"A" * BLOCK)
         self._refused("cfg.txt")
 
+        # 通知はワーカーが ERROR を送ったあとに呼ぶので、ERROR を受け取った
+        # 時点ではまだ来ていないことがある（全体実行の負荷で 1 回落ちた）
+        self.assertTrue(self._wait_until(
+            lambda: any(k == "protocol_error" for k, _ in self.events)),
+            "断ったことが通知されない")
         notices = [p for k, p in self.events if k == "protocol_error"]
-        self.assertTrue(notices, "断ったことが通知されない")
         self.assertIn("cfg.txt", notices[-1][1])
         # 進行中の転送の行を閉じてしまわないよう、ファイル名は空で渡す
         self.assertEqual(notices[-1][0], "")
