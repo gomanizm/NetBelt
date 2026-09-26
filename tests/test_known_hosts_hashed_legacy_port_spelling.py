@@ -264,9 +264,9 @@ class HashedLegacyPortSpellingKnownHostsTest(unittest.TestCase):
                         "読めない行として中止していない: %r" % (errors,))
         self.assertEqual(self.known_hosts.read_text(encoding="utf-8"), text)
 
-    def _assert_saved_meanwhile_stops(self, other_line, port):
+    def _assert_saved_meanwhile_stops(self, other_line, port, host=HOST):
         returned, errors, auth_log = self._connect(
-            "", self.key_b, port, saved_meanwhile=other_line)
+            "", self.key_b, port, host=host, saved_meanwhile=other_line)
         self.assertFalse(returned)
         self.assertEqual(auth_log, [],
                          "別の鍵が保存済みの相手へ認証が届いている: %r" % (errors,))
@@ -308,6 +308,33 @@ class HashedLegacyPortSpellingKnownHostsTest(unittest.TestCase):
                 self._assert_refused(
                     _line(HostKeys.hash_host(name), self.key_a), 22,
                     host="SW1.example.com")
+
+    def test_hashed_port22_name_with_integer_port(self):
+        """旧版が文字列 "22" で書いた "[host]:22" をハッシュ化した行も、port が整数の 22 のとき照合すること。
+
+        設定の綴りのままハッシュ化した行は、paramiko の lookup("[host]:22")
+        がそのまま見つける。大文字小文字だけが違う名前の行・鍵欄が壊れた行・
+        保存の直前に足された大文字小文字違いの行は、ハッシュ化名の候補
+        （_names_same_endpoint が 22 番のときに足す "[host]:22"）でしか
+        照合できない。test_ssh_legacy_port22_known_hosts.py は port を文字列
+        "22" で渡すので、設定の綴りの候補が代わりに照合してしまい、この候補の
+        見張りにならない。
+        """
+        with self.subTest("as written"):
+            self._assert_refused(
+                _line(HostKeys.hash_host("[%s]:22" % HOST), self.key_a), 22)
+        with self.subTest("other case"):
+            self._assert_refused(
+                _line(HostKeys.hash_host("[sw1.example.com]:22"), self.key_a),
+                22, host="SW1.example.com")
+        with self.subTest("broken line"):
+            self._assert_broken_line_stops(
+                "%s ecdsa-sha2-nistp256 AAAA\n"
+                % HostKeys.hash_host("[%s]:22" % HOST), 22)
+        with self.subTest("saved meanwhile, other case"):
+            self._assert_saved_meanwhile_stops(
+                _line(HostKeys.hash_host("[sw1.example.com]:22"), self.key_a),
+                22, host="SW1.example.com")
 
     def test_hashed_legacy_spelling_accepts_the_same_key_with_integer_port(self):
         """port が整数でも、鍵A の相手には認証へ進み、読み替えた鍵をディスクに書かないこと。"""
