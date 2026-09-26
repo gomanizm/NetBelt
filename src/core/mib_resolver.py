@@ -1022,6 +1022,9 @@ class MIBResolver:
         # から来た名前。子が fresh かを親から引く
         fresh_in_module = set()
         fresh_known = set()
+        # 借用で決まった宣言（子孫まで）の (モジュール, 名前)。その下の
+        # 1.3.1 では読めなかった形の子は解決しない（借用の説明を見ること）
+        borrowed = set()
         in_module = {}
         resolved = {}
         pending = list(definitions)
@@ -1050,6 +1053,7 @@ class MIBResolver:
                     bool(newly_read)
                     and (name, parent, index, module) in newly_read)
                 parent_fresh = False
+                parent_borrowed = False
                 if parent == 'enterprises':
                     parent_oid = '1.3.6.1.4.1'
                 elif parent == '':
@@ -1058,6 +1062,7 @@ class MIBResolver:
                 elif parent in declared[module]:
                     parent_oid = in_module.get(module, {}).get(parent)
                     parent_fresh = (module, parent) in fresh_in_module
+                    parent_borrowed = (module, parent) in borrowed
                     if (parent_oid is None and borrow
                             and not new_form
                             and (module, parent) not in awaiting
@@ -1071,13 +1076,18 @@ class MIBResolver:
                         # TRAP-TYPE（添字 0.N）にまで借用を広げない（実測:
                         # 自社が読めない右辺で宣言した system の
                         # { system 5 1 } が標準の 1.3.6.1.2.1.1.5.1 に、
-                        # { system sn(5) } が 1.3.6.1.2.1.1.5 に付いた）
+                        # { system sn(5) } が 1.3.6.1.2.1.1.5 に付いた）。
+                        # 借りて決まった子の下（子孫まで）の新しい形の子も
+                        # 解決しない。解決すると借用を広げたのと同じになる
+                        # （実測: { system 4 } の下の { acmeSingle 6 1 } が
+                        # 標準の 1.3.6.1.2.1.1.4.6.1 に付いた）
                         parent_oid = known.get(parent)
                         parent_fresh = parent in fresh_known
+                        parent_borrowed = True
                 else:
                     parent_oid = known.get(parent)
                     parent_fresh = parent in fresh_known
-                if parent_oid is None:
+                if parent_oid is None or (new_form and parent_borrowed):
                     still_pending.append((name, parent, index, module))
                     continue
                 oid = f"{parent_oid}.{index}" if parent_oid else index
@@ -1094,6 +1104,10 @@ class MIBResolver:
                     fresh_in_module.add((module, name))
                 else:
                     fresh_in_module.discard((module, name))
+                if parent_borrowed:
+                    borrowed.add((module, name))
+                else:
+                    borrowed.discard((module, name))
                 in_module.setdefault(module, {})[name] = oid
                 resolved[oid] = name
                 progressed = True
