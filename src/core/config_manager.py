@@ -1530,16 +1530,17 @@ class ConfigManager:
         return False
 
     def remove_device(self, group_name: str, device_name: str,
-                      endpoint=None) -> bool:
+                      endpoint=None, device=None) -> bool:
         """機器を 1 件だけ削除（対象の機器が無いときも False）
 
         名前で絞ると、同じグループに同名が 2 台あるときに 2 台とも消える。
         画面の確認も完了も 1 台の話をするので、消えたことが伝わらない
         （remove_group は先頭の 1 件だけを消す形に揃っている）。
         endpoint には削除したい機器の接続先（device_endpoint() の戻り値）を
-        渡す。省略すると先頭の 1 件を消す。
+        渡す。省略すると先頭の 1 件を消す。device には削除したい機器の
+        データを渡す（同じ名前のグループの選び分けに使う。_group_of_device）。
         """
-        group = self._group_of_device(group_name, device_name, endpoint)
+        group = self._group_of_device(group_name, device_name, endpoint, device)
         if not group:
             return False
 
@@ -1581,16 +1582,20 @@ class ConfigManager:
         return found[0]
 
     def _group_of_device(self, group_name: str, device_name: str,
-                         endpoint=None) -> Optional[Dict]:
+                         endpoint=None, device=None) -> Optional[Dict]:
         """機器を操作するグループを、グループ名と機器の接続先から選ぶ（無ければ None）。
 
         手編集の config.json では同じ名前のグループが並ぶ（読み込みは警告だけで
         残す）。get_group() は先頭しか返さないので、2 つ目のグループの機器を
         削除・編集・移動したつもりで、1 つ目にいる同名の機器が書き換わっていた
         （実測）。同じ名前のグループが複数あって接続先を渡されたときは、その
-        機器を実際に持っているグループを選ぶ。どれも持っていない・複数が
-        持っていて決まらないときは、別の機器を書き換えないよう None で断る。
-        同じ名前のグループが無いときと接続先を省いたときは get_group() と同じ。
+        機器を実際に持っているグループを選ぶ。接続先まで同じ機器を複数の
+        グループが持っているときは、device（画面の項目が持つ機器データ）と
+        中身が一致する機器を持つグループに絞る（接続先だけで断ると、先に
+        並んでいる方の機器まで操作できなくなっていた。実測）。それでも
+        決まらない・どれも持っていないときは、別の機器を書き換えないよう
+        None で断る。同じ名前のグループが無いときと接続先を省いたときは
+        get_group() と同じ。
         """
         groups = [g for g in self.get_groups() if g.get("name") == group_name]
         if len(groups) <= 1 or endpoint is None:
@@ -1599,6 +1604,8 @@ class ConfigManager:
                    if any(isinstance(d, dict) and d.get("name") == device_name
                           and device_endpoint(d) == endpoint
                           for d in g.get("devices", []))]
+        if len(holders) > 1 and isinstance(device, dict):
+            holders = [g for g in holders if device in g.get("devices", [])]
         return holders[0] if len(holders) == 1 else None
 
     def find_device_group(self, device_name: str) -> Optional[str]:
@@ -1611,7 +1618,7 @@ class ConfigManager:
 
     def update_device(self, group_name: str, old_name: str,
                       new_group_name: str, device_info: Dict,
-                      old_endpoint=None) -> bool:
+                      old_endpoint=None, old_device=None) -> bool:
         """機器を差し替える（改名・グループ移動を含む）。保存は 1 回。
 
         remove_device → add_device の 2 段階にすると、間の状態がディスクに
@@ -1623,10 +1630,12 @@ class ConfigManager:
         渡す。同じグループに同名が並んでいるときに、どちらを編集したのかは
         名前だけでは決まらないため。省略すると先頭の 1 件を編集する。
         同じ名前のグループが並んでいるときは、その接続先の機器を持つグループを
-        編集する（_group_of_device）。グループ名を変えない編集は、そのグループに
-        置いたままにする（名前で引き直すと、先に並んでいる同名のグループへ移る）。
+        編集する（_group_of_device。old_device には編集前の機器データを渡す）。
+        グループ名を変えない編集は、そのグループに置いたままにする（名前で
+        引き直すと、先に並んでいる同名のグループへ移る）。
         """
-        source = self._group_of_device(group_name, old_name, old_endpoint)
+        source = self._group_of_device(group_name, old_name, old_endpoint,
+                                       old_device)
         target = (source if new_group_name == group_name
                   else self.get_group(new_group_name))
         if not source or not target:
@@ -1845,7 +1854,7 @@ class ConfigManager:
         return self.save_config()
     
     def move_device(self, source_group_name: str, target_group_name: str,
-                    device_name: str, endpoint=None) -> bool:
+                    device_name: str, endpoint=None, device=None) -> bool:
         """
         デバイスをグループ間で移動
 
@@ -1856,6 +1865,7 @@ class ConfigManager:
             endpoint: 掴んだ機器の接続先（device_endpoint() の戻り値）。
                 同じグループに同名が並んでいるとき、どの 1 台を動かすかを
                 これで決める。省略時は今までどおり先頭の 1 件
+            device: 掴んだ機器のデータ（同じ名前のグループの選び分けに使う）
 
         Returns:
             移動成功時True、失敗時False
@@ -1863,9 +1873,10 @@ class ConfigManager:
         # 移動元グループを取得。同じ名前のグループが並んでいるときは、掴んだ
         # 機器を持つ方（_group_of_device。決まらなければ断る）
         source_group = self._group_of_device(source_group_name, device_name,
-                                             endpoint)
+                                             endpoint, device)
         if not source_group:
-            print(f"エラー: 移動元グループ '{source_group_name}' が見つかりません")
+            print(f"エラー: 移動元グループ '{source_group_name}' が見つからないか、"
+                  "同じ名前のグループのどれの機器か決められません")
             return False
         
         # 移動先グループを取得（同じ名前なら移動元のまま＝今までどおり断る）

@@ -544,6 +544,21 @@ class MainWindow(QMainWindow):
         return list(dict.fromkeys(
             g["name"] for g in self.config_manager.get_groups()))
 
+    def _same_name_group_hint(self, group_name: str) -> str:
+        """同じ名前のグループが並んでいるとき、機器の操作を断る訳と直し方を返す。
+
+        同じ名前のグループの両方に中身まで同じ機器があると、どちらの機器か
+        決められないので ConfigManager は断る（_group_of_device）。失敗とだけ
+        出すと、訳も直し方も分からなかった（実測）。並んでいなければ空文字。
+        """
+        if sum(g.get("name") == group_name
+               for g in self.config_manager.get_groups()) < 2:
+            return ""
+        return (f"\n\n同じ名前のグループ '{group_name}' が複数あり、どのグループの"
+                "機器か決められないとき（同じ内容の機器が両方にあるときなど）は、"
+                "別の機器を書き換えないよう変更しません。接続先リストで先に並んで"
+                "いる方を右クリックし「グループを編集」で別の名前にすると分かれます。")
+
     def _on_add_device(self):  # 追加
         """機器追加ダイアログを表示"""
         # グループ名リストを取得
@@ -658,7 +673,8 @@ class MainWindow(QMainWindow):
             # だけでは開いた項目を指せず、別の 1 台が書き換わってしまう
             if self.config_manager.update_device(group_name, old_device_name,
                                                  new_group_name, new_device_data,
-                                                 old_endpoint=self._endpoint_of(device_data)):
+                                                 old_endpoint=self._endpoint_of(device_data),
+                                                 old_device=device_data):
                 # 開いているタブの再接続は device_info の写しを見る。
                 # ここを更新しないと編集内容が届かず、古い接続情報のまま
                 # 繋がり続ける（存在しない鍵を指定しても、以前の鍵で
@@ -674,7 +690,8 @@ class MainWindow(QMainWindow):
                 self._load_devices()
                 self.status_bar.showMessage(f"機器 '{new_device_data['name']}' を更新しました")
             else:
-                QMessageBox.warning(self, "エラー", "機器の更新に失敗しました。設定は変更されていません。")
+                QMessageBox.warning(self, "エラー", "機器の更新に失敗しました。設定は変更されていません。"
+                                    + self._same_name_group_hint(group_name))
     
     def _on_device_delete(self, group_name: str, device_name: str,
                           device_data: dict = None):
@@ -719,7 +736,7 @@ class MainWindow(QMainWindow):
             # 接続先で 1 台に絞る（名前だけだと別の 1 台が消える）
             if self.config_manager.remove_device(
                     group_name, device_name,
-                    endpoint=self._endpoint_of(device_data)):
+                    endpoint=self._endpoint_of(device_data), device=device_data):
                 # 消した機器の接続情報を残さない（残すと、開いたままの
                 # タブで Enter を押したときに消したはずの機器へ繋がる）
                 # （接続先が違う写しは、同名の別の機器のセッションのものなので残す）
@@ -737,7 +754,8 @@ class MainWindow(QMainWindow):
                     # 保存に失敗しただけなら remove_device がメモリを戻して
                     # いるので、ツリーは設定と一致したまま＝作り直さない
                     self._load_devices()
-                QMessageBox.warning(self, "エラー", "機器の削除に失敗しました。")
+                QMessageBox.warning(self, "エラー", "機器の削除に失敗しました。"
+                                    + self._same_name_group_hint(group_name))
     
     def _on_device_duplicate(self, group_name: str, device_data: dict):
         """
@@ -796,14 +814,15 @@ class MainWindow(QMainWindow):
         # 掴んだ項目の接続先で 1 台に絞る（名前だけだと別の 1 台が動く）
         if self.config_manager.move_device(
                 source_group_name, target_group_name, device_name,
-                endpoint=self._endpoint_of(device_data)):
+                endpoint=self._endpoint_of(device_data), device=device_data):
             # ツリーを再読み込み
             self._load_devices()
             self.status_bar.showMessage(
                 f"機器 '{device_name}' を '{source_group_name}' から '{target_group_name}' に移動しました"
             )
         else:
-            QMessageBox.warning(self, "エラー", "機器の移動に失敗しました。")
+            QMessageBox.warning(self, "エラー", "機器の移動に失敗しました。"
+                                + self._same_name_group_hint(source_group_name))
     
     def _on_connect_requested(self, device_data: dict):
         """

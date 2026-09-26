@@ -337,5 +337,238 @@ class SameNameGroupsFromTheWindowTest(_ConfigFixture):
                          "掴んでいない 1 つ目の kyoten の R が動いた")
 
 
+def _same_endpoint_groups(second_username="operator"):
+    """両方の kyoten に、名前も接続先も同じ R@192.0.2.1 を置く（ユーザー名だけ違う）。"""
+    groups = _duplicated_groups()
+    groups[3]["devices"] = [_device("R", "192.0.2.1", second_username)]
+    return groups
+
+
+SAME_ENDPOINT_BEFORE = [("Default", []),
+                        ("kyoten", [("R", "192.0.2.1", "admin")]),
+                        ("other", []),
+                        ("kyoten", [("R", "192.0.2.1", "operator")])]
+
+
+class SameEndpointInBothGroupsTest(_ConfigFixture):
+    """両方の同名グループに名前も接続先も同じ機器があるとき、画面の機器データで選ぶ。
+
+    実測（14dc5c9）: kyoten[R@192.0.2.1 admin] / other / kyoten[R@192.0.2.1
+    operator] で、1 つ目の kyoten の R を右クリックして削除・編集すると
+    「機器の削除に失敗しました。」「機器の更新に失敗しました。設定は変更されて
+    いません。」とだけ出て断られ、ドラッグでの移動も断られた（ebbe593 では
+    1 つ目の R に正しく当たっていた）。接続先だけでは、どちらの kyoten の R か
+    決まらないため（b9cbcfa の _group_of_device）。画面の項目が持つ機器データ
+    （中身）と一致する機器を持つグループに絞れば決まる。中身まで同じなら
+    決まらないので、今までどおり断る。
+    """
+
+    def setUp(self):
+        super().setUp()
+        from core.config_manager import device_endpoint
+        self.cm = self._config_manager(_same_endpoint_groups())
+        self.first = _device("R", "192.0.2.1")
+        self.second = _device("R", "192.0.2.1", "operator")
+        self.ep = device_endpoint(self.first)
+
+    def test_removing_picks_the_group_whose_device_matches(self):
+        for device, expected in [
+                (self.first, [("Default", []), ("kyoten", []), ("other", []),
+                              ("kyoten", [("R", "192.0.2.1", "operator")])]),
+                (self.second, [("Default", []),
+                               ("kyoten", [("R", "192.0.2.1", "admin")]),
+                               ("other", []), ("kyoten", [])])]:
+            with self.subTest(device["username"]):
+                cm = self._config_manager(_same_endpoint_groups())
+                self.assertTrue(cm.remove_device("kyoten", "R", endpoint=self.ep,
+                                                 device=device))
+                self.assertEqual(self._on_disk(), expected)
+
+    def test_editing_picks_the_group_whose_device_matches(self):
+        self.assertTrue(self.cm.update_device(
+            "kyoten", "R", "kyoten", dict(self.first, username="changed"),
+            old_endpoint=self.ep, old_device=self.first))
+
+        self.assertEqual(self._on_disk(),
+                         [("Default", []),
+                          ("kyoten", [("R", "192.0.2.1", "changed")]),
+                          ("other", []),
+                          ("kyoten", [("R", "192.0.2.1", "operator")])],
+                         "1 つ目の kyoten の R を編集できない、または別の R が変わった")
+
+        self.assertTrue(self.cm.update_device(
+            "kyoten", "R", "kyoten", dict(self.second, username="changed2"),
+            old_endpoint=self.ep, old_device=self.second))
+        self.assertEqual(self._on_disk()[3],
+                         ("kyoten", [("R", "192.0.2.1", "changed2")]))
+        self.assertEqual(self._on_disk()[1],
+                         ("kyoten", [("R", "192.0.2.1", "changed")]))
+
+    def test_moving_picks_the_group_whose_device_matches(self):
+        self.assertTrue(self.cm.move_device("kyoten", "other", "R",
+                                            endpoint=self.ep, device=self.first))
+
+        self.assertEqual(self._on_disk(),
+                         [("Default", []),
+                          ("kyoten", []),
+                          ("other", [("R", "192.0.2.1", "admin")]),
+                          ("kyoten", [("R", "192.0.2.1", "operator")])])
+
+    def test_identical_devices_in_both_groups_are_still_refused(self):
+        """中身まで同じ機器が両方にあれば、どちらか決まらないので断ること。"""
+        cm = self._config_manager(_same_endpoint_groups("admin"))
+        before = self._on_disk()
+
+        self.assertFalse(cm.remove_device("kyoten", "R", endpoint=self.ep,
+                                          device=self.first))
+        self.assertFalse(cm.update_device(
+            "kyoten", "R", "kyoten", dict(self.first, username="changed"),
+            old_endpoint=self.ep, old_device=self.first))
+        self.assertFalse(cm.move_device("kyoten", "other", "R",
+                                        endpoint=self.ep, device=self.first))
+
+        self.assertEqual(self._on_disk(), before, "断ったのに設定が変わった")
+
+    def test_a_device_that_matches_neither_group_is_refused(self):
+        """画面の機器データがどちらとも一致しなければ、先頭を選ばず断ること。"""
+        stale = _device("R", "192.0.2.1", "someone")
+
+        self.assertFalse(self.cm.remove_device("kyoten", "R", endpoint=self.ep,
+                                               device=stale))
+        self.assertFalse(self.cm.move_device("kyoten", "other", "R",
+                                             endpoint=self.ep, device=stale))
+
+        self.assertEqual(self._on_disk(), SAME_ENDPOINT_BEFORE)
+
+
+class SameEndpointInBothGroupsFromTheWindowTest(_ConfigFixture):
+    """画面の経路でも、1 つ目の kyoten の R を削除・編集・移動できる（ebbe593 と同じ）。"""
+
+    @classmethod
+    def setUpClass(cls):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PyQt6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    # 破棄済みウィジェットへのシグナル配送で落ちるため保持する
+    _windows = []
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._windows.clear()
+
+    def _window(self, groups):
+        from ui.main_window import MainWindow
+        cm = self._config_manager(groups)
+        with mock.patch("ui.main_window.ConfigManager", return_value=cm), \
+                mock.patch.object(MainWindow, "_check_for_updates_on_startup"), \
+                mock.patch("ui.main_window.QMessageBox.warning"):
+            window = MainWindow()
+        type(self)._windows.append(window)
+        return window
+
+    @staticmethod
+    def _first_r(window):
+        from PyQt6.QtCore import Qt
+        tree = window.device_tree.tree
+        items = [tree.topLevelItem(i) for i in range(tree.topLevelItemCount())]
+        item = [i for i in items if i.text(0) == "kyoten"][0].child(0)
+        return item, item.data(0, Qt.ItemDataRole.UserRole)
+
+    def _delete(self, window, data):
+        from PyQt6.QtWidgets import QMessageBox
+        with mock.patch("ui.main_window.QMessageBox.question",
+                        return_value=QMessageBox.StandardButton.Yes), \
+                mock.patch("ui.main_window.QMessageBox.warning") as warn:
+            window.device_tree.device_delete.emit("kyoten", data["name"], data)
+        return warn
+
+    def _edit(self, window, data):
+        from PyQt6.QtWidgets import QDialog
+        dialog = mock.MagicMock()
+        dialog.exec.return_value = QDialog.DialogCode.Accepted
+        dialog.get_device_data.return_value = dict(data, username="changed")
+        dialog.get_selected_group.return_value = "kyoten"
+        dialog.group_combo.findText.return_value = 1
+        with mock.patch("ui.main_window.DeviceDialog", return_value=dialog), \
+                mock.patch("ui.main_window.QMessageBox.warning") as warn:
+            window.device_tree.device_edit.emit("kyoten", data)
+        return warn
+
+    def _drag_to_other(self, window, item):
+        tree = window.device_tree
+        top = [tree.tree.topLevelItem(i)
+               for i in range(tree.tree.topLevelItemCount())]
+        other = [i for i in top if i.text(0) == "other"][0]
+        tree.tree.setCurrentItem(item)
+        event = mock.Mock()
+        with mock.patch.object(tree.tree, "itemAt", return_value=other), \
+                mock.patch.object(tree.tree, "dropIndicatorPosition",
+                                  return_value=None), \
+                mock.patch("ui.main_window.QMessageBox.warning") as warn:
+            tree._on_drop_event(event)
+        self.assertTrue(event.accept.called, "前提: ドロップが受け付けられている")
+        return warn
+
+    def test_deleting_the_first_groups_device(self):
+        window = self._window(_same_endpoint_groups())
+        _, data = self._first_r(window)
+
+        warn = self._delete(window, data)
+
+        self.assertFalse(warn.called, "1 つ目の kyoten の R の削除が断られた")
+        self.assertEqual(self._on_disk(),
+                         [("Default", []), ("kyoten", []), ("other", []),
+                          ("kyoten", [("R", "192.0.2.1", "operator")])])
+
+    def test_editing_the_first_groups_device(self):
+        window = self._window(_same_endpoint_groups())
+        _, data = self._first_r(window)
+
+        warn = self._edit(window, data)
+
+        self.assertFalse(warn.called, "1 つ目の kyoten の R の編集が断られた")
+        self.assertEqual(self._on_disk(),
+                         [("Default", []),
+                          ("kyoten", [("R", "192.0.2.1", "changed")]),
+                          ("other", []),
+                          ("kyoten", [("R", "192.0.2.1", "operator")])])
+
+    def test_dragging_the_first_groups_device(self):
+        window = self._window(_same_endpoint_groups())
+        item, _ = self._first_r(window)
+
+        warn = self._drag_to_other(window, item)
+
+        self.assertFalse(warn.called, "1 つ目の kyoten の R の移動が断られた")
+        self.assertEqual(self._on_disk(),
+                         [("Default", []), ("kyoten", []),
+                          ("other", [("R", "192.0.2.1", "admin")]),
+                          ("kyoten", [("R", "192.0.2.1", "operator")])])
+
+    def test_a_refusal_says_why_and_how_to_separate_the_groups(self):
+        """中身まで同じで決まらず断るときは、理由と直し方を添えること。
+
+        実測（14dc5c9）: 「機器の削除に失敗しました。」などとだけ出て、なぜ断られた
+        のか、どうすれば操作できるのかが分からなかった。
+        """
+        window = self._window(_same_endpoint_groups("admin"))
+        before = self._on_disk()
+
+        for label, operate in [
+                ("削除", lambda: self._delete(window, self._first_r(window)[1])),
+                ("編集", lambda: self._edit(window, self._first_r(window)[1])),
+                ("移動", lambda: self._drag_to_other(window,
+                                                    self._first_r(window)[0]))]:
+            with self.subTest(label):
+                warn = operate()
+                self.assertTrue(warn.called, "断ったのに案内が出ていない")
+                text = warn.call_args.args[2]
+                self.assertIn("kyoten", text)
+                self.assertIn("先に並んでいる方", text)
+                self.assertIn("グループを編集", text)
+        self.assertEqual(self._on_disk(), before, "断ったのに設定が変わった")
+
+
 if __name__ == "__main__":
     unittest.main()
