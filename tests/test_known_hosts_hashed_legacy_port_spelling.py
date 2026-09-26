@@ -189,6 +189,17 @@ class HashedLegacyPortSpellingKnownHostsTest(unittest.TestCase):
             _line(HostKeys.hash_host("[sw1.example.com]:022"), self.key_a),
             "022", host="SW1.example.com")
 
+    def test_hashed_legacy_name_as_written_refuses_other_key(self):
+        """設定の綴りのまま（大文字を含む）ハッシュ化した旧綴りの行も照合すること。
+
+        小文字にせずに hash_host を掛けたスクリプトや paramiko の
+        HostKeys.hash_host で作った行。ハッシュ化名の候補を小文字の綴り
+        だけにすると、この行が照合に使われず、鍵B の相手へ認証が届く。
+        """
+        self._assert_refused(
+            _line(HostKeys.hash_host("[SW1.example.com]:022"), self.key_a),
+            "022", host="SW1.example.com")
+
     def test_hashed_legacy_spelling_accepts_the_same_key_without_writing(self):
         """鍵A の相手には普通に認証へ進み、読み替えた鍵をディスクに書かないこと。"""
         text = _line(HostKeys.hash_host("[%s]:022" % HOST), self.key_a)
