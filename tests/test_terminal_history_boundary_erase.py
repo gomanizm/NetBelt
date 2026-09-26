@@ -1,4 +1,4 @@
-r"""画面の消去で 0 行目が丸ごと消えても、履歴の最後の行が次の出力へ繋がる件を検証する。
+r"""画面の消去で 0 行目が空行へ置き換わっても、履歴の最後の行が次の出力へ繋がる件を検証する。
 
 1.3.2 の 1 周目で、履歴へ送った最後の行が折り返しで 0 行目へ続いているとき
 (_history_open)、0 行目へ別の行が来たら閉じるようにした (IL・上端の SD と RI・
@@ -19,7 +19,7 @@ r"""画面の消去で 0 行目が丸ごと消えても、履歴の最後の行�
   TerminalWidget (3x10) へ a*10 b*10 c*10 d*5 のあと ESC[2;1H ESC[1J ESC[1;3H 'new'
     unwrapped_text の 1 行目 'aaaaaaaaaa  new'。
 
-直し方: 0 行目から始まる範囲を空行へ置き換えた ED (ED 1 のカーソルが 1 行目
+直し方: 0 行目から始まる範囲を空行へ置き換えた ED (ED 1 のカーソルが 0 行目
 より下のとき・ED 2・原点からの ED 0) のあとと、RIS で画面を白紙にする前に
 _break_history を呼ぶ。消した行の折り返しの印は消去で落ちる (xterm の
 ClearBufRows も消した行の印を落とす)。0 行目の上は履歴の最後の行で、その
@@ -27,9 +27,11 @@ ClearBufRows も消した行の印を落とす)。0 行目の上は履歴の最�
 閉じる。画面の中でも、ED 0 は置き換えた範囲の直前の行 (カーソル行) の印を外して
 いるので、それと揃う。中身のある画面を丸ごと消すときは、もともと _record_screen
 が記録して閉じていたので変わらない。
-変えないもの: 0 行目を消し切らない ED 1 (カーソルが 0 行目) と EL は、行を
-その場で消すだけで上の行の印に触らない (画面の中の行と同じ)。ED 3 は画面に
-触らない。代替画面の中では閉じない (1 周目の決定 (a))。
+変えないもの: カーソルが 0 行目の ED 1・0 行目の途中からの ED 0・EL は、0 行目を
+空行へ置き換えずにその場で消すだけで、上の行の印に触らない (画面の中の行と
+同じ)。0 行目が丸ごと空白になる形 (カーソルが右端の ED 1、EL 2、空白の画面
+での ED 0) でも同じ。ED 3 は画面に触らない。代替画面の中では閉じない (1 周目の
+決定 (a))。
 """
 import os
 import sys
@@ -95,7 +97,7 @@ class EraseClosesHistoryLineTest(unittest.TestCase):
     )
 
     def test_erasing_row_zero_ends_the_history_line(self):
-        """0 行目を丸ごと消す ED・RIS のあと、履歴の行を新しい行へ繋げないこと。"""
+        """0 行目を空行へ置き換える ED・RIS のあと、履歴の行を新しい行へ繋げないこと。"""
         for name, seq, want in self.CASES:
             with self.subTest(name):
                 screen = feed(Screen(3, 4), FILL + seq)
@@ -131,6 +133,15 @@ class EraseClosesHistoryLineTest(unittest.TestCase):
         # 原点以外からの ED 0 も、0 行目の左側 'EF' が続きとして残る
         ("ED 0 inside row 0", CSI + "1;3H" + CSI + "J" + CSI + "1;4HZ",
          "ABCDEF Z\n\n\n"),
+        # カーソルが 0 行目の右端の ED 1 は 0 行目を丸ごと空白にするが、空行へ
+        # 置き換えたのではなくその場で消しただけ (EL 2 と同じ)
+        ("ED 1 at the right edge of row 0",
+         CSI + "1;4H" + CSI + "1J" + CSI + "1;3HZ", "ABCD  Z\nIJKLM\n"),
+        # 空白の画面で 0 行目の途中からの ED 0 も、0 行目はその場で消すだけ
+        # (画面は丸ごと空白になるが、原点からの ED 0 とは違って閉じない)
+        ("ED 0 inside row 0 on a blank screen",
+         BLANK_ROWS + CSI + "1;3H" + CSI + "J" + CSI + "1;2HZ",
+         "ABCD Z\n\n\n"),
         # EL は行をその場で消す。画面の中でも上の行の印には触らない
         ("EL 2 on row 0", CSI + "H" + CSI + "2K" + CSI + "1;3HZ",
          "ABCD  Z\nIJKLM\n"),
@@ -139,7 +150,7 @@ class EraseClosesHistoryLineTest(unittest.TestCase):
     )
 
     def test_erasing_in_place_still_joins(self):
-        """対照: 0 行目を消し切らない ED 1・EL・ED 3 では、今までどおり繋がったままのこと。"""
+        """対照: 0 行目をその場で消す ED 1・ED 0・EL と ED 3 では、今までどおり繋がったままのこと。"""
         for name, seq, want in self.KEPT_CASES:
             with self.subTest(name):
                 screen = feed(Screen(3, 4), FILL + seq)
