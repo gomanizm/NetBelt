@@ -9,6 +9,7 @@ send_command は GUI スレッドから呼ばれ、write と flush を同期で�
 送信をワーカースレッドとキューへ移し、呼び出し側はすぐ戻るようにする。
 順序はキューが保つ。
 """
+import gc
 import sys
 import threading
 import time
@@ -85,6 +86,15 @@ class SerialSendOffGuiThreadTest(unittest.TestCase):
         return conn
 
     def test_send_command_returns_before_the_write_completes(self):
+        # 先に走ったテストの残りは GC の対象から外してから測る。全件を 1 プロセスで
+        # 流すと、世代 2 の GC がその残りを調べる止まり（GitHub のランナーで約
+        # 0.26 秒と推定）が区間に入ることがあり、それだけで上限を超える（実測:
+        # 600 万個を抱えて区間の入口で GC を走らせると 0.33 秒で落ちた。
+        # send_command そのものは 0.000 秒台）。このテストが作るオブジェクトは
+        # 普段どおり GC が調べる
+        gc.collect()
+        gc.freeze()
+        self.addCleanup(gc.unfreeze)
         port = _SlowPort(delay=0.5)
         conn = self._conn(port)
         payload = "x" * 512

@@ -12,6 +12,7 @@ B2: 溜めた出力を 1 片描いている最中に割り込んだ出力や案�
 あわせて、テストが守っていなかった部品（貼り付け・IME 確定で最下部へ戻る、
 閉じたタブの溜まり分を捨てる、再接続の前に前の画面へ描き切る）を固定する。
 """
+import gc
 import os
 import re
 import sys
@@ -153,7 +154,18 @@ class QueuedOutputStaysInOrderTest(_Base):
             w.queue_output("dev", text[i:i + 4096])
 
     def test_a_notice_during_a_backlog_does_not_draw_it_all_at_once(self):
-        """溜まっている最中の案内で、溜まり分を一度に描いて固まらないこと。"""
+        """溜まっている最中の案内で、溜まり分を一度に描いて固まらないこと。
+
+        先に走ったテストの残りは GC の対象から外してから測る。全件を 1 プロセスで
+        流すと、世代 2 の GC がその残りを調べる止まり（GitHub のランナーで約
+        0.26 秒と推定）が区間に入ることがあり、それだけで上限を超える（実測:
+        600 万個を抱えて区間の入口で GC を走らせると 0.31 秒で落ちた。案内その
+        ものは 0.000 秒台）。外すのは部品を作る前の分だけで、このテストが作る
+        オブジェクトは普段どおり GC が調べる。
+        """
+        gc.collect()
+        gc.freeze()
+        self.addCleanup(gc.unfreeze)
         w, terminal = self._widget()
         self._backlog(w, 8000)
 
