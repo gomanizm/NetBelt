@@ -671,9 +671,10 @@ class ConfigManager:
         """同じ名前のグループが複数ある設定を読んだら、その名前を挙げて知らせる。
 
         グループもまた名前だけで探す（get_group は先頭の 1 件を返す）ので、
-        2 つ目以降の同名グループに入っている機器には update_device /
-        remove_device / move_device のどれも届かない。画面には並んでいるのに
-        操作だけが黙って失敗するため、機器名の重複と同じく名指しで知らせる。
+        グループの編集・削除や、機器を追加・移動する先は先に並んでいる方に
+        なる（機器そのものの操作は接続先で持ち主のグループを選ぶ。
+        _group_of_device）。画面の見た目と違うグループに当たるため、機器名の
+        重複と同じく名指しで知らせる。
 
         黙って除外・改名すると利用者の機器やグループが消えるので、設定は
         書き換えない。直し方は画面から案内する。rename_group も get_group
@@ -698,8 +699,8 @@ class ConfigManager:
         self._append_load_warning(
             "設定ファイル (config.json) に同じ名前のグループが複数あります: "
             + "、".join(duplicates)
-            + "\nグループも名前で探すため、2 つ目以降の同名グループにある機器は"
-              "編集も削除も移動もできません。接続先リストでどちらかのグループを"
+            + "\nグループは名前で探すため、グループの編集・削除や、機器を追加・"
+              "移動する先は、先に並んでいる方になります。接続先リストでどちらかのグループを"
               "右クリックし「グループを編集」で別の名前にすると分かれます"
               "（名前で探すため、変わるのは先に並んでいる方です）。"
               "config.json を直接直しても構いません。")
@@ -1537,7 +1538,7 @@ class ConfigManager:
         endpoint には削除したい機器の接続先（device_endpoint() の戻り値）を
         渡す。省略すると先頭の 1 件を消す。
         """
-        group = self.get_group(group_name)
+        group = self._group_of_device(group_name, device_name, endpoint)
         if not group:
             return False
 
@@ -1578,6 +1579,27 @@ class ConfigManager:
                 return matched[0]
         return found[0]
 
+    def _group_of_device(self, group_name: str, device_name: str,
+                         endpoint=None) -> Optional[Dict]:
+        """機器を操作するグループを、グループ名と機器の接続先から選ぶ（無ければ None）。
+
+        手編集の config.json では同じ名前のグループが並ぶ（読み込みは警告だけで
+        残す）。get_group() は先頭しか返さないので、2 つ目のグループの機器を
+        削除・編集・移動したつもりで、1 つ目にいる同名の機器が書き換わっていた
+        （実測）。同じ名前のグループが複数あって接続先を渡されたときは、その
+        機器を実際に持っているグループを選ぶ。どれも持っていない・複数が
+        持っていて決まらないときは、別の機器を書き換えないよう None で断る。
+        同じ名前のグループが無いときと接続先を省いたときは get_group() と同じ。
+        """
+        groups = [g for g in self.get_groups() if g.get("name") == group_name]
+        if len(groups) <= 1 or endpoint is None:
+            return groups[0] if groups else None
+        holders = [g for g in groups
+                   if any(isinstance(d, dict) and d.get("name") == device_name
+                          and device_endpoint(d) == endpoint
+                          for d in g.get("devices", []))]
+        return holders[0] if len(holders) == 1 else None
+
     def find_device_group(self, device_name: str) -> Optional[str]:
         """その名前の機器が属するグループ名を返す（無ければ None）"""
         for group in self.get_groups():
@@ -1599,9 +1621,13 @@ class ConfigManager:
         old_endpoint には編集前の機器の接続先（device_endpoint() の戻り値）を
         渡す。同じグループに同名が並んでいるときに、どちらを編集したのかは
         名前だけでは決まらないため。省略すると先頭の 1 件を編集する。
+        同じ名前のグループが並んでいるときは、その接続先の機器を持つグループを
+        編集する（_group_of_device）。グループ名を変えない編集は、そのグループに
+        置いたままにする（名前で引き直すと、先に並んでいる同名のグループへ移る）。
         """
-        source = self.get_group(group_name)
-        target = self.get_group(new_group_name)
+        source = self._group_of_device(group_name, old_name, old_endpoint)
+        target = (source if new_group_name == group_name
+                  else self.get_group(new_group_name))
         if not source or not target:
             return False
         new_name = device_info.get("name", "")
@@ -1833,14 +1859,17 @@ class ConfigManager:
         Returns:
             移動成功時True、失敗時False
         """
-        # 移動元グループを取得
-        source_group = self.get_group(source_group_name)
+        # 移動元グループを取得。同じ名前のグループが並んでいるときは、掴んだ
+        # 機器を持つ方（_group_of_device。決まらなければ断る）
+        source_group = self._group_of_device(source_group_name, device_name,
+                                             endpoint)
         if not source_group:
             print(f"エラー: 移動元グループ '{source_group_name}' が見つかりません")
             return False
         
-        # 移動先グループを取得
-        target_group = self.get_group(target_group_name)
+        # 移動先グループを取得（同じ名前なら移動元のまま＝今までどおり断る）
+        target_group = (source_group if target_group_name == source_group_name
+                        else self.get_group(target_group_name))
         if not target_group:
             print(f"エラー: 移動先グループ '{target_group_name}' が見つかりません")
             return False
