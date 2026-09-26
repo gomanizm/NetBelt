@@ -19,8 +19,9 @@ XTerm Control Sequences。
 行との間に改行が入る。印字が複数回に分かれて届いた場合も、右端までの
 書き直しが途中で切れると印は外れる。続きの行そのものが無くなる命令
 (ED 0・IL・DL・スクロール) では、その場で印を外す。0 行目の上 (履歴へ
-送った最後の行) も同じ扱いで、0 行目へ別の行が来たら閉じる
-(_break_history。代替画面にいる間は閉じない)。
+送った最後の行) も同じ扱いで、0 行目へ別の行が来たときと、ED・RIS が
+0 行目を丸ごと消したときに閉じる (_break_history。代替画面にいる間は
+閉じない)。
 
 DECOM (ESC[?6h) は保持しない。有効なら CUP・VPA の行番号は
 スクロール範囲の上端から数えるべきだが、ここでは常に画面の
@@ -848,6 +849,7 @@ class Screen(object):
             # 中身は記録しない)
             self._switch_screen(False, with_cursor=False)
             self._record_screen()
+            self._break_history()   # 0 行目も白紙になる (ED 2 と同じ)
             self.reset()
         # = > \ H などは表示を変えない
 
@@ -1122,6 +1124,14 @@ class Screen(object):
                 self.lines[r] = self._blank_line()
                 self.wrapped[r] = False
         self.dirty.update(rng)
+        if rng and rng.start == 0:
+            # 0 行目を丸ごと空行にした (カーソルが 0 行目より下の ED 1・
+            # ED 2・原点からの ED 0)。履歴の最後の行の続きはもう無いので、
+            # IL・SD で 0 行目へ別の行が来たときと同じく閉じる。閉じないと、
+            # 0 行目の行頭以外へ来た次の出力が履歴の行へ繋がる。中身の
+            # ある画面は上の _record_screen が記録して閉じ済みなので、
+            # 効くのは記録しない ED 1 と、消す前から空白だった画面
+            self._break_history()
         # 走査で「残りは全部空白」と分かった ED 0 / ED 1 のあとも画面は
         # 丸ごと空白。ここで覚え直さないと、窓や文字の大きさを変えたあと
         # (set_size が落とす) や代替画面から戻ったあとの連打で、毎回また
