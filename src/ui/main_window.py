@@ -736,10 +736,24 @@ class MainWindow(QMainWindow):
         
         if reply == QMessageBox.StandardButton.Yes:
             # 削除に失敗したとき、設定に元から無かったのか（ツリーにだけ
-            # 残っていた）、保存だけ失敗したのかを見分けるために控えておく
-            group = self.config_manager.get_group(group_name) or {}
-            existed = any(d.get("name") == device_name
-                          for d in group.get("devices", []))
+            # 残っていた）、保存だけ失敗したのかを見分けるために控えておく。
+            # 同じ名前のグループが並ぶときは、先頭だけでなく、この機器（名前と
+            # 接続先）を実際に持つ同名グループがあるかで見る（remove_device が
+            # グループを選ぶのと同じ読み方）。先頭だけを見ていたので、後ろの
+            # グループにしか居ない機器の保存の失敗でツリーを作り直して畳んだ
+            # グループが開き直り、先頭に同名の別の機器が居ると、ツリーにだけ
+            # 残った行を何度削除しても消せなかった（実測）
+            endpoint = self._endpoint_of(device_data)
+            groups = [g for g in self.config_manager.get_groups()
+                      if g.get("name") == group_name]
+            if len(groups) > 1 and endpoint is not None:
+                existed = any(d.get("name") == device_name
+                              and self._endpoint_of(d) == endpoint
+                              for g in groups for d in g.get("devices", []))
+            else:
+                group = self.config_manager.get_group(group_name) or {}
+                existed = any(d.get("name") == device_name
+                              for d in group.get("devices", []))
             # 同じグループに同名が並んでいるときは、右クリックした項目の
             # 接続先で 1 台に絞る（名前だけだと別の 1 台が消える）
             if self.config_manager.remove_device(
