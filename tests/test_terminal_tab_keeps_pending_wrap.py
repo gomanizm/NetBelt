@@ -77,6 +77,38 @@ class TabAtThePendingWrapTest(unittest.TestCase):
         self.assertEqual(rows(screen), ["ABCX", "", ""])
 
 
+class TabAtARestoredWaitWithoutAutowrapTest(unittest.TestCase):
+    """戻した待ち (右端で ESC 7 → 窓を広げる → ESC 8) と折り返し無効が重なった形。
+
+    待ちは右端より手前で戻り、折り返し無効なので次の印字で捨てられる。
+    ここで TAB が何もしないと、次の文字が待っていた桁の受信済みの文字を
+    潰す。xterm の TAB は桁を動かし、折り返し無効なので次の文字はタブ位置
+    へ書かれる (基準 441ea02 と同じ結果)。
+    """
+
+    def test_the_tab_still_moves_when_autowrap_is_off(self):
+        """広げたあと ?7l ESC 8 TAB 'X' で D が残り、X はタブ位置へ書かれること。"""
+        screen = feed(Screen(3, 4), "ABCD" + ESC + "7")
+        screen.set_size(3, 8)
+        feed(screen, ESC + "[?7l" + ESC + "8" + TAB + "X")
+        self.assertEqual(rows(screen), ["ABCD   X", "", ""])
+        self.assertFalse(screen.wrapped[0])
+
+    def test_a_restored_wait_at_the_edge_without_autowrap_is_unchanged(self):
+        """対照: 広げずに ?7l ESC 8 TAB 'X' なら右端へ重ねること (xterm と同じ)。"""
+        screen = feed(Screen(3, 4), "ABCD" + ESC + "7" + ESC + "[?7l"
+                      + ESC + "8" + TAB + "X")
+        self.assertEqual(rows(screen), ["ABCX", "", ""])
+
+    def test_a_restored_wait_with_autowrap_still_keeps_the_wait(self):
+        """対照: 折り返し有効のまま戻した待ちでは、TAB のあとも次の行へ行くこと。"""
+        screen = feed(Screen(3, 4), "ABCD" + ESC + "7")
+        screen.set_size(3, 8)
+        feed(screen, ESC + "8" + TAB + "X")
+        self.assertEqual(rows(screen), ["ABCD", "X", ""])
+        self.assertTrue(screen.wrapped[0])
+
+
 class TabAtThePendingWrapThroughWidgetTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -95,6 +127,22 @@ class TabAtThePendingWrapThroughWidgetTest(unittest.TestCase):
         widget.append_output("dev", "0123456789abcdefghij" + TAB + "tail")
         first = terminal.unwrapped_text().split(NL)[0]
         self.assertEqual(first, "0123456789abcdefghijtail")
+
+    def test_the_document_keeps_the_last_column_without_autowrap(self):
+        """戻した待ちと折り返し無効が重なった TAB でも、文書から右端の文字が消えないこと。"""
+        from ui.terminal_widget import TerminalWidget
+        widget = TerminalWidget()
+        self.addCleanup(widget.close)
+        terminal = widget.create_terminal_tab("dev")
+        terminal._screen.set_size(5, 20)
+        widget._render_screen(terminal)
+        widget.append_output("dev", "0123456789abcdefghij" + ESC + "7")
+        terminal._screen.set_size(5, 30)
+        widget._render_screen(terminal)
+        widget.append_output("dev", ESC + "[?7l" + ESC + "8" + TAB + "tail"
+                             + chr(13) + NL + "$ ")
+        first = terminal.unwrapped_text().split(NL)[0]
+        self.assertEqual(first, "0123456789abcdefghij    tail")
 
 
 if __name__ == "__main__":

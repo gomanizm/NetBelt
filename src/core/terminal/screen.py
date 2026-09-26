@@ -602,10 +602,14 @@ class Screen(object):
         elif ch == "\t":
             # 右端で折り返し待ちなら何もしない。xterm の TAB も桁を動かす
             # だけで待ちを解かない。解くと、右端のままのカーソルへ続く
-            # 1 文字が受信済みの右端の文字を黙って潰す
-            if not self._pending_wrap:
+            # 1 文字が受信済みの右端の文字を黙って潰す。折り返しが無効なら
+            # (DECRC で戻した待ち) 待ちは次の印字で捨てられるので、今まで
+            # どおり動いて解く。残すと、広げたあとに右端より手前で戻った
+            # 待ちの桁へ次の文字が重なる
+            if not (self._pending_wrap and self.autowrap):
                 self.cursor_col = min(self.cols - 1,
                                       (self.cursor_col // 8 + 1) * 8)
+                self._pending_wrap = False
                 self._printed_at_last_col = False
         elif ch == "\x0e":              # SO: G1 へ
             self._charset = ")"
