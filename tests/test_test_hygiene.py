@@ -9,8 +9,9 @@
   いた。MainWindow を作るテストは、インストール済みの NetBelt と共用の
   %TEMP%\\NetBeltUpdates にも触っていた。
   1 つずつ直すと数百行になるので、conftest でまとめて片付ける。セッションの頭で
-  %TEMP% の下に nbt-* を 1 つ作り、tempfile.tempdir と環境変数
-  TEMP / TMP / TMPDIR をそこへ向ける（子プロセスも同じ場所を使う）。終わりに
+  %TEMP%（8.3 の短い名前があればそちら）の下に nbt-* を 1 つ作り、
+  tempfile.tempdir と環境変数 TEMP / TMP / TMPDIR をそこへ向ける（子プロセスも
+  同じ場所を使う）。終わりに
   元へ戻してから、そのフォルダを丸ごと消す。すでに %TEMP% にある物には触らない。
 
 既定の設定ファイル（tests-03）
@@ -31,6 +32,7 @@
   消えたら、そのテストを落とす（渡し忘れを捕まえる）。
 """
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -54,6 +56,36 @@ class TempIsASessionFolderTest(unittest.TestCase):
         # 短くしないと落ちるようになる。実測: 141 文字の TEMP で、netbelt-tests-*
         # （23 文字足す）では test_updater_old_script_new_payload の 1 件が落ちた
         self.assertLessEqual(len(os.path.basename(tempfile.gettempdir())), 12)
+
+    def test_the_folder_is_made_under_the_short_name_of_temp(self):
+        # フォルダ名を短くしても、TEMP が 13 文字長くなる。実測: 143 文字の TEMP
+        # （作業フォルダの tmp）で、test_updater_temp_brackets.py の 2 件が落ちた
+        # （セッションのフォルダが無ければ通る）。TEMP に 8.3 の短い名前があれば、
+        # その下に作る（GitHub のランナーの TEMP も C:\Users\RUNNER~1\... の形）
+        from conftest import _enter_temp_session, _leave_temp_session, _short_path
+        long_dir = tempfile.mkdtemp(prefix="netbelt-hygiene-a-long-folder-name-")
+        self.addCleanup(shutil.rmtree, long_dir, True)
+        short_dir = _short_path(long_dir)
+        if short_dir == long_dir:
+            self.skipTest("このボリュームは 8.3 の短い名前を作らない")
+        self.assertLess(len(short_dir), len(long_dir))
+        self.assertTrue(os.path.samefile(short_dir, long_dir))
+
+        saved = tempfile.tempdir
+        tempfile.tempdir = long_dir
+        try:
+            state = _enter_temp_session()
+            try:
+                inner = tempfile.gettempdir()
+                for key in ("TEMP", "TMP", "TMPDIR"):
+                    self.assertEqual(os.environ.get(key), inner, key)
+            finally:
+                _leave_temp_session(state)
+        finally:
+            tempfile.tempdir = saved
+
+        self.assertEqual(os.path.dirname(inner), short_dir)
+        self.assertFalse(os.path.exists(inner), "セッション用のフォルダが残った")
 
     def test_temp_is_a_folder_of_this_session(self):
         self._assert_session_folder(tempfile.gettempdir(), "一時フォルダ")
@@ -86,7 +118,9 @@ class TempIsASessionFolderTest(unittest.TestCase):
         state = _enter_temp_session()
         try:
             inner = tempfile.gettempdir()
-            self.assertEqual(os.path.dirname(inner), outer)
+            # 短い名前の下に作るので、綴りではなく場所で比べる
+            self.assertTrue(os.path.samefile(os.path.dirname(inner), outer),
+                            (inner, outer))
             left = tempfile.mkdtemp(prefix="netbelt-left-")
             with open(os.path.join(left, "file.txt"), "w") as f:
                 f.write("x")

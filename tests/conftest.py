@@ -43,20 +43,44 @@ if os.path.isdir(_font_dir):
 # フォルダ名は短くする（nbt-xxxxxxxx。TEMP が 13 文字長くなる）。更新のテストは
 # TEMP の下へさらに掘り、updater.bat の xcopy は 260 文字を超えるファイルを
 # 黙って飛ばす（upd-04）。TEMP（このフォルダを含む）が 150 文字を超えるあたり
-# から、更新のテストが落ち始める。全件を流すときは、TEMP を %TEMP% の直下か
-# 8.3 の短い名前のような短い場所にする。
+# から、更新のテストが落ち始める（実測: 143 文字の TEMP で 2 件）。そのため
+# TEMP に 8.3 の短い名前があれば、その下に作る（GitHub のランナーの TEMP も
+# C:\Users\RUNNER~1\... の形）。短い名前の無い長い TEMP では、まだ落ちうる。
 _TEMP_VARS = ("TEMP", "TMP", "TMPDIR")
 _TEMP_SESSION_PREFIX = "nbt-"
 _temp_session = None
 
 
+def _short_path(path):
+    """path の 8.3 の短い名前（Windows だけ）。短くならなければ path のまま。"""
+    if sys.platform != "win32":
+        return path
+    try:
+        import ctypes
+        from ctypes import wintypes
+        # windll.kernel32 の関数の argtypes を書き換えると、同じ関数を使う
+        # テストへ移るので、自分用に読み込む
+        get = ctypes.WinDLL("kernel32").GetShortPathNameW
+        get.argtypes = (wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD)
+        get.restype = wintypes.DWORD
+        buf = ctypes.create_unicode_buffer(1024)
+        n = get(path, buf, len(buf))
+    except Exception:
+        return path
+    if 0 < n < len(buf) and len(buf.value) < len(path):
+        return buf.value
+    return path
+
+
 def _enter_temp_session():
-    """いまの一時フォルダの下に nbt-* を作り、以後の置き場にする。
+    """いまの一時フォルダ（8.3 の短い名前があればそちら）の下に nbt-* を作り、
+    以後の置き場にする。
 
     子プロセスも同じ場所を使うよう、環境変数も向ける。戻り値は
     _leave_temp_session に渡す。
     """
-    path = tempfile.mkdtemp(prefix=_TEMP_SESSION_PREFIX)
+    path = tempfile.mkdtemp(prefix=_TEMP_SESSION_PREFIX,
+                            dir=_short_path(tempfile.gettempdir()))
     state = {"dir": path, "tempdir": tempfile.tempdir,
              "env": {key: os.environ.get(key) for key in _TEMP_VARS}}
     for key in _TEMP_VARS:
