@@ -431,6 +431,9 @@ class FTPServerManager(QObject):
 
         class _Handler(FTPHandler):
             dtp_handler = _ProgressDTP
+            # データ接続を使う転送コマンド
+            _TRANSFER_COMMANDS = ("STOR", "APPE", "STOU", "RETR",
+                                  "LIST", "NLST", "MLSD")
 
             def pre_process_command(self, line, cmd, arg):
                 # REST の位置を 0 に戻すのは pyftpdlib の ftp_STOR / ftp_RETR の
@@ -444,9 +447,32 @@ class FTPServerManager(QObject):
                 try:
                     return super().pre_process_command(line, cmd, arg)
                 finally:
-                    if cmd in ("STOR", "APPE", "STOU", "RETR",
-                               "LIST", "NLST", "MLSD"):
+                    if cmd in self._TRANSFER_COMMANDS:
                         self._restart_position = 0
+
+            def process_command(self, cmd, *args, **kwargs):
+                # データ接続で転送が進んでいる間に次の転送コマンドを受けると、
+                # pyftpdlib はそのデータ接続で 125 を返し、送受信するファイル
+                # （file_obj）を途中で差し替える。先の転送の行が開始のまま残り
+                # （取り切った RETR も完了にならず、同じ名前の取り直しが束ねられて
+                # 開始が出ない）、STOR は受けた中身が 2 つのファイルに分かれて
+                # 完了は後の名前だけになっていた（実測）。転送中は断る。張った
+                # だけで待っているデータ接続（cmd が None）は今までどおり使える
+                dc = self.data_channel
+                if (cmd in self._TRANSFER_COMMANDS and not self._closed
+                        and dc is not None and dc.cmd is not None):
+                    arg = args[0] if args else ""
+                    msg = "Data connection busy: another transfer is in progress."
+                    self.respond("425 " + msg)
+                    self.log_cmd(cmd, arg, 425, msg)
+                    if arg and cmd != "STOU":   # STOU 以外は実パスになっている
+                        arg = self.fs.fs2ftp(arg)
+                    mgr._emit_activity(
+                        self.remote_ip,
+                        ("データ接続で別の転送が進行中のため断りました: %s %s"
+                         % (cmd, arg)).rstrip())
+                    return
+                super().process_command(cmd, *args, **kwargs)
 
             def ftp_RETR(self, file):
                 result = super().ftp_RETR(file)  # 成功時はftpパスを返す
