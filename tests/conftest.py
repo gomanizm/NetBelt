@@ -159,6 +159,47 @@ def default_config_outside_the_working_directory(tmp_path_factory):
         yield
 
 
+def _file_mark(path):
+    """path の大きさと更新時刻（ns）。無ければ None"""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return st.st_size, st.st_mtime_ns
+
+
+def _what_happened(before, after):
+    """_file_mark の前後から起きたこと。何も起きていなければ None"""
+    if before == after:
+        return None
+    if before is None:
+        return "作られた"
+    if after is None:
+        return "消えた"
+    return "書き換わった"
+
+
+@pytest.fixture(autouse=True)
+def working_directory_config_left_alone(request):
+    """pytest を起動した場所の config.json に触ったテストを落とす。
+
+    上の既定値の差し替えは子プロセスには効かない。子プロセスで窓を作る
+    テストが cwd を渡し忘れると、作業ディレクトリ（リポジトリの直下。
+    ソースから起動したときの利用者の設定がある）に config.json を作る
+    （test_window_close_waits_for_mib_loader.py で実測。テストは通ったまま）。
+    テストの前後で作られた・書き換わった・消えたなら、そのテストを落とす。
+    同じ時にソースから起動したアプリが書き換えた場合も落ちる。
+    """
+    path = os.path.join(str(request.config.invocation_params.dir),
+                        "config.json")
+    before = _file_mark(path)
+    yield
+    happened = _what_happened(before, _file_mark(path))
+    if happened:
+        pytest.fail("このテストの間に、pytest を起動した場所の config.json が"
+                    "%s: %s" % (happened, path), pytrace=False)
+
+
 @pytest.fixture(autouse=True)
 def no_startup_update_check():
     """テスト中は起動時の更新チェックを走らせない。

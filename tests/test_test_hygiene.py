@@ -24,7 +24,11 @@
   も同じ。
   直し方: conftest で、セッションの間だけ ConfigManager.__init__ の既定値を
   セッションの一時フォルダの config.json へ差し替える（クラスは差し替えない）。
-  子プロセスのテストには作業ディレクトリを渡す。
+  テストが自分の一時フォルダへ移っている（chdir）間は、これまでどおり移った先の
+  config.json にする（そこに置いた設定を窓に読ませるテストがある）。
+  子プロセスのテストには作業ディレクトリを渡す。差し替えは子プロセスには効かない
+  ので、pytest を起動した場所の config.json がテストの間に作られた・書き換わった・
+  消えたら、そのテストを落とす（渡し忘れを捕まえる）。
 """
 import os
 import subprocess
@@ -132,6 +136,36 @@ class DefaultConfigIsNotInTheWorkingDirectoryTest(unittest.TestCase):
         self.assertEqual(os.path.normcase(os.path.realpath(str(used))),
                          os.path.normcase(os.path.realpath(
                              os.path.join(work, "config.json"))))
+
+
+class WorkingDirectoryConfigIsLeftAloneTest(unittest.TestCase):
+    """pytest を起動した場所の config.json に触ったテストを落とす見張り。
+
+    既定の設定の差し替えは子プロセスには効かない。子プロセスで窓を作る
+    test_window_close_waits_for_mib_loader.py から cwd を渡す 1 行を外すと、
+    テストは通ったまま作業ディレクトリに config.json（2015 バイト）ができた。
+    """
+
+    def test_a_created_changed_or_removed_file_is_reported(self):
+        from conftest import _what_happened
+        self.assertIsNone(_what_happened(None, None))
+        self.assertIsNone(_what_happened((10, 1), (10, 1)))
+        self.assertEqual(_what_happened(None, (10, 1)), "作られた")
+        self.assertEqual(_what_happened((10, 1), None), "消えた")
+        self.assertEqual(_what_happened((10, 1), (10, 2)), "書き換わった")
+        self.assertEqual(_what_happened((10, 1), (11, 1)), "書き換わった")
+
+    def test_the_mark_tells_a_missing_file_and_a_rewrite(self):
+        from conftest import _file_mark
+        path = os.path.join(tempfile.mkdtemp(prefix="netbelt-hygiene-mark-"),
+                            "config.json")
+        self.assertIsNone(_file_mark(path))
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("{}")
+        before = _file_mark(path)
+        self.assertIsNotNone(before)
+        os.utime(path, ns=(0, before[1] + 10**9))
+        self.assertNotEqual(_file_mark(path), before)
 
 
 if __name__ == "__main__":
