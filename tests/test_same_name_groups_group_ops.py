@@ -345,6 +345,49 @@ class SameNameGroupsGroupOpsTest(unittest.TestCase):
         self.assertNotIn("どちらかのグループを右クリック", notice,
                          "後ろの方からは編集できないのに、どちらからでもと案内している")
 
+    def _dialog_groups(self, open_dialog):
+        """機器ダイアログを開く操作をし、グループ欄へ渡した名前を返す（キャンセルする）。"""
+        from PyQt6.QtWidgets import QDialog
+        dialog = mock.MagicMock()
+        dialog.exec.return_value = QDialog.DialogCode.Rejected
+        dialog.group_combo.findText.return_value = 1
+        with mock.patch("ui.main_window.DeviceDialog",
+                        return_value=dialog) as dialog_class:
+            open_dialog()
+        return dialog_class.call_args.kwargs["groups"]
+
+    def test_the_device_dialogs_list_a_same_named_group_once(self):
+        """機器の追加・編集・複製のグループ欄に、同じ名前を 1 つだけ並べること。
+
+        実測（02572fd）: グループ欄には Default / kyoten / other / kyoten と同じ
+        名前が 2 つ並び、後ろの方の kyoten を選んでも、選んだ名前で探すので
+        先に並んでいる方へ入った（どちらを選んでも同じ所へ入るのに、選び分け
+        られるように見える）。入る先は読み込み時の案内どおり先に並んでいる方。
+        """
+        from PyQt6.QtCore import Qt
+        window = self._window()
+        r_data = self._group_item(window, "kyoten", 1).child(0).data(
+            0, Qt.ItemDataRole.UserRole)
+        x_data = self._group_item(window, "other", 0).child(0).data(
+            0, Qt.ItemDataRole.UserRole)
+
+        for label, open_dialog in [
+                ("追加", window._on_add_device),
+                ("編集", lambda: window._on_device_edit("kyoten", r_data)),
+                ("複製", lambda: window._on_device_duplicate("other", x_data))]:
+            with self.subTest(label):
+                self.assertEqual(self._dialog_groups(open_dialog),
+                                 ["Default", "kyoten", "other"])
+        self.assertEqual(self._on_disk(), self.before)
+
+    def test_the_device_dialogs_keep_unique_group_names_in_order(self):
+        """前提の確認: 同じ名前の無い設定では、グループ欄は設定の並びのまま。"""
+        window = self._window([_group("Default", []), _group("zeta", []),
+                               _group("alpha", [])])
+
+        self.assertEqual(self._dialog_groups(window._on_add_device),
+                         ["Default", "zeta", "alpha"])
+
 
 if __name__ == "__main__":
     unittest.main()

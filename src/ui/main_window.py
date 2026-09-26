@@ -533,10 +533,21 @@ class MainWindow(QMainWindow):
         finally:
             dialog.deleteLater()
 
+    def _device_dialog_groups(self) -> list:
+        """機器ダイアログのグループ欄に並べる名前を返す（同じ名前は 1 つだけ）。
+
+        手編集の config.json で同じ名前のグループが並ぶと、欄にも同じ名前が
+        並び、後ろの方を選んでも名前で探すので先に並んでいる方へ入っていた
+        （実測）。選び分けられるように見せない（入る先は読み込み時の案内
+        どおり先に並んでいる方）。
+        """
+        return list(dict.fromkeys(
+            g["name"] for g in self.config_manager.get_groups()))
+
     def _on_add_device(self):  # 追加
         """機器追加ダイアログを表示"""
         # グループ名リストを取得
-        group_names = [g["name"] for g in self.config_manager.get_groups()]
+        group_names = self._device_dialog_groups()
         
         if not group_names:
             QMessageBox.warning(
@@ -588,7 +599,7 @@ class MainWindow(QMainWindow):
             device_data: 機器データ
         """
         # グループ名リストを取得
-        group_names = [g["name"] for g in self.config_manager.get_groups()]
+        group_names = self._device_dialog_groups()
         
         # 編集ダイアログを表示
         dialog = DeviceDialog(self, groups=group_names, device_data=device_data)
@@ -737,7 +748,7 @@ class MainWindow(QMainWindow):
             device_data: 機器データ
         """
         # グループ名リストを取得
-        group_names = [g["name"] for g in self.config_manager.get_groups()]
+        group_names = self._device_dialog_groups()
         
         # 複製データを作成（名前に「のコピー」を追加）
         duplicate_data = device_data.copy()
