@@ -516,6 +516,7 @@ class FTPServerManager(QObject):
                         mgr._release_uploads(self, file)
                 if result is not None:
                     self._leave_overwritten_stor(prev, file)
+                    self._leave_queued_send(prev)
                     self._tx_name = os.path.basename(file); self._tx_total = 0  # アップロードは総サイズ不明
                     self._tx_dir = "upload"; self._tx_last = 0.0; self._tx_path = file
                     self._tx_display = mgr._emit_started(
@@ -527,7 +528,22 @@ class FTPServerManager(QObject):
                 prev = self._in_dtp_queue
                 result = super().ftp_STOU(line)
                 self._leave_overwritten_stor(prev)
+                self._leave_queued_send(prev)
                 return result
+
+            def _leave_queued_send(self, prev):
+                """受信を待ち行列に積んだ（prev から変わった）とき、待っていた送信を捨てる。
+
+                pyftpdlib は受信と送信の待ち行列を別々に持ち、データ接続が来ると
+                送信の方だけを使う。RETR・一覧の後に STOR / APPE / STOU を受けると、
+                データ接続では先の RETR が返されて送った中身は書かれず、受信の方が
+                予約と行ごと残って次のデータ接続に結びついていた（実測）。後の
+                転送コマンドを残し、先の送信は RETR の上書きと同じく片付ける
+                """
+                if self._in_dtp_queue is prev or self._out_dtp_queue is None:
+                    return
+                out_q, self._out_dtp_queue = self._out_dtp_queue, None
+                self._leave_queued_retr(out_q)
 
             def _leave_overwritten_stor(self, prev, keep=None):
                 """待ち行列の受信（prev）が後の STOR / APPE / STOU で上書きされていたら片付ける。
@@ -674,6 +690,13 @@ class FTPServerManager(QObject):
                 # ここで片付ける。同じファイルの RETR の積み直しは同じ行のまま
                 prev = self._out_dtp_queue
                 super().push_dtp_data(data, isproducer, file, cmd)
+                if self._out_dtp_queue is not prev and self._in_dtp_queue is not None:
+                    # 待っていた受信（STOR など）も捨てる。データ接続は送信の方
+                    # だけを使うので、受信の方が予約と行ごと残り、次のデータ接続に
+                    # 結びついていた（実測: 次の取得が 425 で断られ、閉じると
+                    # 何も受けていない STOR が 0 バイトで完了になった）
+                    in_q, self._in_dtp_queue = self._in_dtp_queue, None
+                    self._abandon_queued(in_q, None)
                 if prev is None or self._out_dtp_queue is prev:
                     return
                 self._leave_queued_retr(prev, keep_row=(
