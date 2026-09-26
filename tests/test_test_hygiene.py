@@ -112,6 +112,22 @@ class DefaultConfigIsNotInTheWorkingDirectoryTest(unittest.TestCase):
 
         self._assert_not_in_the_working_directory(window.config_manager.config_path)
 
+    def test_a_test_that_moves_to_its_own_folder_reads_the_config_there(self):
+        # 自分の一時フォルダへ移り、そこに置いた config.json を窓に読ませる
+        # テストがある（test_config_invalid_devices.py など）。
+        # 移った先では、これまでどおり作業ディレクトリの config.json を使う
+        from core.config_manager import ConfigManager
+        work = tempfile.mkdtemp(prefix="netbelt-hygiene-cwd-")
+        prev = os.getcwd()
+        os.chdir(work)
+        self.addCleanup(os.chdir, prev)
+
+        used = ConfigManager().config_path
+
+        self.assertEqual(os.path.normcase(os.path.realpath(str(used))),
+                         os.path.normcase(os.path.realpath(
+                             os.path.join(work, "config.json"))))
+
 
 if __name__ == "__main__":
     unittest.main()

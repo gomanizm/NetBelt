@@ -121,6 +121,13 @@ def default_config_outside_the_working_directory(tmp_path_factory):
     変わる。明示的なパスを渡す呼び出しと、自分で ConfigManager を差し替える
     テストには影響しない。setUpClass で作る窓にも効くよう、セッションの
     スコープにする。
+
+    ただし、テストが作業ディレクトリを移している（chdir）間は、これまで
+    どおり作業ディレクトリの "config.json" にする。自分の一時フォルダへ移り、
+    そこに置いた config.json を窓に読ませるテストがある
+    （test_config_invalid_devices.py の窓の 2 件。固定のパスにしたら、置いた
+    設定を読まずに落ちた）。既定値は Path() に渡った時点（ConfigManager を
+    作る時点）の作業ディレクトリで決まる。
     """
     from unittest import mock
 
@@ -134,7 +141,21 @@ def default_config_outside_the_working_directory(tmp_path_factory):
         yield
         return
     path = str(tmp_path_factory.mktemp("netbelt-config") / "config.json")
-    with mock.patch.object(ConfigManager.__init__, "__defaults__", (path,)):
+    start = os.path.normcase(os.getcwd())
+
+    class _DefaultConfigPath:
+        """ConfigManager() の既定の config_path（os.PathLike）"""
+
+        def __fspath__(self):
+            if os.path.normcase(os.getcwd()) == start:
+                return path
+            return "config.json"
+
+        def __repr__(self):
+            return repr(self.__fspath__())
+
+    with mock.patch.object(ConfigManager.__init__, "__defaults__",
+                           (_DefaultConfigPath(),)):
         yield
 
 
