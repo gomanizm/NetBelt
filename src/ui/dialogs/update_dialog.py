@@ -37,13 +37,23 @@ def quit_for_update(window=None) -> None:
 
     閉じる方に失敗しても updater.bat は既に起動していて、数秒後に実行中の
     ファイルを置き換えに来るので、終わらせる方は必ず通す。
+
+    まとめて閉じる前に、表示中のメインウィンドウを先に閉じる。closeAllWindows
+    の並びは実行ごとに変わり、記録中ダイアログ（閉じると記録を止める）が先に
+    来ると、メインウィンドウの closeEvent が配送待ちの受信を取り込んで書き切る
+    前に記録が閉じ、その分が欠けていた（実測: 6 回中 3 回）。メインウィンドウ
+    の closeEvent が記録を書き切ってダイアログを捨てるので、後の closeAllWindows
+    ではもう見えていない。
     """
-    from PyQt6.QtWidgets import QApplication
+    from PyQt6.QtWidgets import QApplication, QMainWindow
 
     try:
         if window is not None:
             window.close()
         else:
+            for top in QApplication.topLevelWidgets():
+                if isinstance(top, QMainWindow) and top.isVisible():
+                    top.close()
             QApplication.closeAllWindows()
     except Exception as e:
         print(f"[Update] 終了前の後始末に失敗: {e}")
