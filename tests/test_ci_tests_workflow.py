@@ -22,7 +22,8 @@
   - Run tests までの手順は、リリースと同じ名前・並び・キーで、その前の手順は中身も
     同じ（依存を足す手順などを入れない）
   - 手順（シーケンスの項目）はすべて '- name:' で始める（名前の無い手順や、name を
-    後に書いた手順は、名前で比べる確かめに現れない）
+    後に書いた手順は、名前で比べる確かめに現れない）。リリースの側も、steps: から
+    Run tests までの手順は同じ
   - 書いてよいキーを決め、それ以外（continue-on-error・if・ジョブやワークフローの
     段の env・strategy など、テストを走らせないか落ちても緑にできるもの）を落とす
   - Run tests に shell・defaults・working-directory を書かない（リリースと同じく
@@ -189,6 +190,12 @@ def _step_keys(step):
     return ["name"] + _keys(step[1:], indent + 2)
 
 
+def _nameless_items(lines):
+    """'-' で始まるシーケンスの項目のうち、'- name:' で始まらない行（前後の空白を落とす）"""
+    return [l.strip() for l in lines
+            if re.match(r"^\s*-(\s|$)", l) and not re.match(r"^\s*- name:", l)]
+
+
 class CiTestsWorkflowTest(unittest.TestCase):
 
     def setUp(self):
@@ -271,10 +278,23 @@ class CiTestsWorkflowTest(unittest.TestCase):
         # 並びにもキーの比べにも現れず、Run tests の前に入れても通っていた
         # （- run: echo "PYTEST_ADDOPTS=--collect-only" >> $env:GITHUB_ENV で、
         # テストを 1 件も走らせずに緑）。シーケンスの項目はすべて '- name:' で
-        # 始める。release の方は tags の '- ...' があるので当てない
-        self.assertEqual([l.strip() for l in _code_lines(self.tests)
-                          if re.match(r"^\s*-(\s|$)", l)
-                          and not re.match(r"^\s*- name:", l)], [])
+        # 始める。リリースの側は次の確かめが見る
+        self.assertEqual(_nameless_items(_code_lines(self.tests)), [])
+
+    def test_every_release_step_up_to_the_tests_starts_with_its_name(self):
+        # 同じ抜けはリリースの側にもあった。リリースの Run tests の前へ名前の
+        # 無い手順（- run: pip install ... など）を入れても、見張りはすべて
+        # 通り、リリースの門番だけが別の依存や環境変数で走っていた。リリースは
+        # on: の tags に '- ...' があるので、ジョブの steps: から Run tests
+        # までに当てる
+        code = _code_lines(self.release)
+        starts = [i for i, l in enumerate(code)
+                  if re.fullmatch(r"\s*steps\s*:\s*(#.*)?", l)]
+        ends = [i for i, l in enumerate(code)
+                if l.strip() == "- name: %s" % STEP_NAME]
+        self.assertEqual((len(starts), len(ends)), (1, 1), (starts, ends))
+        self.assertLess(starts[0], ends[0])
+        self.assertEqual(_nameless_items(code[starts[0] + 1:ends[0]]), [])
 
     def test_it_uses_the_same_runner_python_and_pytest_as_the_release(self):
         for pattern in (r"^\s*runs-on:\s*(\S+)",
@@ -348,10 +368,15 @@ class NamelessStepDriftTest(unittest.TestCase):
       '- run: echo "PYTEST_ADDOPTS=--collect-only" >> $env:GITHUB_ENV' を足すと、
       テストを 1 件も走らせずにジョブが緑になる。'- uses: actions/checkout@v7'
       に with: ref: v1.3.0 を付ければ、別の版を検査することになる。
+      同じ手順をリリース（build-release.yml）の Run tests の前へ入れても、
+      見張りはすべて通った。リリースの門番だけが別の依存や環境変数で走り、
+      PR の CI は元の環境のまま緑になる。
     どう直したか
       tests.yml のシーケンスの項目は、すべて '- name:' で始めることにした
-      （CiTestsWorkflowTest.test_every_step_starts_with_its_name）。ここでは、
-      tests.yml の写しの Run tests の前へ手順を入れて見張りに読ませ、どれかの
+      （CiTestsWorkflowTest.test_every_step_starts_with_its_name）。リリースは
+      steps: から Run tests までの項目に同じことを求める
+      （test_every_release_step_up_to_the_tests_starts_with_its_name）。ここでは、
+      それぞれの写しの Run tests の前へ手順を入れて見張りに読ませ、どれかの
       確かめが落ちることを見る。
     """
 
@@ -373,16 +398,18 @@ class NamelessStepDriftTest(unittest.TestCase):
             ["- {name: Extra, run: pip install something}"],
     }
 
-    def _failed_checks(self, text):
-        """text を tests.yml として見張りに読ませ、落ちた確かめの名前を返す"""
+    def _failed_checks(self, text, target="TESTS"):
+        """text を target（"TESTS" か "RELEASE"）の中身として見張りに読ませ、
+        落ちた確かめの名前を返す"""
+        module = sys.modules[__name__]
         folder = tempfile.mkdtemp(prefix="netbelt-ci-drift-")
         self.addCleanup(shutil.rmtree, folder, True)
-        path = os.path.join(folder, "tests.yml")
+        path = os.path.join(folder, os.path.basename(getattr(module, target)))
         with io.open(path, "w", encoding="utf-8") as f:
             f.write(text)
         suite = unittest.defaultTestLoader.loadTestsFromTestCase(CiTestsWorkflowTest)
         result = unittest.TestResult()
-        with mock.patch.object(sys.modules[__name__], "TESTS", path):
+        with mock.patch.object(module, target, path):
             suite.run(result)
         return sorted({t.id().split(".")[-1].split(" ")[0]
                        for t, _ in result.failures + result.errors})
@@ -399,7 +426,9 @@ class NamelessStepDriftTest(unittest.TestCase):
 
     def test_the_copy_itself_passes(self):
         # 写しを読ませる手順そのものが、ずれの無い写しを落とさないこと
-        self.assertEqual(self._failed_checks(_read(TESTS)), [])
+        for target, path in (("TESTS", TESTS), ("RELEASE", RELEASE)):
+            with self.subTest(target=target):
+                self.assertEqual(self._failed_checks(_read(path), target), [])
 
     def test_a_nameless_step_before_the_tests_is_caught(self):
         base = _read(TESTS)
@@ -408,6 +437,18 @@ class NamelessStepDriftTest(unittest.TestCase):
                 drifted = self._insert_before_run_tests(base, step_lines)
                 self.assertNotEqual(drifted, base)
                 self.assertNotEqual(self._failed_checks(drifted), [],
+                                    "見張りが見逃した: %r" % step_lines)
+
+    def test_a_nameless_step_before_the_release_tests_is_caught(self):
+        # リリースの Run tests の前へ入れると、リリースの門番だけが別の依存や
+        # 環境変数で走り、PR の CI は元の環境のまま緑になる（1.3.1 と同じく、
+        # タグを打ってから初めて落ちる）
+        base = _read(RELEASE)
+        for name, step_lines in self.DRIFTS.items():
+            with self.subTest(drift=name):
+                drifted = self._insert_before_run_tests(base, step_lines)
+                self.assertNotEqual(drifted, base)
+                self.assertNotEqual(self._failed_checks(drifted, "RELEASE"), [],
                                     "見張りが見逃した: %r" % step_lines)
 
 
