@@ -28,6 +28,9 @@
     段の env・strategy など、テストを走らせないか落ちても緑にできるもの）を落とす
   - リリースのワークフローとジョブの段にも env・defaults を書かない（比べるのは
     Run tests までの手順なので、リリースの門番だけが別の環境で走る）
+  - リリースのキーはすべて字面で書く（"env": のような引用符付きのキーや、
+    ? env・!!str env:・&k env:・<<: は、PyYAML では env として読まれるのに、
+    字面で読む見張りには見えない）
   - Run tests に shell・defaults・working-directory を書かない（リリースと同じく
     既定の pwsh の中で、リポジトリの直下から走らせる）
   - テストの手順へ GITHUB_TOKEN を渡さない（製品は環境変数の GITHUB_TOKEN を読み、
@@ -198,6 +201,54 @@ def _nameless_items(lines):
             if re.match(r"^\s*-(\s|$)", l) and not re.match(r"^\s*- name:", l)]
 
 
+# 見張りが字面で読めるキー（英字で始まる名前の後に ':'）
+_PLAIN_KEY = re.compile(r"[A-Za-z][\w-]*\s*:(\s|$)")
+# ブロックの文字列の頭（run: | など）。| か > の後に字下げと末尾の扱いを書ける
+_BLOCK_SCALAR_HEAD = re.compile(r"[|>][0-9+-]*\s*(#.*)?")
+# シーケンスの項目に書いた値だけの行（- 'v*' など）。後ろに ':' を続けてキーに
+# した形（- "env": など）は含めない
+_ITEM_SCALAR = re.compile(
+    r"""(?:'(?:[^']|'')*'|"(?:[^"\\]|\\.)*"|[^\s\-?:,\[\]{}#&*!|>'"%@`](?:(?!:\s|:$|\s#).)*)"""
+    r"\s*(#.*)?")
+
+
+def _unplain_keys(text):
+    """キーを字面で読めない形で書いた行（前後の空白を落とす）。
+
+    見張りはキーを字面（英字で始まる名前の後に ':'）で読む。引用符付きのキー
+    （"env":）・明示のキー（? env）・タグ（!!str env:）・アンカー（&k env:）・
+    マージキー（<<:）は、PyYAML では普通のキーとして読まれるのに、見張りには
+    見えない。コメントと空行のほかは、キーを字面で書いた行、項目の値だけの行、
+    ブロックの文字列（run: | など）の中身のどれかでなければならない"""
+    out, content_above = [], None
+    for line in text.splitlines():
+        indent = len(line) - len(line.lstrip(" "))
+        rest = line[indent:]
+        if not rest.strip(" \t"):
+            continue
+        if content_above is not None:
+            if indent > content_above:
+                continue  # ブロックの文字列の中身（キーより深い行）
+            content_above = None
+        if rest.startswith("#"):
+            continue
+        column, item = indent, False
+        while True:
+            m = re.match(r"-( +|$)", rest)
+            if not m:
+                break
+            column, rest, item = column + m.end(), rest[m.end():], True
+        key = _PLAIN_KEY.match(rest)
+        if key:
+            if _BLOCK_SCALAR_HEAD.fullmatch(rest[key.end():].strip()):
+                content_above = column
+            continue
+        if item and (not rest or _ITEM_SCALAR.fullmatch(rest)):
+            continue
+        out.append(line.strip())
+    return out
+
+
 class CiTestsWorkflowTest(unittest.TestCase):
 
     def setUp(self):
@@ -310,6 +361,14 @@ class CiTestsWorkflowTest(unittest.TestCase):
             with self.subTest(key=key):
                 self.assertNotIn(key, _keys(code, 0))
                 self.assertNotIn(key, job_keys)
+
+    def test_every_release_key_is_written_plainly(self):
+        # 上の確かめはキーを字面で読む。キーに引用符を付ける（"env": や
+        # 'defaults':）と、PyYAML は普通の env / defaults として読むのに、見張りは
+        # すべて通っていた。明示のキー（? env）・タグ（!!str env:）・アンカー
+        # （&k env:）・マージキー（<<:）も同じ。リリースのキーはすべて字面で書く
+        self.assertEqual(_unplain_keys(self.release), [],
+                         "キーは引用符・? ・!!・&・<< を付けずに書く")
 
     def test_it_uses_the_same_runner_python_and_pytest_as_the_release(self):
         for pattern in (r"^\s*runs-on:\s*(\S+)",
@@ -479,17 +538,36 @@ class ReleaseEnvironmentDriftTest(_WorkflowCopy, unittest.TestCase):
       ワークフローやジョブの段に env（PYTEST_ADDOPTS など）や defaults（run の
       shell を cmd にするなど）を書いても、見張りはすべて通った。リリースの
       門番だけが別の環境で走り、PR の CI は元の環境のまま緑になる。
+      その直し（543916d）のあとも、キーに引用符を付けた '"env":' や "'defaults':"、
+      明示のキー（? env）・タグ（!!str env:）・アンカー（&k env:）・マージキー
+      （<<:）は、見張りをすべて通った。PyYAML ではどれも本物の env / defaults に
+      なる。見張りはキーを字面で読み、こうした形をキーとして見ていなかった。
     どう直したか
       リリースのワークフローとジョブの段には env と defaults を書かないことにした
       （CiTestsWorkflowTest.test_the_release_sets_no_environment_above_its_steps）。
+      リリースのキーはすべて字面で書くことにした
+      （CiTestsWorkflowTest.test_every_release_key_is_written_plainly）。
     """
 
-    # (入れる段, 入れる行)。ジョブの段は runs-on の次、ワークフローの段は jobs: の前
+    # (入れる段, 入れる行)。ジョブの段は runs-on の次、ワークフローの段は jobs: の前。
+    # 引用符付き・明示・タグ・アンカー・マージのキーも、PyYAML では本物の env /
+    # defaults として読まれる（543916d で実測）
     DRIFTS = {
         "job env": ("job", ["env:", "  PYTEST_ADDOPTS: --collect-only"]),
         "job defaults": ("job", ["defaults:", "  run:", "    shell: cmd"]),
         "workflow env": ("workflow", ["env:", "  PYTEST_ADDOPTS: --collect-only"]),
         "workflow defaults": ("workflow", ["defaults:", "  run:", "    shell: cmd"]),
+        "job quoted env": ("job", ['"env":', "  PYTEST_ADDOPTS: --collect-only"]),
+        "job single-quoted defaults":
+            ("job", ["'defaults':", "  run:", "    shell: cmd"]),
+        "workflow quoted env":
+            ("workflow", ['"env":', "  PYTEST_ADDOPTS: --collect-only"]),
+        "workflow single-quoted defaults":
+            ("workflow", ["'defaults':", "  run:", "    shell: cmd"]),
+        "job explicit key env": ("job", ["? env", ": PYTEST_ADDOPTS: --collect-only"]),
+        "job tagged key env": ("job", ["!!str env:", "  PYTEST_ADDOPTS: --collect-only"]),
+        "job anchored key env": ("job", ["&k env:", "  PYTEST_ADDOPTS: --collect-only"]),
+        "job merge key env": ("job", ["<<: {env: {PYTEST_ADDOPTS: --collect-only}}"]),
     }
 
     @staticmethod
