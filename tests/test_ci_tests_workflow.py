@@ -28,9 +28,9 @@
     段の env・strategy など、テストを走らせないか落ちても緑にできるもの）を落とす
   - リリースのワークフローとジョブの段にも env・defaults を書かない（比べるのは
     Run tests までの手順なので、リリースの門番だけが別の環境で走る）
-  - リリースのキーはすべて字面で書く（"env": のような引用符付きのキーや、
-    ? env・!!str env:・&k env:・<<: は、PyYAML では env として読まれるのに、
-    字面で読む見張りには見えない）
+  - 両方のワークフローで、キーはすべて字面で書く（"env": のような引用符付きの
+    キーや、? env・!!str env:・&k env:・<<: は、PyYAML では env として読まれる
+    のに、字面で読む見張りには見えない）
   - Run tests に shell・defaults・working-directory を書かない（リリースと同じく
     既定の pwsh の中で、リポジトリの直下から走らせる）
   - テストの手順へ GITHUB_TOKEN を渡さない（製品は環境変数の GITHUB_TOKEN を読み、
@@ -307,6 +307,15 @@ class CiTestsWorkflowTest(unittest.TestCase):
         self.assertEqual(_keys(jobs, 2), ["test"], "ジョブは 1 つだけ")
         self.assertEqual(sorted(_keys(jobs, 4)),
                          ["runs-on", "steps", "timeout-minutes"])
+
+    def test_every_key_is_written_plainly(self):
+        # 上の確かめも、手順のキーの比べも、shell・defaults・working-directory の
+        # 確かめも、キーを字面で読む。キーに引用符を付けると（ジョブの段の
+        # "env": や Run tests の "continue-on-error": true）、PyYAML は本物の
+        # キーとして読むのに、見張りはすべて通っていた。明示のキー（? env）や
+        # タグ（!!str env:）も同じ。キーはすべて字面で書く
+        self.assertEqual(_unplain_keys(self.tests), [],
+                         "キーは引用符・? ・!!・&・<< を付けずに書く")
 
     def test_the_steps_are_the_release_steps_up_to_the_tests(self):
         # 手順を足す・並べ替える・中身を変える（依存を足す pip install など）と、
@@ -588,6 +597,79 @@ class ReleaseEnvironmentDriftTest(_WorkflowCopy, unittest.TestCase):
                 drifted = self._insert(base, level, new_lines)
                 self.assertNotEqual(drifted, base)
                 self.assertNotEqual(self._failed_checks(drifted, "RELEASE"), [],
+                                    "見張りが見逃した: %r" % new_lines)
+
+
+class QuotedKeyDriftTest(_WorkflowCopy, unittest.TestCase):
+    """tests.yml のキーを字面で読めない形で書いたずれを、見張りが捕まえることの検証。
+
+    何が起きていたか（8936274 と ebbe593 で実測）
+      tests.yml の見張りは、書いてよいキーの一覧（_keys）・手順のキーの比べ
+      （_step_keys）・shell: / defaults: / working-directory: の字面でキーを見て
+      いた。キーに引用符を付けると（ジョブの段の '"env":' + PYTEST_ADDOPTS、
+      Run tests の '"continue-on-error": true'・'"if": false'・'"shell": cmd'・
+      '"working-directory": src' など）、見張りはすべて通った。明示のキー
+      （? env）とタグ（!!str env:）も同じ。PyYAML ではどれも本物のキーになり、
+      テストを走らせないか、落ちても緑になる。リリースの Run tests の
+      '"continue-on-error": true' も通り、リリースの門番が落ちても公開へ進んでいた
+      （リリースの側は 8936274 で直した）。
+    どう直したか
+      tests.yml のキーもすべて字面で書くことにした
+      （CiTestsWorkflowTest.test_every_key_is_written_plainly）。
+    """
+
+    JOB = r"\s*runs-on\s*:.*"
+    WORKFLOW = r"jobs\s*:\s*"
+    RUN_TESTS = r"\s*- name: %s\s*" % STEP_NAME
+    # (写し, 目印の行, 目印の前か後か, 入れる行)。入れる行の頭は目印の行の字下げに
+    # そろえる。Run tests のキーは '- ' の分だけ深くする
+    DRIFTS = {
+        "job quoted env":
+            ("TESTS", JOB, "after", ['"env":', "  PYTEST_ADDOPTS: --collect-only"]),
+        "job single-quoted env":
+            ("TESTS", JOB, "after", ["'env':", "  PYTEST_ADDOPTS: --collect-only"]),
+        "job quoted defaults":
+            ("TESTS", JOB, "after", ['"defaults":', "  run:", "    shell: cmd"]),
+        "job explicit key env":
+            ("TESTS", JOB, "after", ["? env", ": PYTEST_ADDOPTS: --collect-only"]),
+        "job tagged key env":
+            ("TESTS", JOB, "after", ["!!str env:", "  PYTEST_ADDOPTS: --collect-only"]),
+        "workflow quoted env":
+            ("TESTS", WORKFLOW, "before",
+             ['"env":', "  PYTEST_ADDOPTS: --collect-only"]),
+        "workflow single-quoted defaults":
+            ("TESTS", WORKFLOW, "before", ["'defaults':", "  run:", "    shell: cmd"]),
+        "Run tests quoted continue-on-error":
+            ("TESTS", RUN_TESTS, "after", ['  "continue-on-error": true']),
+        "Run tests quoted if":
+            ("TESTS", RUN_TESTS, "after", ['  "if": false']),
+        "Run tests quoted shell":
+            ("TESTS", RUN_TESTS, "after", ['  "shell": cmd']),
+        "Run tests quoted working-directory":
+            ("TESTS", RUN_TESTS, "after", ['  "working-directory": src']),
+        "Run tests explicit continue-on-error":
+            ("TESTS", RUN_TESTS, "after", ["  ? continue-on-error", "  : true"]),
+        "release Run tests quoted continue-on-error":
+            ("RELEASE", RUN_TESTS, "after", ['  "continue-on-error": true']),
+    }
+
+    @staticmethod
+    def _insert(text, pattern, where, new_lines):
+        lines = text.splitlines()
+        at = [i for i, l in enumerate(lines) if re.fullmatch(pattern, l)]
+        assert len(at) == 1, (pattern, at)
+        indent = lines[at[0]][:len(lines[at[0]]) - len(lines[at[0]].lstrip())]
+        pos = at[0] + 1 if where == "after" else at[0]
+        lines[pos:pos] = [indent + l for l in new_lines]
+        return "\n".join(lines) + "\n"
+
+    def test_a_key_the_watch_cannot_read_is_caught(self):
+        for name, (target, pattern, where, new_lines) in self.DRIFTS.items():
+            with self.subTest(drift=name):
+                base = _read(TESTS if target == "TESTS" else RELEASE)
+                drifted = self._insert(base, pattern, where, new_lines)
+                self.assertNotEqual(drifted, base)
+                self.assertNotEqual(self._failed_checks(drifted, target), [],
                                     "見張りが見逃した: %r" % new_lines)
 
 
