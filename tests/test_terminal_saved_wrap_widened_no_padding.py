@@ -64,6 +64,24 @@ class SavedWrapAfterWideningTest(unittest.TestCase):
                                  "折り返した行へ埋め草の空白が残っている")
                 self.assertEqual(row_text(screen, 1).rstrip(), "X")
 
+    def test_a_continuation_written_one_by_one_is_trimmed_too(self):
+        """復元のあとの 1 文字目を 1 文字ずつ書く経路 (全角・DEC 罫線・IRM) でも、埋め草を残さないこと。"""
+        # 半角の続き ('X' など) は _print_narrow を通る。全角・DEC 罫線・
+        # 挿入モードは _print_chars の待ちの枝を通るので、別に見張る
+        continuations = (("wide", chr(0x3042), chr(0x3042)),
+                         ("DEC graphics", ESC + "(0q", chr(0x2500)),
+                         ("IRM", CSI + "4hX", "X"))
+        for name, save, restore in self.PAIRS:
+            for kind, text, first in continuations:
+                with self.subTest(name + " / " + kind):
+                    screen = feed(Screen(3, 4), "ABCD" + save)
+                    screen.set_size(3, 8)
+                    feed(screen, restore + text)
+                    self.assertTrue(screen.wrapped[0])
+                    self.assertEqual(row_text(screen, 0), "ABCD",
+                                     "折り返した行へ埋め草の空白が残っている")
+                    self.assertEqual(screen.lines[1][0][0], first)
+
     def test_a_wide_character_at_the_edge_keeps_both_halves(self):
         """右端の全角で待っていたときも、全角を丸ごと残して埋め草だけ落とすこと。"""
         screen = feed(Screen(3, 4), "AB" + chr(0x3042) + ESC + "7")
@@ -130,6 +148,23 @@ class SavedWrapAfterWideningThroughWidgetTest(unittest.TestCase):
                 first = terminal.unwrapped_text().split(NL)[0]
                 self.assertEqual(
                     first, "ssh-rsa AAAAB3NzaC1yc2EAAAADAQAB user@example.com")
+
+    def test_a_wide_continuation_has_no_gap_either(self):
+        """復元のあとの続きが全角で始まっても、文書の行の途中に空白が入らないこと。"""
+        from ui.terminal_widget import TerminalWidget
+        widget = TerminalWidget()
+        self.addCleanup(widget.close)
+        terminal = widget.create_terminal_tab("dev")
+        terminal._screen.set_size(5, 20)
+        widget._render_screen(terminal)
+        widget.append_output("dev", "ssh-rsa AAAAB3NzaC1y" + ESC + "7")
+        terminal._screen.set_size(5, 49)
+        widget._render_screen(terminal)
+        widget.append_output("dev", ESC + "8" + chr(0x3042)
+                             + "c2EA user@example.com" + CRLF + "$ ")
+        first = terminal.unwrapped_text().split(NL)[0]
+        self.assertEqual(
+            first, "ssh-rsa AAAAB3NzaC1y" + chr(0x3042) + "c2EA user@example.com")
 
 
 if __name__ == "__main__":
