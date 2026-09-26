@@ -898,7 +898,9 @@ rd /s /q "!TAKEOVER_DIR!" 2>nul
 exit /b 0
 :release_takeover_owned
 set "LOCK_OWNER="
-set /p LOCK_OWNER=<"!TAKEOVER_DIR!\holder.txt" 2>nul
+rem In parentheses, as in :release_lock_sweep: the marker may already have
+rem been reclaimed by another run, and the missing path would be printed.
+(set /p LOCK_OWNER=<"!TAKEOVER_DIR!\holder.txt") 2>nul
 if "!LOCK_OWNER!"=="!STAMP!" rd /s /q "!TAKEOVER_DIR!" 2>nul
 exit /b 0
 
