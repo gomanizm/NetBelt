@@ -418,6 +418,9 @@ class DeviceTree(QWidget):
             delete_action = menu.addAction("削除")
             menu.addSeparator()
             duplicate_action = menu.addAction("複製")
+            # 先に同じ名前のグループがあると、複製の既定の入れ先（グループ名で
+            # 探す）は先に並んでいる方になるので、灰色にする（_is_shadowed_group）
+            duplicate_action.setEnabled(not self._is_shadowed_group(parent))
             baudrate_actions = []
         
         hide_action = self._add_hide_action(menu)
@@ -532,8 +535,9 @@ class DeviceTree(QWidget):
 
         設定のグループは名前で探す（ConfigManager.get_group は先頭を返す）。
         手編集の config.json で同じ名前のグループが並ぶと、後ろの方で頼んだ
-        グループの編集・削除や、そこへのドロップが、先に並んでいる別の
-        グループを書き換えていた（実測）。後ろの方からは受け付けない。
+        グループの編集・削除や、そこへのドロップ・そこにある機器の複製が、
+        先に並んでいる別のグループを書き換えていた（実測）。後ろの方からは
+        受け付けない。
         """
         root = self.tree.invisibleRootItem()
         return any(root.child(i).text(0) == group_item.text(0)

@@ -134,6 +134,39 @@ class SameNameGroupsGroupOpsTest(unittest.TestCase):
                 tree.tree.visualItemRect(group_item).center(), group_item)
         return offered
 
+    def _choose_from_device_menu(self, window, device_item, text):
+        """機器項目を右クリックし、text の項目を選ぶ（選べなければ何も選ばない）。
+
+        複製のダイアログは、グループを既定（右クリックした項目のグループ名）の
+        まま、名前だけ R2 にして OK する。メニューに出た (文言, 選べるか) を返す。
+        """
+        from PyQt6.QtCore import Qt
+        from PyQt6.QtWidgets import QDialog
+        tree = window.device_tree
+        shown = []
+
+        def fake_exec(menu, *args, **kwargs):
+            chosen = None
+            for action in menu.actions():
+                if action.text():
+                    shown.append((action.text(), action.isEnabled()))
+                    if action.isEnabled() and action.text() == text:
+                        chosen = action
+            return chosen
+
+        data = device_item.data(0, Qt.ItemDataRole.UserRole)
+        dialog = mock.MagicMock()
+        dialog.exec.return_value = QDialog.DialogCode.Accepted
+        dialog.get_device_data.return_value = dict(data, name="R2")
+        dialog.get_selected_group.return_value = device_item.parent().text(0)
+        dialog.group_combo.findText.return_value = 1
+        with mock.patch("PyQt6.QtWidgets.QMenu.exec", fake_exec), \
+                mock.patch.object(tree.tree, "itemAt", return_value=device_item), \
+                mock.patch("ui.main_window.DeviceDialog", return_value=dialog), \
+                mock.patch("ui.main_window.QMessageBox.warning"):
+            tree._show_context_menu(tree.tree.visualItemRect(device_item).center())
+        return shown
+
     def _drop(self, window, source_item, target_item):
         tree = window.device_tree
         tree.tree.setCurrentItem(source_item)
@@ -251,6 +284,57 @@ class SameNameGroupsGroupOpsTest(unittest.TestCase):
         self.assertEqual(self._on_disk()[1],
                          ("kyoten", ["show clock"], [("X", "192.0.2.9")]))
         self.assertEqual(self._on_disk()[3], self.before[3])
+
+    def test_duplicating_a_device_of_the_later_group_changes_nothing(self):
+        """後ろの kyoten の機器は複製を選べず、設定も変わらないこと。
+
+        実測（14dc5c9）: 2 つ目の kyoten（terminal length 0）の R@192.0.2.2 を
+        複製し、グループは既定のままにすると、複製は 1 つ目の kyoten
+        （show clock）に入った。状態バーは「機器 'R2' を追加しました」で警告は
+        出ず、R2 へ繋ぐと 1 つ目の自動実行コマンドが 192.0.2.2 へ送られる。
+        ダイアログの既定の選択（findText）も追加（add_device）も名前で探すため。
+        機器そのものの編集・削除は、接続先で持ち主のグループを選ぶので選べる。
+        """
+        window = self._window()
+        r_item = self._group_item(window, "kyoten", 1).child(0)
+
+        shown = self._choose_from_device_menu(window, r_item, "複製")
+
+        self.assertEqual(self._on_disk(), self.before,
+                         "後ろの kyoten の機器の複製が、1 つ目の kyoten に入った")
+        self.assertIn(("複製", False), shown,
+                      "後ろの kyoten の機器でも複製を選べる（灰色で出ていない）")
+        self.assertIn(("編集", True), shown)
+        self.assertIn(("削除", True), shown)
+
+    def test_duplicating_a_device_of_the_first_group_still_works(self):
+        groups = _groups()
+        groups[1]["devices"] = [_device("R", "192.0.2.1")]
+        window = self._window(groups)
+
+        shown = self._choose_from_device_menu(
+            window, self._group_item(window, "kyoten", 0).child(0), "複製")
+
+        self.assertIn(("複製", True), shown)
+        self.assertEqual(self._on_disk()[1],
+                         ("kyoten", ["show clock"],
+                          [("R", "192.0.2.1"), ("R2", "192.0.2.1")]))
+        self.assertEqual(self._on_disk()[3], self.before[3])
+
+    def test_duplicating_a_device_of_a_uniquely_named_group_still_works(self):
+        window = self._window()
+
+        shown = self._choose_from_device_menu(
+            window, self._group_item(window, "other", 0).child(0), "複製")
+
+        self.assertIn(("複製", True), shown)
+        self.assertEqual(self._on_disk()[2],
+                         ("other", [], [("X", "192.0.2.9"), ("R2", "192.0.2.9")]))
+
+    def test_the_notice_says_devices_of_the_later_group_cannot_be_duplicated(self):
+        window = self._window()
+
+        self.assertIn("複製", window.config_manager.load_warning)
 
     def test_the_notice_points_at_the_first_group(self):
         """読み込み時の案内が、先に並んでいる方の「グループを編集」を指すこと。"""
