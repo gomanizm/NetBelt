@@ -617,7 +617,10 @@ REM 誰の目印かを中へ書く。:release_lock は中身が自分の識別�
 REM 外す。識別子は親が md で確保した作業フォルダの名前（STAMP）。
 REM 括弧で囲むのは、STAMP が数字で終わると echo の直前の 1 桁が
 REM リダイレクト先のハンドル番号として読まれてしまうため。
-(echo !STAMP!)>"!LOCK_DIR!\holder.txt" 2>nul
+rem The outer parentheses matter: if the folder was reclaimed while this
+rem run was stalled right after md, the failed output redirection is
+rem reported before the trailing nul redirect on the same line applies.
+((echo !STAMP!)>"!LOCK_DIR!\holder.txt") 2>nul
 if exist "!LOCK_DIR!\holder.txt" set "LOCK_STAMPED=1"
 
 REM 前の実行が置き去りにした一時名の exe を片付ける。差し替えが 5 回とも
@@ -875,7 +878,8 @@ REM 誰の目印かを中へ書く（:lock_claimed と同じ形。理由は :rel
 REM holder.txt 入りのフォルダは :lock_is_foreign が更新の目印と見るので、
 REM 置き土産の回収の判定は変わらない。
 set "TAKEOVER_STAMPED="
-(echo !STAMP!)>"!TAKEOVER_DIR!\holder.txt" 2>nul
+rem Outer parentheses as in :lock_claimed.
+((echo !STAMP!)>"!TAKEOVER_DIR!\holder.txt") 2>nul
 if exist "!TAKEOVER_DIR!\holder.txt" set "TAKEOVER_STAMPED=1"
 exit /b 0
 
