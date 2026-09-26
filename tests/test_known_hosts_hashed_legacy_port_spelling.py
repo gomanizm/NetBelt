@@ -25,8 +25,16 @@ config.json のポートの文字列をそのまま paramiko へ渡していた�
 （22 と等しくなければ "[host]:<設定の値>"）も加える。設定の値を整数に
 そろえると接続先のポートになるときだけ使う。読み込みの照合・読めない行の
 振り分け・保存直前の食い違い確認の 3 か所が同じ候補を使う。
-設定を整数の 22 に直したあとは、ハッシュ化名から元の綴りを取り戻せないので
-この行は照合に使えない（OpenSSH も同じ。残る制限）。
+
+設定の値だけには頼れない（基準 0a081e6 で実測）。機器の編集で何も変えずに
+OK を押すと、port "022" は整数の 22 で保存される。そのあとは設定の綴りが
+分からず、hash_host('[127.0.0.1]:022') <鍵A> の行が照合に使われなかった
+（"0022"・"+22"・"02202"、大文字を含むホスト名、鍵欄の壊れた行、保存直前に
+足された行でも同じ。認証が鍵B の相手へ届き、鍵B の行が書き足される）。
+そこで、よくある旧綴り（"0<port>"・"00<port>"・"+<port>"）は設定によらず
+候補にする。それ以外の綴り（"+0022" など）でハッシュ化した行は、設定が
+その綴りのあいだしか照合できない（元の綴りをハッシュ化名から取り戻せない。
+残る制限）。
 """
 import os
 import shutil
@@ -246,6 +254,98 @@ class HashedLegacyPortSpellingKnownHostsTest(unittest.TestCase):
         self.assertEqual(auth_log, [("admin", "s3cret")], errors)
         self.assertIn("[%s]:2202" % HOST,
                       self.known_hosts.read_text(encoding="utf-8"))
+
+    def _assert_broken_line_stops(self, text, port):
+        returned, errors, auth_log = self._connect(text, self.key_b, port)
+        self.assertFalse(returned)
+        self.assertEqual(auth_log, [], "認証が相手へ届いている: %r" % (errors,))
+        self.assertTrue(any("known_hosts に読めない行があり" in e
+                            and "1 行目" in e for e in errors),
+                        "読めない行として中止していない: %r" % (errors,))
+        self.assertEqual(self.known_hosts.read_text(encoding="utf-8"), text)
+
+    def _assert_saved_meanwhile_stops(self, other_line, port):
+        returned, errors, auth_log = self._connect(
+            "", self.key_b, port, saved_meanwhile=other_line)
+        self.assertFalse(returned)
+        self.assertEqual(auth_log, [],
+                         "別の鍵が保存済みの相手へ認証が届いている: %r" % (errors,))
+        self.assertTrue(any("ホスト鍵が食い違います" in e for e in errors),
+                        errors)
+        self.assertEqual(self.known_hosts.read_text(encoding="ascii"),
+                         other_line)
+
+    def test_edit_dialog_saves_the_port_as_an_integer(self):
+        """前提: 機器の編集で何も変えずに OK を押すと、port "022" は整数の 22 で保存されること。
+
+        設定の綴り（"022"）が残るのは、config.json を手で直してから機器の
+        編集で保存するまでの間だけ。パスワードの変更など別の用事で OK を
+        押したあとの接続でも、ハッシュ化した旧綴りの行を照合に使う必要がある。
+        """
+        from ui.dialogs.device_dialog import DeviceDialog
+        dialog = DeviceDialog(groups=["Default"], device_data={
+            "name": "sw1", "host": HOST, "port": "022", "protocol": "ssh",
+            "username": "admin", "password": "s3cret"})
+        self.addCleanup(dialog.deleteLater)
+
+        self.assertEqual(dialog.port_edit.text(), "022")
+        saved = dialog.get_device_data()["port"]
+        self.assertEqual((type(saved), saved), (int, 22))
+
+    def test_hashed_legacy_line_refuses_other_key_with_integer_port(self):
+        """port が整数になったあとも、よくある旧綴りをハッシュ化した行 <鍵A> で鍵B の相手を断ること。"""
+        for spelling, port in (("022", 22), ("0022", 22), ("+22", 22),
+                               ("02202", 2202)):
+            with self.subTest(spelling=spelling, port=port):
+                self._assert_refused(
+                    _line(HostKeys.hash_host("[%s]:%s" % (HOST, spelling)),
+                          self.key_a), port)
+
+    def test_hashed_legacy_name_of_other_case_host_with_integer_port(self):
+        """大文字を含む設定で port が整数でも、綴りのまま・小文字のどちらでハッシュ化した旧綴りの行も照合すること。"""
+        for name in ("[SW1.example.com]:022", "[sw1.example.com]:022"):
+            with self.subTest(name=name):
+                self._assert_refused(
+                    _line(HostKeys.hash_host(name), self.key_a), 22,
+                    host="SW1.example.com")
+
+    def test_hashed_legacy_spelling_accepts_the_same_key_with_integer_port(self):
+        """port が整数でも、鍵A の相手には認証へ進み、読み替えた鍵をディスクに書かないこと。"""
+        text = _line(HostKeys.hash_host("[%s]:022" % HOST), self.key_a)
+        returned, errors, auth_log = self._connect(text, self.key_a, 22)
+
+        self.assertEqual(auth_log, [("admin", "s3cret")],
+                         "保存済みの鍵と同じ相手なのに認証へ進んでいない: %r"
+                         % (errors,))
+        self.assertEqual(self.known_hosts.read_text(encoding="utf-8"), text,
+                         "読み替えた鍵がディスクへ書かれた")
+
+    def test_broken_hashed_legacy_line_stops_with_integer_port(self):
+        """port が整数でも、鍵欄が壊れた hash_host('[host]:022') の行はこの機器の読めない行として中止すること。"""
+        self._assert_broken_line_stops(
+            "%s ecdsa-sha2-nistp256 AAAA\n"
+            % HostKeys.hash_host("[%s]:022" % HOST), 22)
+
+    def test_hashed_legacy_line_saved_meanwhile_stops_with_integer_port(self):
+        """port が整数でも、保存の直前に別の接続が保存したハッシュ化した旧綴りの行 <鍵A> に気づくこと。"""
+        self._assert_saved_meanwhile_stops(
+            _line(HostKeys.hash_host("[%s]:022" % HOST), self.key_a), 22)
+
+    def test_unusual_spelling_is_used_while_the_setting_keeps_it(self):
+        """よくある綴りに無い "+0022" も、設定がその綴りのままなら 3 か所とも照合に使うこと。
+
+        読み込みの照合・読めない行の振り分け・保存直前の食い違い確認。
+        設定の綴りは connect() が整数にそろえる前に覚えておく。
+        """
+        name = HostKeys.hash_host("[%s]:+0022" % HOST)
+        with self.subTest("lookup"):
+            self._assert_refused(_line(name, self.key_a), "+0022")
+        with self.subTest("broken line"):
+            self._assert_broken_line_stops(
+                "%s ecdsa-sha2-nistp256 AAAA\n" % name, "+0022")
+        with self.subTest("saved meanwhile"):
+            self._assert_saved_meanwhile_stops(_line(name, self.key_a),
+                                               "+0022")
 
 
 if __name__ == "__main__":

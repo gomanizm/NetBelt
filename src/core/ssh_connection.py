@@ -86,6 +86,15 @@ def _hostnames_match(names, server_name):
     return False
 
 
+# ハッシュ化名の照合で、設定によらず候補にする旧版のポートの綴り（%d は
+# 接続先のポート）。旧版の paramiko へ渡った綴りは Windows の getaddrinfo が
+# 読める形（先頭の "+" と 0 の並び）なら何でもあり得るので、よくある形に
+# 数を限る。1 つ増やすごとに、ハッシュ化名 1 つあたり hash_host が 1〜2 回増える
+# （実測: ハッシュ化行 1 万行で未知の機器へ繋ぐと、この 3 つで読み替えが
+# 0.30 秒→0.52 秒、保存直前の確認が 0.85 秒→1.02 秒）
+_LEGACY_PORT_SPELLINGS = ("0%d", "00%d", "+%d")
+
+
 def _names_same_endpoint(name, host, port, ignore_case=True,
                          written_port=None):
     """known_hosts の名前 1 つが host:port を指すか（別の綴りも含む）。
@@ -96,11 +105,14 @@ def _names_same_endpoint(name, host, port, ignore_case=True,
     みなす。22 番なら "host" と "[host]:22" もこの機器の名前。
 
     ハッシュ化名からはポートを読み出せないので、候補の名前ごとに掛け直して
-    比べる。written_port（整数へそろえる前の設定の文字列）があれば、旧版が
-    その値から組み立てた "[host]:<written_port>" も候補にする。無いと
-    "[host]:022" をハッシュ化した行が照合に使われず、TOFU が別の鍵を
-    受け入れてパスワードが届いていた（実測）。設定を整数に直したあとは
-    元の綴りが分からないので、この行は照合できない（残る制限）。
+    比べる。旧版がポートの文字列から組み立てた "[host]:<綴り>" の候補は、
+    written_port（整数へそろえる前の設定の文字列）と、設定によらない
+    よくある綴り（_LEGACY_PORT_SPELLINGS）。無いと "[host]:022" を
+    ハッシュ化した行が照合に使われず、TOFU が別の鍵を受け入れてパスワードが
+    届いていた（実測）。設定の文字列は、機器の編集で OK を押すだけで
+    整数になる（"022" は 22 で保存される）ので、それだけには頼らない。
+    それ以外の綴り（"+0022" など）でハッシュ化した行は、設定がその綴りの
+    あいだしか照合できない（元の綴りをハッシュ化名から取り戻せない。残る制限）。
 
     ignore_case なら、ホスト名の大文字小文字は区別しない（OpenSSH と同じ）。
     ハッシュ化名は設定の綴りのままと、小文字にそろえた綴りの両方で
@@ -114,12 +126,14 @@ def _names_same_endpoint(name, host, port, ignore_case=True,
     lowered = fold(host)
     if name.startswith("|1|"):
         wanted = {known_hosts_server_name(h, port) for h in (host, lowered)}
+        spellings = {s % port for s in _LEGACY_PORT_SPELLINGS}
         if port == 22:
-            wanted.update("[%s]:22" % h for h in (host, lowered))
+            spellings.add("22")
         if (isinstance(written_port, str)
                 and tcp_port_number(written_port) == port):
-            wanted.update("[%s]:%s" % (h, written_port)
-                          for h in (host, lowered))
+            spellings.add(written_port)
+        wanted.update("[%s]:%s" % (h, s)
+                      for h in (host, lowered) for s in spellings)
         return any(_hostnames_match([name], w) for w in wanted)
     if name.startswith("[") and "]:" in name:
         name_host, _, name_port = name[1:].rpartition("]:")
