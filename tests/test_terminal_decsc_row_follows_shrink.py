@@ -127,6 +127,19 @@ class SavedRowFollowsTheHistoryTest(unittest.TestCase):
         feed(screen, DECRC + "!")
         self.assertEqual(text_of(screen), ["CCCC", "D!DD", "EEEE"])
 
+    def test_only_the_rows_pushed_to_history_shift_the_save(self):
+        """空行の切り捨てと履歴送りが混ざる縮小では、送った行の数だけずれること。"""
+        screen = feed(Screen(5, 8), FILL4 + ESC + "[3;2H" + DECSC
+                      + ESC + "[4;1H")
+        screen.set_size(3, 8)
+        self.assertEqual(len(screen.history), 1,
+                         "前提: 空行 1 行を捨てて 1 行を履歴へ送る形に"
+                         "なっていない")
+        feed(screen, DECRC + "!")
+        self.assertEqual(text_of(screen), ["BBBB", "C!CC", "DDDD"],
+                         "ESC 8 が控えた行へ戻らなかった (捨てた空行の分"
+                         "までずれると上、ずらさないと下の行を潰す)")
+
     def test_growing_back_does_not_land_on_a_blank_row(self):
         """縮めて元の高さへ戻したあとの ESC 8 が、下に足した空行へ行かないこと。"""
         screen = feed(Screen(4, 8), FILL4 + ESC + "[3;2H" + DECSC)
