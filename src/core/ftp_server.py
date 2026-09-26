@@ -437,11 +437,15 @@ class FTPServerManager(QObject):
                 # 先頭だけ。権限で断る 550（ftp_* を呼ばずに戻る）や APPE / STOU
                 # の 450 は位置を残し、次の REST 無しの STOR / RETR が途中から
                 # 書く・返していた（実測）。REST は直後の転送コマンドにだけ効く
-                # （RFC 959）ので、転送コマンドを終えたら結果によらず戻す
+                # （RFC 959）ので、転送コマンドを終えたら結果によらず戻す。
+                # データ接続を使う一覧（LIST / NLST / MLSD）も転送コマンドで、
+                # pyftpdlib は位置を読まずに残す（REST → LIST の後の RETR が
+                # 途中から返していた）。PASV・TYPE などは消費しない
                 try:
                     return super().pre_process_command(line, cmd, arg)
                 finally:
-                    if cmd in ("STOR", "APPE", "STOU", "RETR"):
+                    if cmd in ("STOR", "APPE", "STOU", "RETR",
+                               "LIST", "NLST", "MLSD"):
                         self._restart_position = 0
 
             def ftp_RETR(self, file):
