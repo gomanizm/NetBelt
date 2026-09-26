@@ -1713,8 +1713,14 @@ class TerminalWidget(QWidget):
         handles = list(self._log_files.values()) + [
             entry[0] for entries in self._closing_logs.values()
             for entry in entries]
+        # 止める前に、手が空いたのを見てから記録中の失敗を読み直す。先頭で
+        # 読んだあとに失敗して手を空けた記録を、知らせないまま止めない
+        # （スレッドは失敗を残してから手を空けるので、ここなら見える。
+        # 見えたら止めずに、次の回で知らせる）
         if not self._closing_writers and not self._log_throttled and not any(
-                isinstance(h, LogWriter) and h.busy for h in handles):
+                isinstance(h, LogWriter) and h.busy for h in handles) and not any(
+                isinstance(h, LogWriter) and h.failure is not None
+                for h in self._log_files.values()):
             self._log_watch.stop()
 
     def has_open_log_recordings(self) -> bool:
