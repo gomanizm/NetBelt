@@ -8,6 +8,7 @@ from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
 
 from .send_backpressure import DrainWatcher, socket_writable, wait_writable
 from .sockets import tcp_port_number
+from .unsendable import unsendable_notice
 
 
 class TelnetConnection(QObject):
@@ -236,6 +237,11 @@ class TelnetConnection(QObject):
             self._write_pending()
         except socket.error as e:
             self._report_send_error(e)
+        except UnicodeEncodeError as e:
+            # 送れない文字（孤立したサロゲート）。切断として扱わず、何も
+            # 送らずに知らせる（貼り付けは端末の入口で丸ごと断っている）
+            self.output_received.emit(
+                "\r\n%s\r\n" % unsendable_notice(command, e.start))
         except Exception as e:
             self.error_occurred.emit(f"送信エラー: {str(e)}")
 

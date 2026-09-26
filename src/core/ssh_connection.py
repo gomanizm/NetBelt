@@ -12,6 +12,7 @@ from typing import Callable, Optional
 from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
 
 from .send_backpressure import DrainWatcher, socket_writable
+from .unsendable import unsendable_notice
 
 # known_hosts の読み書きを直列化する。同時に保存すると、あとから
 # os.replace した側が先の結果を丸ごと差し替えてしまう。旧 known_hosts の
@@ -1079,6 +1080,12 @@ class SSHConnection(QObject):
             # InteractiveTerminalからEnterキーは'\r'として送られてくる
             # 書き残しがあれば、その後ろへ足す（後から来た打鍵が追い越さない）
             self._carry += command.encode('utf-8')
+        except UnicodeEncodeError as e:
+            # 送れない文字（孤立したサロゲート）。切断として扱わず、何も
+            # 送らずに知らせる（貼り付けは端末の入口で丸ごと断っている）
+            self.output_received.emit(
+                "\r\n%s\r\n" % unsendable_notice(command, e.start))
+            return
         except Exception as e:
             self.error_occurred.emit(f"送信エラー: {str(e)}")
             return

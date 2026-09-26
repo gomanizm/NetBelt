@@ -12,6 +12,7 @@ from core.log_writer import LogWriter
 from core.terminal import parser as vt
 from core.terminal.attrs import DEFAULT
 from core.terminal.screen import Screen, BLANK
+from core.unsendable import unsendable_index, unsendable_notice
 
 # SGR の基本 16 色 (xterm の既定値)。0-7 が基本、8-15 が明色
 def _u16(text: str) -> int:
@@ -119,6 +120,8 @@ class InteractiveTerminal(QTextEdit):
     font_size_change_requested = pyqtSignal(int)
     # ウィジェットの大きさが変わった（行数・桁数の再計算が要る）
     resized = pyqtSignal()
+    # アプリ自身の案内を画面へ出したい（TerminalWidget.show_notice へ繋ぐ）
+    notice_requested = pyqtSignal(str)
 
     def resizeEvent(self, event):
         self._keep_top_row(super().resizeEvent, event)
@@ -409,9 +412,19 @@ class InteractiveTerminal(QTextEdit):
         見えてしまう。
 
         Returns:
-            bool: 送ったなら True（送れる状態でない・空文字なら False）
+            bool: 送ったなら True（送れる状態でない・空文字・送れない文字を
+            含むなら False）
         """
         if not text or not self.can_send_input():
+            return False
+        # 送れない文字（孤立したサロゲート）を含むなら、区切りに分ける前に
+        # 丸ごと断って知らせる。接続の encode で断られると、それより前の
+        # 区切りは送ったあとで、SSH・Telnet は切断、シリアルは区切り 1 つを
+        # 黙って落として前後の行が繋がったまま実行されていた
+        index = unsendable_index(text)
+        if index is not None:
+            self.notice_requested.emit(
+                "\n" + unsendable_notice(text, index) + "\n")
             return False
         # 改行は端末と同じく CR で送る
         payload = text.replace('\r\n', '\r').replace('\n', '\r')
@@ -1097,6 +1110,10 @@ class TerminalWidget(QWidget):
         terminal.macro_settings_requested.connect(
             lambda: self.macro_settings_requested.emit(device_name)
         )
+
+        # 端末自身の案内（送らなかった理由など）をこのタブへ出す
+        terminal.notice_requested.connect(
+            lambda text: self.show_notice(device_name, text))
 
         # ウィンドウの大きさに画面の格子を追従させる
         terminal.resized.connect(

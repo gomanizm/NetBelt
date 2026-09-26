@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 from .crypto import PasswordCrypto
+from .unsendable import unsendable_index
 
 # ファイルロックの実装。依存パッケージは足さず、標準ライブラリだけで作る
 try:
@@ -50,11 +51,17 @@ def is_readable_macro(macro) -> bool:
     アプリごと落ちる。グループの auto_commands は _is_valid_auto_commands が
     同じ条件で弾いており、マクロにだけこの検査が無かった。
     commands キーが無いのは「コマンド未設定」なので、既定値 [] で通す。
+
+    各行が機器へ送れる（UTF-8 にできる）ことも見る。孤立したサロゲート
+    （手編集の config.json のエスケープ）を含む行は送る途中で断られ、
+    それより前の行だけが機器へ届く（core.unsendable）。GUI の編集からは
+    保存できないので、入ってくるのは手編集の config.json だけ。
     """
     return (isinstance(macro, dict)
             and isinstance(macro.get("name"), str)
             and isinstance(macro.get("commands", []), list)
-            and all(isinstance(c, str) for c in macro.get("commands", [])))
+            and all(isinstance(c, str) and unsendable_index(c) is None
+                    for c in macro.get("commands", [])))
 
 
 def count_macros_named(macros, name) -> int:
@@ -807,9 +814,11 @@ class ConfigManager:
         キーだけが送られる。list() できない値（数値など）は送信を仕掛ける
         QTimer のコールバックの中で TypeError になり、PyQt6 はスロット内の
         未捕捉例外で終了するため、接続した瞬間にアプリごと落ちる。
+        各行が機器へ送れる（UTF-8 にできる）ことも見る（is_readable_macro と同じ）。
         """
         return (isinstance(commands, list)
-                and all(isinstance(c, str) for c in commands))
+                and all(isinstance(c, str) and unsendable_index(c) is None
+                        for c in commands))
 
     @staticmethod
     def _normalize_optional_list(container: Dict, key: str, keep) -> bool:
@@ -1078,7 +1087,8 @@ class ConfigManager:
                          "マクロ設定の「プリセット管理」で入れ直してください。")
         if broken_auto_commands:
             parts.append("設定ファイル (config.json) で自動実行コマンドが"
-                         "文字列の配列になっていないグループがあり、"
+                         "文字列の配列になっていない（または送れない文字を"
+                         "含む）グループがあり、"
                          "そのグループの自動実行を無効にしました。"
                          "グループの編集で入れ直してください: "
                          + "、".join(broken_auto_commands))
