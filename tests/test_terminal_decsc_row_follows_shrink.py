@@ -44,6 +44,11 @@ _other_saved) の行は据え置いていた。そのため ESC 8 が控えた�
 
 直し方: メイン画面に居るとき (alt_active でないとき) は、履歴へ送った
 行数を _saved_main の行からも引く (0 で止める)。桁は触らない。
+引くのは履歴へ送った行数だけで、下の空行を捨てた分は引かない。減った
+行の合計で引くと、控えた行より上の受信済みの行を潰す (検査で試した
+変異: 'AAAA' CRLF 'BBBB' ESC[2;2H ESC[?1049h ESC[?47l ESC[2;1H →
+set_size(2, 8) → ESC[?1049l '!' が ['A!AA', 'BBBB'] になる。正は
+['AAAA', 'B!BB'])。
 """
 import os
 import sys
@@ -136,9 +141,11 @@ class A1049SaveLeftOnTheMainScreenTest(unittest.TestCase):
 
     LEAVES = ("?47l", "?1047l")
 
-    def _left_early(self, leave):
-        screen = feed(Screen(4, 8), FILL4 + ESC + "[3;2H" + ESC + "[?1049h"
-                      + ESC + "[" + leave + ESC + "[4;1H")
+    def _left_early(self, leave, rows=4, fill=FILL4, save="3;2",
+                    cursor="4;1"):
+        screen = feed(Screen(rows, 8), fill + ESC + "[" + save + "H"
+                      + ESC + "[?1049h" + ESC + "[" + leave
+                      + ESC + "[" + cursor + "H")
         self.assertFalse(screen.alt_active, "前提: メイン画面へ戻っていない")
         return screen
 
@@ -162,6 +169,39 @@ class A1049SaveLeftOnTheMainScreenTest(unittest.TestCase):
                 feed(screen, ESC + "[?1049l" + "!")
                 self.assertEqual(text_of(screen),
                                  ["C!CC", "DDDD", "", ""])
+
+    def test_dropping_only_blank_rows_keeps_the_1049_save(self):
+        """下の空行を捨てるだけ (履歴へ送らない) なら、1049 の保存は動かないこと。
+
+        DECSC の test_dropping_only_blank_rows_keeps_the_save と対の形。
+        """
+        for leave in self.LEAVES:
+            with self.subTest(leave=leave):
+                screen = self._left_early(
+                    leave, fill=CRLF.join(["AAAA", "BBBB"]), save="2;2",
+                    cursor="2;1")
+                screen.set_size(2, 8)
+                self.assertEqual(len(screen.history), 0,
+                                 "前提: 下の空行を捨てるだけになっていない")
+                feed(screen, ESC + "[?1049l" + "!")
+                self.assertEqual(text_of(screen), ["AAAA", "B!BB"],
+                                 "空行を捨てただけで 1049 の保存が上へずれ、"
+                                 "控えた行より上の受信済みの行を潰した")
+
+    def test_only_the_rows_pushed_to_history_shift_the_1049_save(self):
+        """空行の切り捨てと履歴送りが混ざる縮小では、送った行の数だけずれること。"""
+        for leave in self.LEAVES:
+            with self.subTest(leave=leave):
+                screen = self._left_early(
+                    leave, rows=5, fill=FILL4, save="3;2", cursor="4;1")
+                screen.set_size(3, 8)
+                self.assertEqual(len(screen.history), 1,
+                                 "前提: 空行 1 行を捨てて 1 行を履歴へ送る"
+                                 "形になっていない")
+                feed(screen, ESC + "[?1049l" + "!")
+                self.assertEqual(text_of(screen), ["BBBB", "C!CC", "DDDD"],
+                                 "1049l が控えた行へ戻らなかった (捨てた空行"
+                                 "の分までずれると上、ずらさないと下の行を潰す)")
 
 
 class WhatAlreadyWorkedStaysTheSameTest(unittest.TestCase):
