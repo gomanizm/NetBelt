@@ -10,6 +10,7 @@ GUI は書き終わりを短い間だけ待つ。普段のローカルディス�
 以後は待たずに積むだけにする（積んだ分がはけたら、また待つ側へ戻る）。
 スレッドで起きた失敗は failure に残し、以後の write / flush / close でも例外として返す。
 """
+import copy
 import os
 import queue
 import threading
@@ -132,13 +133,31 @@ class LogWriter:
             self._closing = True
             self._submit("close")
         if self._core.error is not None:
-            raise self._core.error
+            self._raise_failure()
 
     def _check(self) -> None:
         if self._core.error is not None:
-            raise self._core.error
+            self._raise_failure()
         if self._closing:
             raise ValueError("I/O operation on closed file.")
+
+    def _raise_failure(self) -> None:
+        """スレッドで起きた失敗を、その写しにして投げる（failure は元のまま）。
+
+        元の例外を投げると、その traceback に呼んだ側のフレーム（self や
+        呼び出し元の変数）が継ぎ足される。例外は _Core に残り、_Core は
+        finalize の登録と書き込みスレッドから辿れるので、失敗した LogWriter も
+        呼び出し元のフレームも回収されなくなっていた。
+        """
+        error = self._core.error
+        try:
+            copied = copy.copy(error)
+        except Exception:
+            copied = Exception(str(error))  # 写せない例外は文言だけ持たせる
+        if getattr(error, "winerror", None) is not None:
+            # 写しは winerror を落とし、文言の [WinError n] が [Errno n] に変わる
+            copied.winerror = error.winerror
+        raise copied from error
 
     def _submit(self, op, text="", settle=True) -> None:
         core = self._core
