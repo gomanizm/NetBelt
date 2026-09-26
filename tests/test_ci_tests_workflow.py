@@ -26,6 +26,8 @@
     Run tests までの手順は同じ
   - 書いてよいキーを決め、それ以外（continue-on-error・if・ジョブやワークフローの
     段の env・strategy など、テストを走らせないか落ちても緑にできるもの）を落とす
+  - リリースのワークフローとジョブの段にも env・defaults を書かない（比べるのは
+    Run tests までの手順なので、リリースの門番だけが別の環境で走る）
   - Run tests に shell・defaults・working-directory を書かない（リリースと同じく
     既定の pwsh の中で、リポジトリの直下から走らせる）
   - テストの手順へ GITHUB_TOKEN を渡さない（製品は環境変数の GITHUB_TOKEN を読み、
@@ -296,6 +298,19 @@ class CiTestsWorkflowTest(unittest.TestCase):
         self.assertLess(starts[0], ends[0])
         self.assertEqual(_nameless_items(code[starts[0] + 1:ends[0]]), [])
 
+    def test_the_release_sets_no_environment_above_its_steps(self):
+        # 比べているのは Run tests までの手順だけ。リリースのワークフローや
+        # ジョブの段の env（PYTEST_ADDOPTS など）・defaults（run の shell を
+        # cmd になど）は、リリースの門番だけを別の環境で走らせ、PR の CI は
+        # 緑のままになる（tests.yml の側は、書いてよいキーを決めて落としている）
+        code = _code_lines(self.release)
+        job_keys = _keys(_block(code, "jobs"), 4)
+        self.assertIn("steps", job_keys)  # ジョブの段を読めていること
+        for key in ("env", "defaults"):
+            with self.subTest(key=key):
+                self.assertNotIn(key, _keys(code, 0))
+                self.assertNotIn(key, job_keys)
+
     def test_it_uses_the_same_runner_python_and_pytest_as_the_release(self):
         for pattern in (r"^\s*runs-on:\s*(\S+)",
                         r"^\s*python-version:\s*(\S+)",
@@ -355,7 +370,27 @@ class CiTestsWorkflowTest(unittest.TestCase):
         self.assertRegex(self.tests, r"(?m)^\s*timeout-minutes:\s*\d+")
 
 
-class NamelessStepDriftTest(unittest.TestCase):
+class _WorkflowCopy:
+    """ずらした写しを見張りに読ませる手順（unittest.TestCase と一緒に継ぐ）"""
+
+    def _failed_checks(self, text, target="TESTS"):
+        """text を target（"TESTS" か "RELEASE"）の中身として見張りに読ませ、
+        落ちた確かめの名前を返す"""
+        module = sys.modules[__name__]
+        folder = tempfile.mkdtemp(prefix="netbelt-ci-drift-")
+        self.addCleanup(shutil.rmtree, folder, True)
+        path = os.path.join(folder, os.path.basename(getattr(module, target)))
+        with io.open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        suite = unittest.defaultTestLoader.loadTestsFromTestCase(CiTestsWorkflowTest)
+        result = unittest.TestResult()
+        with mock.patch.object(module, target, path):
+            suite.run(result)
+        return sorted({t.id().split(".")[-1].split(" ")[0]
+                       for t, _ in result.failures + result.errors})
+
+
+class NamelessStepDriftTest(_WorkflowCopy, unittest.TestCase):
     """名前の無い手順を Run tests の前に入れたずれを、見張りが捕まえることの検証。
 
     何が起きていたか（ebbe593 で実測）
@@ -398,22 +433,6 @@ class NamelessStepDriftTest(unittest.TestCase):
             ["- {name: Extra, run: pip install something}"],
     }
 
-    def _failed_checks(self, text, target="TESTS"):
-        """text を target（"TESTS" か "RELEASE"）の中身として見張りに読ませ、
-        落ちた確かめの名前を返す"""
-        module = sys.modules[__name__]
-        folder = tempfile.mkdtemp(prefix="netbelt-ci-drift-")
-        self.addCleanup(shutil.rmtree, folder, True)
-        path = os.path.join(folder, os.path.basename(getattr(module, target)))
-        with io.open(path, "w", encoding="utf-8") as f:
-            f.write(text)
-        suite = unittest.defaultTestLoader.loadTestsFromTestCase(CiTestsWorkflowTest)
-        result = unittest.TestResult()
-        with mock.patch.object(module, target, path):
-            suite.run(result)
-        return sorted({t.id().split(".")[-1].split(" ")[0]
-                       for t, _ in result.failures + result.errors})
-
     @staticmethod
     def _insert_before_run_tests(text, step_lines):
         lines = text.splitlines()
@@ -450,6 +469,48 @@ class NamelessStepDriftTest(unittest.TestCase):
                 self.assertNotEqual(drifted, base)
                 self.assertNotEqual(self._failed_checks(drifted, "RELEASE"), [],
                                     "見張りが見逃した: %r" % step_lines)
+
+
+class ReleaseEnvironmentDriftTest(_WorkflowCopy, unittest.TestCase):
+    """リリースのワークフローやジョブの段で環境を変えたずれを、見張りが捕まえることの検証。
+
+    何が起きていたか（dc01f8b で実測）
+      見張りがリリースと比べるのは、Run tests までの手順だけだった。リリースの
+      ワークフローやジョブの段に env（PYTEST_ADDOPTS など）や defaults（run の
+      shell を cmd にするなど）を書いても、見張りはすべて通った。リリースの
+      門番だけが別の環境で走り、PR の CI は元の環境のまま緑になる。
+    どう直したか
+      リリースのワークフローとジョブの段には env と defaults を書かないことにした
+      （CiTestsWorkflowTest.test_the_release_sets_no_environment_above_its_steps）。
+    """
+
+    # (入れる段, 入れる行)。ジョブの段は runs-on の次、ワークフローの段は jobs: の前
+    DRIFTS = {
+        "job env": ("job", ["env:", "  PYTEST_ADDOPTS: --collect-only"]),
+        "job defaults": ("job", ["defaults:", "  run:", "    shell: cmd"]),
+        "workflow env": ("workflow", ["env:", "  PYTEST_ADDOPTS: --collect-only"]),
+        "workflow defaults": ("workflow", ["defaults:", "  run:", "    shell: cmd"]),
+    }
+
+    @staticmethod
+    def _insert(text, level, new_lines):
+        lines = text.splitlines()
+        pattern = r"\s*runs-on\s*:.*" if level == "job" else r"jobs\s*:\s*"
+        at = [i for i, l in enumerate(lines) if re.fullmatch(pattern, l)]
+        assert len(at) == 1, at
+        indent = lines[at[0]][:len(lines[at[0]]) - len(lines[at[0]].lstrip())]
+        pos = at[0] + 1 if level == "job" else at[0]
+        lines[pos:pos] = [indent + l for l in new_lines]
+        return "\n".join(lines) + "\n"
+
+    def test_an_environment_set_above_the_release_steps_is_caught(self):
+        base = _read(RELEASE)
+        for name, (level, new_lines) in self.DRIFTS.items():
+            with self.subTest(drift=name):
+                drifted = self._insert(base, level, new_lines)
+                self.assertNotEqual(drifted, base)
+                self.assertNotEqual(self._failed_checks(drifted, "RELEASE"), [],
+                                    "見張りが見逃した: %r" % new_lines)
 
 
 if __name__ == "__main__":
