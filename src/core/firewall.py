@@ -340,8 +340,16 @@ def combine_results(results, success_message=None):
     失敗した操作があれば、その msg を返す（複数なら " / " で連結）。成功した
     操作の msg を返すと、失敗の理由が画面に出ず print にしか残らない。
     すべて成功したときは success_message（省略時は最初の操作の msg）を返す。
+    そこに但し書き（_BLOCK_NOT_CHECKED）が無く、ほかの操作の msg にあれば、
+    その msg を " / " で添える。自exe の許可はポートの許可の後ろに並ぶので、
+    最初の msg だけだと但し書きが print にしか残らず、パネルには但し書きの
+    無い「完了」が出ていた（実測: SFTP・SNMP）
     """
     failed = [msg for ok, msg in results if not ok]
     if failed:
         return False, " / ".join(failed)
-    return True, (results[0][1] if success_message is None else success_message)
+    shown = results[0][1] if success_message is None else success_message
+    if _BLOCK_NOT_CHECKED not in shown:
+        shown = " / ".join([shown] + [msg for _ok, msg in results
+                                      if _BLOCK_NOT_CHECKED in msg])
+    return True, shown
