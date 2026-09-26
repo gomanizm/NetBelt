@@ -24,7 +24,10 @@ class _LogLimiter:
     （実測: 3 秒で 2808 行ずつ・約 1.7GB/時）。exe では標準出力が上限も回転も
     無いログファイルなので、ディスクを埋められる。種類ごとに WINDOW_SECONDS
     あたり LIMIT 行まで出し、超えた分は数えるだけにする。省いた件数は、次の
-    窓の最初の行の前か、flush()（サーバーの停止）で 1 行にして出す
+    窓の最初の行の前か、flush()（サーバーの停止）で 1 行にして出す。
+    接続ごとの行（接続・切断・エラー・上限で断った接続）も同じく通す。
+    認証なしの接続→即切断だけでも 1 接続につき 3 行出る
+    （実測: 5 秒で 2787 接続・約 608MB/時）
     """
 
     WINDOW_SECONDS = 60.0
@@ -1027,11 +1030,14 @@ class SFTPServerManager(QObject):
                             client_socket.close()
                         except OSError:
                             pass
-                        print(f"[SFTP Server] Rejected {client_addr[0]}:"
-                              f"{client_addr[1]}: {reject_reason}")
+                        _log_limited("rejected",
+                                     f"[SFTP Server] Rejected {client_addr[0]}:"
+                                     f"{client_addr[1]}: {reject_reason}")
                         continue
 
-                    print(f"[SFTP Server] Client connected from {client_addr[0]}:{client_addr[1]}")
+                    # 接続ごとの行も間引く（_LogLimiter を参照）
+                    _log_limited("client connected",
+                                 f"[SFTP Server] Client connected from {client_addr[0]}:{client_addr[1]}")
 
                 except socket.timeout:
                     # タイムアウトは正常（停止チェックのため）
@@ -1090,7 +1096,8 @@ class SFTPServerManager(QObject):
             # クライアントがチャネルを開くのを待つ
             channel = transport.accept(timeout=20)
             if channel is None:
-                print(f"[SFTP Server] No channel from {client_addr[0]}")
+                _log_limited("no channel",
+                             f"[SFTP Server] No channel from {client_addr[0]}")
                 return
             
             # SFTPServer の生成と起動は set_subsystem_handler 経由で paramiko が行う。
@@ -1101,7 +1108,8 @@ class SFTPServerManager(QObject):
                 threading.Event().wait(0.5)
             
         except Exception as e:
-            print(f"[SFTP Server] Client handler error: {e}")
+            _log_limited("client handler error",
+                         f"[SFTP Server] Client handler error: {e}")
         finally:
             if transport:
                 transport.close()
@@ -1113,4 +1121,5 @@ class SFTPServerManager(QObject):
             # 「接続クライアント: N」が減らないまま残る
             if self._take_closing_notice(shown):
                 self.client_disconnected.emit(client_addr[0])
-            print(f"[SFTP Server] Client disconnected from {client_addr[0]}")
+            _log_limited("client disconnected",
+                         f"[SFTP Server] Client disconnected from {client_addr[0]}")
