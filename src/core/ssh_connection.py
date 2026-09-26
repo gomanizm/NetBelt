@@ -112,6 +112,44 @@ def _names_same_endpoint(name, host, port):
     return port == 22 and name.lower() == lowered
 
 
+def _add_other_spelling_keys(keys, host, port):
+    """同じ接続先を別の綴りの名前で保存した鍵を、接続先名の鍵として keys へ足す。
+
+    paramiko 4.0.0 は known_hosts を引く名前を `port == 22`（整数との
+    比較）で決める。ポートを整数へそろえる前の版は、config.json の
+    文字列をそのまま渡していたので、その機器の鍵は "[host]:22" や
+    "[host]:022"・"[host]:+22"（22 番以外なら "[host]:02202" など）の
+    名前で保存されている。いまは "host" や "[host]:2202" で引くため
+    この行が使われず、更新後の最初の接続で TOFU が黙って別の鍵を
+    受け入れ、パスワードが相手へ届いていた（実測）。
+
+    ホスト名の大文字小文字だけが違う行も同じ。paramiko は名前を文字列の
+    まま比べるので、OpenSSH（小文字で書く）から写した行と大文字を含む
+    設定や、機器の編集で大文字小文字だけを変えた機器で同じことが
+    起きていた（実測）。
+
+    接続先名の鍵が無いときだけ読み替える。22 番は今までどおり
+    "[host]:22" の鍵を先に見る。それも無ければ、同じ接続先を指す
+    ほかの綴りの行（_names_same_endpoint）の鍵を、ファイルの順に
+    接続先名の鍵として足す（paramiko の照合は種別ごとに先頭の鍵を
+    使う）。読み替えはメモリ上だけで、known_hosts には書かない。
+    """
+    server_name = known_hosts_server_name(host, port)
+    if keys.lookup(server_name) is not None:
+        return
+    if port == 22:
+        legacy = keys.lookup("[%s]:22" % host)
+        if legacy is not None:
+            for keytype in legacy.keys():
+                keys.add(host, keytype, legacy[keytype])
+            return
+    for entry in list(keys._entries):
+        if any(_names_same_endpoint(name, host, port)
+               for name in entry.hostnames):
+            keys._entries.append(paramiko.hostkeys.HostKeyEntry(
+                [server_name], entry.key))
+
+
 def _iter_known_hosts_lines(path):
     """known_hosts を paramiko と同じ読み方で 1 行ずつ見る。
 
@@ -293,7 +331,7 @@ def _key_fingerprint(key):
     return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
 
 
-def _refuse_conflicting_host_key(path, hostname, key):
+def _refuse_conflicting_host_key(path, hostname, key, endpoint=None):
     """ディスクに同じ接続先の別の鍵があれば、上書きせず中止する。
 
     missing_host_key が呼ばれるのは「読み込んだ時点でこの接続先の鍵を
@@ -303,6 +341,12 @@ def _refuse_conflicting_host_key(path, hostname, key):
     自分の鍵で置き換えてしまい（実測: 3 行とも後から来た鍵になる）、
     先に登録した機器は次から BadHostKeyException で繋がらなくなる。
     黙って上書きするより、食い違いを伝えて止める。
+
+    endpoint（(host, port)）があれば、完全一致の鍵が無いとき、読み込みの
+    ときと同じ規則（_add_other_spelling_keys）で、大文字小文字や旧版の
+    ポートの綴りが違う名前の鍵も見る。完全一致だけを見ていると、同時に
+    初回接続した別の接続が "SW1.EXAMPLE.COM <鍵 A>" を保存していても
+    気づかず、鍵 B の相手へパスワードが届いていた（実測）。
 
     Raises:
         HostKeyMismatchError: 同じ接続先に別の鍵が保存済みのとき
@@ -315,6 +359,12 @@ def _refuse_conflicting_host_key(path, hostname, key):
     # 扱いになり、他の機器の初回鍵まで保存されなくなる
     load_known_hosts(disk, path)
     stored = disk.lookup(hostname)
+    note = ""
+    if stored is None and endpoint is not None:
+        _add_other_spelling_keys(disk, *endpoint)
+        stored = disk.lookup(hostname)
+        note = ("\n名前の大文字小文字やポートの書き方が違う行も、同じ接続先の"
+                "行です。")
     if stored is None or disk.check(hostname, key):
         return
     raise HostKeyMismatchError(
@@ -324,12 +374,12 @@ def _refuse_conflicting_host_key(path, hostname, key):
         "  今回提示された鍵: %s %s\n"
         "%s\n"
         "機器を入れ替えたなどで変更が意図したものなら、known_hosts の"
-        "該当行を削除してから接続し直してください。"
+        "該当行を削除してから接続し直してください。%s"
         % (hostname,
            " / ".join("%s %s" % (name, _key_fingerprint(stored[name]))
                       for name in sorted(stored.keys())),
            key.get_name(), _key_fingerprint(key),
-           path))
+           path, note))
 
 
 def _write_known_hosts_file(hostkeys, preserved, tmp_path):
@@ -348,7 +398,7 @@ def _write_known_hosts_file(hostkeys, preserved, tmp_path):
                 f.write(raw + os.linesep.encode("ascii"))
 
 
-def _save_known_hosts(known_hosts_path, entry):
+def _save_known_hosts(known_hosts_path, entry, endpoint=None):
     """今回の 1 件を known_hosts へ書き足す（ほかの行はディスクの現状のまま）。
 
     接続開始時に読み込んだ client の HostKeys を丸ごと書き戻していた頃は、
@@ -367,12 +417,14 @@ def _save_known_hosts(known_hosts_path, entry):
     Args:
         entry: (接続先名, 提示された鍵)。書き足す 1 件。書き込む前に、
             同じ接続先の別の鍵がディスクに無いかを錠の中で確かめる
+        endpoint: (host, port)。確かめるときに別の綴りの名前も見る
+            （_refuse_conflicting_host_key）
     """
     path = Path(str(known_hosts_path))
     with _known_hosts_guard(path.parent):
         # 確かめてから書くまでを錠の中で通す。外で見ると、その間に
         # 別のプロセスが保存した鍵を見落とす
-        _refuse_conflicting_host_key(path, entry[0], entry[1])
+        _refuse_conflicting_host_key(path, entry[0], entry[1], endpoint)
         hostkeys = paramiko.HostKeys()
         preserved = []
         if path.exists():
@@ -405,13 +457,16 @@ class _TofuHostKeyPolicy(paramiko.MissingHostKeyPolicy):
     既知ホストで鍵が一致しない場合は paramiko が BadHostKeyException を送出する。
     """
 
-    def __init__(self, known_hosts_path):
+    def __init__(self, known_hosts_path, endpoint=None):
         self._known_hosts_path = known_hosts_path
+        # (host, port)。保存直前の食い違い確認で別の綴りの名前も見る
+        self._endpoint = endpoint
 
     def missing_host_key(self, client, hostname, key):
         client.get_host_keys().add(hostname, key.get_name(), key)
         try:
-            _save_known_hosts(self._known_hosts_path, (hostname, key))
+            _save_known_hosts(self._known_hosts_path, (hostname, key),
+                              self._endpoint)
         except HostKeyMismatchError:
             # 食い違いは「保存できなかった」ではなく「保存してはいけない」。
             # 警告で済ませず、そのまま接続を中止させる（client はこのあと
@@ -555,7 +610,8 @@ class SSHConnection(QObject):
                 % (e, known_hosts_path))
         if broken:
             self._refuse_or_warn_broken_lines(broken, known_hosts_path)
-        policy = _TofuHostKeyPolicy(known_hosts_path)
+        policy = _TofuHostKeyPolicy(known_hosts_path,
+                                    endpoint=(self.host, self.port))
         policy._on_save_error = lambda message: self.output_received.emit(
             "\r\n[NetBelt] 警告: %s\r\n" % message)
         client.set_missing_host_key_policy(policy)
@@ -563,40 +619,9 @@ class SSHConnection(QObject):
     def _use_other_spelling_keys(self, client):
         """同じ接続先を別の綴りの名前で保存した鍵を、照合に使う。
 
-        paramiko 4.0.0 は known_hosts を引く名前を `port == 22`（整数との
-        比較）で決める。ポートを整数へそろえる前の版は、config.json の
-        文字列をそのまま渡していたので、その機器の鍵は "[host]:22" や
-        "[host]:022"・"[host]:+22"（22 番以外なら "[host]:02202" など）の
-        名前で保存されている。いまは "host" や "[host]:2202" で引くため
-        この行が使われず、更新後の最初の接続で TOFU が黙って別の鍵を
-        受け入れ、パスワードが相手へ届いていた（実測）。
-
-        ホスト名の大文字小文字だけが違う行も同じ。paramiko は名前を文字列の
-        まま比べるので、OpenSSH（小文字で書く）から写した行と大文字を含む
-        設定や、機器の編集で大文字小文字だけを変えた機器で同じことが
-        起きていた（実測）。
-
-        接続先名の鍵が無いときだけ読み替える。22 番は今までどおり
-        "[host]:22" の鍵を先に見る。それも無ければ、同じ接続先を指す
-        ほかの綴りの行（_names_same_endpoint）の鍵を、ファイルの順に
-        接続先名の鍵として足す（paramiko の照合は種別ごとに先頭の鍵を
-        使う）。読み替えはメモリ上だけで、known_hosts には書かない。
+        規則は _add_other_spelling_keys（保存直前の食い違い確認も同じ規則）。
         """
-        keys = client.get_host_keys()
-        server_name = known_hosts_server_name(self.host, self.port)
-        if keys.lookup(server_name) is not None:
-            return
-        if self.port == 22:
-            legacy = keys.lookup("[%s]:22" % self.host)
-            if legacy is not None:
-                for keytype in legacy.keys():
-                    keys.add(self.host, keytype, legacy[keytype])
-                return
-        for entry in list(keys._entries):
-            if any(_names_same_endpoint(name, self.host, self.port)
-                   for name in entry.hostnames):
-                keys._entries.append(paramiko.hostkeys.HostKeyEntry(
-                    [server_name], entry.key))
+        _add_other_spelling_keys(client.get_host_keys(), self.host, self.port)
 
     def _refuse_or_warn_broken_lines(self, broken, known_hosts_path):
         """読めない行を名指しで知らせ、その行が指す接続先なら接続を中止する。
