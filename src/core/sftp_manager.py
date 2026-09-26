@@ -355,12 +355,14 @@ class SFTPManager(QObject):
         self.current_path = path
         self.file_list_ready.emit(file_list)
 
-    def list_directory(self, path: str = None):
+    def list_directory(self, path: str = None, *, refresh: bool = False):
         """
         ディレクトリ内のファイル一覧を取得（バックグラウンド）
         
         Args:
             path: ディレクトリパス（Noneの場合は現在のパス）
+            refresh: 変更のあとの自動更新（_refresh_listing）。path は使わず、
+                最後に頼んだ場所（無ければ現在のパス）を番号と同じロックの中で選ぶ
         """
         if not self.is_connected or not self.sftp_client:
             self.error_occurred.emit("SFTP接続がありません")
@@ -372,6 +374,12 @@ class SFTPManager(QObject):
         # 発行の順番を控える。これより新しい要求が出ていたら、この一覧は
         # 届いても捨てられる
         with self._listing_seq_lock:
+            if refresh:
+                # 選んでから番号を取るまでの間に利用者の移動が入ると、選んだ
+                # 古い場所が後から番号を取って移動を追い越す。同じ区間で選ぶ
+                path = self._listing_path
+                if path is None:
+                    path = self.current_path
             self._listing_seq += 1
             seq = self._listing_seq
             self._listing_path = path
@@ -473,11 +481,10 @@ class SFTPManager(QObject):
         current_path は一覧が GUI に届いたときにしか変わらない。移動の一覧が
         届く前に current_path を頼み直すと、一覧は最後に頼んだ分だけを採る
         ので、古い場所の一覧が移動先を追い越して移動を黙って取り消す。
-        控えが無ければ（最後の要求が失敗した）今の場所を取り直す。
+        控えが無ければ（最後の要求が失敗した）今の場所を取り直す。場所は
+        list_directory が番号を進めるのと同じロックの中で選ぶ。
         """
-        with self._listing_seq_lock:
-            path = self._listing_path
-        self.list_directory(path)
+        self.list_directory(refresh=True)
     
     # _remote_probe が返す、送る直前のリモートの状態
     _REMOTE_MISSING = "missing"
