@@ -38,6 +38,8 @@ import sys
 import tempfile
 import unittest
 
+import pytest
+
 sys.path.insert(0, "src")
 
 
@@ -207,6 +209,33 @@ class WorkingDirectoryConfigIsLeftAloneTest(unittest.TestCase):
         self.assertIsNotNone(before)
         os.utime(path, ns=(0, before[1] + 10**9))
         self.assertNotEqual(_file_mark(path), before)
+
+
+class WorkingDirectoryConfigWatchIsOnTest(unittest.TestCase):
+    """見張り（conftest の working_directory_config_left_alone）が、頼んでいない
+    テストにも効いていることの検証。
+
+    何が起きていたか（ebbe593 で実測）
+      上の 2 件が確かめているのは補助関数 _what_happened と _file_mark だけで、
+      見張りが autouse で有効なことは、どのテストも確かめていなかった。
+      conftest の autouse=True を外しても、このファイルの 11 件はすべて通った。
+      1 周目の検査役の実測では、そのうえで子プロセスへ作業ディレクトリを渡す
+      1 行（cwd=work）も外すと、作業ディレクトリに config.json ができても、
+      どのテストも落ちなかった。
+    どう直したか
+      このリポジトリのテストの大半は unittest.TestCase なので、その形のテストで
+      pytest の request.fixturenames に見張りが入っていることを確かめる。
+    """
+
+    @pytest.fixture(autouse=True)
+    def _grab_fixturenames(self, request):
+        self._fixturenames = request.fixturenames
+
+    def test_the_watch_is_on_for_a_test_that_does_not_ask_for_it(self):
+        names = getattr(self, "_fixturenames", None)
+        self.assertIsNotNone(names, "pytest の fixture を受け取れていない")
+        self.assertIn("working_directory_config_left_alone", names,
+                      "作業ディレクトリの config.json の見張りが効いていない")
 
 
 if __name__ == "__main__":
