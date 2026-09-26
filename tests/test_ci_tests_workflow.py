@@ -12,7 +12,11 @@
   PR・main への push・手動で走る tests.yml を足した。中身はリリースの Run tests までと
   同じにし、ずれたらここで落とす。PyYAML は依存に無いので字面で読む。確かめること:
   - pull_request・push・workflow_dispatch だけで起動し、push は main だけ
-    （PR の宛先や paths で絞らない）
+    （PR の宛先や paths で絞らない。on: と event の行のコロンの後ろに値を
+    書かない。同じ行の {paths: [...]} やエイリアスでも絞れる）
+  - アンカー・エイリアス・マージキーを使わない（見張りが字面で見ていない
+    場所の中身を、別の場所へ持ち込める）
+  - ジョブのトークンは読むだけ（permissions は contents: read だけ）
   - リリースと同じランナー・Python・pytest・依存・Run tests の呼び方と環境変数
     （足してよいのは表示の引数 -r… だけ）
   - Run tests までの手順は、リリースと同じ名前・並び・キーで、その前の手順は中身も
@@ -54,6 +58,17 @@ def _on_block(text):
                 break
             lines.append(line)
     return lines
+
+
+def _on_line(text):
+    """トップレベルの on: の行"""
+    return next(l.rstrip() for l in text.splitlines() if re.match(r"^on\s*:", l))
+
+
+# 値の頭（行頭・'- ' の後・'key: ' の後・[ { , の後）に書いたアンカー（&名前）、
+# エイリアス（*名前）、マージキー（<<:）。ブロックの文字列の中の && などは拾わない
+ANCHOR_ALIAS_OR_MERGE = re.compile(
+    r"(?:^\s*(?:-\s+)?|:\s+|[\[{,]\s*)(?:[&*][^\s\[\]{},]|<<\s*:)")
 
 
 def _events(text):
@@ -197,6 +212,23 @@ class CiTestsWorkflowTest(unittest.TestCase):
         self.assertEqual(
             [l.strip() for l in _code_lines(_event_body(self.tests, "push"))],
             ["branches: [main]"])
+        # on: と event の行は、コロンの後ろに値を書かない。同じ行の流れ形式
+        # （pull_request: {paths: ['docs/**']}）やエイリアス（pull_request: *f）
+        # でも絞れる。PyYAML でそう読まれ、上の確かめはすべて通っていた
+        self.assertRegex(_on_line(self.tests), r"^on\s*:\s*(#.*)?$")
+        for line in _code_lines(_on_block(self.tests)):
+            if len(line) - len(line.lstrip()) <= 2:
+                with self.subTest(line=line):
+                    self.assertRegex(
+                        line,
+                        r"^  (pull_request|push|workflow_dispatch)\s*:\s*(#.*)?$")
+
+    def test_no_anchor_alias_or_merge_key(self):
+        # 見張りは字面で読むので、アンカーとエイリアス（push: &f と
+        # pull_request: *f）やマージキー（<<: *j）で、見ていない場所の中身を
+        # 持ち込める
+        self.assertEqual([l for l in _code_lines(self.tests)
+                          if ANCHOR_ALIAS_OR_MERGE.search(l)], [])
 
     def test_nothing_else_can_skip_the_tests_or_turn_a_failure_green(self):
         # 字面で読むので、書いてよいキーを決めておく（それ以外を足したら落とす）。
@@ -271,6 +303,16 @@ class CiTestsWorkflowTest(unittest.TestCase):
         code = [l for l in self.tests.splitlines()
                 if not l.strip().startswith("#")]
         self.assertFalse([l for l in code if "GITHUB_TOKEN" in l])
+
+    def test_the_job_token_can_only_read(self):
+        # PR の中身（テスト）を走らせるので、ジョブのトークンは読むだけにする
+        # （permissions: write-all にしても、ほかの確かめはすべて通っていた）
+        code = _code_lines(self.tests)
+        self.assertEqual(
+            [l for l in code if re.match(r"^permissions\s*:", l)
+             and not re.fullmatch(r"permissions\s*:\s*(#.*)?", l)], [])
+        self.assertEqual([l.strip() for l in _block(code, "permissions")],
+                         ["contents: read"])
 
     def test_a_hang_is_cut_off(self):
         self.assertRegex(self.tests, r"(?m)^\s*timeout-minutes:\s*\d+")
