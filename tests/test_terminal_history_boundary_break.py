@@ -83,6 +83,44 @@ class HistoryBoundaryTest(unittest.TestCase):
                 self.assertTrue(screen.take_history_break())
                 self.assertFalse(screen.take_history_break())
 
+    # 上の CASES は、入れ替えたあと 0 行目の行頭から半角を書く。そこで
+    # _print_narrow の枝が閉じるので、IL・SD・上端の RI と _print_chars の
+    # 枝がそれぞれ閉じているかは分からない。行頭からは半角を書かない形で
+    # 1 つずつ見張る
+    SEPARATE_CASES = (
+        ("IL / CUP", CSI + "H" + CSI + "L" + CSI + "1;3HZ",
+         "ABCD\n  Z\nEFGH\n"),
+        ("RI / CUP", CSI + "H" + ESC + "M" + CSI + "1;3HZ",
+         "ABCD\n  Z\nEFGH\n"),
+        ("SD / CUP", CSI + "H" + CSI + "T" + CSI + "1;3HZ",
+         "ABCD\n  Z\nEFGH\n"),
+        ("IL alone", CSI + "H" + CSI + "L", "ABCD\n\nEFGH\n"),
+        # 原点からでも、全角・DEC 罫線・挿入モードは _print_chars を通る
+        ("home / wide", CSI + "H" + chr(0x3042),
+         "ABCD\n" + chr(0x3042) + "GH\nI\n"),
+        ("home / DEC graphics", CSI + "H" + ESC + "(0q" + ESC + "(B",
+         "ABCD\n" + chr(0x2500) + "FGH\nI\n"),
+        ("home / IRM", CSI + "H" + CSI + "4hZ" + CSI + "4l",
+         "ABCD\nZEFG\nI\n"))
+
+    def test_each_way_of_replacing_row_zero_closes_the_line_by_itself(self):
+        """行頭から半角を書かなくても、IL・上端の RI・SD・1 文字ずつの印字それぞれで閉じること。"""
+        for name, seq, want in self.SEPARATE_CASES:
+            with self.subTest(name):
+                screen = feed(Screen(2, 4), "ABCDEFGHI" + seq)
+                self.assertEqual(logical(screen), want)
+
+    def test_each_way_tells_the_renderer_by_itself(self):
+        """渡し済みの履歴の行でも、同じ形それぞれで描画側へ閉じるよう知らせること。"""
+        for name, seq, _ in self.SEPARATE_CASES:
+            with self.subTest(name):
+                screen = feed(Screen(2, 4), "ABCDEFGHI")
+                self.assertEqual(screen.take_new_history()[-1][1], True,
+                                 "前提: 履歴の最後の行は 0 行目へ続いている")
+                feed(screen, seq)
+                self.assertTrue(screen.take_history_break())
+                self.assertFalse(screen.take_history_break())
+
     def test_a_plain_wrap_still_joins(self):
         """対照: 普通の折り返し (最下行・1 行の画面) は 1 行のまま繋がること。"""
         self.assertEqual(logical(feed(Screen(2, 4), "ABCDEFGHIJKL")),
