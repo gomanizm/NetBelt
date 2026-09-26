@@ -339,9 +339,15 @@ def _load_known_hosts_into_client(client, path, broken):
     try:
         if _hashed_names_need_own_loader(path):
             loaded = _HostKeysLoadedLinearly()
-            loaded.load(str(path))      # 読めなければ何も移さずに下へ
             client._host_keys_filename = None
-            client.get_host_keys()._entries.extend(loaded._entries)
+            try:
+                loaded.load(str(path))
+            finally:
+                # 途中で読めなくなっても、読めた行（既定の文字コードで読んだ
+                # 名前のまま）は残して下の読み直しで足す。client.load_host_keys
+                # と同じ。捨てると cp932 で保存した日本語名が読み直しで
+                # 文字化けし、その機器が「未知」に戻る（実測）
+                client.get_host_keys()._entries.extend(loaded._entries)
         else:
             client.load_host_keys(str(path))
     except UnicodeDecodeError:
