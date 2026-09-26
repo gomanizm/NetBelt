@@ -712,7 +712,17 @@ class InteractiveTerminal(QTextEdit):
         慣習どおり最下部へ戻す。戻さないと、打った文字のエコーもプロンプトも
         見えないまま入力することになる。マクロやキープアライブ、機器の
         問い合わせへの応答はここを通さない（読んでいる位置を勝手に動かさない）。
+
+        送れない文字（孤立したサロゲート）を含む打鍵・IME の確定は、貼り付け
+        （send_text）と同じく区切りに分ける前に丸ごと断って知らせる。接続の
+        保険は区切り 1 つだけを断るので、区切りより長い確定では前の区切りが
+        機器へ届いてしまう。
         """
+        index = unsendable_index(payload)
+        if index is not None:
+            self.notice_requested.emit(
+                "\n" + unsendable_notice(payload, index) + "\n")
+            return
         bar = self.verticalScrollBar()
         bar.setValue(bar.maximum())
         self._note_typed(payload)
