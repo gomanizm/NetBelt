@@ -334,14 +334,21 @@ class Screen(object):
         if pushed:
             # メイン画面の DECSC (ESC 7 / ?1048h) の保存行も、履歴へ送った
             # ぶんだけ上へずらす (代替画面にいる間は裏の _other_saved)。
-            # 1049 の保存と生きているカーソルは keep_row で追っている。
-            # ずらさないと ESC 8 が控えた行より下の受信済みの行へ戻って潰す
+            # 生きているカーソルと、代替画面にいる間の 1049 の保存は
+            # keep_row で追っている。47l / 1047l で先にメイン画面へ戻った
+            # あとも残る 1049 の保存 (あとの 1049l が使う) はここでずらす。
+            # ずらさないと ESC 8 / 1049l が控えた行より下の受信済みの行へ
+            # 戻って潰す
             saved = self._other_saved if self.alt_active else self._saved
             saved = (max(0, saved[0] - pushed),) + saved[1:]
             if self.alt_active:
                 self._other_saved = saved
             else:
                 self._saved = saved
+                if self._saved_main:
+                    self._saved_main = (
+                        (max(0, self._saved_main[0] - pushed),)
+                        + self._saved_main[1:])
         while len(main) < rows:
             main.append([BLANK] * cols)
             main_marks.append(False)

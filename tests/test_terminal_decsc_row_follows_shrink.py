@@ -1,8 +1,8 @@
 r"""ESC 7 で控えた行が、窓を縦に縮めたときの履歴送りに追随する件を検証する。
 
 set_size は縦に縮めるとき、メイン画面の上の行を履歴へ送り、送った数だけ
-残す行 (keep_row) を上へずらす。生きているカーソルと 1049 の保存
-(_saved_main) はこの keep_row で追っているが、DECSC の保存領域
+残す行 (keep_row) を上へずらす。生きているカーソルと、代替画面に居る間の
+1049 の保存 (_saved_main) はこの keep_row で追っているが、DECSC の保存領域
 (ESC 7 / ?1048h。メイン画面にいれば _saved、代替画面にいる間は
 _other_saved) の行は据え置いていた。そのため ESC 8 が控えた行より下の、
 受信済みの別の行へ戻って上書きする (復元時の _move が rows - 1 へ丸める
@@ -18,13 +18,32 @@ _other_saved) の行は据え置いていた。そのため ESC 8 が控えた�
   縮めてから元の高さへ戻すと、ESC 8 は空行へ戻る ([.., ' !', ''])。
   TerminalWidget でも同じ (窓の高さ 25 行 → 14 行で、下から 2 行目に
   控えた ESC 8 '!' が最下行の受信済みの桁を潰した)。
-  1049 の保存と生きているカーソルは同じ形で正しく追随する。
+  生きているカーソルと、代替画面に居る間の 1049 の保存は同じ形で正しく
+  追随する (先にメイン画面へ戻ったあとの 1049 の保存は下の追記)。
 
 起きるのは ESC 7 と ESC 8 の間 (別の受信片) に窓を縦に縮めたときだけ。
 
 直し方: set_size で履歴へ送った行数を数え、メイン画面の DECSC の保存
 (alt_active なら _other_saved、そうでなければ _saved) の行から引く
 (0 で止める)。代替画面の保存は代替画面が下を切るだけなので触らない。
+
+追記 (1049 の保存が 47l / 1047l のあとに残っている場合):
+1049h のあと 47l / 1047l で先にメイン画面へ戻ると、1049h の保存
+(_saved_main) はメイン画面に居る間も残り、あとの 1049l がそこから戻す
+(_switch_screen の早期 return)。set_size が _saved_main の行を keep_row で
+追うのは alt_active のときだけだったので、この間に縮めると行が据え置きに
+なり、1049l が控えた行より下の受信済みの行へ戻って潰していた。
+
+実測 (基準 ebbe593。441ea02 = v1.3.1 も同じ):
+  上と同じ 4 行 → ESC[3;2H ESC[?1049h ESC[?47l ESC[4;1H → set_size(2, 8)
+  → ESC[?1049l '!'
+    ebbe593 : ['CCCC', 'D!DD']   (受信済みの 'D' を潰す)
+    正      : ['C!CC', 'DDDD']
+  ?1047l でも同じ。縮めてから元の高さへ戻すと、1049l は空行へ戻る
+  (['CCCC', 'DDDD', ' !', ''])。
+
+直し方: メイン画面に居るとき (alt_active でないとき) は、履歴へ送った
+行数を _saved_main の行からも引く (0 で止める)。桁は触らない。
 """
 import os
 import sys
@@ -112,6 +131,39 @@ class SavedRowFollowsTheHistoryTest(unittest.TestCase):
         self.assertEqual(text_of(screen), ["C!CC", "DDDD", "", ""])
 
 
+class A1049SaveLeftOnTheMainScreenTest(unittest.TestCase):
+    """1049h のあと 47l / 1047l で先にメイン画面へ戻り、残った 1049 の保存。"""
+
+    LEAVES = ("?47l", "?1047l")
+
+    def _left_early(self, leave):
+        screen = feed(Screen(4, 8), FILL4 + ESC + "[3;2H" + ESC + "[?1049h"
+                      + ESC + "[" + leave + ESC + "[4;1H")
+        self.assertFalse(screen.alt_active, "前提: メイン画面へ戻っていない")
+        return screen
+
+    def test_1049l_after_shrinking_returns_to_the_saved_line(self):
+        """メイン画面に居る間に縮めても、1049l が控えた行へ戻ること。"""
+        for leave in self.LEAVES:
+            with self.subTest(leave=leave):
+                screen = self._left_early(leave)
+                screen.set_size(2, 8)
+                feed(screen, ESC + "[?1049l" + "!")
+                self.assertEqual(text_of(screen), ["C!CC", "DDDD"],
+                                 "1049l が控えた行の下の受信済みの行を潰した")
+
+    def test_growing_back_does_not_land_on_a_blank_row(self):
+        """縮めて元の高さへ戻したあとの 1049l が、下に足した空行へ行かないこと。"""
+        for leave in self.LEAVES:
+            with self.subTest(leave=leave):
+                screen = self._left_early(leave)
+                screen.set_size(2, 8)
+                screen.set_size(4, 8)
+                feed(screen, ESC + "[?1049l" + "!")
+                self.assertEqual(text_of(screen),
+                                 ["C!CC", "DDDD", "", ""])
+
+
 class WhatAlreadyWorkedStaysTheSameTest(unittest.TestCase):
     """直す前から正しかった形 (直したあとも変わらないこと)。"""
 
@@ -121,6 +173,14 @@ class WhatAlreadyWorkedStaysTheSameTest(unittest.TestCase):
                       + ESC + "[4;3H")
         screen.set_size(2, 8)
         feed(screen, DECRC + "!")
+        self.assertEqual(text_of(screen), ["C!CC", "DDDD"])
+
+    def test_a_1049_save_pushed_into_history_goes_to_the_top_row(self):
+        """47l のあとに残った 1049 の保存の行が履歴へ出たら、0 行目へ戻ること。"""
+        screen = feed(Screen(4, 8), FILL4 + ESC + "[1;2H" + ESC + "[?1049h"
+                      + ESC + "[?47l" + ESC + "[4;3H")
+        screen.set_size(2, 8)
+        feed(screen, ESC + "[?1049l" + "!")
         self.assertEqual(text_of(screen), ["C!CC", "DDDD"])
 
     def test_dropping_only_blank_rows_keeps_the_save(self):
