@@ -583,21 +583,47 @@ class FTPServerManager(QObject):
                 いた（実測）。ファイルを閉じ、この接続の予約を keep（続いている
                 受信の保存先）以外すべて外し、捨てた転送の行を中断で閉じる
                 """
-                for f in (in_q and in_q[0], out_q and out_q[2]):
-                    if f is not None:
-                        try: f.close()
-                        except Exception: pass
+                if in_q and in_q[0] is not None:
+                    try: in_q[0].close()
+                    except Exception: pass
                 closed = mgr._drop_uploads(self, self.remote_ip, keep)
-                if out_q is not None and out_q[3] == "RETR" and out_q[2] is not None:
-                    file = out_q[2].name
-                    if self._may_close_row(file):
-                        mgr._emit_interrupted(self.remote_ip, os.path.basename(file),
-                                              "download", file, self._display_for(file))
-                    # 閉じなくても、この接続はもうその行に加わっていない
-                    self._tx_row_id = None
-                    closed.append(file)
+                if out_q is not None:
+                    self._leave_queued_retr(out_q)
                 if getattr(self, "_tx_path", None) in closed:
                     self._forget_tx()
+            def _leave_queued_retr(self, out_q, keep_row=False):
+                """待ち行列から外れた送信（out_q）のファイルを閉じ、RETR ならその行を離れる。
+
+                行は _may_close_row が許すときだけ中断で閉じる。keep_row なら
+                行に加わったままにする（同じファイルの RETR を積み直した）
+                """
+                f = out_q[2]
+                if f is not None:
+                    try: f.close()
+                    except Exception: pass
+                if f is None or out_q[3] != "RETR" or keep_row:
+                    return
+                file = f.name
+                if self._may_close_row(file):
+                    mgr._emit_interrupted(self.remote_ip, os.path.basename(file),
+                                          "download", file, self._display_for(file))
+                # 閉じなくても、この接続はもうその行に加わっていない
+                self._tx_row_id = None
+                if getattr(self, "_tx_path", None) == file:
+                    self._forget_tx()
+            def push_dtp_data(self, data, isproducer=False, file=None, cmd=None):
+                # pyftpdlib は、データ接続を待っている送信の後に来た転送コマンド
+                # （RETR・LIST など）で待ち行列を上書きし、先の RETR を黙って
+                # 捨てる（ファイルも閉じない）。その行が開始のまま残り、同じ名前の
+                # 取り直しも束ねられて開始が出なかった（実測）。上書きされた RETR は
+                # ここで片付ける。同じファイルの RETR の積み直しは同じ行のまま
+                prev = self._out_dtp_queue
+                super().push_dtp_data(data, isproducer, file, cmd)
+                if prev is None or self._out_dtp_queue is prev:
+                    return
+                self._leave_queued_retr(prev, keep_row=(
+                    file is not None and prev[2] is not None
+                    and prev[2].name == file.name))
             def flush_account(self):
                 # REIN と認証済みの USER は待ち行列を捨てる。進行中の転送は
                 # RFC 959 どおり最後まで続くので、その保存先の予約だけは残す
