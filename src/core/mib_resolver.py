@@ -1011,11 +1011,18 @@ class MIBResolver:
                 elif parent in declared[module]:
                     parent_oid = in_module.get(module, {}).get(parent)
                     if (parent_oid is None and borrow
+                            and '.' not in index
                             and (module, parent) not in awaiting
                             and declaring.get(parent, 0) < 2):
                         # よそのモジュールに同名が無い＝曖昧ではない。
                         # 標準表 / custom_mibs.json / IMPORTS の値を
-                        # これまでどおり使う
+                        # これまでどおり使う。ただし 1.3.1 と同じ 1 段の
+                        # 子だけ。ここへ来る親は宣言があるのに OID が
+                        # 決まらない節（右辺を読めない { a b 1 } など）で、
+                        # 1.3.2 から抜き出す複数添字の子と TRAP-TYPE
+                        # （添字 0.N）にまで借用を広げない（実測: 自社が
+                        # 読めない右辺で宣言した system の { system 5 1 } が
+                        # 標準の 1.3.6.1.2.1.1.5.1 に付いた）
                         parent_oid = known.get(parent)
                 else:
                     parent_oid = known.get(parent)
