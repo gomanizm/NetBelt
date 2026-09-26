@@ -1,4 +1,5 @@
 """FTP サーバー（pyftpdlib ラッパ）。UI 通知は Qt シグナル。"""
+import errno
 import os
 import socket
 import threading
@@ -6,9 +7,12 @@ import time
 
 from PyQt6.QtCore import QObject, pyqtSignal
 from pyftpdlib.authorizers import DummyAuthorizer
+from pyftpdlib.exceptions import _RetryError
 from pyftpdlib.handlers import FTPHandler, DTPHandler
 from pyftpdlib.servers import FTPServer as _PyFTPServer
 from pyftpdlib.ioloop import IOLoop as _PyIOLoop
+from pyftpdlib.ioloop import _ERRNOS_DISCONNECTED, _ERRNOS_RETRY
+from pyftpdlib.log import logger as _ftp_logger
 
 from .crypto import PasswordCrypto
 
@@ -42,6 +46,34 @@ def _enable_keepalive(sock):
                         DATA_KEEPALIVE_INTERVAL_SECONDS * 1000))
     except (AttributeError, OSError, ValueError):
         pass
+
+
+# 受信中のデータ接続の recv が返したとき、相手が消えたとみなすエラー。
+# keepalive の確かめが尽きたときに返るのはこのどれか（OS による。localhost
+# では作れないので、どれが返るかは確かめていない）
+_DATA_LOST_ERRNOS = frozenset(
+    getattr(errno, name) for name in
+    ("ETIMEDOUT", "ENOTCONN", "ECONNABORTED", "ENETRESET") if hasattr(errno, name))
+
+# 黙っていた時間を比べるときの余裕（秒）。測るのは最後のデータを読んだ時刻から
+# RST を読んだ時刻までで、時計の粒度（Python 3.12 の Windows の time.monotonic は
+# 約 16 ミリ秒刻み）や読む時刻の遅れの分だけ、確かめへの RST でも
+# DATA_KEEPALIVE_SECONDS をわずかに下回って測れることがある
+_SILENCE_MARGIN_SECONDS = 1.0
+
+
+def _data_connection_lost(code, silent_seconds):
+    """受信中の recv のエラー code が、相手が消えたことを示すか。
+
+    RST（ECONNRESET）は、相手が SO_LINGER 0 で閉じたときなどにも届き、
+    これまで完了として扱ってきたので変えない。ただし keepalive の確かめは
+    DATA_KEEPALIVE_SECONDS 黙った後にしか送らないので、それほど黙った
+    後の RST は、再起動した相手が確かめに返したものとみなす
+    """
+    if code in _DATA_LOST_ERRNOS:
+        return True
+    return (code == errno.ECONNRESET and silent_seconds
+            >= DATA_KEEPALIVE_SECONDS - _SILENCE_MARGIN_SECONDS)
 
 
 class FTPServerManager(QObject):
@@ -325,10 +357,40 @@ class FTPServerManager(QObject):
                 # 回線断などで黙って消えた書き手は、送るものの無いこちらの TCP
                 # では気づけず、予約が無通信の期限（DTPHandler.timeout = 300 秒）
                 # まで残って同じ名前へのアップロードを断り続けた。keepalive を
-                # 送れば確かめが尽きたところで切れ、未完了として予約が外れる。
-                # 生きている相手は応答するだけなので、黙っている転送は切らない
+                # 送れば確かめが尽きたところで recv がエラーになり、下の recv が
+                # 未完了として閉じて予約を外す。生きている相手は応答するだけ
+                # なので、黙っている転送は切らない
+                self._last_recv_at = time.monotonic()
                 _enable_keepalive(sock)
                 super().__init__(sock, cmd_channel)
+            def recv(self, buffer_size):
+                # pyftpdlib（ioloop.AsyncChat.recv）は ETIMEDOUT・ENOTCONN など
+                # 接続断のエラーを EOF と同じく扱い、受信中なら完了（226）にする。
+                # keepalive で切れた書き手の途中までのファイルが完了と記録される
+                # （実測: エラーを差し込むと 226 と完了）ので、相手が消えたときは
+                # 未完了（426）で閉じる。それ以外は pyftpdlib と同じ扱い
+                if not self.receive:
+                    return super().recv(buffer_size)
+                try:
+                    data = self.socket.recv(buffer_size)
+                except OSError as err:
+                    if _data_connection_lost(
+                            err.errno, time.monotonic() - self._last_recv_at):
+                        self._resp = ("426 Connection lost; transfer aborted.",
+                                      _ftp_logger.info)
+                        self.close()   # on_incomplete_file_received が予約を外す
+                        return b""
+                    if err.errno in _ERRNOS_DISCONNECTED:
+                        self.handle_close()
+                        return b""
+                    if err.errno in _ERRNOS_RETRY:
+                        raise _RetryError from err
+                    raise
+                if not data:
+                    self.handle_close()   # 通常の EOF（完了）
+                    return b""
+                self._last_recv_at = time.monotonic()
+                return data
             def send(self, data):
                 result = super().send(data)
                 try: self.cmd_channel._emit_tx_progress(self.get_transmitted_bytes())
