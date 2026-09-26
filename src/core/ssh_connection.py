@@ -261,23 +261,31 @@ def _has_utf8_bom(path):
 
 
 def _hashed_names_need_own_loader(path):
-    """ハッシュ化名（|1|salt|hash）の行があり、自前のローダで読むべきか。
+    """ハッシュ化名（|1|salt|hash）の行があり、_HostKeysLoadedLinearly で読むべきか。
 
     バイト列に "|1|" があるかだけを見る。コメントや注釈欄に偶然含まれて
-    いても、ASCII だけのファイルなら自前のローダで読むだけなので害は無い。
-    次のファイルは今までどおり paramiko に任せる。
-
-    - ASCII 以外を含むファイル。NetBelt は HostKeys.save（既定の文字コード）
-      で書くので、日本語の Windows では日本語のホスト名が cp932 で保存される。
-      自前のローダ（UTF-8 で読む）ではその名前が文字化けし、その機器が
-      黙って「未知」に戻って、別の鍵の相手へパスワードが届く（実測）
-    - CR だけの改行を含むファイル。自前のローダは LF で行を分けるので、
-      paramiko（text モードで CR でも分ける）と違って 2 行目以降を読み
-      落とし、それらの機器が黙って「未知」に戻る
+    いても、読み方は paramiko と同じなので害は無い。
     """
-    raw = Path(str(path)).read_bytes()
-    return (b"|1|" in raw and raw.isascii()
-            and b"\r" not in raw.replace(b"\r\n", b""))
+    return b"|1|" in Path(str(path)).read_bytes()
+
+
+class _HostKeysLoadedLinearly(paramiko.HostKeys):
+    """HostKeys.load の読み方のまま、1 行ごとの重複の判定だけを軽くした HostKeys。
+
+    HostKeys.load は 1 行ごとに check() → lookup で、それまでに読んだ
+    ハッシュ化名すべてに hash_host を掛け直すので、ハッシュ化行の後ろに
+    平文行が続くと行数の 2 乗で重くなる。読み方（既定の文字コード・
+    text モードの改行）は paramiko のまま使い、重複の判定だけを
+    load_known_hosts と同じ名前の文字列の比較にする。畳むのは同じ名前・
+    同じ鍵の行だけなので、照合（lookup）の結果は変わらない。
+    読み込みにだけ使い、照合は paramiko.HostKeys へ移してから行う。
+    """
+
+    def check(self, hostname, key):
+        keytype = key.get_name()
+        blob = key.asbytes()
+        return any(hostname in e.hostnames and e.key.get_name() == keytype
+                   and e.key.asbytes() == blob for e in self._entries)
 
 
 def _load_known_hosts_into_client(client, path, broken):
@@ -302,22 +310,28 @@ def _load_known_hosts_into_client(client, path, broken):
     なる（実測）。行ごとの点検は bytes で読むので「読めない行」は 0 件で、
     行番号も出ない。デコードだけは受け止めて、読める行を取り込む。
 
-    ハッシュ化名の行があるファイルも自前で読む。paramiko の HostKeys.load は
-    1 行ごとに check() で、それまでに読んだハッシュ化行すべてに hash_host を
-    掛け直すので、ハッシュ化行の後ろに平文行が続くと行数の 2 乗で重くなる
-    （実測: 交互に 2,000 行で 6.5 秒。この間 known_hosts の錠を握ったまま）。
-    ASCII だけのファイルに限る（_hashed_names_need_own_loader）。
+    ハッシュ化名の行があるファイルは _HostKeysLoadedLinearly で読む。
+    paramiko の HostKeys.load は、ハッシュ化行の後ろに平文行が続くと行数の
+    2 乗で重くなる（実測: 交互に 2,000 行で 6.5 秒。この間 known_hosts の錠を
+    握ったまま）。読み方は paramiko のままなので、NetBelt が既定の文字コード
+    （日本語の Windows では cp932）で保存した日本語のホスト名も今までどおり
+    読める（UTF-8 で読む自前のローダでは文字化けして「未知」に戻る。実測）。
 
     Args:
         broken: unreadable_known_hosts_lines() の戻り値
     """
-    if (broken or _has_utf8_bom(path)
-            or _hashed_names_need_own_loader(path)):
+    if broken or _has_utf8_bom(path):
         client._host_keys_filename = None
         load_known_hosts(client.get_host_keys(), path)
         return
     try:
-        client.load_host_keys(str(path))
+        if _hashed_names_need_own_loader(path):
+            loaded = _HostKeysLoadedLinearly()
+            loaded.load(str(path))      # 読めなければ何も移さずに下へ
+            client._host_keys_filename = None
+            client.get_host_keys()._entries.extend(loaded._entries)
+        else:
+            client.load_host_keys(str(path))
     except UnicodeDecodeError:
         # paramiko は読む前に _host_keys_filename を覚える。読めたのは
         # 一部だけなので、その名前を見て書き出されないよう戻す
