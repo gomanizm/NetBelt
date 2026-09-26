@@ -226,13 +226,20 @@ def _hashed_names_need_own_loader(path):
     """ハッシュ化名（|1|salt|hash）の行があり、自前のローダで読むべきか。
 
     バイト列に "|1|" があるかだけを見る。コメントや注釈欄に偶然含まれて
-    いても、自前のローダで読むだけなので害は無い。CR だけの改行を含む
-    ファイルは今までどおり paramiko に任せる。自前のローダは LF で行を
-    分けるので、paramiko（text モードで CR でも分ける）と違って 2 行目
-    以降を読み落とし、それらの機器が黙って「未知」に戻る。
+    いても、ASCII だけのファイルなら自前のローダで読むだけなので害は無い。
+    次のファイルは今までどおり paramiko に任せる。
+
+    - ASCII 以外を含むファイル。NetBelt は HostKeys.save（既定の文字コード）
+      で書くので、日本語の Windows では日本語のホスト名が cp932 で保存される。
+      自前のローダ（UTF-8 で読む）ではその名前が文字化けし、その機器が
+      黙って「未知」に戻って、別の鍵の相手へパスワードが届く（実測）
+    - CR だけの改行を含むファイル。自前のローダは LF で行を分けるので、
+      paramiko（text モードで CR でも分ける）と違って 2 行目以降を読み
+      落とし、それらの機器が黙って「未知」に戻る
     """
     raw = Path(str(path)).read_bytes()
-    return b"|1|" in raw and b"\r" not in raw.replace(b"\r\n", b"")
+    return (b"|1|" in raw and raw.isascii()
+            and b"\r" not in raw.replace(b"\r\n", b""))
 
 
 def _load_known_hosts_into_client(client, path, broken):
@@ -261,6 +268,7 @@ def _load_known_hosts_into_client(client, path, broken):
     1 行ごとに check() で、それまでに読んだハッシュ化行すべてに hash_host を
     掛け直すので、ハッシュ化行の後ろに平文行が続くと行数の 2 乗で重くなる
     （実測: 交互に 2,000 行で 6.5 秒。この間 known_hosts の錠を握ったまま）。
+    ASCII だけのファイルに限る（_hashed_names_need_own_loader）。
 
     Args:
         broken: unreadable_known_hosts_lines() の戻り値
