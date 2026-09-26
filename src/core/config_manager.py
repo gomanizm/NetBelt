@@ -821,6 +821,19 @@ class ConfigManager:
                         for c in commands))
 
     @staticmethod
+    def _is_auto_commands_list(commands) -> bool:
+        """文字列だけの list かを返す（機器へ送れる文字かは見ない）。
+
+        GUI からの保存（add_group・set_group_auto_commands）はこれで見る。
+        送れない文字（孤立したサロゲート）は config.json（UTF-8）へも書けない
+        ので、保存の失敗になって変更は取り消され、画面は「保存できません
+        でした」と知らせる。_is_valid_auto_commands で先に断ると、
+        last_save_failed が立たず、理由の分からない「失敗しました」になる。
+        """
+        return (isinstance(commands, list)
+                and all(isinstance(c, str) for c in commands))
+
+    @staticmethod
     def _normalize_optional_list(container: Dict, key: str, keep) -> bool:
         """任意項目のリストをそろえる。読めない分を外したら True を返す。
 
@@ -1255,9 +1268,10 @@ class ConfigManager:
         # ここだけ素通しにすると、そのセッションの間は
         # MainWindow._run_auto_commands が壊れた値をそのまま list() して
         # 送るので、接続した瞬間に 1 文字ずつが実機へ届く（実測）。
-        # None や空の値は「自動実行なし」なので今までどおり [] にそろえる
+        # None や空の値は「自動実行なし」なので今までどおり [] にそろえる。
+        # 送れない文字は保存の失敗として知らせる（_is_auto_commands_list）
         commands = auto_commands or []
-        if not self._is_valid_auto_commands(commands):
+        if not self._is_auto_commands_list(commands):
             print(f"エラー: グループ '{group_name}' の自動実行コマンドは"
                   f"文字列の配列で指定してください")
             return False
@@ -1361,8 +1375,9 @@ class ConfigManager:
         """
         self.last_save_failed = False
         # 文字列を渡されると list() が 1 文字ずつに分解する。そのまま保存すると
-        # 次の接続で 1 文字ずつが実機へ送られるので、書き込む前に断る
-        if not self._is_valid_auto_commands(commands):
+        # 次の接続で 1 文字ずつが実機へ送られるので、書き込む前に断る。
+        # 送れない文字は保存の失敗として知らせる（_is_auto_commands_list）
+        if not self._is_auto_commands_list(commands):
             print(f"エラー: グループ '{group_name}' の自動実行コマンドは"
                   f"文字列の配列で指定してください")
             return False
