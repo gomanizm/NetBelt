@@ -191,6 +191,10 @@ class TFTPServerPanel(QWidget):
         root_directory = settings.get("root_directory")
         # 既定は専用フォルダ。TFTP は無認証で 0.0.0.0 に待ち受けるため、
         # デスクトップ等の個人フォルダを既定にしてはいけない。
+        # 文字列でない値（手で書いた数や配列）も既定にする。setText へ渡すと
+        # TypeError でパネル（MainWindow）の構築が失敗する
+        if not isinstance(root_directory, str):
+            root_directory = ""
         self.root_dir_edit.setText(root_directory if root_directory else "./tftp_root")
         _restore_port(self.port_spin, settings.get("port"))
         self.allow_upload_check.setChecked(bool(settings.get("allow_upload", True)))

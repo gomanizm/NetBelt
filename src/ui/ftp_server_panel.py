@@ -26,6 +26,17 @@ def _restore_port(spin, value):
         spin.setValue(port)
 
 
+def _text_setting(settings, key):
+    """config.json の文字の欄を返す。文字列でなければ空文字列（未設定）。
+
+    手で書いた数や配列（"password": 1234 と引用符を付け忘れた等）を
+    QLineEdit.setText へ渡すと TypeError でパネル（MainWindow）の構築が
+    失敗する。数を文字へ直して資格情報やルートを推測することはしない
+    """
+    value = settings.get(key)
+    return value if isinstance(value, str) else ""
+
+
 class FTPServerPanel(QWidget):
     """FTPサーバー制御パネル"""
 
@@ -207,10 +218,11 @@ class FTPServerPanel(QWidget):
         """保存済み設定を復元"""
         settings = self.config_manager.get_server_settings("ftp_server")
         # 既定は専用フォルダ（個人フォルダを公開しないため）
-        self.root_dir_edit.setText(settings.get("root_directory") or "./ftp_root")
+        self.root_dir_edit.setText(
+            _text_setting(settings, "root_directory") or "./ftp_root")
         _restore_port(self.port_spin, settings.get("port"))
-        if settings.get("username"): self.username_edit.setText(settings["username"])
-        if settings.get("password"): self.password_edit.setText(settings["password"])
+        if _text_setting(settings, "username"): self.username_edit.setText(settings["username"])
+        if _text_setting(settings, "password"): self.password_edit.setText(settings["password"])
         anonymous = bool(settings.get("anonymous", False))
         self.anonymous_check.setChecked(anonymous)
         # 書き込みの可否を持っていない古い設定は、これまでどおり
