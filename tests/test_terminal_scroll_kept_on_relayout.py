@@ -43,8 +43,12 @@ class TerminalScrollKeptOnRelayoutTest(unittest.TestCase):
             self.app.processEvents()
             time.sleep(0.01)
 
-    def _widget(self, lines, line_len=100):
-        """line_len 文字の行を lines 行流し、描き切った端末を返す。"""
+    def _widget(self, lines, line_len=100, body=None):
+        """line_len 文字の行を lines 行流し、描き切った端末を返す。
+
+        body を渡すと、各行の 'line NNNNNN ' のあとに x の並びの代わりに
+        body を続ける。
+        """
         from ui.terminal_widget import TerminalWidget
         w = TerminalWidget()
         self.addCleanup(w.close)
@@ -52,9 +56,10 @@ class TerminalScrollKeptOnRelayoutTest(unittest.TestCase):
         w.show()
         terminal = w.create_terminal_tab("dev")
         self._pump(0.1)
+        if body is None:
+            body = "x" * (line_len - 12)
         w.append_output("dev", "".join(
-            "line %06d %s\r\n" % (i, "x" * (line_len - 12))
-            for i in range(lines)))
+            "line %06d %s\r\n" % (i, body) for i in range(lines)))
         end = time.time() + 30
         while w._pending_output and time.time() < end:
             self._pump(0.02)
@@ -144,6 +149,49 @@ class TerminalScrollKeptOnRelayoutTest(unittest.TestCase):
                 self._pump(0.4)
 
                 self.assertEqual(self._top(terminal), before)
+
+    def test_a_rewrapped_row_keeps_its_first_character_at_the_top(self):
+        """折り返す位置の変わる行の途中を見ていたら、その文字の行が上端に来ること。
+
+        空白で区切った語の並びは、幅や文字の大きさで折り返す位置が変わる。
+        2 行目・3 行目（表示行）を上端にしてから縮める・広げる・文字を大きく
+        すると、組み直しの前に上端の頭にあった文字が、組み直しの後も上端の
+        表示行に載っていること。ブロックの 1 行目へ戻す形や、ブロック上端
+        からのピクセルのずれを保つ形では、別の表示行が上端に来る。
+        """
+        from PyQt6.QtCore import QPoint
+        words = " ".join("w%04d" % k for k in range(70))
+        changes = (
+            ("narrower", lambda w: w.resize(640, 500)),
+            ("wider", lambda w: w.resize(1500, 500)),
+            ("bigger font", self._bigger_font),
+        )
+        for visual_row in (1, 2):
+            for name, change in changes:
+                with self.subTest(change=name, visual_row=visual_row):
+                    w, terminal = self._widget(300, body=words)
+                    self._scroll_to(terminal, 150, visual_row=visual_row)
+                    top = terminal.cursorForPosition(QPoint(0, 1))
+                    self.assertEqual(top.blockNumber(), 150, "前提")
+                    position = top.positionInBlock()
+                    self.assertGreater(position, 0,
+                                       "前提: 折り返した行の途中が上端")
+
+                    change(w)
+                    self._pump(0.4)
+
+                    top = terminal.cursorForPosition(QPoint(0, 1))
+                    self.assertEqual(top.blockNumber(), 150,
+                                     "見ていた行がずれた")
+                    row = top.block().layout().lineForTextPosition(
+                        top.positionInBlock())
+                    self.assertTrue(
+                        row.textStart() <= position
+                        < row.textStart() + row.textLength(),
+                        "上端の表示行 [%d, %d) に、上端にあった %d 文字目が無い"
+                        % (row.textStart(), row.textStart() + row.textLength(),
+                           position))
+                    self.assertFalse(terminal._follow_output)
 
     def test_following_output_stays_at_the_bottom(self):
         """最下部を見ているときは、縮めても文字を大きくしても最下部のままなこと。"""
