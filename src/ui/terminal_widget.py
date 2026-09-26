@@ -1665,11 +1665,22 @@ class TerminalWidget(QWidget):
             # 失敗を知らせるのは 1 回だけ（ここで知らせたら、閉じ終わりでは知らせない）
             self._closing_writers.append(
                 (device_name, handle, path, None if error else report))
-            self._log_watch.start()
+            self._start_log_watch()
         else:
             log_recording.stop(device_name, path)
         if error is not None and report is not None:
             report(error)
+
+    def _start_log_watch(self) -> None:
+        """見回り（_check_log_writers）を、動いていなければ動かす。
+
+        動いている見回りは掛け直さない。QTimer.start() は動いているタイマーを
+        最初から数え直すので、ほかのタブの受信で _flush_pending_output が
+        見回りの間隔より短く回り続けると、見回りが一度も動かず、止めた機器が
+        再開せず、記録の失敗も知らせなかった（実測: 30ms ごとの受信で 3 秒以上）。
+        """
+        if not self._log_watch.isActive():
+            self._log_watch.start()
 
     def _check_log_writers(self) -> None:
         """記録先が詰まっている間、書き込みスレッドを見回る。
@@ -1824,7 +1835,7 @@ class TerminalWidget(QWidget):
                         >= self.PENDING_HIGH_WATER):
                     self._log_throttled.add(device_name)
                     self._update_output_gate(device_name)
-                    self._log_watch.start()
+                    self._start_log_watch()
                     continue
                 text = pending.take(self.OUTPUT_SLICE)
                 if not pending:
@@ -2314,7 +2325,7 @@ class TerminalWidget(QWidget):
                 # 応答しない間に GUI を止めない。core/log_writer.py）
                 log_file = LogWriter(
                     open(file_path, 'w', encoding='utf-8', buffering=1),  # 行バッファリング
-                    on_stall=self._log_watch.start)
+                    on_stall=self._start_log_watch)
                 # 記録していなかった間に受信して、まだ描いていない分を
                 # 取り置く。停止側と同じ式で「どの停止した記録の区間にも
                 # 割り当てられていない文字数」を出し、ハンドルを持たない
