@@ -22,9 +22,16 @@ N-MIB が `IMPORTS acmeX FROM M-MIB;` のうえで `{ acmeX 6 1 }`・
 あれば借用の下として扱い、新しい形の子は解決しない（利用者の決定
 2026-09-20『確定できないときは名前を付けない』）。1.3.1 と同じ `{ 親 番号 }`
 の子は、これまでどおり借用した節の下に付く。
+
+取り込みが 2 段になっても印は伝わる。N-MIB が取り込んだ acmeX の下に 1 段で
+置いた nSingle・nMid は 1.3.1 どおり標準の OID に付くが、借用の下なので
+borrowed_known に入る。O-MIB がそれらを取り込んで置いた新しい形の子も解決
+しない。borrowed_known へ入れるのを「借用の回で直接借りた宣言」だけに狭める
+と、O-MIB の子が標準 sysContact の下に付く（知らせ 0 行）。
 """
 import contextlib
 import io
+import itertools
 import os
 import shutil
 import sys
@@ -60,6 +67,24 @@ N_MIB = mib("N-MIB DEFINITIONS ::= BEGIN",
             "nSingleLeaf OBJECT IDENTIFIER ::= { nSingle 1 }",
             "nUnderSingle OBJECT IDENTIFIER ::= { nSingle 2 1 }")
 ORDERS = (("M.my", "N.my"), ("N.my", "M.my"))
+# 2 段の取り込み: N-MIB は acmeX の下に 1 段の子だけを置き、O-MIB がそれを
+# 取り込んで新しい形の子を置く
+N_SINGLES_MIB = mib("N-MIB DEFINITIONS ::= BEGIN",
+                    "IMPORTS acmeX FROM M-MIB;",
+                    "nSingle OBJECT IDENTIFIER ::= { acmeX 9 }",
+                    "nMid OBJECT IDENTIFIER ::= { acmeX 2 }")
+O_MIB = mib("O-MIB DEFINITIONS ::= BEGIN",
+            "IMPORTS nSingle, nMid FROM N-MIB;",
+            "oRoot OBJECT IDENTIFIER ::= { enterprises 65030 }",
+            "oChild OBJECT IDENTIFIER ::= { nSingle 2 1 }",
+            "oLabeled OBJECT IDENTIFIER ::= { nMid ol(5) }",
+            "oTrap TRAP-TYPE",
+            "    ENTERPRISE nMid",
+            "    ::= 6",
+            "oPre OBJECT IDENTIFIER ::= { oRoot 1 } oBrace OBJECT IDENTIFIER"
+            " ::= { nMid 8 }",
+            "oLeaf OBJECT IDENTIFIER ::= { nSingle 3 }",
+            "oLeafLeaf OBJECT IDENTIFIER ::= { oLeaf 1 }")
 
 
 class NewFormsUnderAnImportedBorrowedNodeTest(unittest.TestCase):
@@ -128,6 +153,33 @@ class NewFormsUnderAnImportedBorrowedNodeTest(unittest.TestCase):
                                  "1.3.6.1.2.1.1.4.9.1")
                 self.assertEqual(r.resolve_name("nOne"),
                                  "1.3.6.1.4.1.65021.1")
+
+    def test_borrowed_mark_crosses_two_imports(self):
+        """借用で決まった節の下の 1 段の子を、さらに別のモジュールが取り込んで
+        置いた新しい形の子も、標準の OID に名前を付けないこと。1 段の子は
+        1.3.1 どおり付くこと（読む順 6 通り）。"""
+        files = {"M.my": M_MIB, "N.my": N_SINGLES_MIB, "O.my": O_MIB}
+        cases = (("oChild", "1.3.6.1.2.1.1.4.9.2.1"),
+                 ("oLabeled", "1.3.6.1.2.1.1.4.2.5"),
+                 ("oTrap", "1.3.6.1.2.1.1.4.2.0.6"),
+                 ("oBrace", "1.3.6.1.2.1.1.4.2.8"))
+        singles = (("nSingle", "1.3.6.1.2.1.1.4.9"),
+                   ("nMid", "1.3.6.1.2.1.1.4.2"),
+                   ("oLeaf", "1.3.6.1.2.1.1.4.9.3"),
+                   ("oLeafLeaf", "1.3.6.1.2.1.1.4.9.3.1"),
+                   ("oPre", "1.3.6.1.4.1.65030.1"))
+        orders = list(itertools.permutations(sorted(files)))
+        self.assertEqual(len(orders), 6)
+        for order in orders:
+            r, _ = self._resolver(files, order)
+            for name, standard_oid in cases:
+                with self.subTest(order=",".join(order), name=name):
+                    self.assertNotEqual(r.resolve_oid(standard_oid), name,
+                                        "標準の OID に他社の名前が付いている")
+                    self.assertIsNone(r.resolve_name(name))
+            for name, oid in singles:
+                with self.subTest(order=",".join(order), name=name):
+                    self.assertEqual(r.resolve_name(name), oid)
 
     def test_new_forms_under_an_imported_unborrowed_node_still_resolve(self):
         """取り込んだ節が借用で決まったものでなければ、その下の新しい形の子
