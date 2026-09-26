@@ -424,9 +424,14 @@ class SFTPServerHandler(SFTPServerInterface):
         tracked = ((writing or bool(flags & os.O_TRUNC))
                    and self._open_writers is not None)
         # O_TRUNC は開く時点で切り詰めるので、パスを解決する前から、開いた
-        # ハンドルを一覧へ載せ終えるまで停止に見せる（_busy を参照）
+        # ハンドルを一覧へ載せ終えるまで停止に見せる（_busy を参照）。
+        # 作成（O_CREAT / O_EXCL）も同じ。WRITE の無い CREATE や paramiko の
+        # 'x' は O_RDONLY|O_CREAT(|O_EXCL) で届き、os.open は空ファイルを作る
+        # （実測: 停止の後に積まれた分が再起動の後に作っていた）。予約は
+        # 掛けない（既存のファイルは変えないので、書き込み中でも妨げない）
+        guarded = tracked or bool(flags & (os.O_CREAT | os.O_EXCL))
         try:
-            with (self._busy(path) if tracked else contextlib.nullcontext()):
+            with (self._busy(path) if guarded else contextlib.nullcontext()):
                 return self._open(path, flags, writing, tracked)
         except Exception as e:
             # _open は自分で失敗を返すので、ここへ来るのは停止の後の要求だけ
