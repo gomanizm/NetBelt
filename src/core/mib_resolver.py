@@ -628,7 +628,10 @@ class MIBResolver:
     # 実測: ds3Compliances と、同じ書き方の MIB ではその配下が名前なし）。
     # 錨を外すと語の途中や `FROM SNMPv2-TC` からの始め直しが戻り、正規
     # 表現も重くなるので、この `}` の後ろにだけ改行を差し込んでから抽出
-    # する。起点は `}` だけで、全部大文字の語は _MIB_NAME と同じく弾く
+    # する。起点は `}` だけで、全部大文字の語は _MIB_NAME と同じく弾く。
+    # こうして拾った定義は 1.3.1 には無かったので、解決では複数添字などと
+    # 同じく 1.3.1 では読めなかった形として扱う（_resolve_definitions の
+    # preset の説明を見ること）
     _MIB_DEFINITION_AFTER_BRACE = (
         r'\}(?=[ \t]*(?![A-Z][A-Z0-9-]*(?![\w-]))[\w-]+\s+'
         r'(?:OBJECT\s+IDENTIFIER|OBJECT-TYPE|NOTIFICATION-TYPE'
@@ -843,16 +846,22 @@ class MIBResolver:
             if local_names is None:
                 # __init__ を通さずに作った（検証用の __new__）ときの保険
                 local_names = self._module_local_names = {}
-            # 1.3.1 では読めなかった形で抜き出した定義（ラベル付きの添字）。
-            # 解決で 1.3.1 の 1 段と区別する（_resolve_definitions の
-            # preset の説明を見ること）
+            # 1.3.1 では読めなかった形で抜き出した定義（ラベル付きの添字と、
+            # `}` の直後から始まる定義）。解決で 1.3.1 の 1 段と区別する
+            # （_resolve_definitions の preset の説明を見ること）
             newly_read = getattr(self, '_newly_read_definitions', None)
             if newly_read is None:
                 newly_read = self._newly_read_definitions = set()
             for module, text in sections:
                 # `}` の直後から始まる定義を行頭へ。詳しくは
-                # _MIB_DEFINITION_AFTER_BRACE を見ること
-                text = re.sub(self._MIB_DEFINITION_AFTER_BRACE, '}\n', text)
+                # _MIB_DEFINITION_AFTER_BRACE を見ること。差し込んだ改行の
+                # 次（その定義の行頭）の位置を覚えて印を付ける
+                breaks = [m.end() for m in re.finditer(
+                    self._MIB_DEFINITION_AFTER_BRACE, text)]
+                after_brace = {end + i + 1 for i, end in enumerate(breaks)}
+                if breaks:
+                    text = '\n'.join(text[a:b] for a, b in zip(
+                        [0] + breaks, breaks + [len(text)]))
                 local_names.setdefault(module, set()).update(
                     re.findall(self._MIB_LOCAL_NAME, text,
                                re.MULTILINE))
@@ -866,7 +875,7 @@ class MIBResolver:
                             definition = (match.group(1), value[0], value[1],
                                           module)
                             definitions.append(definition)
-                            if value[2]:
+                            if value[2] or match.start() in after_brace:
                                 newly_read.add(definition)
                 for match in re.finditer(self._MIB_TRAP_TYPE, text,
                                          re.MULTILINE | re.DOTALL):
@@ -950,9 +959,10 @@ class MIBResolver:
         結果は mib_cache.json に残るので、一度ずれるとキャッシュを
         作り直すまでそのまま使われる。IMPORTS 節（`IMPORTS ... FROM
         <MODULE>;`）を解析して名前ごとに参照先モジュールを持たない限り、
-        ここは直らない。曖昧になったこと自体も知らせていない。1.3.2 から
-        読む右辺（1 段でないもの）の宣言とその子孫は、この候補を増やさない
-        ように扱う（preset の説明を見ること）。
+        ここは直らない。曖昧になったこと自体も知らせていない。1.3.1 では
+        読めなかった宣言（1 段でない右辺・ラベル付きの添字・`}` の直後から
+        始まる定義）とその子孫は、この候補を増やさないように扱う（preset の
+        説明を見ること）。
 
         Args:
             definitions: (名前, 親の名前, 添字, モジュール名) のリスト。
@@ -1002,7 +1012,10 @@ class MIBResolver:
         # 自分のモジュールの子の親（in_module）には、これまでどおり使う。
         # { 親 x(26) } も 1.3.1 では読めなかったので、1 段でも fresh に数える
         # （実測: { acmeRoot sys(9) } で置いた system が known に入り、上と
-        # 同じく zAlarm が自社の木に付いた）
+        # 同じく zAlarm が自社の木に付いた）。`}` の直後から始まる定義も
+        # 1.3.1 は抜き出さなかったので同じ（実測: `… { enterprises 888 }
+        # interfaces … ::= { bxRoot 2 }` の行があると、IF-MIB の interfaces を
+        # 取り込んだ bzLeaf が 1.3.6.1.4.1.888.2.50 に付いた）
         preset = set(known)
         newly_read = getattr(self, '_newly_read_definitions', None) or ()
         # fresh な宣言の (モジュール, 名前) と、known の値が fresh な宣言
