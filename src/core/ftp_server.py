@@ -480,6 +480,7 @@ class FTPServerManager(QObject):
                                        % self.fs.fs2ftp(file))
                     return None
                 result = None
+                prev = self._in_dtp_queue
                 try:
                     result = super().ftp_STOR(file, mode)
                 finally:
@@ -488,12 +489,40 @@ class FTPServerManager(QObject):
                         # 同じ保存先へ誰も書けない
                         mgr._release_uploads(self, file)
                 if result is not None:
+                    self._leave_overwritten_stor(prev, file)
                     self._tx_name = os.path.basename(file); self._tx_total = 0  # アップロードは総サイズ不明
                     self._tx_dir = "upload"; self._tx_last = 0.0; self._tx_path = file
                     self._tx_display = mgr._emit_started(
                         self.remote_ip, self._tx_name, 0, "upload",
                         file, self.fs.fs2ftp(file))
                 return result
+
+            def ftp_STOU(self, line):
+                prev = self._in_dtp_queue
+                result = super().ftp_STOU(line)
+                self._leave_overwritten_stor(prev)
+                return result
+
+            def _leave_overwritten_stor(self, prev, keep=None):
+                """待ち行列の受信（prev）が後の STOR / APPE / STOU で上書きされていたら片付ける。
+
+                pyftpdlib は、データ接続を待っている STOR の後に来たこれらで
+                待ち行列を上書きし、先の方を黙って捨てる（ファイルも閉じない）。
+                後の方を送り切っても先の行が開始のまま残り、同じ名前の上げ直しが
+                その行に束ねられて開始が出なかった（実測）。REIN / USER / ABOR と
+                同じく片付け、予約は keep（新しく待ちにした保存先）だけ残す。
+                同じパスの積み直しは、行も予約もそのまま
+                """
+                if prev is None or self._in_dtp_queue is prev:
+                    return
+                self._abandon_queued(prev, None, keep)
+                # 大文字小文字だけ違う名前などで同じ保存先を積み直すと、予約は
+                # 同じなので上で外れないが、行はパスごとなので先の方が残る
+                old = getattr(prev[0], "name", None)
+                if keep is not None and old != keep and (
+                        self.remote_ip, old, "upload") in mgr._tx:
+                    mgr._emit_interrupted(self.remote_ip, os.path.basename(old),
+                                          "upload", old, self._display_for(old))
 
             def _display_for(self, file):
                 """file の転送について開始時に受け取った表示名。別の転送なら None"""
@@ -575,7 +604,7 @@ class FTPServerManager(QObject):
                 finally:
                     mgr._release_uploads(self)
             def _abandon_queued(self, in_q, out_q, keep=None):
-                """待ち行列から捨てた転送を片付ける（REIN / USER / ABOR）。
+                """待ち行列から捨てた転送を片付ける（REIN / USER / ABOR、STOR / STOU の上書き）。
 
                 pyftpdlib はそのファイルを閉じず、上の未完了のコールバックも
                 呼ばない。予約が制御接続を閉じるまで残って同じ保存先へ誰も
