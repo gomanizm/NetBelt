@@ -32,6 +32,11 @@ class _LogLimiter:
 
     WINDOW_SECONDS = 60.0
     LIMIT = 100
+    # 1 行の長さの上限（文字）。行数だけを数えると、認証済みの相手は名前を
+    # 長くするだけで 1 行を伸ばせる（例外の文言にパスが入る。実測: 約 32K
+    # 文字の名前で 1 行約 32.8KB・rename は約 65KB、1 分の窓で約 29.5MB）。
+    # 超えた分は切り、切った文字数を添える
+    MAX_LINE_CHARS = 500
 
     def __init__(self):
         self._lock = threading.Lock()
@@ -49,11 +54,18 @@ class _LogLimiter:
                 window = self._windows[kind] = [now, 0, 0]
             if window[1] < self.LIMIT:
                 window[1] += 1
-                lines.append(text)
+                lines.append(self._clip(text))
             else:
                 window[2] += 1
         for line in lines:
             print(line)
+
+    def _clip(self, text):
+        """MAX_LINE_CHARS を超えた行を切り、切った文字数を添える"""
+        over = len(text) - self.MAX_LINE_CHARS
+        if over <= 0:
+            return text
+        return "%s...(+%d chars)" % (text[:self.MAX_LINE_CHARS], over)
 
     def flush(self):
         """省いたまま出していない件数を出し、窓を空にする"""
