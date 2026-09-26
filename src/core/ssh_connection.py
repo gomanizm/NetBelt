@@ -1009,6 +1009,11 @@ class SSHConnection(QObject):
         except Exception as e:
             return self._fail(f"接続エラー: {str(e)}", client, transports)
     
+    # 後始末で、受信スレッドが自分で抜けるのを待つ上限（dispose 参照）。
+    # 受信スレッドは 0.01 秒の眠り（受信を止められている間は 0.05 秒）ごとに
+    # 止める印を見るので、抜けられるならこの間に抜ける
+    _READER_EXIT_WAIT_SECONDS = 0.2
+
     def dispose(self):
         """チャネルと SSHClient を閉じて資源を手放す（通知は出さない）
 
@@ -1040,8 +1045,16 @@ class SSHConnection(QObject):
         self._carry = b""
         self._size_unsent = False
 
-        if self._read_thread and self._read_thread.is_alive():
-            self._read_thread.join(timeout=2)
+        # 受信スレッドはふだん短い眠りの間に抜けるので、まず短く待ち、手に
+        # している受信を渡し終えてから閉じる（記録を欠かさない）。抜けないのは
+        # 書き込みで止まっているとき: 相手が TCP まで受け取りを止めている間、
+        # paramiko の Channel.recv は WINDOW_ADJUST を書けるまで戻らず、ここで
+        # 上限（2 秒）まで GUI スレッドが止まっていた。そのときは先に閉じて
+        # 書き込みを打ち切らせる（手にしていた 1 回分は、待っても詰まりが
+        # 続けば渡らないのは同じ）
+        reader = self._read_thread
+        if reader and reader.is_alive():
+            reader.join(timeout=self._READER_EXIT_WAIT_SECONDS)
 
         # client（Transport）をチャネルより先に閉じる。channel.close は相手へ
         # CHANNEL_CLOSE を書くので、相手が TCP まで受け取りを止めている間は
@@ -1051,6 +1064,9 @@ class SSHConnection(QObject):
         if self.client:
             self.client.close()
             self.client = None
+
+        if reader and reader.is_alive():
+            reader.join(timeout=2)
 
         if self.channel:
             self.channel.close()
