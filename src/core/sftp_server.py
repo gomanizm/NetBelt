@@ -177,7 +177,10 @@ class _OpenWriters:
         書き込みハンドルと同じく alive() に出るので、共有フォルダで止まった
         まま停止を迎えたスレッドを stop() が生き残りとして数え、次の start()
         を断る。数えないと、後から戻った旧操作が新しい起動で受けた同名の
-        ファイルを消す・別名へ動かす。抜けたら外す
+        ファイルを消す・別名へ動かす。抜けたら外す。
+
+        パスの解決（realpath）の前から載せるので、real_path には SFTP の
+        パスも渡る（停止のときの print にしか使わない）
         """
         token = object()
         with self._lock:
@@ -239,7 +242,13 @@ class SFTPServerHandler(SFTPServerInterface):
         self._notify = notify
         
     def _busy(self, real_path):
-        """保存先を触る間、停止に見えるよう一覧へ載せる（_OpenWriters.busy）"""
+        """保存先を触る間、停止に見えるよう一覧へ載せる（_OpenWriters.busy）。
+
+        載せるのは操作の入口（パスを解決する前）から。共有フォルダでは
+        realpath も止まり得るので、最後の syscall の間だけ載せると、解決の
+        途中で止まったスレッドを停止が数えず、再起動の後に戻った旧操作が
+        新しく受けたファイルを消す・切り詰める
+        """
         if self._open_writers is None:
             return contextlib.nullcontext()
         return self._open_writers.busy(real_path)
@@ -383,11 +392,21 @@ class SFTPServerHandler(SFTPServerInterface):
         相手の書きかけを 0 バイトに切り詰める）。それ以外の読み取りの open は
         妨げない。
         """
+        writing = bool(flags & (os.O_WRONLY | os.O_RDWR))
+        # 予約するのは書き込みか切り詰めを伴う open。モードとハンドルの
+        # 選び方は writing のまま（切り詰めだけの open は読み取り専用）
+        tracked = ((writing or bool(flags & os.O_TRUNC))
+                   and self._open_writers is not None)
+        # O_TRUNC は開く時点で切り詰めるので、パスを解決する前から、開いた
+        # ハンドルを一覧へ載せ終えるまで停止に見せる（_busy を参照）
+        with (self._busy(path) if tracked else contextlib.nullcontext()):
+            return self._open(path, flags, writing, tracked)
+
+    def _open(self, path, flags, writing, tracked):
+        """open の本体（writing と tracked は open がフラグから決めたもの）"""
         reserved = False
         try:
             real_path = self._get_real_path(path)
-
-            writing = bool(flags & (os.O_WRONLY | os.O_RDWR))
 
             # 親ディレクトリの用意は書き込み時のみ。
             # 読み取り目的の open で空ディレクトリを作らないため。
@@ -396,10 +415,6 @@ class SFTPServerHandler(SFTPServerInterface):
                 if dir_path and not os.path.exists(dir_path):
                     os.makedirs(dir_path)
 
-            # 予約するのは書き込みか切り詰めを伴う open。モードとハンドルの
-            # 選び方は writing のまま（切り詰めだけの open は読み取り専用）
-            tracked = ((writing or bool(flags & os.O_TRUNC))
-                       and self._open_writers is not None)
             if tracked and not self._open_writers.reserve(real_path):
                 # 開くと O_TRUNC が相手の書きかけを切り詰め、双方が成功で
                 # 終わるのに中身が混ざる。TFTP の同名 WRQ と同じく断る
@@ -410,10 +425,7 @@ class SFTPServerHandler(SFTPServerInterface):
                 return SFTP_FAILURE
             reserved = tracked
 
-            # O_TRUNC は開く時点で切り詰めるので、開く間も停止に見せる
-            with (self._busy(real_path) if tracked
-                  else contextlib.nullcontext()):
-                fd = os.open(real_path, flags | getattr(os, "O_BINARY", 0))
+            fd = os.open(real_path, flags | getattr(os, "O_BINARY", 0))
             if flags & os.O_RDWR:
                 mode = 'a+b' if (flags & os.O_APPEND) else 'r+b'
             elif writing:
@@ -449,10 +461,10 @@ class SFTPServerHandler(SFTPServerInterface):
     def remove(self, path):
         """ファイルを削除"""
         try:
+            # パスの解決から停止に見せる（_busy を参照）。
             # リンクの先ではなくリンク自体を消す
-            target = self._get_link_path(path)
-            with self._busy(target):
-                os.remove(target)
+            with self._busy(path):
+                os.remove(self._get_link_path(path))
             return SFTP_OK
         except Exception as e:
             _log_limited("remove error", f"[SFTP Server] remove error: {e}")
@@ -461,11 +473,11 @@ class SFTPServerHandler(SFTPServerInterface):
     def rename(self, oldpath, newpath):
         """ファイル/ディレクトリ名を変更"""
         try:
+            # パスの解決から停止に見せる（_busy を参照）。
             # リンクの先ではなくリンク自体を改名する
-            source = self._get_link_path(oldpath)
-            target = self._get_link_path(newpath)
-            with self._busy(source), self._busy(target):
-                os.rename(source, target)
+            with self._busy("%s -> %s" % (oldpath, newpath)):
+                os.rename(self._get_link_path(oldpath),
+                          self._get_link_path(newpath))
             return SFTP_OK
         except Exception as e:
             _log_limited("rename error", f"[SFTP Server] rename error: {e}")
@@ -501,7 +513,16 @@ class SFTPServerHandler(SFTPServerInterface):
         制限: uid/gid は Windows で意味を持たないので受け取っても無視する
         （この用途の SFTP クライアントは所有者を送ってこない）。開いている
         ハンドルへの FSETSTAT は paramiko の既定のまま「未対応」を返す。
+
+        パスの解決から終わりまでを停止に見せる（_busy を参照）。切り詰め
+        だけでなく、再起動の後に戻った旧 chmod・utime も、新しく受けた
+        ファイルを読み取り専用にする・日時を書き換える
         """
+        with self._busy(path):
+            return self._chattr(path, attr)
+
+    def _chattr(self, path, attr):
+        """chattr の本体"""
         try:
             real_path = self._get_real_path(path)
             if attr.st_size is not None:
@@ -518,8 +539,7 @@ class SFTPServerHandler(SFTPServerInterface):
                             self._notify("他の転送が書き込み中のため断りました: %s" % path)
                         return SFTP_FAILURE
                 try:
-                    with self._busy(real_path):
-                        os.truncate(real_path, attr.st_size)
+                    os.truncate(real_path, attr.st_size)
                 finally:
                     if reserved:
                         # 失敗しても外す。残すと、この接続が切れるまで
@@ -885,7 +905,8 @@ class SFTPServerManager(QObject):
         # 接続はすべて閉じた。書き込み用のハンドルを開いたまま生きている
         # スレッドは、切断に気づいて抜ける途中か、保存先への write()/close()
         # の中で止まっている（共有フォルダの遅延・切断など）。削除・改名・
-        # 切り詰めの最中のスレッドも同じ一覧に載る（_OpenWriters.busy）。
+        # SETSTAT の最中（パスの解決から）のスレッドも同じ一覧に載る
+        # （_OpenWriters.busy）。
         # 前者を取り違えないよう少しだけ待ち、それでも残った分を覚えて、
         # 消えるまで次の start() を断る
         deadline = time.monotonic() + self.WRITER_STOP_TIMEOUT_SECONDS
