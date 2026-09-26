@@ -390,6 +390,9 @@ class MainWindow(QMainWindow):
         splitter.setCollapsible(0, True)
         splitter.setCollapsible(1, False)
         splitter.setCollapsible(2, True)
+        # 接続先リストを隠している間に仕切りが引かれたか（_toggle_device_list で使う）
+        self._list_moved_while_hidden = False
+        splitter.splitterMoved.connect(self._note_splitter_moved)
         
         layout.addWidget(splitter)
         
@@ -2389,11 +2392,20 @@ class MainWindow(QMainWindow):
         そのまま判断すると、隠していただけのリストも既定幅で戻し、Qt が
         覚えている幅（利用者が決めた幅）を上書きする。出した直後に
         並べ直させ、覚えている幅を見てから決める。
+
+        ただし隠している間に端末とツールエリアの仕切りが引かれていたら、
+        Qt が覚えていたリストの幅は 0 になっている。並べ直させるとリストの
+        最小幅を端末とツールエリアから比例で取り、利用者がいま決めた
+        ツールエリアの幅を削るので、並べ直させずに既定幅を端末から取る。
+        ツールエリアも隠れているときは並べ直させる（sizes() がツールエリアに
+        返す 0 を渡すと、ツールエリアが幅 0 のまま戻る）。
         """
         sizes = self.main_splitter.sizes()
         hidden = self.device_tree.isHidden() or (sizes and sizes[0] < 40)
+        moved = self._list_moved_while_hidden
+        self._list_moved_while_hidden = False
         self.device_tree.setVisible(hidden)
-        if hidden:
+        if hidden and not (moved and not self.tool_tabs.isHidden()):
             self.main_splitter.refresh()
             sizes = self.main_splitter.sizes()
         if hidden and sizes and sizes[0] < 40:
@@ -2402,6 +2414,11 @@ class MainWindow(QMainWindow):
                 [self.DEVICE_LIST_WIDTH, spare] + sizes[2:])
         if hasattr(self, "toggle_device_list_action"):
             self.toggle_device_list_action.setChecked(hidden)
+
+    def _note_splitter_moved(self, _pos, _index):
+        """接続先リストを隠している間に仕切りが引かれたことを控える。"""
+        if self.device_tree.isHidden():
+            self._list_moved_while_hidden = True
 
     def _toggle_sftp_panel(self):
         """SFTPクライアントパネルの表示/非表示を切り替え"""

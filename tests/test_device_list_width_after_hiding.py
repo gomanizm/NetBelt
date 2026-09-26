@@ -147,6 +147,92 @@ class DeviceListWidthAfterHidingTest(unittest.TestCase):
         self.assertGreaterEqual(window.main_splitter.sizes()[0], 100,
                                 "表示中なのに幅 0 のままで、リストが見えない")
 
+    def _hide_and_drag_the_tool_handle(self, window, dx):
+        """リストを隠し、端末とツールエリアの仕切りを dx だけ引く（負で広げる）。
+
+        利用者が仕切りを引くと QSplitter.moveSplitter が呼ばれ、splitterMoved が
+        出る（setSizes では出ない）。このとき Qt は、隠れたリストの覚えている幅も
+        0 にする。引く前と引いたあとの sizes() を返す。
+        """
+        window._toggle_device_list()
+        self._pump()
+        self.assertTrue(window.device_tree.isHidden(), "前提: 隠れた")
+        splitter = window.main_splitter
+        before = splitter.sizes()
+        splitter.moveSplitter(splitter.handle(2).pos().x() + dx, 2)
+        self._pump()
+        after = splitter.sizes()
+        self.assertGreater(abs(after[2] - before[2]), abs(dx) // 2,
+                           "前提: 仕切りを引いてツールエリアの幅が変わった")
+        return before, after
+
+    def test_a_tool_width_dragged_while_hidden_is_kept(self):
+        """隠している間に引いて決めたツールエリアの幅が、リストを戻しても削られないこと
+
+        441ea02 と同じく、リストの幅は端末から取る。2ee577c では、並べ直させると
+        リストの最小幅を端末とツールエリアから比例で取り、1400x800・リスト 400 で
+        [0, 810, 586] → 戻す → [262, 656, 474] と、ツールエリアが 112 削られた
+        （441ea02 は [262, 552, 578]）。
+        """
+        for dx in (-100, 150):
+            with self.subTest(dx=dx):
+                window = self._shown_window(400)
+                _, dragged = self._hide_and_drag_the_tool_handle(window, dx)
+
+                window._toggle_device_list()
+                self._pump()
+
+                sizes = window.main_splitter.sizes()
+                self.assertFalse(window.device_tree.isHidden())
+                self.assertGreaterEqual(sizes[0], 100, "リストが見えない")
+                # 戻ってきた仕切りの幅と、最小幅に合わせた端数ぶんだけ揺れてよい
+                self.assertAlmostEqual(
+                    sizes[2], dragged[2], delta=20,
+                    msg="隠している間に決めたツールエリアの幅が削られた: %s -> %s"
+                        % (dragged, sizes))
+
+    def test_the_next_round_trip_after_a_drag_keeps_the_widths(self):
+        """対照: 引いたあとに戻し、もう一度隠して戻しても、幅が動かないこと
+
+        仕切りを引いた印が残ると、次の往復でも既定幅を端末から取り直し、
+        往復のたびにツールエリアが広がっていく。
+        """
+        window = self._shown_window(400)
+        self._hide_and_drag_the_tool_handle(window, -100)
+        window._toggle_device_list()
+        self._pump()
+        shown = window.main_splitter.sizes()
+
+        window._toggle_device_list()
+        self._pump()
+        window._toggle_device_list()
+        self._pump()
+
+        self.assertEqual(window.main_splitter.sizes(), shown)
+
+    def test_a_hidden_tool_area_still_comes_back_with_width_after_a_drag(self):
+        """対照: 引いたあとにツールエリアも隠した場合、どちらも幅 0 のまま出さないこと
+
+        ツールエリアが隠れている間の sizes() はそこに 0 を返す。それを
+        setSizes へ渡すと、ツールエリアを出しても幅 0 のまま見えない。
+        """
+        window = self._shown_window(400)
+        self._hide_and_drag_the_tool_handle(window, -100)
+        window._toggle_tool_area()
+        self._pump()
+        self.assertTrue(window.tool_tabs.isHidden(), "前提: ツールエリアが隠れた")
+
+        window._toggle_device_list()
+        self._pump()
+        window._toggle_tool_area()
+        self._pump()
+
+        sizes = window.main_splitter.sizes()
+        self.assertFalse(window.device_tree.isHidden())
+        self.assertFalse(window.tool_tabs.isHidden())
+        self.assertGreaterEqual(sizes[0], 100, "リストが見えない")
+        self.assertGreaterEqual(sizes[2], 100, "ツールエリアが幅 0 のまま戻った")
+
 
 if __name__ == "__main__":
     unittest.main()
