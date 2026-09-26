@@ -30,7 +30,7 @@ class _Core:
         self.backlog = 0        # 積んだがまだ書いていない文字数
         self.written = 0        # ファイル上で増えたバイト数（書けた分だけ）
         self.error = None       # スレッドで起きた最初の失敗
-        self.in_call = False    # いまファイルの呼び出しの中にいるか
+        self.call_started = None    # いまのファイルの呼び出しに入った時刻（外なら None）
 
     def put(self, op, text=""):
         with self.lock:
@@ -45,7 +45,7 @@ class _Core:
             try:
                 # 失敗したあとは書かない（記録は失敗する前の所まで）。閉じるのは必ず行う
                 if op == "close" or self.error is None:
-                    self.in_call = True
+                    self.call_started = time.monotonic()
                     if op == "write":
                         self.f.write(text)
                         # テキストモードなので LF は os.linesep に直ってから
@@ -61,7 +61,7 @@ class _Core:
                 if self.error is None:
                     self.error = e
             finally:
-                self.in_call = False
+                self.call_started = None
                 with self.lock:
                     self.ops -= 1
                     self.backlog -= len(text)
@@ -149,9 +149,15 @@ class LogWriter:
             return
         started = time.monotonic()
         while not core.idle.wait(0.01):
-            waited = time.monotonic() - started
-            if waited >= self.MAX_WAIT or (waited >= self.STALL_WAIT
-                                           and core.in_call):
+            now = time.monotonic()
+            # 詰まりとみなすのは、1 回の呼び出しが STALL_WAIT を超えて戻らない
+            # とき。短い呼び出しが続いただけ（遅いが応答はある記録先）や、
+            # CPU が混んで少し待たされただけでは諦めない（諦めると書き終える
+            # 前に戻り、「呼んだら書けている」が崩れる）
+            call_started = core.call_started
+            if now - started >= self.MAX_WAIT or (
+                    call_started is not None
+                    and now - call_started >= self.STALL_WAIT):
                 self._stalled = True
                 if self._on_stall is not None:
                     self._on_stall()

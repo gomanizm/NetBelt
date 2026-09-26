@@ -114,6 +114,41 @@ class LogWriterTest(unittest.TestCase):
         self.assertTrue(w.closed)
         self.assertEqual(w.backlog, 0)
 
+    def test_slow_calls_that_each_return_in_time_are_not_a_stall(self):
+        """1 回ずつは STALL_WAIT 内に戻る遅い記録先では、諦めずに書き終わりまで待つこと。
+
+        合計で STALL_WAIT を超えても、戻らない呼び出しが無ければ詰まりではない。
+        待ちの始めから数えると、CPU が混んで呼び出しの途中で待たされただけでも
+        書き終える前に戻ってしまう（呼んだら書けている、が崩れる）。
+        """
+        from core.log_writer import LogWriter
+
+        class _Slow:
+            def __init__(self, f):
+                self._f = f
+                self.name = f.name
+
+            def write(self, text):
+                time.sleep(0.045)
+                return self._f.write(text)
+
+            def flush(self):
+                time.sleep(0.045)
+                return self._f.flush()
+
+            def close(self):
+                return self._f.close()
+
+        stalls = []
+        w = LogWriter(_Slow(self._open()), on_stall=lambda: stalls.append(1))
+        w.write("a\n")
+        w.write("b\n")
+        w.flush()                       # 合計 0.135 秒、1 回ずつは 0.045 秒
+        self.assertEqual(stalls, [], "戻ってくる呼び出しを詰まりとみなした")
+        self.assertFalse(w.busy, "書き終える前に戻った")
+        self.assertEqual(w.written_bytes, 2 * len("a" + os.linesep))
+        w.close()
+
     def test_a_failure_in_the_thread_is_kept_and_raised(self):
         """スレッドで起きた失敗が残り、以後の呼び出しが例外になり、ファイルは閉じること。"""
         w, release, stalls = self._stalling(fail=OSError(28, "No space left on device"))
