@@ -86,13 +86,21 @@ def _hostnames_match(names, server_name):
     return False
 
 
-def _names_same_endpoint(name, host, port, ignore_case=True):
+def _names_same_endpoint(name, host, port, ignore_case=True,
+                         written_port=None):
     """known_hosts の名前 1 つが host:port を指すか（別の綴りも含む）。
 
     完全一致とハッシュ化名のほかに、ポートを整数へそろえる前の版が
     config.json の文字列のまま書いた "[host]:022"・"[host]:+22"・
     "[host]:02202" のような綴りも、ポートを整数にそろえて同じ接続先と
     みなす。22 番なら "host" と "[host]:22" もこの機器の名前。
+
+    ハッシュ化名からはポートを読み出せないので、候補の名前ごとに掛け直して
+    比べる。written_port（整数へそろえる前の設定の文字列）があれば、旧版が
+    その値から組み立てた "[host]:<written_port>" も候補にする。無いと
+    "[host]:022" をハッシュ化した行が照合に使われず、TOFU が別の鍵を
+    受け入れてパスワードが届いていた（実測）。設定を整数に直したあとは
+    元の綴りが分からないので、この行は照合できない（残る制限）。
 
     ignore_case なら、ホスト名の大文字小文字は区別しない（OpenSSH と同じ）。
     ハッシュ化名は設定の綴りのままと、小文字にそろえた綴りの両方で
@@ -108,6 +116,10 @@ def _names_same_endpoint(name, host, port, ignore_case=True):
         wanted = {known_hosts_server_name(h, port) for h in (host, lowered)}
         if port == 22:
             wanted.update("[%s]:22" % h for h in (host, lowered))
+        if (isinstance(written_port, str)
+                and tcp_port_number(written_port) == port):
+            wanted.update("[%s]:%s" % (h, written_port)
+                          for h in (host, lowered))
         return any(_hostnames_match([name], w) for w in wanted)
     if name.startswith("[") and "]:" in name:
         name_host, _, name_port = name[1:].rpartition("]:")
@@ -116,7 +128,7 @@ def _names_same_endpoint(name, host, port, ignore_case=True):
     return port == 22 and fold(name) == lowered
 
 
-def _add_other_spelling_keys(keys, host, port):
+def _add_other_spelling_keys(keys, host, port, written_port=None):
     """同じ接続先を別の綴りの名前で保存した鍵を、接続先名の鍵として keys へ足す。
 
     paramiko 4.0.0 は known_hosts を引く名前を `port == 22`（整数との
@@ -137,6 +149,8 @@ def _add_other_spelling_keys(keys, host, port):
     ほかの綴りの行（_names_same_endpoint）の鍵を、ファイルの順に
     接続先名の鍵として足す（paramiko の照合は種別ごとに先頭の鍵を
     使う）。読み替えはメモリ上だけで、known_hosts には書かない。
+    written_port は整数へそろえる前の設定のポート（ハッシュ化した旧版の
+    綴りの照合に使う。_names_same_endpoint 参照）。
 
     Returns:
         読み替えに使った行の名前（known_hosts に書かれた綴り）。鍵が
@@ -154,7 +168,9 @@ def _add_other_spelling_keys(keys, host, port):
     used = []
     for entry in list(keys._entries):
         name = next((name for name in entry.hostnames
-                     if _names_same_endpoint(name, host, port)), None)
+                     if _names_same_endpoint(name, host, port,
+                                             written_port=written_port)),
+                    None)
         if name is not None:
             keys._entries.append(paramiko.hostkeys.HostKeyEntry(
                 [server_name], entry.key))
@@ -374,7 +390,8 @@ def _refuse_conflicting_host_key(path, hostname, key, endpoint=None):
     先に登録した機器は次から BadHostKeyException で繋がらなくなる。
     黙って上書きするより、食い違いを伝えて止める。
 
-    endpoint（(host, port)）があれば、完全一致の鍵が無いとき、読み込みの
+    endpoint（(host, port) か (host, port, 整数へそろえる前の設定のポート)）
+    があれば、完全一致の鍵が無いとき、読み込みの
     ときと同じ規則（_add_other_spelling_keys）で、大文字小文字や旧版の
     ポートの綴りが違う名前の鍵も見る。完全一致だけを見ていると、同時に
     初回接続した別の接続が "SW1.EXAMPLE.COM <鍵 A>" を保存していても
@@ -449,8 +466,8 @@ def _save_known_hosts(known_hosts_path, entry, endpoint=None):
     Args:
         entry: (接続先名, 提示された鍵)。書き足す 1 件。書き込む前に、
             同じ接続先の別の鍵がディスクに無いかを錠の中で確かめる
-        endpoint: (host, port)。確かめるときに別の綴りの名前も見る
-            （_refuse_conflicting_host_key）
+        endpoint: (host, port[, 設定のポート])。確かめるときに別の綴りの
+            名前も見る（_refuse_conflicting_host_key）
     """
     path = Path(str(known_hosts_path))
     with _known_hosts_guard(path.parent):
@@ -491,7 +508,8 @@ class _TofuHostKeyPolicy(paramiko.MissingHostKeyPolicy):
 
     def __init__(self, known_hosts_path, endpoint=None):
         self._known_hosts_path = known_hosts_path
-        # (host, port)。保存直前の食い違い確認で別の綴りの名前も見る
+        # (host, port[, 設定のポート])。保存直前の食い違い確認で別の綴りの
+        # 名前も見る
         self._endpoint = endpoint
 
     def missing_host_key(self, client, hostname, key):
@@ -551,6 +569,8 @@ class SSHConnection(QObject):
         super().__init__(parent)
         self.host = host
         self.port = port
+        # 整数へそろえる前の設定のポート（文字列のとき）。connect() で覚える
+        self._written_port = None
         self.username = username
         self.password = password
         self.ssh_key = ssh_key
@@ -644,8 +664,9 @@ class SSHConnection(QObject):
                 % (e, known_hosts_path))
         if broken:
             self._refuse_or_warn_broken_lines(broken, known_hosts_path, client)
-        policy = _TofuHostKeyPolicy(known_hosts_path,
-                                    endpoint=(self.host, self.port))
+        policy = _TofuHostKeyPolicy(
+            known_hosts_path,
+            endpoint=(self.host, self.port, self._written_port))
         policy._on_save_error = lambda message: self.output_received.emit(
             "\r\n[NetBelt] 警告: %s\r\n" % message)
         client.set_missing_host_key_policy(policy)
@@ -657,7 +678,7 @@ class SSHConnection(QObject):
         読み替えに使った行の名前を返す。
         """
         return _add_other_spelling_keys(
-            client.get_host_keys(), self.host, self.port)
+            client.get_host_keys(), self.host, self.port, self._written_port)
 
     def _refuse_or_warn_broken_lines(self, broken, known_hosts_path,
                                      client=None):
@@ -691,7 +712,7 @@ class SSHConnection(QObject):
                 and keys.lookup("[%s]:22" % self.host) is not None)
         mine = [(no, text) for no, text, _ in broken
                 if any(_names_same_endpoint(name, self.host, self.port,
-                                            ignore_case)
+                                            ignore_case, self._written_port)
                        for name in known_hosts_names(text))]
         if mine:
             raise HostKeyStoreError(
@@ -884,6 +905,10 @@ class SSHConnection(QObject):
                     "ポート番号 %r は使えないため、接続しませんでした。"
                     "機器の編集で 1〜65535 の整数を設定してください。"
                     % (self.port,))
+            if isinstance(self.port, str):
+                # 旧版はこの綴りのまま known_hosts の名前にしていた。
+                # ハッシュ化された行の照合に使う（_names_same_endpoint）
+                self._written_port = self.port
             self.port = port
 
             # 待っている間に dispose() が走ると self.client は None になる。
