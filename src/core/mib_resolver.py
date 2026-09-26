@@ -931,7 +931,9 @@ class MIBResolver:
         結果は mib_cache.json に残るので、一度ずれるとキャッシュを
         作り直すまでそのまま使われる。IMPORTS 節（`IMPORTS ... FROM
         <MODULE>;`）を解析して名前ごとに参照先モジュールを持たない限り、
-        ここは直らない。曖昧になったこと自体も知らせていない。
+        ここは直らない。曖昧になったこと自体も知らせていない。1.3.2 から
+        読む右辺（1 段でないもの）の宣言は、この候補を増やさないように
+        扱う（preset の説明を見ること）。
 
         Args:
             definitions: (名前, 親の名前, 添字, モジュール名) のリスト。
@@ -963,6 +965,21 @@ class MIBResolver:
             for _declared_name in _module_names:
                 declaring[_declared_name] = (
                     declaring.get(_declared_name, 0) + 1)
+        # 右辺が 1 段（{ 親 添字 }）でない宣言（複数添字・ラベル付き
+        # フルパス・SMIv1 の Trap。1.3.1 までは抽出できなかった形）は、
+        # 同じ名前の候補がほかにある（内蔵表か custom_mibs.json にある、
+        # または別のモジュールも宣言している）とき、よそのモジュールから
+        # 名前で引く known へ入れない。IMPORTS を見ないので、候補が 2 つ
+        # 以上あると取り込んだ側の子は後に決まった方に付く（この関数の
+        # 説明の「残る制限」）。1.3.1 まで見えなかった宣言がその候補に
+        # 加わると、1.3.1 で正しく付いていた名前がよその木へ移る（実測:
+        # 他社の foo ::= { xRoot 5 1 } があると、Y-MIB の foo を取り込んだ
+        # zLeaf が他社の 1.3.6.1.4.1.1111.5.1.7 に付いた。他社の
+        # linkDown TRAP-TYPE があると、内蔵の linkDown の子が他社の Trap の
+        # 下に付いた）。自分のモジュールの子の親（in_module）には、これまで
+        # どおり使う。{ 親 x(26) } は { 親 26 } と同じ 1 段として扱う（1.3.1
+        # では読めなかった形だが、実物の MIB 集 1,653 本に 0 件）
+        preset = set(known)
         in_module = {}
         resolved = {}
         pending = list(definitions)
@@ -1006,7 +1023,10 @@ class MIBResolver:
                     still_pending.append((name, parent, index, module))
                     continue
                 oid = f"{parent_oid}.{index}" if parent_oid else index
-                known[name] = oid
+                if ((parent and '.' not in index)
+                        or (name not in preset
+                            and declaring.get(name, 0) < 2)):
+                    known[name] = oid
                 in_module.setdefault(module, {})[name] = oid
                 resolved[oid] = name
                 progressed = True
@@ -1027,10 +1047,15 @@ class MIBResolver:
         # 残ったもののうち、よそのモジュールの同名を親にすれば解決できた
         # ものの数。利用者の決定（2026-09-20）により、どのモジュールの親か
         # 確定できないときは名前を付けずに OID のまま出すので、ここは
-        # 「黙って捨てた件数」になる。判断に使った条件と件数を 1 行残す
+        # 「黙って捨てた件数」になる。判断に使った条件と件数を 1 行残す。
+        # よその同名は known だけでなく解決済みの名前からも探す。1 段で
+        # ない右辺の宣言は known に入れないことがある（preset の説明）ので、
+        # known だけを見ると、よその同名が複数添字で決まっているときに
+        # 知らせが消える
+        named = set(resolved.values()) if pending else set()
         gave_up = sum(1 for _, parent, _, module in pending
                       if parent != 'enterprises' and parent in declared[module]
-                      and parent in known
+                      and (parent in known or parent in named)
                       and declaring.get(parent, 0) > 1)
         if gave_up:
             print(f"[MIBResolver] 親の名前を自分のモジュールで解決できない"
