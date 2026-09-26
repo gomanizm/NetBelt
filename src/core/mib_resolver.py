@@ -932,8 +932,8 @@ class MIBResolver:
         作り直すまでそのまま使われる。IMPORTS 節（`IMPORTS ... FROM
         <MODULE>;`）を解析して名前ごとに参照先モジュールを持たない限り、
         ここは直らない。曖昧になったこと自体も知らせていない。1.3.2 から
-        読む右辺（1 段でないもの）の宣言は、この候補を増やさないように
-        扱う（preset の説明を見ること）。
+        読む右辺（1 段でないもの）の宣言とその子孫は、この候補を増やさない
+        ように扱う（preset の説明を見ること）。
 
         Args:
             definitions: (名前, 親の名前, 添字, モジュール名) のリスト。
@@ -965,21 +965,29 @@ class MIBResolver:
             for _declared_name in _module_names:
                 declaring[_declared_name] = (
                     declaring.get(_declared_name, 0) + 1)
-        # 右辺が 1 段（{ 親 添字 }）でない宣言（複数添字・ラベル付き
-        # フルパス・SMIv1 の Trap。1.3.1 までは抽出できなかった形）は、
-        # 同じ名前の候補がほかにある（内蔵表か custom_mibs.json にある、
-        # または別のモジュールも宣言している）とき、よそのモジュールから
-        # 名前で引く known へ入れない。IMPORTS を見ないので、候補が 2 つ
-        # 以上あると取り込んだ側の子は後に決まった方に付く（この関数の
-        # 説明の「残る制限」）。1.3.1 まで見えなかった宣言がその候補に
-        # 加わると、1.3.1 で正しく付いていた名前がよその木へ移る（実測:
-        # 他社の foo ::= { xRoot 5 1 } があると、Y-MIB の foo を取り込んだ
-        # zLeaf が他社の 1.3.6.1.4.1.1111.5.1.7 に付いた。他社の
+        # 1.3.1 では OID が決まらなかった宣言（fresh）は、同じ名前の候補が
+        # ほかにある（内蔵表か custom_mibs.json にある、または別のモジュール
+        # も宣言している）とき、よそのモジュールから名前で引く known へ
+        # 入れない。fresh は、右辺が 1 段（{ 親 添字 }）でない宣言（複数
+        # 添字・ラベル付きフルパス・SMIv1 の Trap。1.3.1 までは抽出できな
+        # かった形）と、親が fresh な宣言（子孫まで）。IMPORTS を見ない
+        # ので、候補が 2 つ以上あると取り込んだ側の子は後に決まった方に
+        # 付く（この関数の説明の「残る制限」）。1.3.1 で決まらなかった宣言が
+        # その候補に加わると、1.3.1 で正しく付いていた名前がよその木へ移る
+        # （実測: 他社の foo ::= { xRoot 5 1 } があると、Y-MIB の foo を
+        # 取り込んだ zLeaf が他社の 1.3.6.1.4.1.1111.5.1.7 に付いた。他社の
         # linkDown TRAP-TYPE があると、内蔵の linkDown の子が他社の Trap の
-        # 下に付いた）。自分のモジュールの子の親（in_module）には、これまで
-        # どおり使う。{ 親 x(26) } は { 親 26 } と同じ 1 段として扱う（1.3.1
-        # では読めなかった形だが、実物の MIB 集 1,653 本に 0 件）
+        # 下に付いた。右辺の形だけを見ていたときは、ラベル付きの根の下に
+        # 1 段で置いた system ::= { acmeRoot 9 } が known に入り、SNMPv2-MIB
+        # の system を取り込んだ zAlarm が 1.3.6.1.4.1.777.9.99 に付いた）。
+        # 自分のモジュールの子の親（in_module）には、これまでどおり使う。
+        # { 親 x(26) } は { 親 26 } と同じ 1 段として扱う（1.3.1 では読め
+        # なかった形だが、実物の MIB 集 1,653 本に 0 件）
         preset = set(known)
+        # fresh な宣言の (モジュール, 名前) と、known の値が fresh な宣言
+        # から来た名前。子が fresh かを親から引く
+        fresh_in_module = set()
+        fresh_known = set()
         in_module = {}
         resolved = {}
         pending = list(definitions)
@@ -1003,6 +1011,7 @@ class MIBResolver:
                 for _pending_name, _, _, _pending_module in pending:
                     awaiting.add((_pending_module, _pending_name))
             for name, parent, index, module in pending:
+                parent_fresh = False
                 if parent == 'enterprises':
                     parent_oid = '1.3.6.1.4.1'
                 elif parent == '':
@@ -1010,6 +1019,7 @@ class MIBResolver:
                     parent_oid = ''
                 elif parent in declared[module]:
                     parent_oid = in_module.get(module, {}).get(parent)
+                    parent_fresh = (module, parent) in fresh_in_module
                     if (parent_oid is None and borrow
                             and '.' not in index
                             and (module, parent) not in awaiting
@@ -1024,16 +1034,27 @@ class MIBResolver:
                         # 読めない右辺で宣言した system の { system 5 1 } が
                         # 標準の 1.3.6.1.2.1.1.5.1 に付いた）
                         parent_oid = known.get(parent)
+                        parent_fresh = parent in fresh_known
                 else:
                     parent_oid = known.get(parent)
+                    parent_fresh = parent in fresh_known
                 if parent_oid is None:
                     still_pending.append((name, parent, index, module))
                     continue
                 oid = f"{parent_oid}.{index}" if parent_oid else index
-                if ((parent and '.' not in index)
-                        or (name not in preset
-                            and declaring.get(name, 0) < 2)):
+                # 1.3.1 では決まらなかった宣言か（preset の説明を見ること）
+                fresh = not parent or '.' in index or parent_fresh
+                if not fresh or (name not in preset
+                                 and declaring.get(name, 0) < 2):
                     known[name] = oid
+                    if fresh:
+                        fresh_known.add(name)
+                    else:
+                        fresh_known.discard(name)
+                if fresh:
+                    fresh_in_module.add((module, name))
+                else:
+                    fresh_in_module.discard((module, name))
                 in_module.setdefault(module, {})[name] = oid
                 resolved[oid] = name
                 progressed = True
