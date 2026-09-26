@@ -588,6 +588,9 @@ class SSHConnection(QObject):
     # resume_send_queue へ繋ぐ。接続自身も持ち越しを書くのに使う）。
     # 見張りのスレッドから出すのでキュー接続で届く
     send_drained = pyqtSignal()
+    # 保留した端末の大きさを、Transport へまた書けるようになったので送れる
+    # （_send_terminal_size。見張りのスレッドから出すのでキュー接続で届く）
+    _size_writable = pyqtSignal()
     
     def __init__(self, host: str, port: int, username: str, password: str = "", 
                  ssh_key: str = "", parent=None):
@@ -636,7 +639,10 @@ class SSHConnection(QObject):
         self._carry = b""
         # まだ機器へ伝えていない端末の大きさがあるか（_send_terminal_size）
         self._size_unsent = False
+        # その大きさを送れるようになるのを待つ見張り（_send_terminal_size）
+        self._size_watcher: Optional[DrainWatcher] = None
         self.send_drained.connect(self._write_carry_when_drained)
+        self._size_writable.connect(self._send_terminal_size)
 
     def set_read_gate(self, gate) -> None:
         """受信を止める合図（threading.Event）を受け取る
@@ -1110,6 +1116,9 @@ class SSHConnection(QObject):
         watcher, self._drain_watcher = self._drain_watcher, None
         if watcher is not None:
             watcher.stop()
+        size_watcher, self._size_watcher = self._size_watcher, None
+        if size_watcher is not None:
+            size_watcher.stop()
         # 書き残しは捨てる（繋ぎ直した先へ古い残りを書かない）
         self._carry = b""
         self._size_unsent = False
@@ -1272,6 +1281,7 @@ class SSHConnection(QObject):
         self._size_unsent = True
         self._send_terminal_size()
 
+    @pyqtSlot()
     def _send_terminal_size(self):
         """覚えている大きさを送る。いま書くと待たされるなら送らずに残す（GUI スレッドから呼ぶ）
 
@@ -1279,21 +1289,37 @@ class SSHConnection(QObject):
         （時間切れを無限に再試行する）。相手が TCP まで受け取りを止めている間や
         鍵交換中に GUI スレッドから書くと、その間画面が止まっていた（実測
         7 秒。相手が受け取らないままなら無期限）。その間は大きさだけを覚えて
-        見張りを起こし、書けるようになった知らせ（send_drained）で最後の
-        大きさを送る。見張りが無い（接続の手順を通っていない）ときは待てない
-        ので、これまでどおりその場で送る。
+        専用の見張りを起こし、Transport へ書けるようになった知らせ
+        （_size_writable）で最後の大きさを送る。送信の背圧の見張り
+        （send_drained）はチャネルの窓が空くまで待つので、それに頼ると、
+        機器が読まずに窓が 0 のままの間は送られず、機器側の端末の大きさが
+        古いままだった（window-change は窓と関係なく書ける）。送信の背圧の見張り
+        が無い（接続の手順を通っていない）ときは待てないので、これまでどおり
+        その場で送る。
         """
-        channel, watcher = self.channel, self._drain_watcher
+        channel = self.channel
         if not self._size_unsent or not self.is_connected or channel is None:
             return
-        if (watcher is not None and self._transport_backlogged(channel)
-                and watcher.check()):
-            return   # 書けるようになったら send_drained でここへ戻ってくる
+        if self._drain_watcher is not None:
+            if self._size_watcher is None:
+                # このチャネルに束縛する（dispose で止めて捨てる）
+                self._size_watcher = DrainWatcher(
+                    lambda: self._transport_backlogged(channel),
+                    self._announce_size_writable)
+            if self._size_watcher.check():
+                return   # 書けるようになったら _size_writable でここへ戻ってくる
         self._size_unsent = False
         try:
             channel.resize_pty(width=self.term_cols, height=self.term_rows)
         except Exception:
             pass
+
+    def _announce_size_writable(self):
+        """見張りのスレッドから、保留した大きさを送れるようになったことを知らせる"""
+        try:
+            self._size_writable.emit()
+        except RuntimeError:
+            pass   # 捨てられた接続（C++ 側が消えている）
 
     @staticmethod
     def _transport_backlogged(channel) -> bool:

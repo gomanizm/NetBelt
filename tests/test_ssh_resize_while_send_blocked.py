@@ -14,9 +14,11 @@ window-change を Transport へ書くとき、書けるまで時間切れを無�
 
 どう直したか。Transport へいま書くと待たされる（鍵交換中・TCP へ書けない）
 間は window-change を送らず、大きさだけを覚えて見張り（DrainWatcher）を
-起こしておく。書けるようになった知らせ（send_drained）で、覚えておいた
-最後の大きさを 1 回だけ送る。チャネルの窓は見ない（window-change は窓と
-関係なく書ける）ので、窓が 0 なだけのときは今までどおりその場で送る。
+起こしておく。Transport へ書けるようになったら、覚えておいた最後の大きさを
+1 回だけ送る。チャネルの窓は見ない（window-change は窓と関係なく書ける）
+ので、窓が 0 なだけのときは今までどおりその場で送る。窓が 0 のまま詰まりが
+解けた場合も、窓が空くのを待たずに送る
+（tests/test_ssh_resize_after_transport_recovers.py）。
 """
 import os
 import socket
