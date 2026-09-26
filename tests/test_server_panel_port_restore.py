@@ -31,13 +31,19 @@ FTP_DEFAULTS = {"port": 21, "passive_low": 50100, "passive_high": 50150}
 TFTP_DEFAULTS = {"port": 69}
 
 
-def _config_text(section, field, literal):
-    """settings.<section>.<field> に literal（JSON の字面そのまま）を書いた config.json の中身"""
+def _config_text(section, field, literal, extra=None):
+    """settings.<section>.<field> に literal（JSON の字面そのまま）を書いた config.json の中身。
+
+    extra（欄の名前 → JSON の字面）があれば、同じセクションに並べて書く
+    """
+    fields = '"%s": %s' % (field, literal)
+    for name, value in (extra or {}).items():
+        fields += ', "%s": %s' % (name, value)
     return ('{"config_version": "1.0", "groups": [{"name": "Default", '
             '"auto_commands": [], "devices": []}], "global_macros": [], '
-            '"settings": {"%s": {"root_directory": "./example-root", "%s": %s}}, '
+            '"settings": {"%s": {"root_directory": "./example-root", %s}}, '
             '"update_settings": {"check_on_startup": false}}'
-            % (section, field, literal))
+            % (section, fields))
 
 
 class ServerPanelPortRestoreTest(unittest.TestCase):
@@ -64,17 +70,24 @@ class ServerPanelPortRestoreTest(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def _panel(self, section, field, literal):
+    def _panel(self, section, field, literal, extra=None):
         from core.config_manager import ConfigManager
         from ui.ftp_server_panel import FTPServerPanel
         from ui.tftp_server_panel import TFTPServerPanel
+        if field == "passive_high" and extra is None:
+            # 前提: passive_high だけを書くと passive_low は既定値 50100 のままで、
+            # それより下の番号（2121 など）は範囲の逆転として組ごと既定値へ戻る
+            # （test_inverted_passive_range_falls_back_to_the_default_pair）。
+            # 欄ごとの読み方を確かめるため、passive_low には欄の下端 1024 を置く
+            extra = {"passive_low": "1024"}
         path = os.path.join(self.dir, "config.json")
         with open(path, "w", encoding="utf-8") as f:
-            f.write(_config_text(section, field, literal))
+            f.write(_config_text(section, field, literal, extra))
         cm = ConfigManager(config_path=path)
         # 前提: 読み込みの経路（_load_config）を通っても値が残っている
         self.assertIsNone(cm.load_error)
-        self.assertIn(field, cm.get_server_settings(section))
+        for name in [field] + list(extra or {}):
+            self.assertIn(name, cm.get_server_settings(section))
         cls = FTPServerPanel if section == "ftp_server" else TFTPServerPanel
         panel = cls(config_manager=cm)
         self._keep.append(panel)
@@ -114,6 +127,35 @@ class ServerPanelPortRestoreTest(unittest.TestCase):
                 panel = self._panel("ftp_server", field, "80")
                 self.assertEqual(self._spin(panel, field).value(),
                                  FTP_DEFAULTS[field])
+
+    def _passive_pair(self, low, high):
+        """passive_low / passive_high に low / high（JSON の字面）を書いて FTP パネルを作り、欄の組を返す"""
+        panel = self._panel("ftp_server", "passive_low", low,
+                            {"passive_high": high})
+        return panel.passive_lo_spin.value(), panel.passive_hi_spin.value()
+
+    def test_inverted_passive_range_falls_back_to_the_default_pair(self):
+        # 片方だけを既定値へ戻すと範囲が逆転しうる（60000 と 70000 は 60000-50150）。
+        # 逆転した範囲で起動すると、PASV のときに制御接続ごと切られ、理由は
+        # パネルにもコンソールにも出ない（転送が黙って失敗する）。組として
+        # 使えないので、両方を既定値へ戻す。両方とも読める値で逆転しているとき
+        # （60000 と 55000）も同じ
+        default = (FTP_DEFAULTS["passive_low"], FTP_DEFAULTS["passive_high"])
+        for low, high in (("60000", "70000"), ("60000", "65535.5"),
+                          ("60000", "1e309"), ("1000", "40000"),
+                          ("60000", "55000")):
+            with self.subTest(low=low, high=high):
+                self.assertEqual(self._passive_pair(low, high), default)
+
+    def test_usable_passive_range_is_kept(self):
+        # 逆転していなければ、これまでどおり欄ごとに戻す（片方だけ既定値でもよい）
+        for low, high, expected in (("60000", "65535", (60000, 65535)),
+                                    ("40000", "45000", (40000, 45000)),
+                                    ("50200", "50200", (50200, 50200)),
+                                    ("1000", "60000", (50100, 60000)),
+                                    ("40000", "70000", (40000, 50150))):
+            with self.subTest(low=low, high=high):
+                self.assertEqual(self._passive_pair(low, high), expected)
 
     def test_other_settings_are_still_restored(self):
         """ポートが使えなくても、同じセクションのほかの設定は読み込まれる"""

@@ -220,8 +220,16 @@ class FTPServerPanel(QWidget):
         self.anonymous_write_check.setChecked(
             bool(settings.get("anonymous_write", anonymous)))
         self.anonymous_write_check.setEnabled(anonymous)
+        passive_default = (self.passive_lo_spin.value(),
+                           self.passive_hi_spin.value())
         _restore_port(self.passive_lo_spin, settings.get("passive_low"))
         _restore_port(self.passive_hi_spin, settings.get("passive_high"))
+        # 片方だけ既定値へ戻ると範囲が逆転しうる（60000 と 70000 は
+        # 60000-50150）。逆転した範囲では PASV で制御接続ごと切られ、理由は
+        # どこにも出ない。組として使えないので両方を既定値へ戻す
+        if self.passive_lo_spin.value() > self.passive_hi_spin.value():
+            self.passive_lo_spin.setValue(passive_default[0])
+            self.passive_hi_spin.setValue(passive_default[1])
 
     def _on_browse_directory(self):
         """ディレクトリ参照ダイアログを表示"""
