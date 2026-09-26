@@ -303,6 +303,23 @@ class SFTPManager(QObject):
             self.error_occurred.emit(f"SFTP接続エラー: {str(e)}")
             return False
     
+    def quiesce(self) -> bool:
+        """新しい操作を止め、進行中の操作が手を離すのを上限つきで待つ
+
+        機器へは何も書かない。後始末で SSH の接続を閉じる前に呼ぶ
+        （MainWindow._let_sftp_finish 参照）。disconnect() と同じ上限
+        （_DISCONNECT_WAIT_SECONDS）まで待ち、クライアントはまだ閉じない。
+
+        Returns:
+            bool: 進行中の操作が上限までに終わった（または無かった）なら True
+        """
+        # 新しい操作をここで止める（各メソッドが先頭で見ている）
+        self.is_connected = False
+        if not self._sftp_lock.acquire(timeout=self._DISCONNECT_WAIT_SECONDS):
+            return False
+        self._sftp_lock.release()
+        return True
+
     def disconnect(self):
         """SFTP接続を切断
 

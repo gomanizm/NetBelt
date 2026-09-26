@@ -1164,6 +1164,7 @@ class MainWindow(QMainWindow):
         チャネルへ CHANNEL_CLOSE を書くので、相手が TCP まで受け取りを止めて
         いる間は書けるまで GUI スレッドが止まる（実測: タブを閉じるのに 4.9 秒）。
         先に Transport が閉じていれば、チャネルも閉じ済みで何も書かない。
+        SSH を閉じる前には _let_sftp_finish で進行中の操作を待っておく。
         """
         if device_name not in self.sftp_managers:
             return
@@ -1175,6 +1176,26 @@ class MainWindow(QMainWindow):
         self._release_object(sftp_mgr)
         if self.sftp_panel.current_device == device_name:
             self.sftp_panel.clear()
+
+    def _let_sftp_finish(self, device_name: str) -> None:
+        """SSH を閉じる前に、その機器の SFTP の進行中の操作を上限つきで待つ
+
+        後始末は SSH を SFTP より先に閉じる（_drop_sftp_manager 参照）。
+        待たずに閉じると、置き換えの途中のアップロードが Transport ごと
+        断ち切られ、機器に旧版の設定ファイルと一時名が残る。posix_rename の
+        無い機器では最終名を消した直後に切れ、最終名が無くなる（実測。
+        進捗が 100% に見えた直後に閉じても起きる）。知らせは画面に出ない。
+        新しい操作を止め、いま走っている操作が手を離すのを待つ。待つだけで
+        何も書かないので、相手が TCP まで詰まっていても止まるのは
+        SFTPManager._DISCONNECT_WAIT_SECONDS まで。
+        """
+        sftp_mgr = self.sftp_managers.get(device_name)
+        if sftp_mgr is None:
+            return
+        try:
+            sftp_mgr.quiesce()
+        except Exception as e:
+            print(f"[SFTP] {device_name} の転送の終わりを待てませんでした: {e}")
 
     def _on_connection_success(self, device_name: str, terminal, conn=None):
         """接続成功時の処理（SSH/Telnet/シリアル共通）"""
@@ -1578,7 +1599,9 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage(f"{device_name} から切断されました")
         
         # 接続を閉じてから削除（閉じないとポートを掴んだまま残る）。
-        # SFTP より先に閉じる（_drop_sftp_manager 参照）
+        # SFTP より先に閉じる（_drop_sftp_manager 参照）。機器がシェルだけを
+        # 閉じたときは SFTP が生きているので、進行中の転送を先に待つ
+        self._let_sftp_finish(device_name)
         self._dispose_connection(device_name)
         
         # SFTP接続を切断
@@ -1610,6 +1633,7 @@ class MainWindow(QMainWindow):
         else:
             # その他のエラー
             self.terminal_widget.show_notice(device_name, f"\nエラー: {error}\n")
+            self._let_sftp_finish(device_name)
             self._dispose_connection(device_name)
             # 閉じた client を抱えた SFTP マネージャを残さない（SSH の後に閉じる）
             self._drop_sftp_manager(device_name)
@@ -1705,7 +1729,8 @@ class MainWindow(QMainWindow):
         self.macro_manager.cleanup_device(device_name)
         
         # SSH接続を切断（接続が存在する場合のみ）。SFTP より先に閉じる
-        # （_drop_sftp_manager 参照）
+        # （_drop_sftp_manager 参照）。その前に進行中の転送を待つ
+        self._let_sftp_finish(device_name)
         if device_name in self.connections:
             try:
                 self.connections[device_name].disconnect()
@@ -2978,7 +3003,10 @@ for details.
         # _dispose_connection() を使う。disconnect() は disconnected を出し、
         # その先の _on_connection_closed が切断バナーを端末へ書くので、
         # まだ開いている記録へ終了時の案内が混ざる。
-        # SFTP より先に閉じる（_drop_sftp_manager 参照）
+        # SFTP より先に閉じる（_drop_sftp_manager 参照）。その前に進行中の
+        # 転送を待つ（_let_sftp_finish 参照）
+        for device_name in list(self.sftp_managers.keys()):
+            self._let_sftp_finish(device_name)
         closed = list(self.connections.values())
         for device_name in list(self.connections.keys()):
             self._dispose_connection(device_name)
