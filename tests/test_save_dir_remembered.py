@@ -191,13 +191,23 @@ class SaveDirRememberedTest(unittest.TestCase):
         """覚えたフォルダが消えていたら、これまでどおりの初期値へ戻ること。"""
         w = self._terminal(self._window())
         target = os.path.join(self.saved_dir, "out.log")
+
+        def exec_until_saved(dialog):
+            # 本物の exec はモーダルで、保存ワーカーが書き終えるまで戻らない。
+            # 偽物もワーカーの終わりを待ってから戻す。待たないと、下の rmtree
+            # がワーカーの一時ファイルの作成と競ってフォルダが残り、1〜6% の
+            # 割合で『消えたフォルダを指し続けている』で落ちた（実測）
+            dialog.worker.wait(5000)
+            return True
+
         with mock.patch("PyQt6.QtWidgets.QFileDialog.getSaveFileName",
                         return_value=(target, "")), \
                 mock.patch("ui.dialogs.log_save_dialog.LogSaveProgressDialog.exec",
-                           return_value=True), \
+                           autospec=True, side_effect=exec_until_saved), \
                 mock.patch("PyQt6.QtWidgets.QMessageBox.information"):
             w.save_current_log()
-        shutil.rmtree(self.saved_dir, ignore_errors=True)
+        shutil.rmtree(self.saved_dir)
+        self.assertFalse(os.path.exists(self.saved_dir), "前提: 覚えたフォルダを消せた")
 
         with mock.patch("PyQt6.QtWidgets.QFileDialog.getSaveFileName",
                         return_value=("", "")) as dialog:
