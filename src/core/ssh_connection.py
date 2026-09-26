@@ -9,6 +9,8 @@ import threading
 import time
 from pathlib import Path
 from typing import Callable, Optional
+from paramiko.common import cMSG_CHANNEL_WINDOW_ADJUST
+from paramiko.message import Message
 from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
 
 from .send_backpressure import DrainWatcher, socket_writable
@@ -1048,10 +1050,10 @@ class SSHConnection(QObject):
         # 受信スレッドはふだん短い眠りの間に抜けるので、まず短く待ち、手に
         # している受信を渡し終えてから閉じる（記録を欠かさない）。抜けないのは
         # 書き込みで止まっているとき: 相手が TCP まで受け取りを止めている間、
-        # paramiko の Channel.recv は WINDOW_ADJUST を書けるまで戻らず、ここで
-        # 上限（2 秒）まで GUI スレッドが止まっていた。そのときは先に閉じて
-        # 書き込みを打ち切らせる（手にしていた 1 回分は、待っても詰まりが
-        # 続けば渡らないのは同じ）
+        # 受信スレッドは WINDOW_ADJUST を書けるまで戻らず、ここで上限
+        # （2 秒）まで GUI スレッドが止まっていた。そのときは先に閉じて
+        # 書き込みを打ち切らせる（読み終えた分は、書く前に渡し済み。
+        # _recv_handing_over 参照）
         reader = self._read_thread
         if reader and reader.is_alive():
             reader.join(timeout=self._READER_EXIT_WAIT_SECONDS)
@@ -1244,24 +1246,58 @@ class SSHConnection(QObject):
         except Exception:
             return False
 
+    @staticmethod
+    def _recv_handing_over(channel, nbytes: int, hand_over) -> bytes:
+        """channel.recv(nbytes) と同じに読み、WINDOW_ADJUST を書く前に hand_over(読んだ分) を呼ぶ
+
+        paramiko（4.0.0）の Channel.recv は、読んだ量がしきい値を超えると
+        WINDOW_ADJUST を Transport へ書き、書けるまで戻らない。相手が TCP まで
+        受け取りを止めている間に後始末（dispose）が Transport を閉じると、その
+        書き込みが EOFError になり、recv が読み終えていた分（4096 バイトまで）は
+        返らずに捨てられて、セッションの記録から欠けていた。ここでは同じ手順で
+        読み、渡してから書く。読み方・窓の数え方・書く内容は Channel.recv と
+        同じ。paramiko の Channel でないときは、これまでどおり recv で読む。
+        読み切って閉じていれば b"" を返す（渡す物は無い）。paramiko の版を
+        上げたら、tests/test_ssh_reader_chunk_kept_on_dispose.py で recv と
+        同じ WINDOW_ADJUST を書くことを確かめる（内部の名前を使っている）。
+        """
+        if not isinstance(channel, paramiko.Channel):
+            data = channel.recv(nbytes)
+            if data:
+                hand_over(data)
+            return data
+        data = channel.in_buffer.read(nbytes, channel.timeout)
+        if data:
+            hand_over(data)
+        ack = channel._check_add_window(len(data))
+        if ack > 0:
+            m = Message()
+            m.add_byte(cMSG_CHANNEL_WINDOW_ADJUST)
+            m.add_int(channel.remote_chanid)
+            m.add_int(ack)
+            channel.transport._send_user_message(m)
+        return data
+
     def _read_output(self):
         """バックグラウンドで出力を読み取る"""
         # 受信の切れ目で割れた多バイト文字を、次の受信と繋いで復号する。
         # 受信ごとに復号すると、前半と後半がそれぞれ U+FFFD になり、
         # 画面にもセッションログにも化けたまま渡る
         decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
+
+        def hand_over(data):
+            text = decoder.decode(data)
+            # リアルタイムで出力（バッファリングなし）
+            if text:
+                self.output_received.emit(text)
+
         while not self._stop_reading and self.is_connected:
             try:
                 if self._wait_while_gated():
                     continue
                 if self.channel and self.channel.recv_ready():
-                    data = self.channel.recv(4096)
-                    if data:
-                        text = decoder.decode(data)
-                        # リアルタイムで出力（バッファリングなし）
-                        if text:
-                            self.output_received.emit(text)
-                    else:
+                    if not self._recv_handing_over(self.channel, 4096,
+                                                   hand_over):
                         # データがないのにrecv_readyがTrueの場合は接続が閉じられた
                         if self.is_connected:
                             self.is_connected = False
