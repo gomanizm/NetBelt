@@ -159,7 +159,9 @@ class InteractiveTerminal(QTextEdit):
         within = bar.value() - self._row_of(top)[0]
         relayout(event)
         row_top, height = self._row_of(top)
-        target = row_top + max(0, min(within, height - 1))
+        # 一番上では上端が文書の上の余白にあり、within は負になる。負のまま
+        # 足して余白ごと見せる（0 で切ると値 0 が 4 になっていた）
+        target = row_top + min(within, max(height - 1, 0))
         if target > bar.maximum():
             # 組版が遅れて進むあいだ、スクロールバーの最大値は組み終えた分の
             # 高さのまま残り、値がそこで切られて最下部（追従）扱いになる

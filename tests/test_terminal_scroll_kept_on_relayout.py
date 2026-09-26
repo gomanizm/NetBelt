@@ -193,6 +193,30 @@ class TerminalScrollKeptOnRelayoutTest(unittest.TestCase):
                            position))
                     self.assertFalse(terminal._follow_output)
 
+    def test_the_very_top_stays_at_the_very_top(self):
+        """一番上（値 0）を見ていたら、縮めても文字を大きくしても値 0 のままなこと。
+
+        一番上では、上端の頭（1 ピクセル目）が文書の上の余白にあり、最初の
+        表示行はそれより下から始まる。組み直しの後に最初の表示行の上端へ
+        合わせると、余白の分だけ下へずれて値が 4 になっていた（a852f59）。
+        """
+        for name, change in (("narrower", lambda w: w.resize(500, 500)),
+                             ("bigger font", self._bigger_font)):
+            with self.subTest(change=name):
+                w, terminal = self._widget(300)
+                bar = terminal.verticalScrollBar()
+                bar.setValue(0)
+                self._pump(0.05)
+                self.assertFalse(terminal._follow_output,
+                                 "前提: 上へスクロールしている")
+
+                change(w)
+                self._pump(0.4)
+
+                self.assertEqual(bar.value(), 0)
+                self.assertEqual(self._top(terminal), ("line 000000", 0))
+                self.assertFalse(terminal._follow_output)
+
     def test_following_output_stays_at_the_bottom(self):
         """最下部を見ているときは、縮めても文字を大きくしても最下部のままなこと。"""
         w, terminal = self._widget(300)
