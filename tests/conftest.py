@@ -40,17 +40,23 @@ if os.path.isdir(_font_dir):
 # 収集より先に動く pytest_configure で切り替える）。
 # すでに %TEMP% にある物には触らない。止め損ねたスレッドや子プロセスが掴んで
 # いるファイルは消せずに残る（そのフォルダだけが残る）。
+# フォルダ名は短くする（nbt-xxxxxxxx。TEMP が 13 文字長くなる）。更新のテストは
+# TEMP の下へさらに掘り、updater.bat の xcopy は 260 文字を超えるファイルを
+# 黙って飛ばす（upd-04）。TEMP（このフォルダを含む）が 150 文字を超えるあたり
+# から、更新のテストが落ち始める。全件を流すときは、TEMP を %TEMP% の直下か
+# 8.3 の短い名前のような短い場所にする。
 _TEMP_VARS = ("TEMP", "TMP", "TMPDIR")
+_TEMP_SESSION_PREFIX = "nbt-"
 _temp_session = None
 
 
 def _enter_temp_session():
-    """いまの一時フォルダの下に netbelt-tests-* を作り、以後の置き場にする。
+    """いまの一時フォルダの下に nbt-* を作り、以後の置き場にする。
 
     子プロセスも同じ場所を使うよう、環境変数も向ける。戻り値は
     _leave_temp_session に渡す。
     """
-    path = tempfile.mkdtemp(prefix="netbelt-tests-")
+    path = tempfile.mkdtemp(prefix=_TEMP_SESSION_PREFIX)
     state = {"dir": path, "tempdir": tempfile.tempdir,
              "env": {key: os.environ.get(key) for key in _TEMP_VARS}}
     for key in _TEMP_VARS:

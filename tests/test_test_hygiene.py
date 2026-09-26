@@ -9,7 +9,7 @@
   いた。MainWindow を作るテストは、インストール済みの NetBelt と共用の
   %TEMP%\\NetBeltUpdates にも触っていた。
   1 つずつ直すと数百行になるので、conftest でまとめて片付ける。セッションの頭で
-  %TEMP% の下に netbelt-tests-* を 1 つ作り、tempfile.tempdir と環境変数
+  %TEMP% の下に nbt-* を 1 つ作り、tempfile.tempdir と環境変数
   TEMP / TMP / TMPDIR をそこへ向ける（子プロセスも同じ場所を使う）。終わりに
   元へ戻してから、そのフォルダを丸ごと消す。すでに %TEMP% にある物には触らない。
 
@@ -42,11 +42,18 @@ sys.path.insert(0, "src")
 class TempIsASessionFolderTest(unittest.TestCase):
 
     def _assert_session_folder(self, path, what):
-        """path がこのセッション用のフォルダ（%TEMP%\\netbelt-tests-*）であること"""
-        self.assertTrue(os.path.basename(path).startswith("netbelt-tests-"),
+        """path がこのセッション用のフォルダ（%TEMP%\\nbt-*）であること"""
+        self.assertTrue(os.path.basename(path).startswith("nbt-"),
                         "%sがセッション用のフォルダではない: %s" % (what, path))
         self.assertEqual(os.path.normcase(path),
                          os.path.normcase(tempfile.gettempdir()), what)
+
+    def test_the_folder_name_is_short(self):
+        # 更新のテストは TEMP の下へさらに掘り、updater.bat の xcopy は 260 文字を
+        # 超えるファイルを黙って飛ばす（upd-04）。フォルダ名の分だけ、TEMP を
+        # 短くしないと落ちるようになる。実測: 141 文字の TEMP で、netbelt-tests-*
+        # （23 文字足す）では test_updater_old_script_new_payload の 1 件が落ちた
+        self.assertLessEqual(len(os.path.basename(tempfile.gettempdir())), 12)
 
     def test_temp_is_a_folder_of_this_session(self):
         self._assert_session_folder(tempfile.gettempdir(), "一時フォルダ")
