@@ -19,6 +19,23 @@ rd /s /q で自分の目印（NetBelt-update-lock）を消した後、2 周目�
 直した形: その 1 行を (set /p LOCK_OWNER=<"...") 2>nul と括弧で包み、
 リダイレクトの失敗ごと 2>nul で黙らせる。ファイルがあるときは、これまで
 どおり 1 行目を読める（2 周走査する仕組みそのものは変えない）。
+
+同じ形の残り（:release_lock_old）: インストール先に holder.txt の無い空の
+NetBelt-update-lock.<STAMP>.old が残っていると（md の直後で落ちた更新の
+目印を、回収しようとした側が ren の直後に落ちたときにできる）、上の直しの
+後（ebbe593）でも、正常に当たった更新の「クリーンアップ中...」の直後に
+
+    The system cannot find the file specified.
+
+が 2 行出ていた（実測。:release_lock_sweep の 2 周 × 1 行。v1.3.1 では
+上の 1 行と合わせて 3 行）。出どころは .old を 1 つずつ見る
+:release_lock_old の、括弧で包んでいない
+
+    set /p LOCK_OWNER=<"%~1\\holder.txt" 2>nul
+
+で、理由は上と同じ（無いファイルを入力として開く失敗が 2>nul より先に
+出る）。直した形も同じで、括弧で包んで 2>nul で受ける。その .old は
+自分のものではないので、これまでどおり消さずに残す。
 """
 import hashlib
 import io
@@ -36,6 +53,13 @@ UPDATER = os.path.join(REPO_ROOT, "updater.bat")
 # chcp 65001 の下では英語で出る。念のため日本語の文言も見る。
 STRAY_MESSAGES = ("The system cannot find the path specified",
                   "指定されたパスが見つかりません")
+# 無いファイルを開けなかったときの文言も含めた、見つからない系の行すべて。
+MISSING_MESSAGES = STRAY_MESSAGES + (
+    "The system cannot find the file specified",
+    "指定されたファイルが見つかりません")
+# 他の更新が残した、holder.txt の無い .old。TRY は 20 まで、%RANDOM% は
+# 32767 までなので、この名前がこの回の STAMP と重なることは無い。
+LEFTOVER_OLD = "NetBelt-update-lock.NetBeltUpdate_99_99999.old"
 
 
 def _runnable_exe():
@@ -104,6 +128,33 @@ class UpdaterReleaseLockQuietTest(unittest.TestCase):
 
         stray = [line for line in text.splitlines()
                  if any(m in line for m in STRAY_MESSAGES)]
+        self.assertEqual(stray, [],
+                         "成功した更新なのにエラーのような行が出た:\n" + text)
+
+    def test_a_leftover_old_marker_without_holder_prints_no_missing_error(self):
+        """holder.txt の無い空の .old が残っていても、正常に当たった更新の
+        出力に見つからないという行が出ず、その .old は消さずに残ること。"""
+        leftover = os.path.join(self.app_dir, LEFTOVER_OLD)
+        os.makedirs(leftover)
+
+        code, text = self._run()
+
+        # 前提: 起動まで含めて正常な道を通ったこと
+        self.assertEqual(code, 0, text)
+        self.assertIn("更新が完了しました", text, text)
+        self.assertIn("起動しました", text, text)
+        with io.open(self.app_path, "rb") as f:
+            self.assertEqual(f.read(), self.new_exe, text)
+        # 他人の .old は消さない（持ち主を確かめられないものは触らない）
+        self.assertEqual(
+            sorted(n for n in os.listdir(self.app_dir)
+                   if n.startswith("NetBelt-update-")), [LEFTOVER_OLD],
+            "目印が残ったか、他人の .old が消えた:\n" + text)
+        self.assertEqual(os.listdir(leftover), [],
+                         "他人の .old の中身が変わった:\n" + text)
+
+        stray = [line for line in text.splitlines()
+                 if any(m in line for m in MISSING_MESSAGES)]
         self.assertEqual(stray, [],
                          "成功した更新なのにエラーのような行が出た:\n" + text)
 

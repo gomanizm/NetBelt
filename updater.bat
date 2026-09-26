@@ -818,7 +818,9 @@ exit /b 0
 
 :release_lock_old
 set "LOCK_OWNER="
-set /p LOCK_OWNER=<"%~1\holder.txt" 2>nul
+rem In parentheses, as in :release_lock_sweep: a .old left without a
+rem holder.txt would otherwise print a missing-file line on every pass.
+(set /p LOCK_OWNER=<"%~1\holder.txt") 2>nul
 if "!LOCK_OWNER!"=="!STAMP!" rd /s /q "%~1" 2>nul
 exit /b 0
 
