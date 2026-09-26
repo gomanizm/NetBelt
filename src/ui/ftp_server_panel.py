@@ -7,8 +7,24 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtGui import QFont
 from core.ftp_server import FTPServerManager
+from core.sockets import tcp_port_number
 from ui import log_export, plain_log, theme
 from datetime import datetime
+
+
+def _restore_port(spin, value):
+    """config.json のポートを欄へ戻す。使えない値なら欄の既定値のまま。
+
+    config.json は手で編集できる。json は 2121.0 や 1e309 を float に読み、
+    QSpinBox.setValue は float を TypeError で断る。パネルは MainWindow の
+    構築中に作られるので、受けないとアプリが起動しない。読み方は SSH・Telnet
+    と同じ（tcp_port_number）。欄の範囲外は端へ寄せず（設定していない番号で
+    待ち受ける）既定値のままにする
+    """
+    port = tcp_port_number(value)
+    if port is not None and spin.minimum() <= port <= spin.maximum():
+        spin.setValue(port)
+
 
 class FTPServerPanel(QWidget):
     """FTPサーバー制御パネル"""
@@ -192,7 +208,7 @@ class FTPServerPanel(QWidget):
         settings = self.config_manager.get_server_settings("ftp_server")
         # 既定は専用フォルダ（個人フォルダを公開しないため）
         self.root_dir_edit.setText(settings.get("root_directory") or "./ftp_root")
-        if settings.get("port"): self.port_spin.setValue(settings["port"])
+        _restore_port(self.port_spin, settings.get("port"))
         if settings.get("username"): self.username_edit.setText(settings["username"])
         if settings.get("password"): self.password_edit.setText(settings["password"])
         anonymous = bool(settings.get("anonymous", False))
@@ -204,8 +220,8 @@ class FTPServerPanel(QWidget):
         self.anonymous_write_check.setChecked(
             bool(settings.get("anonymous_write", anonymous)))
         self.anonymous_write_check.setEnabled(anonymous)
-        if settings.get("passive_low"): self.passive_lo_spin.setValue(settings["passive_low"])
-        if settings.get("passive_high"): self.passive_hi_spin.setValue(settings["passive_high"])
+        _restore_port(self.passive_lo_spin, settings.get("passive_low"))
+        _restore_port(self.passive_hi_spin, settings.get("passive_high"))
 
     def _on_browse_directory(self):
         """ディレクトリ参照ダイアログを表示"""
