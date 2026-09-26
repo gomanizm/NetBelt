@@ -1022,9 +1022,14 @@ class MIBResolver:
         # から来た名前。子が fresh かを親から引く
         fresh_in_module = set()
         fresh_known = set()
-        # 借用で決まった宣言（子孫まで）の (モジュール, 名前)。その下の
-        # 1.3.1 では読めなかった形の子は解決しない（借用の説明を見ること）
+        # 借用で決まった宣言（子孫まで）の (モジュール, 名前) と、known の値が
+        # そうした宣言から来た名前。その下の 1.3.1 では読めなかった形の子は
+        # 解決しない（借用の説明を見ること）。後者が無いと、よそのモジュール
+        # が取り込んだ親では借用の印が消える（実測: M-MIB の借用で決まった
+        # acmeX ::= { system 4 } を取り込んだ N-MIB の { acmeX 6 1 } が、
+        # 標準の 1.3.6.1.2.1.1.4.6.1 に付いた）
         borrowed = set()
+        borrowed_known = set()
         in_module = {}
         resolved = {}
         pending = list(definitions)
@@ -1087,6 +1092,7 @@ class MIBResolver:
                 else:
                     parent_oid = known.get(parent)
                     parent_fresh = parent in fresh_known
+                    parent_borrowed = parent in borrowed_known
                 if parent_oid is None or (new_form and parent_borrowed):
                     still_pending.append((name, parent, index, module))
                     continue
@@ -1100,6 +1106,10 @@ class MIBResolver:
                         fresh_known.add(name)
                     else:
                         fresh_known.discard(name)
+                    if parent_borrowed:
+                        borrowed_known.add(name)
+                    else:
+                        borrowed_known.discard(name)
                 if fresh:
                     fresh_in_module.add((module, name))
                 else:
