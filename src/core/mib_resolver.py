@@ -97,6 +97,9 @@ class MIBResolver:
         # モジュール名→そのモジュールが宣言している名前。抽出のあいだに
         # 貯めて解決で使う。詳しくは _MIB_LOCAL_NAME を見ること
         self._module_local_names: Dict[str, set] = {}
+        # 1.3.1 では読めなかった形で抜き出した定義。詳しくは
+        # _extract_mib_definitions を見ること
+        self._newly_read_definitions: set = set()
         self._load_default_mibs()
         self._load_custom_mibs()
     
@@ -410,6 +413,7 @@ class MIBResolver:
             unread = set()
             # 解析し直すたびに取り直す（前回の mibs/ の名前を残さない）
             self._module_local_names = {}
+            self._newly_read_definitions = set()
             for filename in current_files.keys():
                 filepath = os.path.join(mibs_dir, filename)
                 try:
@@ -522,23 +526,29 @@ class MIBResolver:
 
     @classmethod
     def _parse_oid_value(cls, text: str):
-        """右辺 `{ … }` の中身を (親の名前, 添字) にする。読めなければ None。
+        """右辺 `{ … }` の中身を (親の名前, 添字, ラベル付きか) にする。
+        読めなければ None。
 
-        { aRoot 0 1 } → ('aRoot', '0.1')、{ mib-2 x(26) 4 } → ('mib-2',
-        '26.4')、{ iso(1) org(3) 6 } → ('', '1.3.6')。親 '' は「根から
-        数字だけで書いた OID」。2 つ目以降に裸の名前が来る形（{ a b 1 }）は
-        OID にならないので読まない（これまでどおり、その定義だけ落とす）。
+        { aRoot 0 1 } → ('aRoot', '0.1', False)、{ mib-2 x(26) 4 } →
+        ('mib-2', '26.4', True)、{ iso(1) org(3) 6 } → ('', '1.3.6', True)。
+        親 '' は「根から数字だけで書いた OID」。2 つ目以降に裸の名前が来る
+        形（{ a b 1 }）は OID にならないので読まない（これまでどおり、その
+        定義だけ落とす）。ラベル付きか＝`x(26)` の形の添字が 1 つでも
+        あったか。1.3.1 は { 親 番号 } しか読めなかったので、{ system sn(5) }
+        のような 1 段も 1.3.1 には無かった宣言として扱う（_resolve_definitions）
         """
         import re
 
         component = re.compile(cls._MIB_OID_COMPONENT)
         parent, numbers, pos = '', [], 0
+        has_label = False
         text = text.rstrip()
         while pos < len(text):
             match = component.match(text, pos)
             if match is None:
                 return None
             label, labeled, number, bare = match.groups()
+            has_label = has_label or labeled is not None
             if labeled is not None and not (
                     pos == 0 and label not in cls._MIB_ROOT_LABELS):
                 numbers.append(labeled)
@@ -551,7 +561,7 @@ class MIBResolver:
             pos = match.end()
         if not numbers:
             return None
-        return parent, '.'.join(numbers)
+        return parent, '.'.join(numbers), has_label
 
     # 定義の名前。全部大文字の語は名前として認めない。ASN.1 の値参照は
     # 小文字で始まるので、IMPORTS / EXPORTS のような節のキーワードが
@@ -833,6 +843,12 @@ class MIBResolver:
             if local_names is None:
                 # __init__ を通さずに作った（検証用の __new__）ときの保険
                 local_names = self._module_local_names = {}
+            # 1.3.1 では読めなかった形で抜き出した定義（ラベル付きの添字）。
+            # 解決で 1.3.1 の 1 段と区別する（_resolve_definitions の
+            # preset の説明を見ること）
+            newly_read = getattr(self, '_newly_read_definitions', None)
+            if newly_read is None:
+                newly_read = self._newly_read_definitions = set()
             for module, text in sections:
                 # `}` の直後から始まる定義を行頭へ。詳しくは
                 # _MIB_DEFINITION_AFTER_BRACE を見ること
@@ -847,8 +863,11 @@ class MIBResolver:
                                              re.MULTILINE | re.DOTALL):
                         value = self._parse_oid_value(match.group(2))
                         if value is not None:
-                            definitions.append(
-                                (match.group(1), value[0], value[1], module))
+                            definition = (match.group(1), value[0], value[1],
+                                          module)
+                            definitions.append(definition)
+                            if value[2]:
+                                newly_read.add(definition)
                 for match in re.finditer(self._MIB_TRAP_TYPE, text,
                                          re.MULTILINE | re.DOTALL):
                     definitions.append((match.group(1), match.group(2),
@@ -968,9 +987,9 @@ class MIBResolver:
         # 1.3.1 では OID が決まらなかった宣言（fresh）は、同じ名前の候補が
         # ほかにある（内蔵表か custom_mibs.json にある、または別のモジュール
         # も宣言している）とき、よそのモジュールから名前で引く known へ
-        # 入れない。fresh は、右辺が 1 段（{ 親 添字 }）でない宣言（複数
-        # 添字・ラベル付きフルパス・SMIv1 の Trap。1.3.1 までは抽出できな
-        # かった形）と、親が fresh な宣言（子孫まで）。IMPORTS を見ない
+        # 入れない。fresh は、右辺が 1.3.1 の 1 段（{ 親 番号 }）でない宣言
+        # （複数添字・ラベル付きの添字・SMIv1 の Trap。1.3.1 までは抽出
+        # できなかった形）と、親が fresh な宣言（子孫まで）。IMPORTS を見ない
         # ので、候補が 2 つ以上あると取り込んだ側の子は後に決まった方に
         # 付く（この関数の説明の「残る制限」）。1.3.1 で決まらなかった宣言が
         # その候補に加わると、1.3.1 で正しく付いていた名前がよその木へ移る
@@ -981,9 +1000,11 @@ class MIBResolver:
         # 1 段で置いた system ::= { acmeRoot 9 } が known に入り、SNMPv2-MIB
         # の system を取り込んだ zAlarm が 1.3.6.1.4.1.777.9.99 に付いた）。
         # 自分のモジュールの子の親（in_module）には、これまでどおり使う。
-        # { 親 x(26) } は { 親 26 } と同じ 1 段として扱う（1.3.1 では読め
-        # なかった形だが、実物の MIB 集 1,653 本に 0 件）
+        # { 親 x(26) } も 1.3.1 では読めなかったので、1 段でも fresh に数える
+        # （実測: { acmeRoot sys(9) } で置いた system が known に入り、上と
+        # 同じく zAlarm が自社の木に付いた）
         preset = set(known)
+        newly_read = getattr(self, '_newly_read_definitions', None) or ()
         # fresh な宣言の (モジュール, 名前) と、known の値が fresh な宣言
         # から来た名前。子が fresh かを親から引く
         fresh_in_module = set()
@@ -1011,6 +1032,10 @@ class MIBResolver:
                 for _pending_name, _, _, _pending_module in pending:
                     awaiting.add((_pending_module, _pending_name))
             for name, parent, index, module in pending:
+                # 自分の右辺が 1.3.1 では読めなかった形か（preset の説明）
+                new_form = not parent or '.' in index or (
+                    bool(newly_read)
+                    and (name, parent, index, module) in newly_read)
                 parent_fresh = False
                 if parent == 'enterprises':
                     parent_oid = '1.3.6.1.4.1'
@@ -1021,7 +1046,7 @@ class MIBResolver:
                     parent_oid = in_module.get(module, {}).get(parent)
                     parent_fresh = (module, parent) in fresh_in_module
                     if (parent_oid is None and borrow
-                            and '.' not in index
+                            and not new_form
                             and (module, parent) not in awaiting
                             and declaring.get(parent, 0) < 2):
                         # よそのモジュールに同名が無い＝曖昧ではない。
@@ -1029,10 +1054,11 @@ class MIBResolver:
                         # これまでどおり使う。ただし 1.3.1 と同じ 1 段の
                         # 子だけ。ここへ来る親は宣言があるのに OID が
                         # 決まらない節（右辺を読めない { a b 1 } など）で、
-                        # 1.3.2 から抜き出す複数添字の子と TRAP-TYPE
-                        # （添字 0.N）にまで借用を広げない（実測: 自社が
-                        # 読めない右辺で宣言した system の { system 5 1 } が
-                        # 標準の 1.3.6.1.2.1.1.5.1 に付いた）
+                        # 1.3.2 から抜き出す複数添字・ラベル付きの子と
+                        # TRAP-TYPE（添字 0.N）にまで借用を広げない（実測:
+                        # 自社が読めない右辺で宣言した system の
+                        # { system 5 1 } が標準の 1.3.6.1.2.1.1.5.1 に、
+                        # { system sn(5) } が 1.3.6.1.2.1.1.5 に付いた）
                         parent_oid = known.get(parent)
                         parent_fresh = parent in fresh_known
                 else:
@@ -1043,7 +1069,7 @@ class MIBResolver:
                     continue
                 oid = f"{parent_oid}.{index}" if parent_oid else index
                 # 1.3.1 では決まらなかった宣言か（preset の説明を見ること）
-                fresh = not parent or '.' in index or parent_fresh
+                fresh = new_form or parent_fresh
                 if not fresh or (name not in preset
                                  and declaring.get(name, 0) < 2):
                     known[name] = oid
