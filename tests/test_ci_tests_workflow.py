@@ -21,6 +21,8 @@
     （足してよいのは表示の引数 -r… だけ）
   - Run tests までの手順は、リリースと同じ名前・並び・キーで、その前の手順は中身も
     同じ（依存を足す手順などを入れない）
+  - 手順（シーケンスの項目）はすべて '- name:' で始める（名前の無い手順や、name を
+    後に書いた手順は、名前で比べる確かめに現れない）
   - 書いてよいキーを決め、それ以外（continue-on-error・if・ジョブやワークフローの
     段の env・strategy など、テストを走らせないか落ちても緑にできるもの）を落とす
   - Run tests に shell・defaults・working-directory を書かない（リリースと同じく
@@ -32,7 +34,11 @@
 import io
 import os
 import re
+import shutil
+import sys
+import tempfile
 import unittest
+from unittest import mock
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WORKFLOWS = os.path.join(REPO_ROOT, ".github", "workflows")
@@ -259,6 +265,17 @@ class CiTestsWorkflowTest(unittest.TestCase):
                     self.assertEqual([l.strip() for l in _code_lines(tests_step)],
                                      [l.strip() for l in _code_lines(release_step)])
 
+    def test_every_step_starts_with_its_name(self):
+        # 上の確かめは '- name:' で始まる項目だけを手順として見る。名前の無い
+        # 手順（- run: / - uses: で始まる）や、name を後に書いた手順は、名前の
+        # 並びにもキーの比べにも現れず、Run tests の前に入れても通っていた
+        # （- run: echo "PYTEST_ADDOPTS=--collect-only" >> $env:GITHUB_ENV で、
+        # テストを 1 件も走らせずに緑）。シーケンスの項目はすべて '- name:' で
+        # 始める。release の方は tags の '- ...' があるので当てない
+        self.assertEqual([l.strip() for l in _code_lines(self.tests)
+                          if re.match(r"^\s*-(\s|$)", l)
+                          and not re.match(r"^\s*- name:", l)], [])
+
     def test_it_uses_the_same_runner_python_and_pytest_as_the_release(self):
         for pattern in (r"^\s*runs-on:\s*(\S+)",
                         r"^\s*python-version:\s*(\S+)",
@@ -316,6 +333,82 @@ class CiTestsWorkflowTest(unittest.TestCase):
 
     def test_a_hang_is_cut_off(self):
         self.assertRegex(self.tests, r"(?m)^\s*timeout-minutes:\s*\d+")
+
+
+class NamelessStepDriftTest(unittest.TestCase):
+    """名前の無い手順を Run tests の前に入れたずれを、見張りが捕まえることの検証。
+
+    何が起きていたか（ebbe593 で実測）
+      見張りは '- name:' で始まる項目だけを手順として見て、名前の並びと
+      キーを比べていた。名前の無い手順（'- run:' / '- uses:' で始まる項目）、
+      '- id:' で始まり name を後に書いた項目、run の後に name を書いた項目、
+      '-' だけの行で始まる項目、流れ形式の項目（- {name: ..., run: ...}）を
+      Run tests の前に入れると、見張りの 12 件はすべて通った。PyYAML で読むと、
+      どれも Run tests の前の本物の手順になる。例えば
+      '- run: echo "PYTEST_ADDOPTS=--collect-only" >> $env:GITHUB_ENV' を足すと、
+      テストを 1 件も走らせずにジョブが緑になる。'- uses: actions/checkout@v7'
+      に with: ref: v1.3.0 を付ければ、別の版を検査することになる。
+    どう直したか
+      tests.yml のシーケンスの項目は、すべて '- name:' で始めることにした
+      （CiTestsWorkflowTest.test_every_step_starts_with_its_name）。ここでは、
+      tests.yml の写しの Run tests の前へ手順を入れて見張りに読ませ、どれかの
+      確かめが落ちることを見る。
+    """
+
+    # Run tests の前へ入れる手順（行の頭は、Run tests の '- ' の字下げにそろえる）
+    DRIFTS = {
+        "nameless run: collect-only via GITHUB_ENV":
+            ['- run: echo "PYTEST_ADDOPTS=--collect-only" >> $env:GITHUB_ENV'],
+        "nameless run: add a dependency":
+            ["- run: pip install pytest-custom_exit_code"],
+        "nameless uses: check out another ref":
+            ["- uses: actions/checkout@v7", "  with:", "    ref: v1.3.0"],
+        "name written after run":
+            ["- run: pip install something", "  name: Extra step"],
+        "id before name":
+            ["- id: extra", "  name: Extra", "  run: pip install something"],
+        "dash alone on its line":
+            ["-", "  run: pip install something"],
+        "flow mapping":
+            ["- {name: Extra, run: pip install something}"],
+    }
+
+    def _failed_checks(self, text):
+        """text を tests.yml として見張りに読ませ、落ちた確かめの名前を返す"""
+        folder = tempfile.mkdtemp(prefix="netbelt-ci-drift-")
+        self.addCleanup(shutil.rmtree, folder, True)
+        path = os.path.join(folder, "tests.yml")
+        with io.open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        suite = unittest.defaultTestLoader.loadTestsFromTestCase(CiTestsWorkflowTest)
+        result = unittest.TestResult()
+        with mock.patch.object(sys.modules[__name__], "TESTS", path):
+            suite.run(result)
+        return sorted({t.id().split(".")[-1].split(" ")[0]
+                       for t, _ in result.failures + result.errors})
+
+    @staticmethod
+    def _insert_before_run_tests(text, step_lines):
+        lines = text.splitlines()
+        at = [i for i, l in enumerate(lines)
+              if re.fullmatch(r"\s*- name: %s\s*" % STEP_NAME, l)]
+        assert len(at) == 1, at
+        indent = lines[at[0]][:len(lines[at[0]]) - len(lines[at[0]].lstrip())]
+        lines[at[0]:at[0]] = [indent + l for l in step_lines] + [""]
+        return "\n".join(lines) + "\n"
+
+    def test_the_copy_itself_passes(self):
+        # 写しを読ませる手順そのものが、ずれの無い写しを落とさないこと
+        self.assertEqual(self._failed_checks(_read(TESTS)), [])
+
+    def test_a_nameless_step_before_the_tests_is_caught(self):
+        base = _read(TESTS)
+        for name, step_lines in self.DRIFTS.items():
+            with self.subTest(drift=name):
+                drifted = self._insert_before_run_tests(base, step_lines)
+                self.assertNotEqual(drifted, base)
+                self.assertNotEqual(self._failed_checks(drifted), [],
+                                    "見張りが見逃した: %r" % step_lines)
 
 
 if __name__ == "__main__":
