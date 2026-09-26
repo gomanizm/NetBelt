@@ -16,9 +16,12 @@
 『'cp932' codec can't encode character』で失敗する）。441ea02 は paramiko に
 cp932 で読ませていたので『ホストキーが変更されています』で止まっていた。
 
-どう直したか。ハッシュ化名があるときに自前のローダへ回すのは、ファイルが
-ASCII だけのときに限る。ASCII 以外を含むファイルは今までどおり paramiko に
-読ませる（読み込みの重さも今までどおり）。
+どう直したか。ハッシュ化名の行があるファイルは、ASCII かどうかによらず、
+自前のローダではなく _HostKeysLoadedLinearly で読む。paramiko の
+HostKeys.load の読み方（既定の文字コード・text モードの改行）のまま、1 行ごとの
+重複の判定だけを名前の文字列の比較に替えたもので、cp932 の日本語名も
+paramiko と同じ名前で読める。読み込みの重さは行数に比例する
+（test_known_hosts_load_cost.py・test_known_hosts_load_cost_non_ascii.py）。
 
 テストの前提: paramiko.hostkeys の open を、文字コードを指定しないテキストを
 cp932 で開くものに差し替える（日本語の Windows の既定と同じ）。どの環境で
@@ -195,7 +198,7 @@ class KnownHostsHashedNonAsciiNameTest(unittest.TestCase):
                 self.assertEqual(self.known_hosts.read_bytes(), data)
 
     def test_ascii_file_with_hashed_names_uses_own_loader(self):
-        """ASCII だけのファイルは、ハッシュ化名があれば今までどおり自前で読むこと。"""
+        """ASCII だけのファイルも、ハッシュ化名があれば _HostKeysLoadedLinearly で読む側へ回すこと。"""
         from core import ssh_connection
         self.known_hosts.write_bytes(
             (self._line(HostKeys.hash_host("198.51.100.9"), self.key_c)
