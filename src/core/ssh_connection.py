@@ -134,21 +134,29 @@ def _add_other_spelling_keys(keys, host, port):
     ほかの綴りの行（_names_same_endpoint）の鍵を、ファイルの順に
     接続先名の鍵として足す（paramiko の照合は種別ごとに先頭の鍵を
     使う）。読み替えはメモリ上だけで、known_hosts には書かない。
+
+    Returns:
+        読み替えに使った行の名前（known_hosts に書かれた綴り）。鍵が
+        食い違ったときの案内に載せる。読み替えなければ空
     """
     server_name = known_hosts_server_name(host, port)
     if keys.lookup(server_name) is not None:
-        return
+        return []
     if port == 22:
         legacy = keys.lookup("[%s]:22" % host)
         if legacy is not None:
             for keytype in legacy.keys():
                 keys.add(host, keytype, legacy[keytype])
-            return
+            return ["[%s]:22" % host]
+    used = []
     for entry in list(keys._entries):
-        if any(_names_same_endpoint(name, host, port)
-               for name in entry.hostnames):
+        name = next((name for name in entry.hostnames
+                     if _names_same_endpoint(name, host, port)), None)
+        if name is not None:
             keys._entries.append(paramiko.hostkeys.HostKeyEntry(
                 [server_name], entry.key))
+            used.append(name)
+    return list(dict.fromkeys(used))
 
 
 def _iter_known_hosts_lines(path):
@@ -635,8 +643,10 @@ class SSHConnection(QObject):
         """同じ接続先を別の綴りの名前で保存した鍵を、照合に使う。
 
         規則は _add_other_spelling_keys（保存直前の食い違い確認も同じ規則）。
+        読み替えに使った行の名前を返す。
         """
-        _add_other_spelling_keys(client.get_host_keys(), self.host, self.port)
+        return _add_other_spelling_keys(
+            client.get_host_keys(), self.host, self.port)
 
     def _refuse_or_warn_broken_lines(self, broken, known_hosts_path,
                                      client=None):
@@ -838,6 +848,8 @@ class SSHConnection(QObject):
         client = None       # 例外の後始末で閉じるため、try の外で用意する
         # client.connect() の中で作られた Transport。後始末で直接閉じる
         transports = []
+        # 照合に読み替えた別の綴りの行の名前（鍵が食い違ったときの案内用）
+        other_names = []
 
         def transport_factory(*args, **kwargs):
             transport = paramiko.Transport(*args, **kwargs)
@@ -872,8 +884,8 @@ class SSHConnection(QObject):
                 self._setup_host_keys(client)
             except HostKeyStoreError as e:
                 return self._fail(str(e))
-            self._use_other_spelling_keys(client)
-            
+            other_names = self._use_other_spelling_keys(client)
+
             # 接続パラメータの準備
             connect_kwargs = {
                 'hostname': self.host,
@@ -978,10 +990,17 @@ class SSHConnection(QObject):
         except paramiko.AuthenticationException:
             return self._fail(self._auth_failure_message(), client, transports)
         except paramiko.BadHostKeyException:
+            # 別の綴りの行の鍵で食い違ったなら、その行を名指しする。接続先の
+            # 綴りの行は known_hosts に無いので、消すべき行が見つけにくい
+            note = ""
+            if other_names:
+                note = ("\n照合に使ったのは、名前の大文字小文字やポートの書き方"
+                        "が違う次の行です（同じ接続先の行です）: %s"
+                        % ", ".join(other_names))
             return self._fail(
                 "ホストキーが変更されています(中間者攻撃の可能性)。"
-                "意図的な変更の場合は ~/.netbelt/known_hosts の該当ホスト行を削除してください。",
-                client, transports)
+                "意図的な変更の場合は ~/.netbelt/known_hosts の該当ホスト行を削除してください。"
+                + note, client, transports)
         except paramiko.SSHException as e:
             return self._fail(f"SSH接続エラー: {str(e)}", client, transports)
         except Exception as e:
