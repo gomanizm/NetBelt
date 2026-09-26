@@ -266,20 +266,30 @@ def load_known_hosts(hostkeys, path):
     lookup 経由でハッシュ化名（|1|salt|hash）とも照合するので、それを
     使うと「ハッシュ行＋同じ鍵の平文行」の平文行が畳まれ、別の機器の
     保存で利用者の書いた行が黙って消える（実測）。
+
+    同じ行があるかは (名前, 鍵種別, 鍵) の集合で引く。1 名前ごとに _entries
+    全体をたどると、名前がすべて異なる 1 万行で約 5,000 万回の比較になり、
+    保存のたびに錠の中で 2 回通るので 4 秒ほど他の接続を待たせていた（実測）。
     """
     from paramiko.hostkeys import HostKeyEntry
+    seen = _entry_names_and_keys(hostkeys._entries)
     for _lineno, _text, _raw, entry in _iter_known_hosts_lines(path):
         if entry is None:
             continue
         keytype = entry.key.get_name()
         blob = entry.key.asbytes()
         for name in entry.hostnames:
-            if any(name in e.hostnames and e.key.get_name() == keytype
-                   and e.key.asbytes() == blob
-                   for e in hostkeys._entries):
+            if (name, keytype, blob) in seen:
                 continue
+            seen.add((name, keytype, blob))
             # HostKeys.load 自身も _entries へ append する（paramiko 4.0.0）
             hostkeys._entries.append(HostKeyEntry([name], entry.key))
+
+
+def _entry_names_and_keys(entries):
+    """エントリの (名前, 鍵種別, 鍵) を集合にする（重複の判定用）"""
+    return {(name, e.key.get_name(), e.key.asbytes())
+            for e in entries if e.key is not None for name in e.hostnames}
 
 
 def _has_utf8_bom(path):
@@ -307,13 +317,25 @@ class _HostKeysLoadedLinearly(paramiko.HostKeys):
     load_known_hosts と同じ名前の文字列の比較にする。畳むのは同じ名前・
     同じ鍵の行だけなので、照合（lookup）の結果は変わらない。
     読み込みにだけ使い、照合は paramiko.HostKeys へ移してから行う。
+
+    判定は (名前, 鍵種別, 鍵) の集合で引く。HostKeys.load は _entries へ
+    足すだけなので、check() のたびに増えた分だけを集合へ足せば、読み込みの
+    重さは行数に比例する（1 行ごとに _entries 全体をたどると、名前がすべて
+    異なる 1 万行で約 5,000 万回の比較・約 2 秒。実測）。
     """
 
+    def __init__(self, filename=None):
+        self._seen = set()
+        self._seen_count = 0        # _entries の何件目までを _seen に入れたか
+        super().__init__(filename)
+
     def check(self, hostname, key):
-        keytype = key.get_name()
-        blob = key.asbytes()
-        return any(hostname in e.hostnames and e.key.get_name() == keytype
-                   and e.key.asbytes() == blob for e in self._entries)
+        if len(self._entries) < self._seen_count:
+            # 読み込み以外で減った（想定外）。数え直す
+            self._seen, self._seen_count = set(), 0
+        self._seen |= _entry_names_and_keys(self._entries[self._seen_count:])
+        self._seen_count = len(self._entries)
+        return (hostname, key.get_name(), key.asbytes()) in self._seen
 
 
 def _load_known_hosts_into_client(client, path, broken):
