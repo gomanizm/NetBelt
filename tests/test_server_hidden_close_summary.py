@@ -137,5 +137,25 @@ class FtpHiddenCloseTest(_HiddenCloseCases, unittest.TestCase):
         self.m._emit_complete(ip, "get.cfg", 10, 10, "download")
 
 
+class TftpHiddenCloseTest(_HiddenCloseCases, unittest.TestCase):
+    """開始を省いた転送の完了（TFTP の row == 'hidden' も同じ形だった）。
+
+    TFTP は要約を配送待ちに数えずに出していた（client_activity を配送待ちの
+    受け口へつないでいなかった）。その形のまま終わりの側でも要約を出すと、
+    GUI が塞がっている間に省いた終わりの数だけ要約が積み上がる（実測: 下の
+    2 つ目のテストで 5 件）。SFTP・FTP と同じく要約も数える形にそろえた
+    """
+
+    def _new_manager(self):
+        from core.tftp_server import TFTPServerManager
+        return TFTPServerManager()
+
+    def _open(self, ip):
+        self.m._on_event("transfer_started", ip, ("get.cfg", 10, "download"))
+
+    def _close(self, ip):
+        self.m._on_event("transfer_complete", ip, ("get.cfg", 10, 10, "download"))
+
+
 if __name__ == "__main__":
     unittest.main()

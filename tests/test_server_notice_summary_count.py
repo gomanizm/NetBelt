@@ -194,5 +194,22 @@ class SyslogSummaryCountTest(_SummaryCountCases, unittest.TestCase):
         m._emit_message(SyslogMessage("<13>" + text, ip))
 
 
+class TftpSummaryCountTest(_SummaryCountCases, unittest.TestCase):
+    """TFTP（失敗した要求ごとの protocol_event。要約は client_activity で出る）"""
+
+    def _new_manager(self):
+        from core.tftp_server import TFTPServerManager
+        return TFTPServerManager()
+
+    def _listen(self, m, log):
+        from PyQt6.QtCore import Qt
+        direct = Qt.ConnectionType.DirectConnection
+        m.protocol_event.connect(lambda ip, fn, reason, d: log.append(fn), direct)
+        m.client_activity.connect(lambda ip, msg: log.append(msg), direct)
+
+    def _emit(self, m, ip, text):
+        m._emit_protocol_event(ip, text, "ファイルがありません", "download")
+
+
 if __name__ == "__main__":
     unittest.main()

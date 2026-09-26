@@ -824,10 +824,13 @@ class TFTPServerManager(QObject):
         # 自分の信号を自分でも受ける。ワーカーから emit した分はキュー経由で
         # GUI スレッドへ届くので、呼ばれたことが「GUI が 1 件処理した」の合図。
         # 転送の通知も同じカウンタに数える（存在する小さいファイルへの
-        # RRQ→即 ACK を連打されると、成功した転送の通知だけで積み上がる）
-        for signal in (self.protocol_event, self.transfer_started,
-                       self.transfer_progress, self.transfer_complete,
-                       self.transfer_interrupted):
+        # RRQ→即 ACK を連打されると、成功した転送の通知だけで積み上がる）。
+        # client_activity（省略件数の要約を含む）も SFTP・FTP と同じく数える。
+        # 数え違えないよう、この信号はすべて配送待ちに数えてから出す
+        # （_emit_activity と、省略件数の要約）
+        for signal in (self.client_activity, self.protocol_event,
+                       self.transfer_started, self.transfer_progress,
+                       self.transfer_complete, self.transfer_interrupted):
             signal.connect(self._on_notice_delivered)
 
     def _take_notice(self, force=False, count_drop=True):
@@ -849,8 +852,8 @@ class TFTPServerManager(QObject):
         """完了・中断を渡すかを決める（_tx_lock の中で呼ぶ）。
 
         開始を届けた行を閉じる最初の 1 件は必ず渡す。開始を省いた転送の
-        ものは渡さずに省略件数へ足す。行の無いもの（台帳に無い・行を閉じた後）
-        は上限の範囲でだけ渡す
+        ものは渡さずに省略件数へ足し、配送待ちが 0 ならその場で要約を出す。
+        行の無いもの（台帳に無い・行を閉じた後）は上限の範囲でだけ渡す
         """
         row = st["row"] if st is not None else None
         if row == "shown":
@@ -859,6 +862,9 @@ class TFTPServerManager(QObject):
         if row == "hidden":
             with self._notice_lock:
                 self._dropped_notices += 1
+                # 配送待ちが 0 だと、要約を出すきっかけ（次の配送）が来ない
+                dropped = self._take_summary()
+            self._emit_summary(dropped)
             return False
         return self._take_notice()
 
@@ -870,17 +876,39 @@ class TFTPServerManager(QObject):
         if self._take_notice(force=force):
             self.protocol_event.emit(ip, filename, reason, direction)
 
+    def _emit_activity(self, ip, message):
+        """client_activity を 1 件渡す。配送待ちが上限に達している間は数えるだけ。"""
+        if self._take_notice():
+            self.client_activity.emit(ip, message)
+
+    def _take_summary(self):
+        """配送待ちが 0 で省略件数があれば、要約の枠を取って件数を返す（無ければ 0）。
+
+        _notice_lock の中で呼ぶ（SFTP・FTP と同じ）。要約も数えないと、
+        GUI の外のスレッド（省いた転送の終わり）から出したときに要約が
+        際限なく積み上がる。枠は取り出すのと同じ錠の中で取る。錠を離して
+        から取ると、その隙に別スレッドが枠を埋めて要約ごと省かれ、件数が
+        失われる
+        """
+        if self._pending_notices or not self._dropped_notices:
+            return 0
+        dropped, self._dropped_notices = self._dropped_notices, 0
+        self._pending_notices += 1
+        return dropped
+
+    def _emit_summary(self, dropped):
+        """_take_summary で枠を取った要約を出す（_notice_lock の外で呼ぶ）"""
+        if dropped:
+            self.client_activity.emit(
+                "", "表示が追いつかず %d 件の通知を省略しました" % dropped)
+
     def _on_notice_delivered(self, *_args):
         """GUI が通知を 1 件処理したので配送待ちを戻す（GUI スレッドで動く）"""
         with self._notice_lock:
             if self._pending_notices > 0:
                 self._pending_notices -= 1
-            dropped = 0
-            if self._pending_notices == 0:
-                dropped, self._dropped_notices = self._dropped_notices, 0
-        if dropped:
-            self.client_activity.emit(
-                "", "表示が追いつかず %d 件の通知を省略しました" % dropped)
+            dropped = self._take_summary()
+        self._emit_summary(dropped)
 
     def start(self, port=69, root_dir="./tftp_root", allow_upload=True, allow_download=True):
         if self.is_running:
@@ -896,7 +924,7 @@ class TFTPServerManager(QObject):
         # ファイアウォールは自動設定しない（3CDaemon 方式）。管理者昇格(UAC)を避けるため、
         # 受信許可は Windows 標準の初回プロンプト／既存の許可ルールに委ねる。過去にプロンプトを
         # 拒否してブロックが残っている場合のみ手動修正が要る（firewall.ensure_* は手動用に残置）。
-        self.client_activity.emit("", "ファイアウォール: 自動設定なし（Windowsの許可に委ねます）")
+        self._emit_activity("", "ファイアウォール: 自動設定なし（Windowsの許可に委ねます）")
         try:
             self._srv = TFTPServer(port=port, root_dir=root_dir,
                                    allow_upload=allow_upload, allow_download=allow_download,
@@ -937,9 +965,9 @@ class TFTPServerManager(QObject):
             from .firewall import (combine_results, ensure_inbound_allow,
                                    ensure_self_program_allow)
             ok, msg = ensure_inbound_allow("TFTP Server", "UDP", port)
-            self.client_activity.emit("", "ファイアウォール: %s" % msg)
+            self._emit_activity("", "ファイアウォール: %s" % msg)
             ok2, msg2 = ensure_self_program_allow()
-            self.client_activity.emit("", "ファイアウォール(自exe): %s" % msg2)
+            self._emit_activity("", "ファイアウォール(自exe): %s" % msg2)
             return combine_results([(ok, msg), (ok2, msg2)])
         except Exception as e:
             self.error_occurred.emit("ファイアウォール設定エラー: %s" % e)
@@ -1032,4 +1060,4 @@ class TFTPServerManager(QObject):
                 self._emit_protocol_event(ip, filename, reason, direction,
                                           force=closing)
         else:
-            self.client_activity.emit(ip, payload)
+            self._emit_activity(ip, payload)
