@@ -83,7 +83,7 @@ def _hostnames_match(names, server_name):
     return False
 
 
-def _names_same_endpoint(name, host, port):
+def _names_same_endpoint(name, host, port, ignore_case=True):
     """known_hosts の名前 1 つが host:port を指すか（別の綴りも含む）。
 
     完全一致とハッシュ化名のほかに、ポートを整数へそろえる前の版が
@@ -91,15 +91,16 @@ def _names_same_endpoint(name, host, port):
     "[host]:02202" のような綴りも、ポートを整数にそろえて同じ接続先と
     みなす。22 番なら "host" と "[host]:22" もこの機器の名前。
 
-    ホスト名の大文字小文字は区別しない（OpenSSH と同じ）。ハッシュ化名は
-    設定の綴りのままと、小文字にそろえた綴りの両方で掛け直して比べる
-    （OpenSSH は小文字にしてから掛ける）。
+    ignore_case なら、ホスト名の大文字小文字は区別しない（OpenSSH と同じ）。
+    ハッシュ化名は設定の綴りのままと、小文字にそろえた綴りの両方で
+    掛け直して比べる（OpenSSH は小文字にしてから掛ける）。
     """
     try:
         port = int(port)            # known_hosts_server_name と同じ読み方
     except (TypeError, ValueError):
         port = 22
-    lowered = host.lower()
+    fold = str.lower if ignore_case else str
+    lowered = fold(host)
     if name.startswith("|1|"):
         wanted = {known_hosts_server_name(h, port) for h in (host, lowered)}
         if port == 22:
@@ -107,9 +108,9 @@ def _names_same_endpoint(name, host, port):
         return any(_hostnames_match([name], w) for w in wanted)
     if name.startswith("[") and "]:" in name:
         name_host, _, name_port = name[1:].rpartition("]:")
-        return (name_host.lower() == lowered
+        return (fold(name_host) == lowered
                 and tcp_port_number(name_port) == port)
-    return port == 22 and name.lower() == lowered
+    return port == 22 and fold(name) == lowered
 
 
 def _add_other_spelling_keys(keys, host, port):
@@ -623,7 +624,7 @@ class SSHConnection(QObject):
                 "（退避すると全機器が初回接続の扱いになります）。"
                 % (e, known_hosts_path))
         if broken:
-            self._refuse_or_warn_broken_lines(broken, known_hosts_path)
+            self._refuse_or_warn_broken_lines(broken, known_hosts_path, client)
         policy = _TofuHostKeyPolicy(known_hosts_path,
                                     endpoint=(self.host, self.port))
         policy._on_save_error = lambda message: self.output_received.emit(
@@ -637,7 +638,8 @@ class SSHConnection(QObject):
         """
         _add_other_spelling_keys(client.get_host_keys(), self.host, self.port)
 
-    def _refuse_or_warn_broken_lines(self, broken, known_hosts_path):
+    def _refuse_or_warn_broken_lines(self, broken, known_hosts_path,
+                                     client=None):
         """読めない行を名指しで知らせ、その行が指す接続先なら接続を中止する。
 
         壊れた行を読み飛ばしたまま進むと、その接続先は初回接続の扱いに戻り、
@@ -649,15 +651,26 @@ class SSHConnection(QObject):
         Args:
             broken: unreadable_known_hosts_lines() の戻り値
             known_hosts_path: known_hosts のパス（案内に載せる）
+            client: 読める行を読み込み済みの SSHClient。完全一致の鍵が
+                あるかを見る
         """
         server_name = known_hosts_server_name(self.host, self.port)
         # 旧版が文字列のポートの名前（"[host]:22" や "[host]:022"）で残した
         # 行や、大文字小文字だけが違う行も照合に使う
         # （_use_other_spelling_keys）。その行が壊れていたときも、
         # この機器の行として中止する。警告だけで進むと TOFU が別の鍵を
-        # 受け入れ、パスワードが相手へ届く（実測）
+        # 受け入れ、パスワードが相手へ届く（実測）。ただし大文字小文字を
+        # 区別しないのは、照合と同じく完全一致の鍵（22 番は "[host]:22" の
+        # 鍵も）が無いときだけ。あれば、その行は読めていても照合に使われない
+        ignore_case = True
+        if client is not None:
+            keys = client.get_host_keys()
+            ignore_case = keys.lookup(server_name) is None and not (
+                server_name == self.host
+                and keys.lookup("[%s]:22" % self.host) is not None)
         mine = [(no, text) for no, text, _ in broken
-                if any(_names_same_endpoint(name, self.host, self.port)
+                if any(_names_same_endpoint(name, self.host, self.port,
+                                            ignore_case)
                        for name in known_hosts_names(text))]
         if mine:
             raise HostKeyStoreError(
