@@ -724,14 +724,17 @@ class SFTPServerManager(QObject):
         """切断を渡すかを決める。
 
         接続を届けた相手（shown が True）の切断は必ず渡す。接続を省いた相手
-        （False）のものは渡さずに省略件数へ足す。記録が無い（None）ものは
-        上限の範囲でだけ渡す
+        （False）のものは渡さずに省略件数へ足し、配送待ちが 0 ならその場で
+        要約を出す。記録が無い（None）ものは上限の範囲でだけ渡す
         """
         if shown:
             return self._take_notice(force=True)
         if shown is False:
             with self._notice_lock:
                 self._dropped_notices += 1
+                # 配送待ちが 0 だと、要約を出すきっかけ（次の配送）が来ない
+                dropped = self._take_summary()
+            self._emit_summary(dropped)
             return False
         return self._take_notice()
 
@@ -740,22 +743,33 @@ class SFTPServerManager(QObject):
         if self._take_notice():
             self.client_activity.emit(ip, message)
 
+    def _take_summary(self):
+        """配送待ちが 0 で省略件数があれば、要約の枠を取って件数を返す（無ければ 0）。
+
+        _notice_lock の中で呼ぶ。この 1 行も client_activity なので同じく数える
+        （FTP と同じ）。数えずに出すと、届いたときに他の通知の分まで戻してしまう。
+        枠は取り出すのと同じ錠の中で取る。錠を離してから取ると、その隙に
+        別スレッドが枠を埋めて要約ごと省かれ、件数が失われる
+        """
+        if self._pending_notices or not self._dropped_notices:
+            return 0
+        dropped, self._dropped_notices = self._dropped_notices, 0
+        self._pending_notices += 1
+        return dropped
+
+    def _emit_summary(self, dropped):
+        """_take_summary で枠を取った要約を出す（錠の外で呼ぶ）"""
+        if dropped:
+            self.client_activity.emit(
+                "", "表示が追いつかず %d 件の通知を省略しました" % dropped)
+
     def _on_notice_delivered(self, *_args):
         """GUI が通知を 1 件処理したので配送待ちを戻す（GUI スレッドで動く）"""
         with self._notice_lock:
             if self._pending_notices > 0:
                 self._pending_notices -= 1
-            dropped = 0
-            if self._pending_notices == 0 and self._dropped_notices:
-                dropped, self._dropped_notices = self._dropped_notices, 0
-                # この 1 行も client_activity なので同じく数える（FTP と同じ）。
-                # 数えずに出すと、届いたときに他の通知の分まで戻してしまう。
-                # 枠は取り出すのと同じ錠の中で取る。錠を離してから取ると、
-                # その隙に別スレッドが枠を埋めて要約ごと省かれ、件数が失われる
-                self._pending_notices += 1
-        if dropped:
-            self.client_activity.emit(
-                "", "表示が追いつかず %d 件の通知を省略しました" % dropped)
+            dropped = self._take_summary()
+        self._emit_summary(dropped)
 
     def _load_or_create_host_key(self):
         """ホストキーをユーザデータディレクトリから読み込む。無ければ生成して保存する。

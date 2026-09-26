@@ -185,14 +185,17 @@ class FTPServerManager(QObject):
         """完了・中断を渡すかを決める。
 
         開始を届けた行を閉じる 1 件は必ず渡す。開始を省いた転送のものは
-        渡さずに省略件数へ足す。行の無いもの（台帳に無い＝束ねた相手が
-        先に閉じた）は上限の範囲でだけ渡す
+        渡さずに省略件数へ足し、配送待ちが 0 ならその場で要約を出す。行の
+        無いもの（台帳に無い＝束ねた相手が先に閉じた）は上限の範囲でだけ渡す
         """
         if row == "shown":
             return self._take_notice(force=True)
         if row == "hidden":
             with self._notice_lock:
                 self._dropped_notices += 1
+                # 配送待ちが 0 だと、要約を出すきっかけ（次の配送）が来ない
+                dropped = self._take_summary()
+            self._emit_summary(dropped)
             return False
         return self._take_notice()
 
@@ -201,19 +204,31 @@ class FTPServerManager(QObject):
         if self._take_notice():
             self.client_activity.emit(ip, message)
 
+    def _take_summary(self):
+        """配送待ちが 0 で省略件数があれば、要約の枠を取って件数を返す（無ければ 0）。
+
+        _notice_lock の中で呼ぶ。要約の枠は取り出すのと同じ錠の中で取る。
+        錠を離してから取ると、その隙に別スレッドが枠を埋めて要約ごと省かれ、
+        件数が失われる
+        """
+        if self._pending_notices or not self._dropped_notices:
+            return 0
+        dropped, self._dropped_notices = self._dropped_notices, 0
+        self._pending_notices += 1
+        return dropped
+
+    def _emit_summary(self, dropped):
+        """_take_summary で枠を取った要約を出す（錠の外で呼ぶ）"""
+        if dropped:
+            self.client_activity.emit("", "表示が追いつかず %d 件の通知を省略しました" % dropped)
+
     def _on_notice_delivered(self, *_args):
         """GUI が通知を 1 件処理したので配送待ちを戻す（GUI スレッドで動く）"""
         with self._notice_lock:
             if self._pending_notices > 0:
                 self._pending_notices -= 1
-            dropped = 0
-            if self._pending_notices == 0 and self._dropped_notices:
-                dropped, self._dropped_notices = self._dropped_notices, 0
-                # 要約の枠は取り出すのと同じ錠の中で取る。錠を離してから取ると、
-                # その隙に別スレッドが枠を埋めて要約ごと省かれ、件数が失われる
-                self._pending_notices += 1
-        if dropped:
-            self.client_activity.emit("", "表示が追いつかず %d 件の通知を省略しました" % dropped)
+            dropped = self._take_summary()
+        self._emit_summary(dropped)
 
     def _emit_started(self, ip, filename, total, direction, path=None, ftp_path=None):
         """開始を通知し、この転送の表示名を返す（束ねたときは既存の行の表示名）。
