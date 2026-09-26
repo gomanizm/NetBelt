@@ -11,9 +11,14 @@
 どう直したか
   PR・main への push・手動で走る tests.yml を足した。中身はリリースの Run tests までと
   同じにし、ずれたらここで落とす。PyYAML は依存に無いので字面で読む。確かめること:
-  - pull_request・push・workflow_dispatch で起動し、push は main だけ
+  - pull_request・push・workflow_dispatch だけで起動し、push は main だけ
+    （PR の宛先や paths で絞らない）
   - リリースと同じランナー・Python・pytest・依存・Run tests の呼び方と環境変数
     （足してよいのは表示の引数 -r… だけ）
+  - Run tests までの手順は、リリースと同じ名前・並び・キーで、その前の手順は中身も
+    同じ（依存を足す手順などを入れない）
+  - 書いてよいキーを決め、それ以外（continue-on-error・if・ジョブやワークフローの
+    段の env・strategy など、テストを走らせないか落ちても緑にできるもの）を落とす
   - Run tests に shell・defaults・working-directory を書かない（リリースと同じく
     既定の pwsh の中で、リポジトリの直下から走らせる）
   - テストの手順へ GITHUB_TOKEN を渡さない（製品は環境変数の GITHUB_TOKEN を読み、
@@ -119,6 +124,50 @@ def _step_env(step):
     return out
 
 
+def _code_lines(src):
+    """空行とコメントだけの行を除いた行（行末の空白を落とす）。src は文字列か行の並び"""
+    if isinstance(src, str):
+        src = src.splitlines()
+    return [l.rstrip() for l in src
+            if l.strip() and not l.strip().startswith("#")]
+
+
+def _keys(lines, indent):
+    """ちょうど indent 個の空白の後に書いたキー（'- ' で始まる項目は含めない）"""
+    keys = []
+    for line in lines:
+        m = re.match(r"^ {%d}([A-Za-z][\w-]*)\s*:" % indent, line)
+        if m:
+            keys.append(m.group(1))
+    return keys
+
+
+def _block(lines, key):
+    """トップレベルの key: の下の行"""
+    out, inside = [], False
+    for line in lines:
+        if re.match(r"^%s\s*:" % re.escape(key), line):
+            inside = True
+            continue
+        if inside:
+            if not line[0].isspace():
+                break
+            out.append(line)
+    return out
+
+
+def _step_names(text):
+    """ステップの名前（書いた順）"""
+    return re.findall(r"(?m)^\s*- name:\s*(.+?)\s*$", text)
+
+
+def _step_keys(step):
+    """ステップに書いたキー（name を含む）"""
+    head = step[0]
+    indent = len(head) - len(head.lstrip())
+    return ["name"] + _keys(step[1:], indent + 2)
+
+
 class CiTestsWorkflowTest(unittest.TestCase):
 
     def setUp(self):
@@ -136,6 +185,47 @@ class CiTestsWorkflowTest(unittest.TestCase):
         # PR のブランチへの push で同じ中身を 2 回走らせない
         self.assertRegex(_event_body(self.tests, "push"),
                          r"branches:\s*\[\s*main\s*\]")
+
+    def test_no_filter_narrows_the_events(self):
+        # 起動は決定 A の 3 つだけ。PR は宛先を問わず、push は main だけ。
+        # branches や paths(-ignore) を足すと、走らないまま通る PR ができる
+        self.assertEqual(sorted(_events(self.tests)),
+                         ["pull_request", "push", "workflow_dispatch"])
+        for event in ("pull_request", "workflow_dispatch"):
+            with self.subTest(event=event):
+                self.assertEqual(_code_lines(_event_body(self.tests, event)), [])
+        self.assertEqual(
+            [l.strip() for l in _code_lines(_event_body(self.tests, "push"))],
+            ["branches: [main]"])
+
+    def test_nothing_else_can_skip_the_tests_or_turn_a_failure_green(self):
+        # 字面で読むので、書いてよいキーを決めておく（それ以外を足したら落とす）。
+        # continue-on-error・if・env（ワークフローやジョブの段の PYTEST_ADDOPTS
+        # など）・strategy・defaults は、テストを走らせないか、落ちても緑にするか、
+        # 対象を絞れる
+        self.assertEqual(sorted(_keys(_code_lines(self.tests), 0)),
+                         ["concurrency", "jobs", "name", "on", "permissions"])
+        jobs = _block(_code_lines(self.tests), "jobs")
+        self.assertEqual(_keys(jobs, 2), ["test"], "ジョブは 1 つだけ")
+        self.assertEqual(sorted(_keys(jobs, 4)),
+                         ["runs-on", "steps", "timeout-minutes"])
+
+    def test_the_steps_are_the_release_steps_up_to_the_tests(self):
+        # 手順を足す・並べ替える・中身を変える（依存を足す pip install など）と、
+        # リリースの門番と違う環境で走る。Run tests までの手順は同じ名前・同じ
+        # 並び・同じキーで、Run tests より前の手順は中身も同じ
+        release_names = _step_names(self.release)
+        release_names = release_names[:release_names.index(STEP_NAME) + 1]
+        self.assertEqual(_step_names(self.tests), release_names)
+        for name in release_names:
+            with self.subTest(step=name):
+                tests_step = _step(self.tests, name)
+                release_step = _step(self.release, name)
+                self.assertEqual(sorted(_step_keys(tests_step)),
+                                 sorted(_step_keys(release_step)))
+                if name != STEP_NAME:
+                    self.assertEqual([l.strip() for l in _code_lines(tests_step)],
+                                     [l.strip() for l in _code_lines(release_step)])
 
     def test_it_uses_the_same_runner_python_and_pytest_as_the_release(self):
         for pattern in (r"^\s*runs-on:\s*(\S+)",
@@ -159,7 +249,7 @@ class CiTestsWorkflowTest(unittest.TestCase):
         self.assertTrue(tests_run[0].startswith(release_run[0]),
                         (tests_run, release_run))
         extra = tests_run[0][len(release_run[0]):].split()
-        self.assertTrue(all(a.startswith("-r") for a in extra), extra)
+        self.assertTrue(all(re.fullmatch(r"-r[A-Za-z]+", a) for a in extra), extra)
         self.assertEqual(_step_env(tests_step), _step_env(release_step))
 
     def test_the_tests_run_inside_the_same_shell_as_the_release(self):
