@@ -104,6 +104,11 @@ class FTPServerManager(QObject):
         # 同じ鍵で持つ行の状態: 開始を届けた（shown）／配送待ちの上限で
         # 省いた（hidden）。_tx の値は表示名なので、そこへは混ぜられない
         self._tx_row = {}
+        # 同じ鍵で持つ行の番号。行を作るたびに新しい番号を振る。捨てた転送の
+        # 行を閉じるとき、それが自分の加わった行か（閉じられた後で別の接続が
+        # 作り直した行でないか）を見分ける
+        self._tx_ids = {}
+        self._tx_next_id = 0
         # GUI へ渡したまま、まだ処理されていない通知の件数の上限。
         # 接続と切断のたびに 1 件出るので、認証の要らない相手が接続して即切断を
         # 繰り返すと、GUI が他の処理で塞がっている間に Qt の配送キューへ際限なく
@@ -227,6 +232,8 @@ class FTPServerManager(QObject):
                                  if i == ip and d == direction]:
             name = ftp_path
         self._tx[key] = name
+        self._tx_next_id += 1
+        self._tx_ids[key] = self._tx_next_id
         shown = self._take_notice()
         self._tx_row[key] = "shown" if shown else "hidden"
         if shown:
@@ -251,6 +258,7 @@ class FTPServerManager(QObject):
         # 完了で解放し次の転送は新規行に
         key = (ip, path or filename, direction)
         name = self._tx.pop(key, display or filename)
+        self._tx_ids.pop(key, None)
         if self._take_closing_notice(self._tx_row.pop(key, None)):
             self.transfer_complete.emit(ip, name, int(done), int(total), direction)
 
@@ -262,6 +270,7 @@ class FTPServerManager(QObject):
         """
         key = (ip, path or filename, direction)
         name = self._tx.pop(key, display or filename)
+        self._tx_ids.pop(key, None)
         if self._take_closing_notice(self._tx_row.pop(key, None)):
             self.transfer_interrupted.emit(ip, name, direction)
 
@@ -430,6 +439,9 @@ class FTPServerManager(QObject):
                     self._tx_display = mgr._emit_started(
                         self.remote_ip, self._tx_name, self._tx_total, "download",
                         file, self.fs.fs2ftp(file))
+                    # 加わった行（束ねたときは既存の行）の番号
+                    self._tx_row_id = mgr._tx_ids.get(
+                        (self.remote_ip, file, "download"))
                 return result
 
             def ftp_STOR(self, file, mode="w"):
@@ -489,7 +501,27 @@ class FTPServerManager(QObject):
                 LIST / NLST）もある。消さずに残すと、それらの進捗が
                 直前に終わった転送の名前・方向で出てしまう
                 """
-                self._tx_name = None; self._tx_path = None
+                self._tx_name = None; self._tx_path = None; self._tx_row_id = None
+
+            def _may_close_row(self, file):
+                """待ち行列から捨てた RETR（file）の行を閉じてよいか。
+
+                台帳の行は同じ IP の接続で共有する（機器のプローブを束ねる）ので、
+                鍵だけで閉じると、束ねた別の接続が取得中の行や、別の接続が閉じた
+                後で作り直した行まで中断にしていた（実測）。この接続が加わった
+                行がまだ開いていて、その行に加わったほかの（切断していない）
+                接続が無いときだけ閉じる。ほかの接続は、転送中のものも待ち行列に
+                置いているだけのものも数える（閉じずに残すのは、この片付けを
+                入れる前と同じ扱い）
+                """
+                row_id = getattr(self, "_tx_row_id", None)
+                if row_id is None or mgr._tx_ids.get(
+                        (self.remote_ip, file, "download")) != row_id:
+                    return False
+                return not any(
+                    h is not self and isinstance(h, _Handler)
+                    and getattr(h, "_tx_row_id", None) == row_id
+                    for h in list(self.ioloop.socket_map.values()))
 
             def on_file_sent(self, file):
                 try: total = os.path.getsize(file)
@@ -539,8 +571,11 @@ class FTPServerManager(QObject):
                 closed = mgr._drop_uploads(self, self.remote_ip, keep)
                 if out_q is not None and out_q[3] == "RETR" and out_q[2] is not None:
                     file = out_q[2].name
-                    mgr._emit_interrupted(self.remote_ip, os.path.basename(file),
-                                          "download", file, self._display_for(file))
+                    if self._may_close_row(file):
+                        mgr._emit_interrupted(self.remote_ip, os.path.basename(file),
+                                              "download", file, self._display_for(file))
+                    # 閉じなくても、この接続はもうその行に加わっていない
+                    self._tx_row_id = None
                     closed.append(file)
                 if getattr(self, "_tx_path", None) in closed:
                     self._forget_tx()
@@ -681,6 +716,7 @@ class FTPServerManager(QObject):
         self.is_running = False
         self._tx.clear()
         self._tx_row.clear()
+        self._tx_ids.clear()
         self.stopped.emit()
 
     def fix_firewall(self, port=21, passive_ports=(50100, 50150)):
