@@ -233,6 +233,28 @@ class FTPServerManager(QObject):
         if self._take_closing_notice(self._tx_row.pop(key, None)):
             self.transfer_interrupted.emit(ip, name, direction)
 
+    def _drop_uploads(self, handler, ip, keep=None):
+        """handler の予約を keep（続いている受信の保存先）以外すべて外し、
+        ip からのその保存先のアップロード行を中断で閉じる。閉じた行のパスを返す。
+
+        待ち行列から捨てられた STOR の分。pyftpdlib は後の STOR で待ち行列を
+        上書きするので、手元に残るのは最後の 1 件だけで、それより前の分は
+        予約と行だけが残っている
+        """
+        keep_key = None if keep is None else self._upload_key(keep)
+        keys = {k for k, h in self._uploads.items()
+                if h is handler and k != keep_key}
+        for k in keys:
+            del self._uploads[k]
+        closed = []
+        if not keys:
+            return closed
+        for (i, path, d) in list(self._tx):
+            if i == ip and d == "upload" and self._upload_key(path) in keys:
+                self._emit_interrupted(ip, os.path.basename(path), "upload", path)
+                closed.append(path)
+        return closed
+
     # 匿名に与える権限。認証ユーザー用の "elradfmwMT" を使い回すと、
     # 資格情報なしでルート配下を上書き・削除・改名・フォルダ作成できる。
     # このパネルの主用途は `copy running-config ftp://…`、つまり機器が
@@ -439,25 +461,45 @@ class FTPServerManager(QObject):
                     super().close()
                 finally:
                     mgr._release_uploads(self)
-            def flush_account(self):
-                # REIN と認証済みの USER は、データ接続を待っている STOR / APPE
-                # （待ち行列）を捨てるが、pyftpdlib はそのファイルを閉じず、
-                # 上の未完了のコールバックも呼ばない。予約が制御接続を閉じるまで
-                # 残って同じ保存先へ誰も書けず、行も開始のまま残っていた（実測）。
-                # 捨てた分だけ閉じて未完了として片付ける。進行中の転送は
-                # RFC 959 どおり最後まで続くので、その予約には触れない
-                queued = self._in_dtp_queue
-                super().flush_account()
-                if queued is None or queued[1] not in ("STOR", "APPE"):
-                    return
-                file = queued[0].name
-                try: queued[0].close()
-                except Exception: pass
-                mgr._release_uploads(self, file)
-                mgr._emit_interrupted(self.remote_ip, os.path.basename(file), "upload",
-                                      file, self._display_for(file))
-                if getattr(self, "_tx_path", None) == file:
+            def _abandon_queued(self, in_q, out_q, keep=None):
+                """待ち行列から捨てた転送を片付ける（REIN / USER / ABOR）。
+
+                pyftpdlib はそのファイルを閉じず、上の未完了のコールバックも
+                呼ばない。予約が制御接続を閉じるまで残って同じ保存先へ誰も
+                書けず、行も開始のまま残って、後の一覧の進捗がその名前で出て
+                いた（実測）。ファイルを閉じ、この接続の予約を keep（続いている
+                受信の保存先）以外すべて外し、捨てた転送の行を中断で閉じる
+                """
+                for f in (in_q and in_q[0], out_q and out_q[2]):
+                    if f is not None:
+                        try: f.close()
+                        except Exception: pass
+                closed = mgr._drop_uploads(self, self.remote_ip, keep)
+                if out_q is not None and out_q[3] == "RETR" and out_q[2] is not None:
+                    file = out_q[2].name
+                    mgr._emit_interrupted(self.remote_ip, os.path.basename(file),
+                                          "download", file, self._display_for(file))
+                    closed.append(file)
+                if getattr(self, "_tx_path", None) in closed:
                     self._forget_tx()
+            def flush_account(self):
+                # REIN と認証済みの USER は待ち行列を捨てる。進行中の転送は
+                # RFC 959 どおり最後まで続くので、その保存先の予約だけは残す
+                in_q, out_q = self._in_dtp_queue, self._out_dtp_queue
+                super().flush_account()
+                dc = self.data_channel   # 残っていれば続いている転送
+                keep = (dc.file_obj.name if dc is not None and dc.receive
+                        and dc.file_obj is not None else None)
+                self._abandon_queued(in_q, out_q, keep)
+            def ftp_ABOR(self, line):
+                # ABOR は直前の転送コマンドを取り消す（RFC 959）が、pyftpdlib は
+                # データ接続の受け口を閉じるだけで待ち行列を残す。予約と行が
+                # 残り、後で張ったデータ接続が取り消した転送を受け取っていた
+                # （実測: ABOR 後の LIST に RETR したファイルの中身が流れた）
+                in_q, out_q = self._in_dtp_queue, self._out_dtp_queue
+                super().ftp_ABOR(line)   # 続いていたデータ接続はここで閉じる
+                self._in_dtp_queue = self._out_dtp_queue = None
+                self._abandon_queued(in_q, out_q)
             def on_connect(self):
                 mgr._emit_activity(self.remote_ip, "接続")
             def on_disconnect(self):
