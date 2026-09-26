@@ -840,7 +840,8 @@ class TerminalWidget(QWidget):
     # 色付きでも 4 秒ぶんの描き待ちを飲み込めるので、通常の操作では
     # ここまで届かない。届くのは 127.0.0.1 級の速さで流し続けたとき
     # （実測: 上限が無いと 27.5 秒で 21.3 MB まで単調に増えた）。
-    # 記録先が詰まったときの、記録の書き込み待ちの上限にも使う（同じく待たせる）
+    # 記録先が詰まったときの、記録の書き込み待ちの上限にも使う（同じく待たせる。
+    # 関所の無い接続は待たせられないので、描き進めて知らせる）
     PENDING_HIGH_WATER = 8 * 1024 * 1024
     # ここまで減らしてから再開する。上限の直下で開け閉めを繰り返さない
     PENDING_LOW_WATER = 2 * 1024 * 1024
@@ -877,6 +878,8 @@ class TerminalWidget(QWidget):
         self._closing_writers: list = []
         # 記録の書き込み待ちが溜まって、描くのと受信を止めている機器
         self._log_throttled = set()
+        # 関所の無い接続で、書き込み待ちが上限を超えたと知らせた機器
+        self._log_lag_noticed = set()
         self._log_dialogs: Dict[str, object] = {}  # 機器名 -> ログ記録ダイアログ
         # ターミナルの外観設定。_create_terminal が参照するので _create_ui より先に持つ
         self._terminal_settings = dict(self.DEFAULT_TERMINAL_SETTINGS)
@@ -1769,9 +1772,11 @@ class TerminalWidget(QWidget):
 
         スレッドで起きた書き込みの失敗を、次の受信を待たずに知らせる
         （知らせないと、利用者は記録できていると思って作業を続ける）。
-        閉じ終えた記録の使用中の登録を外す。見回るものが無くなったら止まる。
+        閉じ終えた記録の使用中の登録を外す。止めた機器を再開させ、関所の無い
+        接続の書き込み待ちの遅れを知らせる。見回るものが無くなったら止まる。
         警告はモーダルで、出ている間にここへ入り直すことがある。
         """
+        from PyQt6.QtWidgets import QMessageBox
         from core import log_recording
         for name in list(self._log_files):
             handle = self._log_files.get(name)
@@ -1792,6 +1797,23 @@ class TerminalWidget(QWidget):
                 self._update_output_gate(name)
                 if self._pending_output.get(name):
                     self._output_timer.start()
+        # 関所の無い接続（シリアル）は止めずに書き込み待ちを積み続ける（記録は
+        # 欠かさない）。上限を超えたら一度だけ知らせ、減ったらまた知らせる側へ戻す
+        for name in list(self._log_lag_noticed):
+            if self._log_backlog(name) <= self.PENDING_LOW_WATER:
+                self._log_lag_noticed.discard(name)
+        for name in set(self._log_files) | set(self._closing_logs):
+            if (name not in self._output_gates
+                    and name not in self._log_lag_noticed
+                    and self._log_backlog(name) >= self.PENDING_HIGH_WATER):
+                self._log_lag_noticed.add(name)
+                QMessageBox.warning(
+                    self, "ログ記録",
+                    "%s のログ記録で、記録先への書き込みが遅れています。\n\n"
+                    "この接続は受信を止められないため、画面は進めたまま、記録する"
+                    "分をメモリに溜めて順に書き込みます。記録先が応答しないままだと、"
+                    "使うメモリが増え続けます。保存先の接続を確認してください。"
+                    % name)
         handles = list(self._log_files.values()) + [
             entry[0] for entries in self._closing_logs.values()
             for entry in entries]
@@ -1917,8 +1939,11 @@ class TerminalWidget(QWidget):
                 # 記録先が詰まって書き込み待ちが上限を超えたら、この機器だけ
                 # 描くのを止めて受信の関所を閉じる。機器側が待つので記録も
                 # 画面も欠けず、書き込み待ちがメモリに積み上がり続けない
-                # （利用者の決定）。減ったら _check_log_writers が再開させる
-                if (device_name in self._log_throttled
+                # （利用者の決定）。減ったら _check_log_writers が再開させる。
+                # 関所の無い接続（シリアル）は止めない。受信は止まらないので、
+                # 止めると描き待ちが上限なく増えるだけになる（知らせは見回りが出す）
+                if device_name in self._output_gates and (
+                        device_name in self._log_throttled
                         or self._log_backlog(device_name)
                         >= self.PENDING_HIGH_WATER):
                     self._log_throttled.add(device_name)
@@ -2124,6 +2149,7 @@ class TerminalWidget(QWidget):
             del self._terminals[tab_name]
         self._pending_output.pop(tab_name, None)
         self._log_throttled.discard(tab_name)
+        self._log_lag_noticed.discard(tab_name)
         # 受信を止めたまま閉じない。開けてから外さないと、まだ動いている
         # 受信スレッドが待ち続ける（切断の検知もその先にある）
         gate = self._output_gates.pop(tab_name, None)
