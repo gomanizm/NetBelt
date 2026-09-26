@@ -10,11 +10,20 @@
 """
 import os
 import re
+import threading
 
 from PyQt6.QtWidgets import QMessageBox
 
 # 覚えたフォルダの置き場所は ConfigManager が持つ
 # （settings.paths.last_save_dir。get_last_save_dir / set_last_save_dir）
+
+# 覚えたフォルダの実在の確認を待つ上限（秒）。これを超えたら覚えたフォルダを
+# 使わない（応答しない共有フォルダで、保存ダイアログを出す前に GUI を止めない）
+DIR_CHECK_WAIT = 1.0
+
+# 確認中のフォルダ（normcase 済み）-> 答えが出たら set される Event。
+# 触るのは保存ダイアログを出す側（GUI スレッド）だけ
+_dir_checks = {}
 
 # 表や一覧のある画面（SNMP の結果・Trap、Syslog）で使う絞り込み。
 # 並びと表記をここへ一本化しておかないと、画面ごとに順番も言い回しも
@@ -128,12 +137,53 @@ def apply_filter_suffix_confirmed(parent, title, file_path, selected_filter,
     return new_path
 
 
+def _isdir_in_time(directory):
+    """directory が実在するフォルダかを、DIR_CHECK_WAIT 秒まで待って確かめる
+
+    os.path.isdir は、応答しない共有フォルダでは長く戻らない。GUI スレッドで
+    呼ぶと保存ダイアログを出す前に全タブが止まっていた（実測: 詰まった共有
+    フォルダへ記録したあと、別の機器の記録をローカルへ始めると isdir の間
+    ずっと止まった）。確認は別スレッドで行い、上限を過ぎたら使わない。
+
+    前の確認がまだ戻っていないフォルダは、待たずに使わない（詰まっている
+    間に何度開いても、戻らない確認を積み上げない）。戻ったら確かめ直す。
+    """
+    key = os.path.normcase(directory)
+    pending = _dir_checks.get(key)
+    if pending is not None and not pending.is_set():
+        return False
+    done = threading.Event()
+    answer = []
+
+    def check():
+        try:
+            answer.append(os.path.isdir(directory))
+        except Exception:
+            answer.append(False)
+        finally:
+            done.set()
+
+    _dir_checks[key] = done
+    try:
+        threading.Thread(target=check, name="save-dir-check",
+                         daemon=True).start()
+    except RuntimeError:
+        # スレッドを起こせない。確かめられないので使わない
+        _dir_checks.pop(key, None)
+        return False
+    if not done.wait(DIR_CHECK_WAIT):
+        return False
+    _dir_checks.pop(key, None)
+    return bool(answer and answer[0])
+
+
 def last_dir(config_manager):
     """前回保存したフォルダを返す（覚えていない・消えていれば None）
 
     覚えたフォルダは利用者が後から消せる（一時フォルダ・外付け・共有）。
     消えたパスを初期値にすると、ダイアログがどこを開くかは環境任せに
-    なるので、実在を確かめてから使う。
+    なるので、実在を確かめてから使う。確かめるのに DIR_CHECK_WAIT 秒を
+    超えるフォルダ（応答しない共有フォルダ）も使わない。
     """
     if config_manager is None:
         return None
@@ -145,9 +195,9 @@ def last_dir(config_manager):
     if not directory:
         return None
     try:
-        if not os.path.isdir(directory):
+        if not _isdir_in_time(directory):
             return None
-    except (OSError, ValueError):
+    except (OSError, TypeError, ValueError):
         return None
     return directory
 
