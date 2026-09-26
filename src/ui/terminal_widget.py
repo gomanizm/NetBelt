@@ -1667,6 +1667,11 @@ class TerminalWidget(QWidget):
                 (device_name, handle, path, None if error else report))
             self._start_log_watch()
         else:
+            if isinstance(handle, LogWriter):
+                # 手が空いたのを見てから失敗を読み直す。close() は詰まっていると
+                # 待たずに戻るので、その直後に詰まりが解けて失敗し、閉じ終えた
+                # 記録の失敗は close() からは見えない（知らせないと黙って欠ける）
+                error = error or handle.failure
             log_recording.stop(device_name, path)
         if error is not None and report is not None:
             report(error)
