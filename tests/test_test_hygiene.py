@@ -91,10 +91,15 @@ class TempIsASessionFolderTest(unittest.TestCase):
 class DefaultConfigIsNotInTheWorkingDirectoryTest(unittest.TestCase):
 
     def _assert_not_in_the_working_directory(self, path):
-        used = os.path.normcase(os.path.abspath(str(path)))
-        self.assertNotEqual(used, os.path.normcase(os.path.abspath("config.json")),
+        # 両辺を realpath で長い名前へそろえてから比べる。GitHub のランナーの
+        # TEMP は 8.3 の短い名前（C:\Users\RUNNER~1\...）で、tempfile は短い
+        # 名前のまま、pytest の tmp_path_factory は長い名前へ直した場所を返す
+        def real(p):
+            return os.path.normcase(os.path.realpath(str(p)))
+        used = real(path)
+        self.assertNotEqual(used, real("config.json"),
                             "作業ディレクトリの config.json を使っている")
-        self.assertTrue(used.startswith(os.path.normcase(tempfile.gettempdir())),
+        self.assertTrue(used.startswith(real(tempfile.gettempdir()) + os.sep),
                         "既定の設定がセッションの一時フォルダの外にある: %s" % used)
 
     def test_a_config_manager_without_a_path(self):
