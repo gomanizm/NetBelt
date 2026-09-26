@@ -507,6 +507,12 @@ class DeviceTree(QWidget):
             # Defaultグループは削除不可
             if group_name != "Default":
                 delete_action = menu.addAction("グループを削除")
+            # 先に同じ名前のグループがあると、名前で探す編集・削除はそちらを
+            # 書き換えるので、灰色にして選べなくする（_is_shadowed_group）
+            if self._is_shadowed_group(group_item):
+                for action in (edit_action, delete_action):
+                    if action is not None:
+                        action.setEnabled(False)
         hide_action = self._add_hide_action(menu)
 
         try:
@@ -521,6 +527,18 @@ class DeviceTree(QWidget):
         elif action == delete_action and delete_action is not None:
             self.group_delete_requested.emit(group_name)
     
+    def _is_shadowed_group(self, group_item: QTreeWidgetItem) -> bool:
+        """先に同じ名前のグループが並んでいるかを返す。
+
+        設定のグループは名前で探す（ConfigManager.get_group は先頭を返す）。
+        手編集の config.json で同じ名前のグループが並ぶと、後ろの方で頼んだ
+        グループの編集・削除や、そこへのドロップが、先に並んでいる別の
+        グループを書き換えていた（実測）。後ろの方からは受け付けない。
+        """
+        root = self.tree.invisibleRootItem()
+        return any(root.child(i).text(0) == group_item.text(0)
+                   for i in range(root.indexOfChild(group_item)))
+
     def _set_baudrate(self, port: str, baudrate: int):
         """
         シリアルポートのボーレートを設定
@@ -650,6 +668,12 @@ class DeviceTree(QWidget):
             event.ignore()
             return
         
+        # 先に同じ名前のグループがあると、名前で探す移動はそちらへ入るので断る
+        if self._is_shadowed_group(target_parent if target_parent is not None
+                                   else target_item):
+            event.ignore()
+            return
+
         # 同じグループ内での移動は無視
         if source_group_name == target_group_name:
             event.ignore()
