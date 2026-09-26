@@ -544,20 +544,27 @@ class MainWindow(QMainWindow):
         return list(dict.fromkeys(
             g["name"] for g in self.config_manager.get_groups()))
 
-    def _same_name_group_hint(self, group_name: str) -> str:
-        """同じ名前のグループが並んでいるとき、機器の操作を断る訳と直し方を返す。
+    def _same_name_group_hint(self, group_name: str, device_name: str,
+                              device_data: dict = None) -> str:
+        """同じ名前のグループのどれの機器か決められずに断ったとき、訳と直し方を返す。
 
-        同じ名前のグループの両方に中身まで同じ機器があると、どちらの機器か
-        決められないので ConfigManager は断る（_group_of_device）。失敗とだけ
-        出すと、訳も直し方も分からなかった（実測）。並んでいなければ空文字。
+        同じ名前のグループの複数に名前も接続先も同じ機器があり、中身でも絞れ
+        ないと、どれの機器か決められないので ConfigManager は断る
+        （_group_of_device / device_group_is_ambiguous）。失敗とだけ
+        出すと、訳も直し方も分からなかった（実測）。ほかの理由（移動先に同じ
+        名前の機器がいる・保存の失敗など）で断ったときは、改名しても直らない
+        ので付けない（グループ名が並んでいるだけで付けていた。実測）。
+        付けないときは空文字。断った操作はメモリを元に戻しているので、
+        断った後に聞いても、操作の前と同じ答えになる。
         """
-        if sum(g.get("name") == group_name
-               for g in self.config_manager.get_groups()) < 2:
+        if not self.config_manager.device_group_is_ambiguous(
+                group_name, device_name, self._endpoint_of(device_data),
+                device_data):
             return ""
-        return (f"\n\n同じ名前のグループ '{group_name}' が複数あり、どのグループの"
-                "機器か決められないとき（同じ内容の機器が両方にあるときなど）は、"
-                "別の機器を書き換えないよう変更しません。接続先リストで先に並んで"
-                "いる方を右クリックし「グループを編集」で別の名前にすると分かれます。")
+        return (f"\n\n同じ名前のグループ '{group_name}' の複数に、名前も接続先も"
+                "同じ機器があり、どのグループの機器か決められないため、別の機器を"
+                "書き換えないよう変更していません。接続先リストで先に並んでいる方を"
+                "右クリックし「グループを編集」で別の名前にすると分かれます。")
 
     def _on_add_device(self):  # 追加
         """機器追加ダイアログを表示"""
@@ -691,7 +698,8 @@ class MainWindow(QMainWindow):
                 self.status_bar.showMessage(f"機器 '{new_device_data['name']}' を更新しました")
             else:
                 QMessageBox.warning(self, "エラー", "機器の更新に失敗しました。設定は変更されていません。"
-                                    + self._same_name_group_hint(group_name))
+                                    + self._same_name_group_hint(
+                                        group_name, old_device_name, device_data))
     
     def _on_device_delete(self, group_name: str, device_name: str,
                           device_data: dict = None):
@@ -755,7 +763,8 @@ class MainWindow(QMainWindow):
                     # いるので、ツリーは設定と一致したまま＝作り直さない
                     self._load_devices()
                 QMessageBox.warning(self, "エラー", "機器の削除に失敗しました。"
-                                    + self._same_name_group_hint(group_name))
+                                    + self._same_name_group_hint(
+                                        group_name, device_name, device_data))
     
     def _on_device_duplicate(self, group_name: str, device_data: dict):
         """
@@ -822,7 +831,8 @@ class MainWindow(QMainWindow):
             )
         else:
             QMessageBox.warning(self, "エラー", "機器の移動に失敗しました。"
-                                + self._same_name_group_hint(source_group_name))
+                                + self._same_name_group_hint(
+                                    source_group_name, device_name, device_data))
     
     def _on_connect_requested(self, device_data: dict):
         """

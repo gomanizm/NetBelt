@@ -1601,12 +1601,33 @@ class ConfigManager:
         if len(groups) <= 1 or endpoint is None:
             return groups[0] if groups else None
         holders = [g for g in groups
-                   if any(isinstance(d, dict) and d.get("name") == device_name
-                          and device_endpoint(d) == endpoint
-                          for d in g.get("devices", []))]
+                   if self._holds_device(g, device_name, endpoint)]
         if len(holders) > 1 and isinstance(device, dict):
             holders = [g for g in holders if device in g.get("devices", [])]
         return holders[0] if len(holders) == 1 else None
+
+    @staticmethod
+    def _holds_device(group: Dict, device_name: str, endpoint) -> bool:
+        """そのグループに、名前も接続先も一致する機器がいるかを返す。"""
+        return any(isinstance(d, dict) and d.get("name") == device_name
+                   and device_endpoint(d) == endpoint
+                   for d in group.get("devices", []))
+
+    def device_group_is_ambiguous(self, group_name: str, device_name: str,
+                                  endpoint=None, device=None) -> bool:
+        """同じ名前のグループのどれの機器か決められずに断る機器なら True を返す。
+
+        _group_of_device が None で断るうち、同じ名前のグループの複数に名前も
+        接続先も同じ機器がいて 1 つに絞れないときだけ真にする。画面は、これが
+        真のときだけ失敗の案内に同名グループの訳と直し方を足す（グループ名が
+        並んでいるというだけで足すと、移動先の重複や保存の失敗で断ったときにも
+        改名へ誘導していた。実測）。
+        """
+        if endpoint is None or self._group_of_device(
+                group_name, device_name, endpoint, device) is not None:
+            return False
+        return sum(self._holds_device(g, device_name, endpoint)
+                   for g in self.get_groups() if g.get("name") == group_name) > 1
 
     def find_device_group(self, device_name: str) -> Optional[str]:
         """その名前の機器が属するグループ名を返す（無ければ None）"""

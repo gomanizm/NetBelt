@@ -570,5 +570,164 @@ class SameEndpointInBothGroupsFromTheWindowTest(_ConfigFixture):
         self.assertEqual(self._on_disk(), before, "断ったのに設定が変わった")
 
 
+class AmbiguityIsReportedOnlyWhenItIsTheReasonTest(_ConfigFixture):
+    """ConfigManager 単体: 同名グループのどれの機器か決められずに断るときだけ真。
+
+    画面は、この答えを見て失敗の案内に同名グループの話を足す
+    （MainWindow._same_name_group_hint）。
+    """
+
+    @staticmethod
+    def _ep(host):
+        from core.config_manager import device_endpoint
+        return device_endpoint(_device("R", host))
+
+    def test_identical_devices_in_both_groups_are_ambiguous(self):
+        cm = self._config_manager(_same_endpoint_groups("admin"))
+        device = _device("R", "192.0.2.1")
+
+        self.assertTrue(cm.device_group_is_ambiguous(
+            "kyoten", "R", self._ep("192.0.2.1"), device))
+        self.assertFalse(cm.remove_device("kyoten", "R",
+                                          endpoint=self._ep("192.0.2.1"),
+                                          device=device),
+                         "前提: この機器の削除は断られる")
+
+    def test_a_device_that_one_group_holds_is_not_ambiguous(self):
+        for label, groups, device in [
+                ("接続先違い", _duplicated_groups(), _device("R", "192.0.2.2")),
+                ("接続先は同じで中身違い", _same_endpoint_groups(),
+                 _device("R", "192.0.2.1", "operator")),
+                ("どの同名グループにも無い", _duplicated_groups(),
+                 _device("R", "192.0.2.9"))]:
+            with self.subTest(label):
+                cm = self._config_manager(groups)
+                self.assertFalse(cm.device_group_is_ambiguous(
+                    "kyoten", "R", self._ep(device["host"]), device))
+
+    def test_without_same_named_groups_or_endpoint_nothing_is_ambiguous(self):
+        cm = self._config_manager([_group("Default", []),
+                                   _group("kyoten", [_device("R", "192.0.2.1")])])
+        self.assertFalse(cm.device_group_is_ambiguous(
+            "kyoten", "R", self._ep("192.0.2.1"), _device("R", "192.0.2.1")))
+
+        cm = self._config_manager(_same_endpoint_groups("admin"))
+        self.assertFalse(cm.device_group_is_ambiguous("kyoten", "R"))
+
+
+class UnrelatedRefusalsGetNoSameNameHintTest(_ConfigFixture):
+    """同名グループと関係の無い理由で断ったときは、同名グループの案内を付けない。
+
+    実測（b815dfb）: 案内は、同じ名前のグループが 2 つ以上あるというだけで
+    付いていた。kyoten[R@192.0.2.1] / other[R@192.0.2.9] / kyoten[R@192.0.2.2]
+    で 2 つ目の kyoten の R を other へドラッグすると、移動先に同じ名前の R が
+    いるので断る（コンソールには「移動先グループに既に存在します」）のに、警告は
+    「機器の移動に失敗しました。」に「先に並んでいる方を右クリックし「グループを
+    編集」で別の名前にすると分かれます」を足した文になり、改名しても直らない
+    操作へ誘導していた。2 つ目の kyoten の R の削除・編集で保存に失敗したときも
+    同じ。同名グループの無い設定と同じ文言にする。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PyQt6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    # 破棄済みウィジェットへのシグナル配送で落ちるため保持する
+    _windows = []
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._windows.clear()
+
+    def _window(self, groups):
+        from ui.main_window import MainWindow
+        cm = self._config_manager(groups)
+        with mock.patch("ui.main_window.ConfigManager", return_value=cm), \
+                mock.patch.object(MainWindow, "_check_for_updates_on_startup"), \
+                mock.patch("ui.main_window.QMessageBox.warning"):
+            window = MainWindow()
+        type(self)._windows.append(window)
+        return window
+
+    @staticmethod
+    def _tree_group(window, name, nth):
+        tree = window.device_tree.tree
+        items = [tree.topLevelItem(i) for i in range(tree.topLevelItemCount())]
+        return [item for item in items if item.text(0) == name][nth]
+
+    def _second_r(self, window):
+        from PyQt6.QtCore import Qt
+        item = self._tree_group(window, "kyoten", 1).child(0)
+        data = item.data(0, Qt.ItemDataRole.UserRole)
+        self.assertEqual(data["host"], "192.0.2.2",
+                         "前提: 2 つ目の kyoten の R は 192.0.2.2")
+        return item, data
+
+    def test_a_move_refused_by_the_target_gets_the_plain_message(self):
+        groups = _duplicated_groups()
+        groups[2]["devices"] = [_device("R", "192.0.2.9")]
+        window = self._window(groups)
+        before = self._on_disk()
+        item, _ = self._second_r(window)
+        tree = window.device_tree
+        tree.tree.setCurrentItem(item)
+        event = mock.Mock()
+
+        with mock.patch.object(tree.tree, "itemAt",
+                               return_value=self._tree_group(window, "other", 0)), \
+                mock.patch.object(tree.tree, "dropIndicatorPosition",
+                                  return_value=None), \
+                mock.patch("ui.main_window.QMessageBox.warning") as warn:
+            tree._on_drop_event(event)
+
+        self.assertTrue(event.accept.called, "前提: ドロップが受け付けられている")
+        self.assertEqual(self._on_disk(), before,
+                         "前提: 移動先に同じ名前の R がいるので断られている")
+        self.assertTrue(warn.called, "断ったのに案内が出ていない")
+        self.assertEqual(warn.call_args.args[2], "機器の移動に失敗しました。",
+                         "移動先の重複で断ったのに、同名グループの案内が付いた")
+
+    def test_a_delete_whose_save_fails_gets_the_plain_message(self):
+        from PyQt6.QtWidgets import QMessageBox
+        window = self._window(_duplicated_groups())
+        _, data = self._second_r(window)
+
+        with mock.patch.object(window.config_manager, "save_config",
+                               return_value=False), \
+                mock.patch("ui.main_window.QMessageBox.question",
+                           return_value=QMessageBox.StandardButton.Yes), \
+                mock.patch("ui.main_window.QMessageBox.warning") as warn:
+            window.device_tree.device_delete.emit("kyoten", data["name"], data)
+
+        self.assertEqual(self._on_disk(), BEFORE)
+        self.assertTrue(warn.called, "断ったのに案内が出ていない")
+        self.assertEqual(warn.call_args.args[2], "機器の削除に失敗しました。",
+                         "保存の失敗なのに、同名グループの案内が付いた")
+
+    def test_an_edit_whose_save_fails_gets_the_plain_message(self):
+        from PyQt6.QtWidgets import QDialog
+        window = self._window(_duplicated_groups())
+        _, data = self._second_r(window)
+        dialog = mock.MagicMock()
+        dialog.exec.return_value = QDialog.DialogCode.Accepted
+        dialog.get_device_data.return_value = dict(data, username="changed")
+        dialog.get_selected_group.return_value = "kyoten"
+        dialog.group_combo.findText.return_value = 1
+
+        with mock.patch.object(window.config_manager, "save_config",
+                               return_value=False), \
+                mock.patch("ui.main_window.DeviceDialog", return_value=dialog), \
+                mock.patch("ui.main_window.QMessageBox.warning") as warn:
+            window.device_tree.device_edit.emit("kyoten", data)
+
+        self.assertEqual(self._on_disk(), BEFORE)
+        self.assertTrue(warn.called, "断ったのに案内が出ていない")
+        self.assertEqual(warn.call_args.args[2],
+                         "機器の更新に失敗しました。設定は変更されていません。",
+                         "保存の失敗なのに、同名グループの案内が付いた")
+
+
 if __name__ == "__main__":
     unittest.main()
