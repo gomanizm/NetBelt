@@ -583,58 +583,96 @@ class HostKeyMismatchError(Exception):
     """同じ接続先の別の鍵が known_hosts にある。上書きせず接続を中止する"""
 
 
-class _WindowChangeSender:
-    """window-change を GUI スレッドの外で書く送り役（1 つのチャネルに束縛する）
+class _ChannelWriter:
+    """チャネルへの書き込み（データと window-change）を GUI スレッドの外で行う書き手（1 つのチャネルに束縛する）
 
-    paramiko の resize_pty は、Transport へ書くと待たされる間（鍵交換中・
-    TCP へ書けない）戻らない。書けるかを先に調べても、調べた直後に
-    Transport のスレッドが鍵交換を始めると、書き込みは鍵交換が終わるまで
-    （最長 30 秒）待ち、GUI スレッドで書くとその間は画面も切断の操作も
-    止まっていた。書くのはこのスレッドに任せる。書き込みが待たされている
-    間に渡された大きさは、それが終わってから最後の 1 つだけを書く。
+    paramiko の sendall・resize_pty は、Transport へ書くと待たされる間
+    （鍵交換中・TCP へ書けない）戻らない。書けるかを先に調べても、調べた
+    直後に Transport のスレッドが鍵交換を始めると、書き込みは鍵交換が
+    終わるまで（最長 30 秒）待ち、GUI スレッドで書くとその間は画面も切断の
+    操作も止まっていた。書くのはこのスレッドに任せ、渡された順に書く。
+    データは前の書き込みが終わってから渡される（SSHConnection._send_backlogged
+    が待たせる）。書き込みが待たされている間に渡された大きさは、それが
+    終わってから最後の 1 つだけを書く。
     """
 
     def __init__(self, channel):
         self.channel = channel
         self._lock = threading.Lock()
+        self._data = b""           # まだ書いていないデータ
         self._size = None          # まだ書いていない最後の大きさ
+        self._error = None         # データの書き込みの失敗（GUI スレッドが取り出す）
         self._running = False      # 書き手のスレッドが動いている
         self._stopped = False
         self._idle = threading.Event()
         self._idle.set()
 
-    def send(self, cols: int, rows: int, wait: float) -> None:
+    def busy(self) -> bool:
+        """書いている最中か、まだ書いていない物がある"""
+        return not self._idle.is_set()
+
+    def failed(self) -> bool:
+        """データの書き込みの失敗を、まだ取り出していない"""
+        return self._error is not None
+
+    def take_error(self):
+        """データの書き込みの失敗を取り出す（無ければ None）"""
+        with self._lock:
+            error, self._error = self._error, None
+        return error
+
+    def write(self, data: bytes, wait: float) -> bool:
+        """データを渡し、書き終わるのを最大 wait 秒だけ待つ。書き終えたら True"""
+        return self._hand_over(wait, data=data)
+
+    def send_size(self, cols: int, rows: int, wait: float) -> None:
         """大きさを渡し、書き終わるのを最大 wait 秒だけ待つ
 
         前の書き込みがまだ終わっていなければ待たない（それは待たされて
         いる。終わったら、ここで渡した最後の大きさを書く）。
         """
+        self._hand_over(wait, size=(cols, rows))
+
+    def _hand_over(self, wait: float, data: bytes = b"", size=None) -> bool:
         with self._lock:
             if self._stopped:
-                return
-            self._size = (cols, rows)
+                return True
+            self._data += data
+            if size is not None:
+                self._size = size
             if self._running:
-                return
+                return False
             self._running = True
             self._idle.clear()
         try:
-            threading.Thread(target=self._run, name="netbelt-window-change",
+            threading.Thread(target=self._run, name="netbelt-channel-writer",
                              daemon=True).start()
         except RuntimeError:
-            # スレッドを作れない。これまでどおりその場で書く（渡した大きさを
+            # スレッドを作れない。これまでどおりその場で書く（渡した物を
             # 誰も書かないまま残さない）
             self._run()
-            return
-        self._idle.wait(wait)
+            return True
+        return self._idle.wait(wait)
 
     def _run(self):
         while True:
             with self._lock:
-                size, self._size = self._size, None
-                if size is None or self._stopped:
+                # データから書く。データは書き手が空いているときにしか渡されない
+                # ので、残っている大きさはそのデータより後に渡された物
+                data, self._data, size = self._data, b"", None
+                if not data:
+                    size, self._size = self._size, None
+                if self._stopped or (not data and size is None):
                     self._running = False
                     self._idle.set()
                     return
+            if data:
+                try:
+                    self.channel.sendall(data)
+                except Exception as e:
+                    with self._lock:
+                        self._error = e
+                continue
             try:
                 self.channel.resize_pty(width=size[0], height=size[1])
             except Exception:
@@ -644,6 +682,7 @@ class _WindowChangeSender:
         """以後は書かない（書いている最中の 1 つは、閉じた接続で終わる）"""
         with self._lock:
             self._stopped = True
+            self._data = b""
             self._size = None
 
 
@@ -712,8 +751,8 @@ class SSHConnection(QObject):
         self._size_unsent = False
         # その大きさを送れるようになるのを待つ見張り（_send_terminal_size）
         self._size_watcher: Optional[DrainWatcher] = None
-        # その大きさを GUI スレッドの外で書く送り役（_send_terminal_size）
-        self._size_sender: Optional[_WindowChangeSender] = None
+        # データとその大きさを GUI スレッドの外で書く書き手（_writer_for）
+        self._writer: Optional[_ChannelWriter] = None
         self.send_drained.connect(self._write_carry_when_drained)
         self._size_writable.connect(self._send_terminal_size)
 
@@ -1192,9 +1231,9 @@ class SSHConnection(QObject):
         size_watcher, self._size_watcher = self._size_watcher, None
         if size_watcher is not None:
             size_watcher.stop()
-        size_sender, self._size_sender = self._size_sender, None
-        if size_sender is not None:
-            size_sender.stop()
+        writer, self._writer = self._writer, None
+        if writer is not None:
+            writer.stop()
         # 書き残しは捨てる（繋ぎ直した先へ古い残りを書かない）
         self._carry = b""
         self._size_unsent = False
@@ -1269,21 +1308,38 @@ class SSHConnection(QObject):
         待つと、補充を遅らせる機器では補充が永遠に来ず、送信が止まっていた。
         書き切れずに残ったら見張りを始めて True を返す（続きは send_drained で）。
         send は送れたバイト数を返すだけなので、書くのは sendall にする。
+        書くのは書き手のスレッド（_ChannelWriter）に任せ、書き終わりを
+        _WRITE_WAIT_SECONDS まで待つ。「書ける」と判定した直後に鍵交換が
+        始まると、書き込みは鍵交換が終わるまで待つため（GUI が止まっていた。
+        実測 3 秒、最長 30 秒）。ふだんは 1ms もかからずに書き終わる。
+        書き終わらなければ見張りが待たせ、終われば send_drained で続きを書く。
+        書き手で起きた失敗も、ここで送信エラーとして知らせる。見張りが無い
+        （接続の手順を通っていない）ときは、これまでどおりその場で書く。
         """
         watcher = self._drain_watcher
+        if self._report_write_error():
+            return False
         while self._carry:
             channel = self.channel
             if not self.is_connected or channel is None:
                 self._carry = b""   # 切れた接続の残りは捨てる
                 return False
             if watcher is not None and watcher.check():
-                return True   # ウィンドウが 0・鍵交換中・TCP へ書けない
+                return True   # ウィンドウが 0・鍵交換中・TCP へ書けない・書いている最中
             room = channel.out_window_size
             if watcher is None or not isinstance(room, int) or room <= 0:
                 # 待てない（見張りが無い・窓が分からない・閉じた）: 全部を送り、
                 # 失敗は送信エラーとして知らせる（これまでどおり）
                 room = len(self._carry)
             head, self._carry = self._carry[:room], self._carry[room:]
+            if watcher is not None:
+                writer = self._writer_for(channel)
+                if (not writer.write(head, self._WRITE_WAIT_SECONDS)
+                        and watcher.check()):
+                    return True   # 待たされている。書き終われば send_drained で続きを
+                if self._report_write_error():
+                    return False
+                continue
             try:
                 channel.sendall(head)
             except Exception as e:
@@ -1291,6 +1347,28 @@ class SSHConnection(QObject):
                 self.error_occurred.emit(f"送信エラー: {str(e)}")
                 return False
         return False
+
+    def _writer_for(self, channel) -> _ChannelWriter:
+        """channel に書く書き手（チャネルが変わったら作り直し、ほかの接続へ書かない）"""
+        writer = self._writer
+        if writer is None or writer.channel is not channel:
+            if writer is not None:
+                writer.stop()
+            writer = self._writer = _ChannelWriter(channel)
+        return writer
+
+    def _report_write_error(self) -> bool:
+        """書き手のデータの書き込みの失敗を送信エラーとして知らせる（GUI スレッドから呼ぶ）"""
+        writer = self._writer
+        if writer is None or writer.channel is not self.channel:
+            return False
+        error = writer.take_error()
+        if error is None:
+            return False
+        self._carry = b""   # どこまで送れたか分からない
+        if self.is_connected:   # 切れた後（受信側が知らせ済み・後始末済み）は知らせない
+            self.error_occurred.emit(f"送信エラー: {str(error)}")
+        return True
 
     @pyqtSlot()
     def _write_carry_when_drained(self):
@@ -1310,8 +1388,9 @@ class SSHConnection(QObject):
         チャネルの時間切れ（0.1 秒）で途中までしか送れずに失敗する。どこまで
         送れたかは分からないので、切断として扱うしかなかった（実機の IOSv で
         16KB の貼り付けが途中で切れた）。先に書き残しを書き、それが残るか、
-        ウィンドウが 0・鍵交換中・TCP へ書けない間は端末に次を渡させず、
-        未送信の分を端末の列に残す。空いたら send_drained で知らせる。
+        ウィンドウが 0・鍵交換中・TCP へ書けない・前の書き込みが終わって
+        いない間は端末に次を渡させず、未送信の分を端末の列に残す。空いたら
+        send_drained で知らせる。
         """
         watcher = self._drain_watcher
         if watcher is None:
@@ -1324,10 +1403,18 @@ class SSHConnection(QObject):
         判定できないとき・閉じたときは False（送らせれば送信エラーとして知らせる）。
         送信ウィンドウが 0 でないことと、鍵交換中でないこと（その間 paramiko は
         送信を待たせる）と、TCP へ書けることを見る。状態を読むだけで書かない。
+        書き手（_ChannelWriter）が前の書き込みを終えていない間も True。
+        書き手の失敗を知らせていなければ False（送らせて送信エラーを知らせる）。
         """
         try:
             if channel.closed or not self.is_connected:
                 return False
+            writer = self._writer
+            if writer is not None and writer.channel is channel:
+                if writer.failed():
+                    return False
+                if writer.busy():
+                    return True
             transport = channel.get_transport()
             if not transport.clear_to_send.is_set():
                 return True
@@ -1344,9 +1431,9 @@ class SSHConnection(QObject):
         except RuntimeError:
             pass   # 捨てられた接続（C++ 側が消えている）
 
-    # GUI スレッドが、送り役の window-change の書き終わりを待つ上限（秒）。
+    # GUI スレッドが、書き手（_ChannelWriter）の書き終わりを待つ上限（秒）。
     # 書き込みが待たされても、GUI が止まるのはここまで
-    _SIZE_SEND_WAIT_SECONDS = 0.1
+    _WRITE_WAIT_SECONDS = 0.1
 
     def set_terminal_size(self, cols: int, rows: int):
         """端末の大きさを機器へ伝える (RFC 4254 6.7 window-change)。
@@ -1374,11 +1461,12 @@ class SSHConnection(QObject):
         （send_drained）はチャネルの窓が空くまで待つので、それに頼ると、
         機器が読まずに窓が 0 のままの間は送られず、機器側の端末の大きさが
         古いままだった（window-change は窓と関係なく書ける）。
-        書けると判定したあとも、書くのは送り役のスレッド（_WindowChangeSender）
-        に任せる。判定の直後に鍵交換が始まると、書き込みは鍵交換が終わるまで
-        待つため（GUI が止まっていた。実測 3 秒、最長 30 秒）。ふだんは 1ms
-        もかからずに書き終わるので、書き終わりを _SIZE_SEND_WAIT_SECONDS まで
-        待ち、これまでどおり大きさを伝えてから次の打鍵を送る順序にする。
+        書けると判定したあとも、書くのはデータと同じ書き手のスレッド
+        （_ChannelWriter）に任せる。判定の直後に鍵交換が始まると、書き込みは
+        鍵交換が終わるまで待つため（GUI が止まっていた。実測 3 秒、最長 30 秒）。
+        ふだんは 1ms もかからずに書き終わるので、書き終わりを
+        _WRITE_WAIT_SECONDS まで待ち、これまでどおり大きさを伝えてから次の
+        打鍵を送る順序にする。
         送信の背圧の見張りが無い（接続の手順を通っていない）ときは、これまで
         どおりその場で送る。
         """
@@ -1400,13 +1488,8 @@ class SSHConnection(QObject):
         if self._size_watcher.check():
             return   # 書けるようになったら _size_writable でここへ戻ってくる
         self._size_unsent = False
-        sender = self._size_sender
-        if sender is None or sender.channel is not channel:
-            # 送り役もこのチャネルに束縛する（ほかの接続のチャネルへ書かない）
-            if sender is not None:
-                sender.stop()
-            sender = self._size_sender = _WindowChangeSender(channel)
-        sender.send(self.term_cols, self.term_rows, self._SIZE_SEND_WAIT_SECONDS)
+        self._writer_for(channel).send_size(
+            self.term_cols, self.term_rows, self._WRITE_WAIT_SECONDS)
 
     def _announce_size_writable(self):
         """見張りのスレッドから、保留した大きさを送れるようになったことを知らせる"""
