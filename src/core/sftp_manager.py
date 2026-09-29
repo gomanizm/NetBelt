@@ -78,13 +78,15 @@ class SFTPManager(QObject):
         # （list_directory は転送スレッドからも呼ばれるのでロックで守る）
         self._listing_seq = 0
         self._listing_seq_lock = threading.Lock()
-        # 行き先の控え: 自動更新ではない最後の一覧の要求の場所と、その番号
-        # （_refresh_listing が使う。_listing_seq_lock で守る）
+        # 行き先の控え: 自動更新ではない最後の一覧の要求の場所と、その番号と、
+        # その要求が機器に頼み終えた印（_pick_refresh_path が使う。
+        # _listing_seq_lock で守る）
         self._listing_path = None
         # 後始末で待つ期限（time.monotonic() の値）。最初の quiesce が決め、
         # そのあとの quiesce / disconnect は残りだけ待つ（_teardown_wait）
         self._teardown_deadline: Optional[float] = None
         self._listing_path_seq = 0
+        self._listing_path_fetched = None
         self._listing_done.connect(self._on_listing_done)
     
     # GUI スレッドから直接呼ぶ操作が、転送の終わりを待つ最大時間。
@@ -411,8 +413,7 @@ class SFTPManager(QObject):
         Args:
             path: ディレクトリパス（Noneの場合は現在のパス）
             refresh: 変更のあとの自動更新（_refresh_listing）。path は使わず、
-                最後に頼んだ場所（無ければ現在のパス）を番号と同じロックの中で選ぶ
-                （通信のロックを取った時点で最新なら選び直す）
+                通信のロックを取った時点で場所を選ぶ（_pick_refresh_path）
         """
         if not self.is_connected or not self.sftp_client:
             self.error_occurred.emit("SFTP接続がありません")
@@ -423,19 +424,17 @@ class SFTPManager(QObject):
 
         # 発行の順番を控える。これより新しい要求が出ていたら、この一覧は
         # 届いても捨てられる
+        fetched = None
         with self._listing_seq_lock:
-            if refresh:
-                # 選んでから番号を取るまでの間に利用者の移動が入ると、選んだ
-                # 古い場所が後から番号を取って移動を追い越す。同じ区間で選ぶ
-                path = self._listing_path
-                if path is None:
-                    path = self.current_path
             self._listing_seq += 1
             seq = self._listing_seq
             if not refresh:
-                # 自動更新は行き先を変えないので控えを置かない
+                # 自動更新は行き先を変えないので控えを置かない。機器に
+                # 頼み終えたら fetched を立てる（自動更新がそれを待つ）
+                fetched = threading.Event()
                 self._listing_path = path
                 self._listing_path_seq = seq
+                self._listing_path_fetched = fetched
 
         def list_thread():
             import stat as stat_mod
@@ -446,15 +445,7 @@ class SFTPManager(QObject):
                 self._sftp_lock.acquire()
                 try:
                     if refresh:
-                        # 選んだ移動先の一覧が、この順番待ちの間に失敗していたら
-                        # 今の場所を選び直す。そのまま頼むと同じ失敗を重ねて
-                        # 知らせ、今の場所も取り直さない。最新でなくなった分は
-                        # 届いても捨てられるので選び直さない
-                        with self._listing_seq_lock:
-                            if seq == self._listing_seq:
-                                path = self._listing_path
-                                if path is None:
-                                    path = self.current_path
+                        path = self._pick_refresh_path()
                     # 待っているあいだに切断されたかもしれない。取得前の
                     # 確認だけでは足りない（起きたら None を触ることになる）。
                     # 黙って戻ると、一覧が変わらない理由が利用者に届かない。
@@ -502,6 +493,9 @@ class SFTPManager(QObject):
                     self._forget_failed_destination(seq)
                     raise
                 finally:
+                    # 頼み終えた印は、控えを外したあと・ロックを放す前に立てる
+                    if fetched is not None:
+                        fetched.set()
                     self._sftp_lock.release()
                 
                 # ファイル情報をリストに変換
@@ -556,16 +550,37 @@ class SFTPManager(QObject):
             if seq == self._listing_path_seq:
                 self._listing_path = None
 
+    def _pick_refresh_path(self) -> str:
+        """自動更新が頼む場所を選ぶ。通信のロックを持って呼び、持ったまま戻る
+
+        行き先の控えがあればその場所、無ければ（移動が失敗した）今の場所。
+        控えを置いた要求の一覧がまだ機器に頼まれていなければ、ロックを
+        一度放してそれが済むのを待ち、選び直す。先に同じ場所を頼むと、
+        読めない移動先では同じ失敗を 2 回知らせ、今の場所も取り直さない。
+        待つ相手は自動更新ではない（ロックしか待たない）ので待ち合わない。
+        番号を取ったあとに選ぶので、選んだあとの移動はこれより新しい番号を
+        持ち、この一覧は届いても捨てられる（移動を取り消さない）。
+        """
+        while True:
+            with self._listing_seq_lock:
+                path = self._listing_path
+                fetched = self._listing_path_fetched
+                if path is None:
+                    return self.current_path
+            if fetched.is_set():
+                return path
+            self._sftp_lock.release()
+            fetched.wait()
+            self._sftp_lock.acquire()
+
     def _refresh_listing(self):
         """変更のあとの自動更新。行き先の控えの場所の一覧を取り直す
 
         current_path は一覧が GUI に届いたときにしか変わらない。移動の一覧が
         届く前に current_path を頼み直すと、一覧は最後に頼んだ分だけを採る
         ので、古い場所の一覧が移動先を追い越して移動を黙って取り消す。
-        控えが無ければ（移動が失敗した）今の場所を取り直す。場所は
-        list_directory が番号を進めるのと同じロックの中で選び、通信のロックを
-        取った時点でまだ最新なら選び直す（順番待ちの間に移動が失敗していれば
-        今の場所になる）。
+        控えが無ければ（移動が失敗した）今の場所を取り直す。場所は通信の
+        ロックを取った時点で選ぶ（_pick_refresh_path）。
         """
         self.list_directory(refresh=True)
     

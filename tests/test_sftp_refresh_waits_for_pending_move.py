@@ -1,21 +1,37 @@
-"""あとの移動に追い越された自動更新が、その移動の一覧より先に通信のロックを
-取っても、同じ失敗を重ねて知らせないことを検証する（テストの穴を埋める）。
+"""自動更新が、失敗する移動の一覧より先に通信のロックを取っても、同じ失敗を
+重ねて知らせず、今の場所を取り直すことを検証する。
 
-実測（157b833。本体は正しく、テストが守っていなかった）:
-  自動更新（_refresh_listing）は、通信のロックを取った時点でまだ最新の要求の
-  ときだけ場所を選び直す（src/core/sftp_manager.py:424 の
-  if seq == self._listing_seq:）。この確かめを if True: にしても、SFTP
-  クライアントに関わるテスト 86 ファイル（522 件）はすべて通った。外すと、
-  /B への移動の途中で頼まれた自動更新 R1 が、続く読めない /C への移動に
-  追い越されたうえで /C の一覧より先にロックを取ったとき、R1 は控えの /C を
-  選び直して頼む。/C の一覧も失敗するので、「ディレクトリ一覧取得エラー:
-  Permission denied」が 2 件（パネルでは警告のモーダルが 2 枚）出る。頼んだ
-  順は ['/B', '/C', '/C']（157b833 は ['/B', '/B', '/C'] で 1 件）。
-  CPython の Windows のロックはほぼ先着順なので、ロックの代わりを差し込んで
-  順を強制する。
+実測（157b833。ロックを取る順を強制したとき）:
+  自動更新（_refresh_listing）は、頼んだ時点で行き先の控え（_listing_path）を
+  選び、通信のロックを取った時点でまだ最新の要求なら選び直していた。控えを
+  外すのは移動の一覧が失敗したときなので、移動の一覧がまだ機器に頼まれて
+  いなければ、どちらの時点でも控えは読めない /C のまま。次の 2 つの並びで
+  「ディレクトリ一覧取得エラー: Permission denied」が 2 件（パネルでは警告の
+  モーダルが 2 枚）出た。
+  (1) あとから頼んだ自動更新が、先に頼まれた /C への移動の一覧より先に
+      ロックを取る。頼んだ順は ['/C', '/C']、今いる /A の一覧は取り直されず、
+      転送などで変わった中身が表に出ない（441ea02 は ['/A', '/C'] で 1 件）。
+  (2) /C の一覧がロックの中にある間に自動更新 R1 が頼まれ（/C を選ぶ）、
+      /C の失敗のあと、別の操作の自動更新 R2 が R1 を追い越す。追い越された
+      R1 は選び直さず、最初に選んだ /C を頼む。頼んだ順は ['/C', '/A', '/C']
+      （441ea02 は 1 件）。
+  (3) /B への移動の途中で頼まれた自動更新が、続く読めない /C への移動に
+      追い越されたうえで /C の一覧より先にロックを取る並びは、157b833 では
+      1 件だった。ただ、それを支える「最新なら選び直す」の確かめ
+      （if seq == self._listing_seq:）を if True: にすると ['/B', '/C', '/C']
+      で 2 件になるのに、SFTP クライアントに関わるテスト 86 ファイルは
+      すべて通った（テストの穴。3 つ目のテストで埋めた）。
+  CPython の Windows のロックはほぼ先着順で、(1) は止め具なしでは稀
+  （転送の完了と読めない場所への移動を続けて頼む筋書きで 300 回中 1 回）。
+  このテストはロックの代わりを差し込んで順を強制する。
 
-守り方:
-  その並びを作り、失敗が 1 件で、/C を 1 回しか頼まないことを確かめる。
+直し方:
+  自動更新の場所は、通信のロックを取った時点でだけ選ぶ（最新かどうかに
+  かかわらず。追い越された分は届いても捨てられる）。控えを置いた要求
+  （移動・利用者の更新）の一覧がまだ機器に頼まれていなければ、ロックを一度
+  放してそれが済むのを待ち、選び直す（失敗なら控えは外れていて今の場所に
+  なる）。待つ相手は自動更新ではないので、待ち合いにはならない。(3) の
+  確かめは無くなり、この並びでも待つので 1 件のまま。
 """
 import sys
 import threading
@@ -181,6 +197,57 @@ class RefreshWaitsForPendingMoveTest(unittest.TestCase):
             self.app.processEvents()
             time.sleep(0.01)
         self._pump(seconds=0.3)
+
+    def test_a_refresh_taking_the_lock_first_waits_for_the_failing_move(self):
+        """自動更新が、先に頼まれた読めない /C の一覧より先にロックを取っても、
+        失敗は 1 件で、今の /A を取り直すこと。"""
+        m, lock = self._manager({})
+        lock.armed = True
+        m.change_directory("/C")        # 利用者の移動。一覧はロックの手前で止まる
+        move = lock.wait_held(1)
+        self.assertIsNotNone(move, "前提: /C の一覧がロックを取りに来ない")
+        m._refresh_listing()            # 転送などのあとの自動更新
+        refresh = lock.wait_held(2)
+        self.assertIsNotNone(refresh, "前提: 自動更新がロックを取りに来ない")
+        lock.grant(refresh)             # 自動更新が先にロックを取る
+        self.assertTrue(lock.wait_acquired(refresh), "前提: 自動更新がロックを取らない")
+        lock.grant(move)
+        self._settle(lock)
+        self.assertEqual(self.errors, [_DENIED],
+                         "同じ失敗が重ねて知らされた（頼んだ順 %r）" % self.asked)
+        self.assertEqual(self.asked.count("/C"), 1, self.asked)
+        self.assertEqual(m.current_path, "/A")
+        self.assertEqual(self.lists, [["in-A.cfg", "new.cfg"]],
+                         "今の場所の一覧が取り直されていない（頼んだ順 %r）"
+                         % self.asked)
+
+    def test_an_overtaken_refresh_does_not_ask_the_failed_move_again(self):
+        """/C の一覧の途中で頼まれ、別の自動更新に追い越された自動更新が、
+        /C の失敗のあとに /C を頼み直さないこと。"""
+        c_gate = threading.Event()
+        m, lock = self._manager({"/C": c_gate})
+        m.change_directory("/C")        # 利用者の移動。一覧はロックの中で止まる
+        self.assertTrue(self._wait_asked("/C"), "前提: /C の一覧が始まらない")
+        lock.armed = True
+        m._refresh_listing()            # R1（転送のあとの自動更新）
+        first = lock.wait_held(1)
+        self.assertIsNotNone(first, "前提: R1 がロックを取りに来ない")
+        c_gate.set()                    # /C が失敗する
+        self.assertTrue(self._pump(lambda: self.errors, seconds=5.0),
+                        "前提: /C の失敗が知らされない")
+        m._refresh_listing()            # R2（別の操作のあとの自動更新）
+        second = lock.wait_held(2)
+        self.assertIsNotNone(second, "前提: R2 がロックを取りに来ない")
+        lock.grant(second)              # R2 が R1 を追い越して先に済む
+        self.assertTrue(self._pump(lambda: self.lists, seconds=5.0),
+                        "前提: R2 の一覧が届かない")
+        lock.grant(first)
+        self._settle(lock)
+        self.assertEqual(self.errors, [_DENIED],
+                         "同じ失敗が重ねて知らされた（頼んだ順 %r）" % self.asked)
+        self.assertEqual(self.asked.count("/C"), 1, self.asked)
+        self.assertEqual(m.current_path, "/A")
+        self.assertEqual(self.lists, [["in-A.cfg", "new.cfg"]])
 
     def test_an_overtaken_refresh_taking_the_lock_first_waits_for_the_move(self):
         """/B への移動の途中で頼まれた自動更新が、続く読めない /C への移動に
