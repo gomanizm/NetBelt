@@ -1790,9 +1790,9 @@ class TerminalWidget(QWidget):
             log_recording.stop(name, path)
             if handle.failure is not None and report is not None:
                 report(handle.failure)
-        # 書き込み待ちが減った機器は、描くのと受信を再開する
+        # 書き込み待ちが減った機器（記録を停止した機器を含む）は、描くのと受信を再開する
         for name in list(self._log_throttled):
-            if self._log_backlog(name) <= self.PENDING_LOW_WATER:
+            if self._held_log_backlog(name) <= self.PENDING_LOW_WATER:
                 self._log_throttled.discard(name)
                 self._update_output_gate(name)
                 if self._pending_output.get(name):
@@ -1923,6 +1923,19 @@ class TerminalWidget(QWidget):
             entry[0] for entry in self._closing_logs.get(device_name, ())]
         return sum(h.backlog for h in handles if isinstance(h, LogWriter))
 
+    def _held_log_backlog(self, device_name: str) -> int:
+        """描画と受信を止めるかどうかの判定に使う、記録中のファイルの書き込み待ちの文字数
+
+        停止した記録（_closing_logs）は数えない。停止した記録が受け取るのは
+        停止より前に受信した分だけで量に上限があるので、描いてその書き込み
+        スレッドへ積めばよい。数えると、記録先が詰まったままでは停止した記録の
+        書き込み待ちが減らず、「記録停止」を押しても、健全なファイルへ記録を
+        始め直しても、止めたままになっていた（実測: 詰まりが解けるまで画面が
+        進まなかった）。
+        """
+        handle = self._log_files.get(device_name)
+        return handle.backlog if isinstance(handle, LogWriter) else 0
+
     def _flush_pending_output(self) -> None:
         """溜めた出力を機器ごとに OUTPUT_SLICE 文字まで描き、残りは次の回へ回す"""
         # 描画が失敗しても、関所の開け直しと次の排出だけは続ける。飛ばすと
@@ -1936,15 +1949,16 @@ class TerminalWidget(QWidget):
                 if not pending or device_name not in self._terminals:
                     self._pending_output.pop(device_name, None)
                     continue
-                # 記録先が詰まって書き込み待ちが上限を超えたら、この機器だけ
-                # 描くのを止めて受信の関所を閉じる。機器側が待つので記録も
-                # 画面も欠けず、書き込み待ちがメモリに積み上がり続けない
+                # 記録先が詰まって記録中のファイルの書き込み待ちが上限を超えたら、
+                # この機器だけ描くのを止めて受信の関所を閉じる。機器側が待つので
+                # 記録も画面も欠けず、書き込み待ちがメモリに積み上がり続けない
                 # （利用者の決定）。減ったら _check_log_writers が再開させる。
+                # 停止した記録は数えない（_held_log_backlog）。
                 # 関所の無い接続（シリアル）は止めない。受信は止まらないので、
                 # 止めると描き待ちが上限なく増えるだけになる（知らせは見回りが出す）
                 if device_name in self._output_gates and (
                         device_name in self._log_throttled
-                        or self._log_backlog(device_name)
+                        or self._held_log_backlog(device_name)
                         >= self.PENDING_HIGH_WATER):
                     self._log_throttled.add(device_name)
                     self._update_output_gate(device_name)
