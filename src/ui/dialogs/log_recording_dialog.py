@@ -1,5 +1,5 @@
 from PyQt6.QtWidgets import QDialog, QVBoxLayout, QLabel, QPushButton, QHBoxLayout
-from PyQt6.QtCore import Qt, pyqtSignal, QTimer
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QPoint, QRect, QSize
 from PyQt6.QtGui import QKeySequence
 from datetime import datetime
 from ui import theme
@@ -13,6 +13,16 @@ class LogRecordingDialog(QDialog):
     # 2台を同時に記録しているときに別の機器の記録を打ち切ってしまう。
     stop_requested = pyqtSignal(str)
     
+    # 状態の行に出す知らせ（どれを出すかは TerminalWidget の見回りが決める）
+    STATUS_HELD = ("記録先への書き込みが遅れているため、受信を止めています"
+                   "（画面にも記録にも欠けは出ません。記録先が応答すると"
+                   "再開します）。止めている間も、打った文字は機器へ送られ"
+                   "ます（エコーは再開してから表示されます）。")
+    STATUS_LAGGING = ("記録先への書き込みが遅れています。記録する分をメモリに"
+                      "溜めています（保存先の接続を確認してください）。")
+    # 並べるときのダイアログどうしの隙間（px）
+    PLACE_GAP = 8
+
     def __init__(self, device_name: str, file_path: str, parent=None,
                  size_provider=None):
         """
@@ -150,6 +160,86 @@ class LogRecordingDialog(QDialog):
         need = self.heightForWidth(self.width())
         if need > self.height():
             self.resize(self.width(), need)
+
+    def place_apart(self, others) -> None:
+        """表示する前に、開いているほかの記録中ダイアログ（others）と重ならない所へ置く。
+
+        置かないと、どれも親の中央に出て、後から始めた記録のダイアログが先の
+        ダイアログにぴったり重なり、先の記録の状態の行が隠れていた（止まった
+        理由が見えず、エコーの見えないまま打ち直すと機器へ二重に送る）。
+        状態の行が出て伸びる分（set_status）も空けておく。親の中央から近い
+        順に、同じ段の左右、次に上下の段を（画面の内側へ寄せて）探し、どれとも
+        重ならない最初の所へ置く。画面に空きが無ければ、重なる面積が最も
+        小さい所へ置く（既定の位置のままだと先のダイアログに丸ごと重なる）。
+        move は位置を決めるだけで、前に出さず活性化もしない。
+        """
+        # show() と同じ大きさにする（show() と同じく、自動で決めた大きさの扱い）
+        self.adjustSize()
+        self.setAttribute(Qt.WidgetAttribute.WA_Resized, False)
+        room = self._status_room()
+        self._full_height = self.height() + room
+        shown = [d for d in others if d is not self and d.isVisible()]
+        if not shown:
+            return
+        taken = [d.frameGeometry().adjusted(
+            0, 0, 0, max(0, getattr(d, "_full_height", 0) - d.height()))
+            for d in shown]
+        # 枠（タイトルバーなど）の厚みは、表示しているダイアログから借りる
+        frame = shown[0].frameGeometry()
+        size = QSize(self.width() + frame.width() - shown[0].width(),
+                     self.height() + frame.height() - shown[0].height() + room)
+        host = self.parentWidget().window() if self.parentWidget() else self
+        screen = host.screen()
+        if screen is None:          # 画面が 1 つも無い間（ドックの抜き差しなど）
+            return
+        area = screen.availableGeometry()
+        center = host.mapToGlobal(QPoint(host.width() // 2, host.height() // 2))
+        # 既定の位置（QDialog が親の中央に置く所）と同じ見積もりにして、最初の
+        # ダイアログと段を揃える（Windows では枠の左の厚みが 0 で、10 と 40）
+        fx = max(d.geometry().x() - d.x() for d in shown)
+        fy = max(d.geometry().y() - d.y() for d in shown)
+        if not fx or not fy or fx >= 10 or fy >= 40:
+            fx, fy = 10, 40
+        base = center - QPoint(self.width() // 2 + fx, self.height() // 2 + fy)
+        step_x = size.width() + self.PLACE_GAP
+        step_y = size.height() + self.PLACE_GAP
+
+        def spread(count):
+            yield 0
+            for i in range(1, count + 1):
+                yield i
+                yield -i
+        best = None
+        for dy in spread(area.height() // step_y + 1):
+            for dx in spread(area.width() // step_x + 1):
+                pos = base + QPoint(dx * step_x, dy * step_y)
+                pos = QPoint(   # 画面からはみ出す所は内側へ寄せる
+                    max(area.left(), min(pos.x(), area.right() + 1 - size.width())),
+                    max(area.top(), min(pos.y(), area.bottom() + 1 - size.height())))
+                covered = sum(r.width() * r.height() for r in (
+                    QRect(pos, size).intersected(t) for t in taken))
+                if best is None or covered < best[0]:
+                    best = (covered, pos)
+                if not covered:
+                    break
+            if not best[0]:
+                break
+        self.move(best[1])
+
+    def _status_room(self) -> int:
+        """状態の行に知らせを出すと、いまの幅で高さがどれだけ伸びるか（表示する前に測る）"""
+        label = self.status_label
+        if label.isVisibleTo(self):
+            return 0
+        now = self.heightForWidth(self.width())
+        need = now
+        label.show()                # 窓を表示する前なので画面には出ない
+        for text in (self.STATUS_HELD, self.STATUS_LAGGING):
+            label.setText(text)
+            need = max(need, self.heightForWidth(self.width()))
+        label.hide()
+        label.setText("")
+        return max(0, need - now)
 
     def _on_stop(self):
         """停止ボタンクリック時の処理"""

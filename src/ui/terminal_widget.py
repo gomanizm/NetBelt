@@ -1863,13 +1863,9 @@ class TerminalWidget(QWidget):
         """
         for name, dialog in list(self._log_dialogs.items()):
             if name in self._log_throttled:
-                text = ("記録先への書き込みが遅れているため、受信を止めています"
-                        "（画面にも記録にも欠けは出ません。記録先が応答すると"
-                        "再開します）。止めている間も、打った文字は機器へ送られ"
-                        "ます（エコーは再開してから表示されます）。")
+                text = dialog.STATUS_HELD
             elif name in self._log_lagging:
-                text = ("記録先への書き込みが遅れています。記録する分をメモリに"
-                        "溜めています（保存先の接続を確認してください）。")
+                text = dialog.STATUS_LAGGING
             else:
                 text = ""
             dialog.set_status(text)
@@ -2525,6 +2521,9 @@ class TerminalWidget(QWidget):
                     tab_name, file_path, self,
                     size_provider=lambda name=tab_name: self.recorded_bytes(name))
                 dialog.stop_requested.connect(self.stop_log_recording)
+                # ほかの機器の記録中ダイアログに重ねない（重ねると、その状態の
+                # 行が隠れる）
+                dialog.place_apart(self._log_dialogs.values())
                 dialog.show()
                 self._log_dialogs[tab_name] = dialog
                 # show() はダイアログを活性化し、フォーカスが「記録停止」へ

@@ -47,6 +47,15 @@ show / showNormal / setFocus / open / exec を数える偽物に替えて、0 �
 られない。描き待ちを残したまま停止すると、停止した記録は描き終わるまで
 _closing_logs に残り、上限を超えた書き込み待ちを持つ（ダイアログは無い）。
 その状態で見回りを回しても窓を出さないことを確かめる（検査役の変異 closingwin）。
+
+2 台以上を同時に記録しているとき、記録中ダイアログを重ねないこと（7 周目 term の
+検査役の指摘。4262df7 で実測）: 記録中ダイアログはどれも親の中央に出るので、
+後から始めた記録のダイアログが先のダイアログにぴったり重なり、先の記録の状態の
+行が後のダイアログの下に隠れていた（dev と dev2 のダイアログが同じ位置で、dev の
+行は dev2 のダイアログの中に完全に入る）。状態の行が出て伸びた分も重ならないこと
+を確かめる。画面に空きが無いときも、丸ごと重ねずに重なりの最も小さい所へ置き、
+先の行を隠さないことを確かめる。offscreen の画面は 800x800 なので、画面の使える
+範囲は QScreen.availableGeometry の差し替えで決める。
 """
 import builtins
 import os
@@ -742,6 +751,122 @@ class LogRecordingIoStallStatusLineTest(unittest.TestCase):
             self.assertEqual(f.read(), _chunk("ser", 0, fed).replace("\r\n", "\n"),
                              "停止した記録が欠けた・崩れた")
         self.assertIn("ser%06d" % (fed - 1), w._terminals["ser"].toPlainText())
+        self.assertEqual(self._windows(), [], "窓を出した")
+
+    @staticmethod
+    def _screen_area(width, height):
+        """画面の使える範囲を (0, 0, width, height) にする（offscreen の画面は 800x800）。"""
+        from PyQt6.QtCore import QRect
+        from PyQt6.QtGui import QScreen
+        mock.patch.object(QScreen, "availableGeometry",
+                          lambda screen: QRect(0, 0, width, height)).start()
+        return QRect(0, 0, width, height)
+
+    def test_recording_dialogs_do_not_cover_each_other(self):
+        """3 台を同時に記録しているとき、記録中ダイアログを重ねて出さず、どの状態の行も別のダイアログの下に隠れないこと（行が出て伸びた分も）。記録と画面は欠けないこと。"""
+        from PyQt6.QtCore import QPoint, QRect
+        from PyQt6.QtWidgets import QApplication
+        w = self._widget(["dev", "ser", "dev3"])
+        # 横に 2 枚、縦に 2 段まで並ぶ広さ（3 枚目は下の段へ行き、上の段の行が
+        # 出て伸びた分と重ならないことも確かめる）
+        area = self._screen_area(1300, 1000)
+        dev_release = self._stalled()
+        ser_release = self._stalled()
+        dev_path = self._start(w, "dev", "dev.log", dev_release)
+        ser_path = self._start(w, "ser", "ser.log", ser_release)
+        path3 = self._start(w, "dev3", "dev3.log")
+        gate = w.output_gate("dev")
+        w.output_gate("dev3")
+        _pump(50)
+        self.assertIs(QApplication.activeWindow(), w,
+                      "記録中ダイアログを出したあと、主窓へ活性を戻さなかった")
+        self.assertIs(QApplication.focusWidget(), w._terminals["dev3"],
+                      "記録中ダイアログを出したあと、端末へフォーカスを戻さなかった")
+
+        dev_fed = self._feed_until_held(w, gate, "dev", 0)
+        ser_fed = self._feed_serial_over(w, "ser", 0)
+        self.assertTrue(self._wait_until(
+            lambda: self._line(w, "dev") and self._line(w, "ser"), 2.0),
+            "前提: dev と ser の記録中ダイアログに状態の行が出た")
+        _pump(100)
+        dialogs = {name: w._log_dialogs[name] for name in ("dev", "ser", "dev3")}
+        frames = {name: dialog.frameGeometry() for name, dialog in dialogs.items()}
+        for name, frame in frames.items():
+            self.assertTrue(area.contains(frame),
+                            "%s の記録中ダイアログが画面からはみ出した: %r" % (name, frame))
+        names = list(frames)
+        for i, first in enumerate(names):
+            for second in names[i + 1:]:
+                self.assertFalse(
+                    frames[first].intersects(frames[second]),
+                    "%s と %s の記録中ダイアログが重なっている: %r / %r"
+                    % (first, second, frames[first], frames[second]))
+        for name in ("dev", "ser"):
+            label = dialogs[name].status_label
+            line = QRect(label.mapToGlobal(QPoint(0, 0)), label.size())
+            for other, frame in frames.items():
+                self.assertTrue(
+                    other == name or not frame.intersects(line),
+                    "%s の状態の行が、%s の記録中ダイアログの下に隠れた" % (name, other))
+
+        dev_release.set()
+        ser_release.set()
+        self.assertTrue(self._wait_until(
+            lambda: self._caught_up(w, gate, "dev")
+            and not w._pending_output.get("ser") and w._log_backlog("ser") == 0,
+            10.0), "詰まりが解けても追いつかなかった")
+        self.assertEqual(self._stop_and_read(w, "dev", dev_path),
+                         _chunk("dev", 0, dev_fed).replace("\r\n", "\n"),
+                         "止めている間の記録が欠けた・崩れた")
+        self.assertEqual(self._stop_and_read(w, "ser", ser_path),
+                         _chunk("ser", 0, ser_fed).replace("\r\n", "\n"),
+                         "遅れている間の記録が欠けた・崩れた")
+        self.assertEqual(self._stop_and_read(w, "dev3", path3), "")
+        self.assertIn("dev%06d" % (dev_fed - 1), w._terminals["dev"].toPlainText())
+        self.assertIn("ser%06d" % (ser_fed - 1), w._terminals["ser"].toPlainText())
+        self.assertEqual(self._windows(), [], "窓を出した")
+
+    def test_a_full_screen_still_keeps_the_earlier_line_in_view(self):
+        """画面に空きが無いときも、後から出す記録中ダイアログを先のダイアログに丸ごと重ねず、先の状態の行を隠さないこと（重なりの最も小さい所へ置く）。"""
+        from PyQt6.QtCore import QPoint, QRect
+        w = self._widget(["dev", "dev2"])
+        release = self._stalled()
+        # 保存先の表示の折り返しを揃える（同じ幅の名前にして、2 枚を同じ高さにする）
+        path = self._start(w, "dev", "dev1.log", release)
+        gate = w.output_gate("dev")
+        w.output_gate("dev2")
+        fed = self._feed_until_held(w, gate, "dev", 0)
+        self.assertTrue(self._wait_until(lambda: self._line(w, "dev"), 2.0),
+                        "前提: dev の記録中ダイアログに状態の行が出た")
+        _pump(100)
+        first = w._log_dialogs["dev"]
+        frame = first.frameGeometry()
+        # 横には並ばず、下の段には 40px 足りない画面（どこへ置いても重なる）
+        area = self._screen_area(frame.right() + 1 + 10,
+                                 frame.bottom() + 1 + frame.height() - 40)
+        path2 = self._start(w, "dev2", "dev2.log")
+        _pump(100)
+
+        second = w._log_dialogs["dev2"].frameGeometry()
+        self.assertTrue(area.contains(second),
+                        "dev2 の記録中ダイアログが画面からはみ出した: %r" % second)
+        self.assertTrue(area.contains(first.frameGeometry()), "前提: dev は画面の中")
+        self.assertTrue(second.intersects(first.frameGeometry()),
+                        "前提: 画面に空きが無く、重ねて置くしかなかった")
+        label = first.status_label
+        line = QRect(label.mapToGlobal(QPoint(0, 0)), label.size())
+        self.assertTrue(label.isVisible() and line.height() > 0, "前提: dev の行が出ている")
+        self.assertFalse(second.intersects(line),
+                         "dev の状態の行が、後から出した dev2 の記録中ダイアログの下に"
+                         "隠れた（dev %r / 行 %r / dev2 %r）" % (frame, line, second))
+
+        release.set()
+        self.assertTrue(self._wait_until(lambda: self._caught_up(w, gate, "dev"), 10.0),
+                        "詰まりが解けても受信・描画を再開しなかった")
+        self.assertEqual(self._stop_and_read(w, "dev", path),
+                         _chunk("dev", 0, fed).replace("\r\n", "\n"),
+                         "止めている間の記録が欠けた・崩れた")
+        self.assertEqual(self._stop_and_read(w, "dev2", path2), "")
         self.assertEqual(self._windows(), [], "窓を出した")
 
 
