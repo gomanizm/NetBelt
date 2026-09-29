@@ -26,6 +26,8 @@
 
 このテストでは上限をインスタンスで小さくして（256 KiB / 64 KiB）確かめる。
 案内は QMessageBox.show を見張って数える（モーダルの information は出ない）。
+information と QMessageBox.exec は、開かずにすぐ戻る偽物に替え、モーダルで出た
+案内として数える（モーダルへ戻る退行があっても、止まったままにならずに落ちる）。
 """
 import builtins
 import os
@@ -97,12 +99,24 @@ class LogRecordingIoStallHoldNoticeTest(unittest.TestCase):
         self.addCleanup(log_recording.stop, "dev")
         self.dir = tempfile.mkdtemp(prefix="netbelt-logstall-notice-")
         from PyQt6.QtWidgets import QMessageBox
-        self.warning = mock.patch("PyQt6.QtWidgets.QMessageBox.warning").start()
-        self.information = mock.patch(
-            "PyQt6.QtWidgets.QMessageBox.information").start()
-        # show() で出た案内を、出た順に（題, 本文, モーダルか）で覚える
+        # 出た案内を、出た順に（題, 本文, モーダルか）で覚える
         self.shown = []
         self.boxes = []
+        # モーダルで出した案内（information、または exec）も覚える。どちらも
+        # 開かずにすぐ戻す（本物は利用者が閉じるまで戻らないので、モーダルへ
+        # 戻る退行があるとテストが止まったままになる）
+        self.execs = []
+
+        def recording_exec(box, *args):
+            self.execs.append(box.text())
+            self.shown.append((box.windowTitle(), box.text(), True))
+            return QMessageBox.StandardButton.Ok.value
+        self.warning = mock.patch("PyQt6.QtWidgets.QMessageBox.warning").start()
+        self.information = mock.patch(
+            "PyQt6.QtWidgets.QMessageBox.information",
+            side_effect=lambda parent, title, text, *a, **k:
+            self.shown.append((title, text, True))).start()
+        mock.patch.object(QMessageBox, "exec", recording_exec).start()
         real_show = QMessageBox.show
 
         def recording_show(box):
@@ -218,6 +232,7 @@ class LogRecordingIoStallHoldNoticeTest(unittest.TestCase):
         self.assertEqual(len(self._hold_notices()), 1)
         self.assertEqual(len(self.shown), 1, "ほかの案内が出た")
         self.assertEqual(self.information.call_count, 0, "モーダルの案内が出た")
+        self.assertEqual(self.execs, [], "案内を exec のモーダルで出した")
 
     def test_a_new_hold_is_noticed_again_only_in_a_new_recording(self):
         """追いついてからまた止めても同じ記録のうちは知らせ直さず、記録を始め直して止めたら、また一度だけ知らせること。"""
@@ -227,6 +242,8 @@ class LogRecordingIoStallHoldNoticeTest(unittest.TestCase):
         fed = self._feed_until_held(w, gate, 0)
         self.assertTrue(self._wait_until(lambda: self._hold_notices(), 2.0),
                         "記録先の詰まりで受信を止めたのに、何も知らせなかった")
+        self.assertEqual([modal for _, _, modal in self._hold_notices()], [False],
+                         "案内がモーダルで出た")
         self._close_boxes()             # 利用者が閉じる
         self.release.set()
         self.assertTrue(self._wait_until(lambda: self._caught_up(w, gate), 10.0),
@@ -256,6 +273,7 @@ class LogRecordingIoStallHoldNoticeTest(unittest.TestCase):
         self.assertEqual([modal for _, _, modal in self._hold_notices()],
                          [False, False], "案内がモーダルで出た")
         self.assertEqual(self.information.call_count, 0)
+        self.assertEqual(self.execs, [], "案内を exec のモーダルで出した")
         self.assertEqual(self.warning.call_count, 0)
 
 

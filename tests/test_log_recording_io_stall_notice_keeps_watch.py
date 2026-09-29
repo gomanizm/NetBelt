@@ -29,7 +29,9 @@ Qt は、スロットが入れ子のイベントループにいる間、同じ�
 
 警告は、入れ子のイベントループを回してから戻る偽物に替える（本物のモーダルと
 同じく、開いている間は呼んだスロットへ戻らない）。止めたことの案内は
-QMessageBox.show を見張って数える。上限はインスタンスで小さくする。
+QMessageBox.show を見張って数える。information と QMessageBox.exec は、開かずに
+すぐ戻る偽物に替え、モーダルで出た案内として数える（モーダルへ戻る退行が
+あっても、止まったままにならずに落ちる）。上限はインスタンスで小さくする。
 """
 import builtins
 import os
@@ -104,12 +106,24 @@ class LogRecordingNoticeKeepsWatchTest(unittest.TestCase):
     def setUp(self):
         from PyQt6.QtWidgets import QMessageBox
         self.dir = tempfile.mkdtemp(prefix="netbelt-logstall-keepwatch-")
-        self.warning = mock.patch("PyQt6.QtWidgets.QMessageBox.warning").start()
-        self.information = mock.patch(
-            "PyQt6.QtWidgets.QMessageBox.information").start()
-        # show() で出た案内を、出た順に覚える（題, 本文, モーダルか）
+        # 出た案内を、出た順に覚える（題, 本文, モーダルか）
         self.shown = []
         self.boxes = []
+        # モーダルで出した案内（information、または exec）も覚える。どちらも
+        # 開かずにすぐ戻す（本物は利用者が閉じるまで戻らないので、モーダルへ
+        # 戻る退行があるとテストが止まったままになる）
+        self.execs = []
+
+        def recording_exec(box, *args):
+            self.execs.append(box.text())
+            self.shown.append((box.windowTitle(), box.text(), True))
+            return QMessageBox.StandardButton.Ok.value
+        self.warning = mock.patch("PyQt6.QtWidgets.QMessageBox.warning").start()
+        self.information = mock.patch(
+            "PyQt6.QtWidgets.QMessageBox.information",
+            side_effect=lambda parent, title, text, *a, **k:
+            self.shown.append((title, text, True))).start()
+        mock.patch.object(QMessageBox, "exec", recording_exec).start()
         real_show = QMessageBox.show
 
         def recording_show(box):
@@ -146,6 +160,15 @@ class LogRecordingNoticeKeepsWatchTest(unittest.TestCase):
             except RuntimeError:
                 pass
         return opened
+
+    def _wait_for_open_hold_box(self):
+        """止めたことの案内が開くのを待って返す（モーダルで出たら落とす）。"""
+        def modal_notices():
+            return [text for _, text, modal in self._hold_notices() if modal]
+        self._wait_until(lambda: self._open_hold_boxes() or modal_notices(), 2.0)
+        self.assertEqual(modal_notices(), [], "案内をモーダルで出した")
+        self.assertTrue(self._open_hold_boxes(), "前提: 止めたことの案内が開いた")
+        return self._open_hold_boxes()[0]
 
     def _widget(self, names):
         from core import log_recording
@@ -229,9 +252,7 @@ class LogRecordingNoticeKeepsWatchTest(unittest.TestCase):
         path = self._start(w, "dev", self.release)
         gate = w.output_gate("dev")
         self._feed_until_held(w, gate, "dev")
-        self.assertTrue(self._wait_until(lambda: self._open_hold_boxes(), 2.0),
-                        "前提: 止めたことの案内が開いた")
-        box = self._open_hold_boxes()[0]
+        box = self._wait_for_open_hold_box()
         seen = {}
         # 案内は開いたまま（利用者は閉じていない）、記録先が戻る
         self._open_until_resumed(w, gate, seen, box.text())
@@ -242,6 +263,7 @@ class LogRecordingNoticeKeepsWatchTest(unittest.TestCase):
                         "閉じるまで受信・描画を再開しなかった")
         self.assertEqual(len(self._hold_notices()), 1)
         self.assertEqual(self.information.call_count, 0, "案内をモーダルで出した")
+        self.assertEqual(self.execs, [], "案内を exec のモーダルで出した")
         self.assertEqual(self.warning.call_count, 0)
         self._assert_recorded_in_full(w, path, "dev")
 
@@ -279,6 +301,7 @@ class LogRecordingNoticeKeepsWatchTest(unittest.TestCase):
                         "別のタブの止めた機器が、記録先が戻っても閉じるまで"
                         "再開しなかった")
         self.assertEqual(self.warning.call_count, 1)
+        self.assertEqual(self.execs, [], "案内を exec のモーダルで出した")
         self._assert_recorded_in_full(w, path, "dev")
 
     def test_a_held_device_resumes_while_a_write_failure_warning_is_open(self):
@@ -315,6 +338,7 @@ class LogRecordingNoticeKeepsWatchTest(unittest.TestCase):
                         "再開しなかった")
         self.assertNotIn("bad", w._log_files, "失敗した記録が記録中のまま残った")
         self.assertEqual(self.warning.call_count, 1)
+        self.assertEqual(self.execs, [], "案内を exec のモーダルで出した")
         self._assert_recorded_in_full(w, path, "dev")
 
     def test_a_device_held_again_while_its_notice_is_open_is_not_noticed_again(self):
@@ -323,9 +347,7 @@ class LogRecordingNoticeKeepsWatchTest(unittest.TestCase):
         path = self._start(w, "dev", self.release)
         gate = w.output_gate("dev")
         self._feed_until_held(w, gate, "dev")
-        self.assertTrue(self._wait_until(lambda: self._open_hold_boxes(), 2.0),
-                        "前提: 止めたことの案内が開いた")
-        box = self._open_hold_boxes()[0]
+        box = self._wait_for_open_hold_box()
         seen = {}
         self._open_until_resumed(w, gate, seen, box.text())
         self.assertTrue(seen["resumed"],
@@ -340,6 +362,7 @@ class LogRecordingNoticeKeepsWatchTest(unittest.TestCase):
         self.assertTrue(box.isVisible(), "前提: 案内は開いたまま")
         self.assertEqual(len(self._hold_notices()), 1, "開いている間に案内を出し直した")
         self.assertEqual(self.information.call_count, 0, "案内をモーダルで出した")
+        self.assertEqual(self.execs, [], "案内を exec のモーダルで出した")
         self._close_boxes()     # 利用者が閉じる
         _pump(300)
         self.assertEqual(len(self._hold_notices()), 1,
@@ -403,6 +426,7 @@ class LogRecordingNoticeKeepsWatchTest(unittest.TestCase):
                          "います』と知らせた")
         self.assertEqual(self.warning.call_count, 1)
         self.assertEqual(self.information.call_count, 0)
+        self.assertEqual(self.execs, [], "案内を exec のモーダルで出した")
         self._assert_recorded_in_full(w, path, "dev")
 
 

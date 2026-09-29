@@ -101,11 +101,22 @@ class LogRecordingIoStallReconnectRejudgedTest(unittest.TestCase):
         self.dir = tempfile.mkdtemp(prefix="netbelt-logstall-reconnect-")
         from PyQt6.QtWidgets import QMessageBox
         self.warning = mock.patch("PyQt6.QtWidgets.QMessageBox.warning").start()
-        self.information = mock.patch(
-            "PyQt6.QtWidgets.QMessageBox.information").start()
         # 止めたことの案内はモーダルでない QMessageBox の show() で出る。
         # 出た順に本文を覚え、開いたままの案内は後のテストへ残さない
         self.shown = []
+        # モーダルで出した案内（information、または exec）は、開かずにすぐ戻して
+        # 本文を覚える（本物は利用者が閉じるまで戻らないので、モーダルへ戻る
+        # 退行があるとテストが止まったままになる）
+        self.modal_notices = []
+
+        def recording_exec(box, *args):
+            self.modal_notices.append(box.text())
+            return QMessageBox.StandardButton.Ok.value
+        self.information = mock.patch(
+            "PyQt6.QtWidgets.QMessageBox.information",
+            side_effect=lambda parent, title, text, *a, **k:
+            self.modal_notices.append(text)).start()
+        mock.patch.object(QMessageBox, "exec", recording_exec).start()
         real_show = QMessageBox.show
 
         def recording_show(box):
@@ -232,6 +243,7 @@ class LogRecordingIoStallReconnectRejudgedTest(unittest.TestCase):
                 f.read(), (_chunk(0, fed) + _chunk(0, after, "N")).replace("\r\n", "\n"),
                 "再接続の前後の記録が欠けた・崩れた")
         self.assertEqual(self.warning.call_count, 0)
+        self.assertEqual(self.modal_notices, [], "案内をモーダルで出した")
 
     def test_a_reconnect_while_still_over_the_limit_holds_the_new_link_again(self):
         """記録待ちが上限を超えたままなら、次の接続の受信で改めて止め、解けたら欠けなく描くこと。"""
@@ -240,8 +252,10 @@ class LogRecordingIoStallReconnectRejudgedTest(unittest.TestCase):
         path, logfile = self._start(w)
         gate = w.output_gate("dev")
         fed = self._hold(w, gate)
-        self.assertTrue(self._wait_until(lambda: self._hold_notices(), 2.0),
-                        "前提: 止めたことを知らせた")
+        self.assertTrue(self._wait_until(
+            lambda: self._hold_notices() or self.modal_notices, 2.0),
+            "前提: 止めたことを知らせた")
+        self.assertEqual(self.modal_notices, [], "案内をモーダルで出した")
 
         w.create_terminal_tab("dev")            # 記録は止めずに再接続
         after = self._feed_while_open(w, gate, 0, 1.0, tag="N")
@@ -266,6 +280,7 @@ class LogRecordingIoStallReconnectRejudgedTest(unittest.TestCase):
                 f.read(), (_chunk(0, fed) + _chunk(0, after, "N")).replace("\r\n", "\n"),
                 "再接続の前後の記録が欠けた・崩れた")
         self.assertEqual(self.warning.call_count, 0)
+        self.assertEqual(self.modal_notices, [], "案内をモーダルで出した")
 
 
 if __name__ == "__main__":
