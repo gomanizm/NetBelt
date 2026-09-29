@@ -35,6 +35,12 @@ QMessageBox を 10ms ごとに探す。キーは、本物のキーボードと�
 後から出しても、窓は最小の高さ（1 行分）までしか伸びず、2 行目から先が切れていた
 （offscreen で行の高さ 25、要る高さ 54。Windows のフォントで 36 と 78）。行の
 高さが、その幅で要る高さ（heightForWidth）以上あることを確かめる。
+
+行を書き換えても記録中ダイアログを前に出さないこと: offscreen では raise_ で活性が
+移らないので、主窓の活性を見るだけでは、set_status が raise_ を呼んでも見逃す
+（7 周目 term の検査役の変異 raise_only）。本物の Windows で前に出すと、活性化を
+伴ってキーの横取りへ戻りうる。LogRecordingDialog の raise_ / activateWindow /
+show / showNormal / setFocus / open / exec を数える偽物に替えて、0 回を確かめる。
 """
 import builtins
 import os
@@ -633,6 +639,64 @@ class LogRecordingIoStallStatusLineTest(unittest.TestCase):
                          "遅れている間の記録が欠けた・崩れた")
         self.assertIn("dev%06d" % (dev_fed - 1), w._terminals["dev"].toPlainText())
         self.assertIn("ser%06d" % (ser_fed - 1), w._terminals["ser"].toPlainText())
+        self.assertEqual(self._windows(), [], "窓を出した")
+
+    def _count_dialog_raises(self):
+        """記録中ダイアログを前に出す・活性化する・見せ直す呼び出しを数える（本物は呼ばない）。"""
+        from ui.dialogs.log_recording_dialog import LogRecordingDialog
+        calls = []
+        for method in ("raise_", "activateWindow", "show", "showNormal",
+                       "setFocus", "open", "exec"):
+            def counting(dialog, *args, _method=method):
+                calls.append((_method, dialog.device_name))
+            mock.patch.object(LogRecordingDialog, method, counting).start()
+        return calls
+
+    def test_updating_the_line_neither_raises_nor_activates_the_dialog(self):
+        """状態の行を出す・書き換える・消すときに、記録中ダイアログを前に出さず、活性化もしないこと（止めている行とシリアルの行）。"""
+        from PyQt6.QtWidgets import QApplication
+        w = self._widget(["dev", "ser"])
+        dev_release = self._stalled()
+        ser_release = self._stalled()
+        dev_path = self._start(w, "dev", "dev.log", dev_release)
+        ser_path = self._start(w, "ser", "ser.log", ser_release)
+        gate = w.output_gate("dev")
+        w.tab_widget.setCurrentWidget(w._terminals["dev"])
+        w.activateWindow()
+        w._terminals["dev"].setFocus()
+        _pump(50)
+        self.assertIs(QApplication.focusWidget(), w._terminals["dev"],
+                      "前提: 端末にフォーカスがある")
+        # 記録を始めたとき（show）は数えない。数えるのは見回りが行を書き換える間
+        raised = self._count_dialog_raises()
+
+        dev_fed = self._feed_until_held(w, gate, "dev", 0)
+        ser_fed = self._feed_serial_over(w, "ser", 0)
+        self.assertTrue(self._wait_until(
+            lambda: self._line(w, "dev") and self._line(w, "ser"), 2.0),
+            "前提: どちらの記録中ダイアログにも状態の行が出た")
+        _pump(300)
+        self.assertEqual(raised, [], "状態の行を出すときに、記録中ダイアログを前に出した")
+        self.assertIs(QApplication.activeWindow(), w, "主窓から活性を移した")
+        self.assertIs(QApplication.focusWidget(), w._terminals["dev"],
+                      "端末からフォーカスを移した")
+
+        dev_release.set()
+        ser_release.set()
+        self.assertTrue(self._wait_until(
+            lambda: self._caught_up(w, gate, "dev")
+            and not w._pending_output.get("ser") and w._log_backlog("ser") == 0,
+            10.0), "詰まりが解けても追いつかなかった")
+        self.assertTrue(self._wait_until(
+            lambda: self._line(w, "dev") == "" and self._line(w, "ser") == "", 2.0),
+            "追いついたのに状態の行を消さなかった")
+        self.assertEqual(raised, [], "状態の行を消すときに、記録中ダイアログを前に出した")
+        self.assertEqual(self._stop_and_read(w, "dev", dev_path),
+                         _chunk("dev", 0, dev_fed).replace("\r\n", "\n"),
+                         "止めている間の記録が欠けた・崩れた")
+        self.assertEqual(self._stop_and_read(w, "ser", ser_path),
+                         _chunk("ser", 0, ser_fed).replace("\r\n", "\n"),
+                         "遅れている間の記録が欠けた・崩れた")
         self.assertEqual(self._windows(), [], "窓を出した")
 
 
