@@ -18,7 +18,11 @@
 始まり、『1 != 2』で落ちていた（1d9d5c5 で、受け渡しの呼び出し側を 10 回目の
 前に 1.3 秒止めると、数える 2 件とも落ちた）。待ちを長くしても、受け渡しごとに
 スレッドを作れば本数で、待っている書き手を起こし損ねれば書き終わりの待ちで
-落ちる。
+落ちる。ただし待ちを差し替えるので、本体の既定の待ちが 0 に戻る退行（41cac56
+の遅さへ戻る）は本数では捕まらない（f800d3c で既定を 0 にしても、このファイル
+の 6 件はすべて通った）。既定の待ちは
+test_default_linger_outlasts_back_to_back_hand_overs で、停止に左右されない
+よう値そのものを確かめる。
 """
 import os
 import socket
@@ -104,6 +108,18 @@ class _ChannelCase(unittest.TestCase):
 
 
 class WriterKeepsItsThreadTest(_ChannelCase):
+    def test_default_linger_outlasts_back_to_back_hand_overs(self):
+        """本体の既定の待ちが、続けて渡される区切りの間より十分に長い"""
+        from core.ssh_connection import _ChannelWriter
+        # 貼り付けの区切りは続けて渡される（冒頭の直したあとの測定では、
+        # 540 KB を 512 文字ずつ 0.62〜0.64 秒で書いた。1 区切りあたり
+        # 1 ms 未満）。その 100 倍を下限にする
+        linger = _ChannelWriter._LINGER_SECONDS
+        self.assertGreaterEqual(
+            linger, 0.1,
+            "既定の待ちが %.3f 秒しかない。続けて渡される区切りの間より短いと、"
+            "受け渡しごとに書き手のスレッドを作る" % linger)
+
     def test_consecutive_hand_overs_use_one_thread(self):
         from core.ssh_connection import _ChannelWriter
         channel = self._channel()
