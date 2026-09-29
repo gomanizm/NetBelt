@@ -641,13 +641,26 @@ class FTPServerManager(QObject):
             def close(self):
                 # STOR を受けたがデータ接続が来ないまま相手が去ると（受動ポートが
                 # 塞がれているなど）、pyftpdlib はファイルを閉じるだけで上の
-                # コールバックを呼ばない。予約が残ると同じ名前へ書けなくなる
+                # コールバックを呼ばない。予約が残ると同じ名前へ書けなくなる。
+                # 待っていた STOR / APPE の行も開始のまま残り、中断が出ず、
+                # 上げ直しがその行に束ねられていた（実測: 150 の後の切断・QUIT）。
+                # pyftpdlib は待ち行列を消すので、先に控えて REIN / ABOR と同じく
+                # 片付ける。待っていた RETR の行は残す（機器のプローブ＝接続→
+                # RETR→即切断を 1 行に束ねる設計。
+                # tests/test_ftp_server_abandoned_retr_shared_row.py）
+                queued = None
+                if not getattr(self, "_closed", True):
+                    queued = getattr(self, "_in_dtp_queue", None)
                 try:
                     super().close()
                 finally:
-                    mgr._release_uploads(self)
+                    try:
+                        if queued is not None:
+                            self._abandon_queued(queued, None)
+                    finally:
+                        mgr._release_uploads(self)
             def _abandon_queued(self, in_q, out_q, keep=None):
-                """待ち行列から捨てた転送を片付ける（REIN / USER / ABOR、STOR / STOU の上書き）。
+                """待ち行列から捨てた転送を片付ける（REIN / USER / ABOR、STOR / STOU の上書き、切断）。
 
                 pyftpdlib はそのファイルを閉じず、上の未完了のコールバックも
                 呼ばない。予約が制御接続を閉じるまで残って同じ保存先へ誰も
