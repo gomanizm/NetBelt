@@ -27,7 +27,9 @@ delete より前からあった許可かは見分けられない。そこで、
     のが show の一時的な失敗だと、次に見えたのは delete より前の既存の許可で
     ありうる。e22cce1 はこれで delete より前に完了と返した）
   - 見えていた許可が消えたまま最後まで戻らなければ失敗とし、既存の規則が
-    消えたことを文言で知らせる（管理者の経路の _SELF_RULES_DELETED と同じ一言）
+    消えたことを文言で知らせる（管理者の経路の _SELF_RULES_DELETED と同じ一言）。
+    ただし起動前に無かった許可が最後の 1 回だけ見えないときは添えない
+    （show の一時的な失敗と見分けられず、見えていたのは add が作った許可）
   - 昇格した delete → add は、1 回目の確認（0.25 秒後）より前に終わるのが
     普通の順序（この PC の netsh は 1 回約 0.05 秒）。既存の許可が消えて add が
     失敗しても確認では一度も見えないので、起動の前に 1 回だけ既存の許可を
@@ -48,6 +50,10 @@ delete より前からあった許可かは見分けられない。そこで、
 根拠に途中で完了とする案も採らない。その確認が一時的に失敗すると、delete
 より前に完了と返す経路が増えるため
 （test_a_failed_pre_check_does_not_make_done_early）。
+最後の確認の show が一時的に失敗すると、許可はあっても失敗とする（待つ上限を
+延ばさずに確かめ直す手段が無い）。起動前に許可があったときは、そのうえ
+『削除済み』の一言も添える（5 回目と 6 回目の確認の間に delete が走り add が
+失敗した場合と見分けられない）。
 """
 import subprocess
 import sys
@@ -296,6 +302,27 @@ class ElevatedSelfRuleVerdictTest(unittest.TestCase):
         self.assertTrue(finished, "前提: 判定までに昇格した処理が終わっていない")
         self.assertIn("削除済み", msg,
                       "既存の許可が消えたことが文言に出ていない: %s" % msg)
+
+    def test_a_failed_last_check_does_not_claim_a_first_time_rule_was_deleted(self):
+        """初めて足したとき、最後の確認だけが一時的に失敗しても「削除済み」と言わないこと
+
+        起動前の確認では許可が無く、見えていた許可は昇格した add が作ったもの
+        （add の後に delete は走らない）。最後の 1 回だけ見えないのは show の
+        一時的な失敗と見分けられないので判定は失敗のままだが、f0ad44d までは
+        一度でも見えていれば『既存の受信規則は削除済み。手動で追加を』と添え、
+        許可があるのに手で重ねて足させていた（模擬で再現）。
+        """
+        ok, msg, _finished, elevated = self._run(
+            pre_existing=False, delete_at=1, add_at=1, add_ok=True,
+            failing_checks=(CHECKS,))
+        # 前提: 起動前には無く、最後には自exe の許可が残っている
+        self.assertEqual(elevated.shows_before_launch, 1)
+        self.assertEqual(elevated.rules, [fw._self_rule_name()])
+        self.assertNotIn("削除済み", msg,
+                         "許可は消えていないのに削除済みと添えた: %s" % msg)
+        if not ok:
+            self.assertEqual(msg, "自exe受信許可を要求したが反映を確認できず: "
+                             + fw._self_rule_name())
 
     def test_a_rule_that_never_shows_keeps_the_old_message(self):
         """対照: 一度も見えなければ、今までどおりの失敗の文言"""

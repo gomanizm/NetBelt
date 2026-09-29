@@ -369,9 +369,14 @@ def ensure_self_program_allow():
         if seen[-1]:
             return True, "自exe受信許可を追加（管理者昇格。%s）: %s" % (
                 _BLOCK_NOT_CHECKED, name)
-        if existed or any(seen):
-            # 起動前にあった許可や見えていた許可が、消えたまま戻らない
-            # （delete は効き、add は見えない）
+        # 起動前にあった許可や見えていた許可が、消えたまま戻らない（delete は
+        # 効き、add は見えない）ときに一言を添える。ただし起動前に無く、
+        # 最後の 1 回だけ見えないときは添えない。見えていたのは add が作った
+        # 許可のはずで（add の後に delete は走らない）、最後の 1 回だけ見えない
+        # のは show の一時的な失敗と見分けられない。起動前にあったときは
+        # 添える（5 回目と 6 回目の確認の間に delete が走り add が失敗した
+        # 場合と見分けられない）
+        if existed or (any(seen) and not seen[-2]):
             return False, "自exe受信許可を要求したが反映を確認できず（%s）: %s" % (
                 _SELF_RULES_DELETED, name)
         # 反映を確認できないものを成功にすると「通らないのに完了」と出る
