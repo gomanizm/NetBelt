@@ -281,6 +281,59 @@ class LogRecordingIoStallNoGateTest(unittest.TestCase):
             "詰まりが解けても受信・描画を再開しなかった")
         self.assertEqual(self.warning.call_count, 0)
 
+    def test_a_link_with_a_gate_over_the_limit_but_not_held_gets_no_serial_line(self):
+        """関所のある接続で、書き込み待ちが上限を超えたまま受信を止めていない間も、シリアル向けの遅れ（メモリに溜めて…）として数えず、行も出さないこと。
+
+        受信を止めている間は止めている行が優先されるので、上のテストでは遅れの
+        行を出す作りかどうかを見分けられない（7 周目の検査役の変異 lag_on_gate:
+        見回りの「関所の無い接続だけ」の条件を外しても通った）。止めるのは描き
+        待ちがあるとき（_flush_pending_output）なので、1 回で描き切れる量ずつ
+        渡して描き切るのを待ち、描き待ちが空のまま（受信が途切れたまま）
+        書き込み待ちを上限より上にしてから見回りを回す。
+        """
+        from core import log_recording
+        w = self._widget()
+        release = threading.Event()
+        self.addCleanup(release.set)
+        path = self._start(w, release, limit=30.0)
+        gate = w.output_gate("ser")     # SSH / Telnet と同じく関所を渡す
+        lines = w.OUTPUT_SLICE // len(_chunk(0, 1))   # 1 回で描き切れる行数
+
+        fed = 0
+        end = time.perf_counter() + 8.0
+        while w._log_backlog("ser") < self.HIGH and time.perf_counter() < end:
+            w.queue_output("ser", _chunk(fed, lines))
+            fed += lines
+            self._wait_until(lambda: not w._pending_output.get("ser"), 2.0)
+        self.assertGreaterEqual(w._log_backlog("ser"), self.HIGH,
+                                "前提: 書き込み待ちが上限を超えた")
+        self.assertFalse(w._pending_output.get("ser"), "前提: 描き待ちが無い")
+        self.assertNotIn("ser", w._log_throttled, "前提: 受信を止めていない")
+        self.assertTrue(gate.is_set(), "前提: 関所は開いている")
+
+        w._check_log_writers()
+        _pump(300)                      # 見回りの刻み（100ms）も何回か回す
+        self.assertGreaterEqual(w._log_backlog("ser"), self.HIGH,
+                                "前提: 書き込み待ちは上限を超えたまま")
+        self.assertNotIn("ser", w._log_lagging,
+                         "受信を止められる接続を、シリアルの遅れとして数えた")
+        self.assertIsNone(self._lag_line(w),
+                          "受信を止められる接続にも、シリアル向けの遅れの行を出した")
+        self.assertEqual(self._line(w), "", "止めていないのに状態の行を出した")
+
+        release.set()
+        self.assertTrue(self._wait_until(
+            lambda: w._log_backlog("ser") == 0, 10.0),
+            "詰まりが解けても記録待ちが書き終わらない")
+        w.stop_log_recording("ser")
+        self.assertTrue(self._wait_until(
+            lambda: log_recording.device_using(path) is None, 5.0))
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(f.read(), _chunk(0, fed).replace("\r\n", "\n"),
+                             "詰まっている間の記録が欠けた・崩れた")
+        self.assertIn("L%06d" % (fed - 1), w._terminals["ser"].toPlainText())
+        self.assertEqual(self.warning.call_count, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
