@@ -1,8 +1,9 @@
 """書き手のスレッドを作れなくても、端末の大きさが黙って落ちないことを検証する。
 
-何が起きていたか（30a3821 で確かめた）。window-change の書き込みは、GUI
-スレッドの外（送り役のスレッド）へ出した。送り役は書くたびにスレッドを
-始めるが、プロセスがスレッドを作れない（threading.Thread.start が
+何が起きていたか（30a3821 で確かめた。fix/v1.3.2 では同じ変更が 6c90f50。
+以下は当時の設計の説明）。window-change の書き込みは、GUI スレッドの外
+（window-change だけを書く送り役のスレッド）へ出した。送り役は書くたびに
+スレッドを始めるが、プロセスがスレッドを作れない（threading.Thread.start が
 RuntimeError）と、渡された大きさは誰にも書かれずに残った。呼び出し元は
 「送った」扱いにしているので、次に大きさが変わるまで、機器側の端末の
 大きさは古いままだった（エラーも出ない）。送り役を入れる前は、その場で
@@ -12,7 +13,10 @@ RuntimeError）と、渡された大きさは誰にも書かれずに残った�
     resize_pty は 1 回も呼ばれない
 
 どう直したか。スレッドを作れないときは、これまでどおりその場（GUI
-スレッド）で書く。
+スレッド）で書く。いまは、データも大きさも同じ書き手（_ChannelWriter）が
+書き、書き終えたスレッドは次の受け渡しを少し待つ。書き手がスレッドを
+始めるのは待っているスレッドが無いときだけで、そこで始められなければ、
+同じくその場で書く。
 """
 import os
 import socket
@@ -104,7 +108,7 @@ class ThreadCannotStartTest(unittest.TestCase):
                          "スレッドを作れないと、端末の大きさが機器へ届かない")
 
     def test_the_next_size_still_goes_out_after_the_failure(self):
-        """失敗のあとも送り役が「書いている最中」に残らず、次の大きさを書く"""
+        """失敗のあとも書き手が「書いている最中」に残らず、次の大きさを書く"""
         conn, channel = self._session()
         with mock.patch.object(threading.Thread, "start",
                                _start_fails_on_the_gui_thread):
