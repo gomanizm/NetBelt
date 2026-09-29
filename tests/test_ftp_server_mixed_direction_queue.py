@@ -221,6 +221,24 @@ class MixedDirectionQueueTest(_FtpServerCase):
                     [("started", "b.cfg"), ("interrupted", "b.cfg"),
                      ("complete", unique)])
 
+    def test_refused_stou_keeps_the_queued_retr(self):
+        # 断られた STOU は受信を積まないので、待っている RETR を捨てない。
+        # 捨てると、張ったデータ接続に何も流れず、クライアントが固まる（実測）
+        ftp = self.client()
+        self._queue(ftp, "RETR b.cfg")
+        self.assertTrue(ftp.sendcmd("REST 5").startswith("350"))
+        with self.assertRaises(ftplib.error_temp) as refused:
+            ftp.sendcmd("STOU")   # REST の後の STOU は 450 で断られる
+        self.assertTrue(str(refused.exception).startswith("450"),
+                        str(refused.exception))
+        self._sync(ftp)
+        # データ接続を張る前に確かめる（捨てていれば、ここで行が中断になっている）
+        self.assertEqual(self.events, [("started", "b.cfg")])
+        # 待っていた RETR が先頭から流れる（REST の位置は断られた STOU で消える）
+        transfer = self._receive_queued(ftp)
+        self._check(ftp, transfer, ("226", B),
+                    [("started", "b.cfg"), ("complete", "b.cfg")])
+
 
 if __name__ == "__main__":
     unittest.main()
