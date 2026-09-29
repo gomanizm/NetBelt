@@ -380,10 +380,10 @@ def ensure_self_program_allow():
         # 判定の限界: 一言は起動前の確認と 6 回の確認の真偽だけで決めるので、
         # 観測が同じになる順序どうしは、許可が本当に残っているかで分けられない。
         # 初めて足して最後の 2 回の show が一時的に失敗すると、許可は残って
-        # いるのに添える。起動前の確認が一時的に失敗し、既存の許可が 5 回目と
-        # 6 回目の確認の間に消えて add が失敗すると、添えない（それぞれと
-        # 同じ観測になる順序は tests/test_firewall_self_rule_elevated_verdict.py
-        # の docstring）
+        # いるのに添える。起動前の確認が一時的に失敗し、既存の許可が消えて
+        # add が失敗すると、消えたのが 1 回目の確認より前（普通の順序）でも、
+        # 5 回目と 6 回目の確認の間でも添えない（それぞれと同じ観測になる
+        # 順序は tests/test_firewall_self_rule_elevated_verdict.py の docstring）
         if existed or (any(seen) and not seen[-2]):
             return False, "自exe受信許可を要求したが反映を確認できず（%s）: %s" % (
                 _SELF_RULES_DELETED, name)
