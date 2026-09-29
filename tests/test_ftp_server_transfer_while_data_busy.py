@@ -35,6 +35,15 @@
 だけ（dc.receive と送ったコマンドの向きが揃うときだけ）に絞っても、FTP の
 テストは 1 件も落ちなかった（実測）。下の向きの違う 4 件は、その絞り方では
 125 で受け付けて落ちる。
+
+同じく、425 の条件から STOU・NLST・MLSD だけを外しても、FTP のテストは 1 件も
+落ちなかった（実測）。外した形の 5879190 で流すと（127.0.0.1 のみ）
+  6) RETR big.bin の転送中に STOU（125）: big.bin は 65536 バイトで止まって
+     クライアントの recv が時間切れになり、通知は [開始 big, 完了 ftpd.…] で、
+     STOU の保存先が完了になり、big.bin の行が開始のまま残った
+  7) STOR up.bin の受信中に NLST / MLSD（125）: 最終応答が来ずに時間切れ、
+     up.bin は 0 バイトで、行と予約が残った
+だった。下の STOU・NLST・MLSD の 3 件は、その外し方では 125 で受け付けて落ちる。
 """
 import ftplib
 import os
@@ -292,6 +301,30 @@ class TransferWhileDataBusyTest(_FtpServerCase):
 
     def test_a_list_while_an_upload_is_running_is_refused(self):
         self._check_download_refused_during_upload("LIST")
+
+    # --- STOU（ダウンロード中）と NLST / MLSD（アップロード中）（6・7）
+    def test_a_stou_while_a_download_is_running_is_refused(self):
+        """STOU は保存先の名前をサーバーが決めるので、フォルダに新しいファイルが
+        できないことで確かめる"""
+        before = sorted(os.listdir(self.root))
+        ftp = self.client()
+        data, received = self._start_big_download(ftp)
+        refused = self._command(ftp, "STOU")
+        self.assertTrue(refused.startswith("425"),
+                        "送信中のデータ接続で STOU を受け付けた: %s" % refused)
+        self.assertEqual(sorted(os.listdir(self.root)), before,
+                         "断った STOU の保存先が作られた")
+        self._finish_big_download(ftp, data, received, refused)
+        self.assertEqual(sorted(os.listdir(self.root)), before)
+        self.assertEqual(self.m._uploads, {}, "予約が残った")
+        self.assertIsNotNone(self._wait_activity("別の転送", "STOU"),
+                             "断った理由がパネルのログに出ていない: %r" % self.activity)
+
+    def test_a_nlst_while_an_upload_is_running_is_refused(self):
+        self._check_download_refused_during_upload("NLST")
+
+    def test_a_mlsd_while_an_upload_is_running_is_refused(self):
+        self._check_download_refused_during_upload("MLSD")
 
 
 if __name__ == "__main__":
