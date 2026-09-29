@@ -594,15 +594,22 @@ class _ChannelWriter:
     データは前の書き込みが終わってから渡される（SSHConnection._send_backlogged
     が待たせる）。書き込みが待たされている間に渡された大きさは、それが
     終わってから最後の 1 つだけを書く。
+    書き終えたスレッドは、次の受け渡しを _LINGER_SECONDS まで待ってから
+    終わる。打鍵・貼り付けの区切りごとにスレッドを作ると、そのたびに
+    0.2〜0.4 ms 余計に掛かり、localhost への貼り付けが 1.7 倍遅かった。
     """
+
+    # 書き終えたあと、次の受け渡しを待つ時間（秒）
+    _LINGER_SECONDS = 1.0
 
     def __init__(self, channel):
         self.channel = channel
         self._lock = threading.Lock()
+        self._wake = threading.Condition(self._lock)   # 待っている書き手を起こす
         self._data = b""           # まだ書いていないデータ
         self._size = None          # まだ書いていない最後の大きさ
         self._error = None         # データの書き込みの失敗（GUI スレッドが取り出す）
-        self._running = False      # 書き手のスレッドが動いている
+        self._running = False      # 書き手のスレッドが動いている（次を待つ間も）
         self._stopped = False
         self._idle = threading.Event()
         self._idle.set()
@@ -650,32 +657,31 @@ class _ChannelWriter:
             self._data += data
             if size is not None:
                 self._size = size
-            if self._running:
-                return False
-            self._running = True
+            if not self._idle.is_set():
+                return False   # 書いている最中。終わったら、ここで渡した物も書く
             self._idle.clear()
-        try:
-            threading.Thread(target=self._run, name="netbelt-channel-writer",
-                             daemon=True).start()
-        except RuntimeError:
-            # スレッドを作れない。これまでどおりその場で書く（渡した物を
-            # 誰も書かないまま残さない）
-            self._run()
-            return True
+            start = not self._running
+            if start:
+                self._running = True
+            else:
+                self._wake.notify()   # 次を待っている書き手に書かせる
+        if start:
+            try:
+                threading.Thread(target=self._run, name="netbelt-channel-writer",
+                                 daemon=True).start()
+            except RuntimeError:
+                # スレッドを作れない。これまでどおりその場で書く（渡した物を
+                # 誰も書かないまま残さない）
+                self._run(linger=0.0)
+                return True
         return self._idle.wait(wait)
 
-    def _run(self):
+    def _run(self, linger=None):
+        if linger is None:
+            linger = self._LINGER_SECONDS
         while True:
             with self._lock:
-                # データから書く。データは書き手が空いているときにしか渡されない
-                # ので、残っている大きさはそのデータより後に渡された物
-                data, self._data, size = self._data, b"", None
-                if not data:
-                    size, self._size = self._size, None
-                if self._stopped or (not data and size is None):
-                    self._running = False
-                    self._idle.set()
-                    return
+                data, size = self._next_locked(linger)
             if data:
                 try:
                     self.channel.sendall(data)
@@ -683,11 +689,40 @@ class _ChannelWriter:
                     with self._lock:
                         self._error = e
                         self._data = b""   # 失敗した区切りの続きは書かない
-                continue
-            try:
-                self.channel.resize_pty(width=size[0], height=size[1])
-            except Exception:
-                pass   # 通知に失敗しても接続はそのまま続ける
+            elif size is not None:
+                try:
+                    self.channel.resize_pty(width=size[0], height=size[1])
+                except Exception:
+                    pass   # 通知に失敗しても接続はそのまま続ける
+            else:
+                return
+
+    def _next_locked(self, linger: float):
+        """次に書く (データ, 大きさ) を取る（ロックを持って呼ぶ）
+
+        無ければ空いたことを知らせ、次の受け渡しを linger 秒まで待つ。
+        止められたか、待っても来なければ、スレッドを終える印に (b"", None)。
+        """
+        deadline = None
+        while not self._stopped:
+            # データから書く。データは書き手が空いているときにしか渡されない
+            # ので、残っている大きさはそのデータより後に渡された物
+            if self._data:
+                data, self._data = self._data, b""
+                return data, None
+            if self._size is not None:
+                size, self._size = self._size, None
+                return b"", size
+            self._idle.set()
+            now = time.monotonic()
+            if deadline is None:
+                deadline = now + linger
+            if now >= deadline:
+                break
+            self._wake.wait(deadline - now)
+        self._running = False
+        self._idle.set()
+        return b"", None
 
     def stop(self) -> None:
         """以後は書かない（書いている最中の 1 つは、閉じた接続で終わる）"""
@@ -695,6 +730,7 @@ class _ChannelWriter:
             self._stopped = True
             self._data = b""
             self._size = None
+            self._wake.notify_all()   # 次を待っている書き手を終わらせる
 
 
 class SSHConnection(QObject):

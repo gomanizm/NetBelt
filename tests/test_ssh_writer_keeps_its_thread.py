@@ -1,0 +1,244 @@
+"""SSH の書き手のスレッドを、打鍵・貼り付けの区切りごとに作り直さないことを検証する。
+
+何が起きていたか（41cac56 で測った。localhost の paramiko サーバ、鍵交換なし）。
+41cac56 は、判定の直後に鍵交換が始まっても GUI を止めないよう、チャネルへの
+書き込みを書き手のスレッド（_ChannelWriter）へ出した。書き手は渡されるたびに
+スレッドを作り、書き終えると終わっていたので、打鍵 1 回は 31b45ee の平均
+0.04 ms から 0.22 ms へ、端末経由の 540 KB の貼り付けは 0.62 秒から 1.03 秒へ
+（約 1.7 倍）遅くなった（512 文字の区切りごとに約 0.4 ms）。
+
+どう直したか。書き終えたスレッドは、次の受け渡しを短い間（_LINGER_SECONDS）
+待ってから終わる。その間に渡された物は同じスレッドが書く。止めれば
+（dispose・繋ぎ直し）、待っているスレッドもすぐ終わる。直したあとの同じ
+測定は、打鍵 0.07〜0.09 ms、貼り付け 0.62〜0.64 秒。
+"""
+import os
+import socket
+import sys
+import threading
+import time
+import unittest
+from unittest import mock
+
+sys.path.insert(0, "src")
+
+WRITER_THREAD_NAME = "netbelt-channel-writer"
+
+
+class _FakeTransport:
+    def __init__(self, sock):
+        self.sock = sock
+        self.clear_to_send = threading.Event()
+        self.clear_to_send.set()
+
+
+class _RecordingChannel:
+    """書いた順に writes へ控えるチャネル（偽物。待たずに書ける）"""
+
+    closed = False
+    out_window_size = 1024 * 1024
+
+    def __init__(self, transport):
+        self.transport = transport
+        self.writes = []
+
+    def get_transport(self):
+        return self.transport
+
+    def sendall(self, data):
+        self.writes.append(("data", bytes(data)))
+
+    def resize_pty(self, width, height):
+        self.writes.append(("size", (width, height)))
+
+    def close(self):
+        self.closed = True
+
+
+class _WriterThreads:
+    """書き手のスレッドの開始を数える（ほかのスレッドはそのまま始める）"""
+
+    def __init__(self):
+        self.started = []
+        self._real_start = threading.Thread.start
+
+    def __enter__(self):
+        real_start = self._real_start
+        started = self.started
+
+        def counting_start(thread):
+            if thread.name == WRITER_THREAD_NAME:
+                started.append(thread)
+            return real_start(thread)
+
+        self._patcher = mock.patch.object(threading.Thread, "start",
+                                          counting_start)
+        self._patcher.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._patcher.stop()
+        return False
+
+
+class _ChannelCase(unittest.TestCase):
+    def _channel(self):
+        a, b = socket.socketpair()      # 待たずに書ける（詰めていない）
+        self.addCleanup(a.close)
+        self.addCleanup(b.close)
+        return _RecordingChannel(_FakeTransport(a))
+
+    def _writer(self, channel):
+        from core.ssh_connection import _ChannelWriter
+        writer = _ChannelWriter(channel)
+        self.addCleanup(writer.stop)
+        return writer
+
+
+class WriterKeepsItsThreadTest(_ChannelCase):
+    def test_consecutive_hand_overs_use_one_thread(self):
+        channel = self._channel()
+        writer = self._writer(channel)
+        expected = []
+        with _WriterThreads() as threads:
+            for i in range(50):
+                data = b"chunk%d" % i
+                # 待っている書き手を起こし損ねると、待ちの終わり（1 秒）まで
+                # 書かれない。それより短く待つ
+                self.assertTrue(writer.write(data, 0.5),
+                                "書き込みが終わらない（%d 個目）" % i)
+                expected.append(("data", data))
+                if i % 10 == 9:
+                    writer.send_size(80 + i, 24, 0.5)
+                    expected.append(("size", (80 + i, 24)))
+
+        self.assertEqual(expected, channel.writes, "渡した順に書かれていない")
+        self.assertEqual(1, len(threads.started),
+                         "渡すたびに書き手のスレッドを作り直している（%d 本）"
+                         % len(threads.started))
+
+    def test_stop_ends_the_waiting_thread_at_once(self):
+        from core.ssh_connection import _ChannelWriter
+        channel = self._channel()
+        writer = self._writer(channel)
+        with mock.patch.object(_ChannelWriter, "_LINGER_SECONDS", 30.0), \
+                _WriterThreads() as threads:
+            self.assertTrue(writer.write(b"x", 2.0))
+            self.assertEqual(1, len(threads.started), "前提: 書き手のスレッドが無い")
+            thread = threads.started[0]
+
+            started = time.perf_counter()
+            writer.stop()
+            thread.join(2.0)
+            elapsed = time.perf_counter() - started
+
+        self.assertFalse(thread.is_alive(), "止めたのに、書き手のスレッドが残っている")
+        self.assertLess(elapsed, 1.0, "止めてから書き手が終わるまで %.2f 秒" % elapsed)
+        self.assertTrue(writer.write(b"y", 0.2), "止めたあとの受け渡しが待たされた")
+        self.assertEqual([("data", b"x")], channel.writes, "止めたあとに書いた")
+
+    def test_a_thread_left_waiting_ends_and_the_next_hand_over_starts_one(self):
+        from core.ssh_connection import _ChannelWriter
+        channel = self._channel()
+        writer = self._writer(channel)
+        with mock.patch.object(_ChannelWriter, "_LINGER_SECONDS", 0.05), \
+                _WriterThreads() as threads:
+            self.assertTrue(writer.write(b"a", 2.0))
+            first = threads.started[0]
+            first.join(2.0)
+            self.assertFalse(first.is_alive(),
+                             "次が来ないのに、書き手のスレッドが終わらない")
+            self.assertFalse(writer.busy())
+
+            self.assertTrue(writer.write(b"b", 2.0),
+                            "スレッドが終わったあとの受け渡しが書かれない")
+
+        self.assertEqual([("data", b"a"), ("data", b"b")], channel.writes)
+        self.assertEqual(2, len(threads.started))
+
+    def test_hand_overs_while_the_wait_runs_out_are_not_lost(self):
+        """待ち終わりと受け渡しが重なっても、渡した物は必ず書かれる"""
+        from core.ssh_connection import _ChannelWriter
+        channel = self._channel()
+        writer = self._writer(channel)
+        expected = []
+        with mock.patch.object(_ChannelWriter, "_LINGER_SECONDS", 0.002):
+            for i in range(300):
+                data = b"%d," % i
+                self.assertTrue(writer.write(data, 2.0),
+                                "受け渡しが書かれないまま残った（%d 個目）" % i)
+                expected.append(("data", data))
+                time.sleep((i % 4) * 0.001)
+
+        self.assertEqual(expected, channel.writes)
+
+
+class _QtCase(_ChannelCase):
+    @classmethod
+    def setUpClass(cls):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PyQt6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    def _session(self, channel):
+        """connect() と同じ見張りを持つ SSHConnection に、偽のチャネルを差す"""
+        from core.send_backpressure import DrainWatcher
+        from core.ssh_connection import SSHConnection
+        conn = SSHConnection("192.0.2.1", 22, "admin")
+        conn.channel = channel
+        conn.is_connected = True
+        conn._drain_watcher = DrainWatcher(
+            lambda: conn._send_backlogged(channel), conn._announce_drained)
+        self.addCleanup(conn.dispose)
+        return conn
+
+    def _pump(self, seconds, until):
+        end = time.time() + seconds
+        while time.time() < end and not until():
+            self.app.processEvents()
+            time.sleep(0.002)
+        self.app.processEvents()
+
+
+class TypingKeepsTheThreadTest(_QtCase):
+    def test_typing_does_not_start_a_thread_per_key(self):
+        channel = self._channel()
+        conn = self._session(channel)
+        with _WriterThreads() as threads:
+            for ch in "show running-config\r":
+                conn.send_command(ch)
+                # ふだんは渡したその場で書き終わる。混んだ機械でも、待っている
+                # 書き手を起こし損ねたとき（待ちの終わりの 1 秒まで書かれない）
+                # より短い間に書き終わる
+                self._pump(0.5, until=lambda: not conn.has_pending_sends())
+                self.assertFalse(conn.has_pending_sends(),
+                                 "打鍵 %r が書き終わらない" % ch)
+            conn.set_terminal_size(132, 43)
+            self._pump(0.5, until=lambda: len(channel.writes) > 20)
+
+        self.assertEqual(
+            [("data", ch.encode()) for ch in "show running-config\r"]
+            + [("size", (132, 43))], channel.writes)
+        self.assertEqual(1, len(threads.started),
+                         "打鍵ごとに書き手のスレッドを作っている（%d 本）"
+                         % len(threads.started))
+
+    def test_dispose_ends_the_waiting_thread(self):
+        from core.ssh_connection import _ChannelWriter
+        channel = self._channel()
+        conn = self._session(channel)
+        with mock.patch.object(_ChannelWriter, "_LINGER_SECONDS", 30.0), \
+                _WriterThreads() as threads:
+            conn.send_command("x")
+            self.assertEqual(1, len(threads.started), "前提: 書き手のスレッドが無い")
+            self._pump(2.0, until=lambda: channel.writes)
+            conn.dispose()
+            threads.started[0].join(2.0)
+
+        self.assertFalse(threads.started[0].is_alive(),
+                         "後始末のあとも、書き手のスレッドが残っている")
+        self.assertEqual([("data", b"x")], channel.writes)
+
+
+if __name__ == "__main__":
+    unittest.main()
