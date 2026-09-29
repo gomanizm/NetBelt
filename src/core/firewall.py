@@ -281,7 +281,12 @@ _BLOCK_NOT_CHECKED = "既存のブロック規則の除去は確認していま�
 def ensure_self_program_allow():
     """自 exe 宛の受信ブロックを削除し受信許可を追加する（ブロックは許可を上書きするため）。
     Windows かつ frozen のときのみ実行。冪等。未昇格なら UAC 昇格で netsh 実行。
-    ブロックの削除は試みるだけで、消えたかは確かめない（_BLOCK_NOT_CHECKED）。"""
+    ブロックの削除は試みるだけで、消えたかは確かめない（_BLOCK_NOT_CHECKED）。
+
+    netsh の delete rule は action を引数に取らない（付けると『'action' is not a
+    valid argument』で何もしない。実測）。name=all と program= で自 exe の受信
+    規則を許可も含めてすべて消し、その後の add で許可（全プロファイル）を
+    作り直す。add より後に消すと、足した許可まで消える。"""
     if not is_windows():
         return True, "非Windowsのためスキップ"
     prog = _self_program()
@@ -289,19 +294,20 @@ def ensure_self_program_allow():
         return True, "開発実行のためスキップ（frozen時のみ有効）"
     name = _self_rule_name()
     # netsh の program 指定ルールを、既存の add/delete と同じ昇格経路で処理する。
-    # 未昇格時は ShellExecuteW で delete(block)+add(allow) をまとめて昇格実行する。
+    # 未昇格時は ShellExecuteW で delete+add(allow) をまとめて昇格実行する。
     try:
         if is_admin():
-            # delete は該当ブロックが無ければ rc!=0 なので結果は見ない
+            # delete は該当する規則が無ければ rc!=0 なので結果は見ない
             _netsh(["advfirewall", "firewall", "delete", "rule", "name=all", "dir=in",
-                    "action=block", 'program=' + prog])
+                    'program=' + prog])
             r = _netsh(["advfirewall", "firewall", "add", "rule", "name=" + name, "dir=in",
                         "action=allow", 'program=' + prog, "profile=any", "enable=yes"])
             if r.returncode != 0:
                 return False, "自exe受信許可の追加に失敗: " + name
             return True, "自exe受信許可を追加（%s）: %s" % (_BLOCK_NOT_CHECKED, name)
-        # 未昇格: cmd.exe /c 経由で delete(block)+add(allow) を昇格実行（& をシェルに解釈させる）。
+        # 未昇格: cmd.exe /c 経由で delete+add(allow) を昇格実行（& をシェルに解釈させる）。
         # ShellExecuteW(lpFile="netsh") は netsh を直接起動するため & がシェル区切りにならず add が実行されない。
+        # && にしない（消す規則が無いと delete は rc!=0 で、add が走らなくなる）。
         #
         # cmd.exe は二重引用符の中でも %VAR% を展開するので、置き場所の名前に
         # 定義済みの環境変数名が %..% の形で含まれていると、delete も add も
@@ -313,7 +319,7 @@ def ensure_self_program_allow():
             return False, ("実行ファイルのパスに % が含まれるため自exe受信許可を"
                            "自動設定できません（手動で追加してください）: " + prog)
         import ctypes
-        cmd = ('/c netsh advfirewall firewall delete rule name=all dir=in action=block '
+        cmd = ('/c netsh advfirewall firewall delete rule name=all dir=in '
                'program="{0}" & netsh advfirewall firewall add rule name="{1}" dir=in '
                'action=allow program="{0}" profile=any enable=yes').format(prog, name)
         rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", "cmd.exe", cmd, None, 0)
