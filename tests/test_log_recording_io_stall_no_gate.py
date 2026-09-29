@@ -12,8 +12,10 @@ L004607 で止まったまま。知らせも出なかった）。
 無い接続では描画を止めない（画面は進める）。記録待ちは上限を超えても積み続け、
 記録を欠かさない（シリアルの速度では 115200bps で 1 時間に最大約 41 MB）。上限を
 超えたときに一度だけ『記録先への書き込みが遅れています』の趣旨の知らせを、ほかの
-記録の知らせと同じ警告で出す。関所のある接続（SSH / Telnet）の Q1 (b) は変えない
-（test_log_recording_io_stall_backpressure.py ほか）。
+記録の知らせと同じ警告で出す。関所のある接続（SSH / Telnet）の Q1 (b)（描画と
+受信を止める）は変えない（test_log_recording_io_stall_backpressure.py ほか）。
+関所のある接続にはこの警告を出さない。止めたことは、別の文面の案内として一度
+だけ出す（警告ではない。4 周目 term。test_log_recording_io_stall_hold_notice.py）。
 
 どう直したか: _flush_pending_output が描画を止めるのは、関所を持つ機器だけにした。
 記録待ちの知らせは見回り（_check_log_writers）が出す。「一度だけ」は上限を
@@ -216,8 +218,11 @@ class LogRecordingIoStallNoGateTest(unittest.TestCase):
         _pump(300)
         self.assertEqual(len(self._lag_notices()), 2, "知らせを繰り返した")
 
-    def test_a_link_with_a_gate_is_still_held_back_without_the_notice(self):
-        """関所のある接続は、これまでどおり描画と受信を止め、遅れの知らせは出さないこと。"""
+    def test_a_link_with_a_gate_is_still_held_back_without_the_serial_warning(self):
+        """関所のある接続は、これまでどおり描画と受信を止め、シリアル向けの遅れの警告（画面は進めたまま…）は出さないこと。
+
+        止めたことの案内（警告ではない）は、test_log_recording_io_stall_hold_notice.py が確かめる。
+        """
         w = self._widget()
         release = threading.Event()
         self.addCleanup(release.set)
@@ -234,7 +239,7 @@ class LogRecordingIoStallNoGateTest(unittest.TestCase):
         self.assertIn("ser", w._log_throttled)
         _pump(300)
         self.assertEqual(self._lag_notices(), [],
-                         "受信を止められる接続にも遅れの知らせを出した")
+                         "受信を止められる接続にも、シリアル向けの遅れの警告を出した")
         release.set()
         self.assertTrue(self._wait_until(
             lambda: gate.is_set() and not w._pending_output.get("ser"), 10.0),

@@ -10,10 +10,13 @@ repro_termui03_io_stall.py）: 記録の書き込みは GUI スレッドで同�
 機器側が待つので、記録も画面も欠けない。ほかのタブは動く。記録待ちが
 PENDING_LOW_WATER まで減ったら再開する。
 
-どう直したか: _flush_pending_output が機器ごとの記録待ち（記録中と、停止して
-書き終えていない記録の書き込みスレッドに積んだ文字数）を見て、上限を超えて
+どう直したか: _flush_pending_output が機器ごとの記録待ち（記録中のファイルの
+書き込みスレッドに積んだ文字数。_held_log_backlog）を見て、上限を超えて
 いればその機器を描かずに関所を閉じる。見回り（_check_log_writers）が、減ったら
-関所を開け直して描画を再開させる。
+関所を開け直して描画を再開させる。停止して書き終えていない記録の分は数えない
+（数えると、記録を停止しても止めたままになった。4 周目 term。
+test_log_recording_io_stall_stop_releases_hold.py）。止めたことは、見回りが
+一度だけ案内する（警告ではない。test_log_recording_io_stall_hold_notice.py）。
 
 このテストでは上限をインスタンスで小さくして（256 KiB / 64 KiB）確かめる。
 """
