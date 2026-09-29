@@ -621,10 +621,9 @@ class _WindowChangeSender:
             threading.Thread(target=self._run, name="netbelt-window-change",
                              daemon=True).start()
         except RuntimeError:
-            # スレッドを作れない。書けないまま「書いている最中」に残さない
-            with self._lock:
-                self._running = False
-                self._idle.set()
+            # スレッドを作れない。これまでどおりその場で書く（渡した大きさを
+            # 誰も書かないまま残さない）
+            self._run()
             return
         self._idle.wait(wait)
 
