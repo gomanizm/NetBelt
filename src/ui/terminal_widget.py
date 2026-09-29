@@ -878,12 +878,16 @@ class TerminalWidget(QWidget):
         self._closing_writers: list = []
         # 記録の書き込み待ちが溜まって、描くのと受信を止めている機器
         self._log_throttled = set()
-        # 書き込み待ちが上限を超えた（関所のある接続は受信を止めた）と知らせた機器
+        # 書き込み待ちが上限を超えたと知らせた、関所の無い接続（シリアル）の機器
         self._log_lag_noticed = set()
-        # その遅れの知らせが開いている機器。開いている間は、その機器へは出し直さない
-        # （見回りは開いている間も動くので、止めては再開する遅い記録先では、
+        # その遅れの警告が開いている機器。開いている間は、その機器へは出し直さない
+        # （見回りは開いている間も動くので、書き込み待ちが上下する遅い記録先では、
         # 出し直すたびにモーダルが入れ子に積み上がる）
         self._log_notices_open = set()
+        # 関所のある接続で受信を止めたことを、いまの記録で知らせた機器（記録を
+        # 始めたら外す）と、出したその案内（機器名 -> QMessageBox。閉じると消える）
+        self._log_hold_noticed = set()
+        self._log_hold_notices: Dict[str, object] = {}
         self._log_dialogs: Dict[str, object] = {}  # 機器名 -> ログ記録ダイアログ
         # ターミナルの外観設定。_create_terminal が参照するので _create_ui より先に持つ
         self._terminal_settings = dict(self.DEFAULT_TERMINAL_SETTINGS)
@@ -912,7 +916,7 @@ class TerminalWidget(QWidget):
         self._output_timer.timeout.connect(self._flush_pending_output)
         # 記録先が詰まっている間だけ、書き込みスレッドを見回る（_check_log_writers）。
         # 本体は刻み（_log_watch）から単発のタイマー（_log_check）へ渡して動かす。
-        # 本体は知らせをモーダルで出し、Qt はスロットが入れ子のループにいる間、
+        # 本体は警告をモーダルで出し、Qt はスロットが入れ子のループにいる間、
         # 同じタイマーを配り直さない。刻みのスロットで出すと、開いている間は
         # 見回りが一度も動かず、記録先が戻っても止めた機器は OK を押すまで
         # 再開しなかった（実測: 5.5 秒開いたままで呼び出しは 0 回）。単発の
@@ -1798,9 +1802,9 @@ class TerminalWidget(QWidget):
         閉じ終えた記録の使用中の登録を外す。止めた機器を再開させ、関所の無い
         接続の書き込み待ちの遅れと、関所のある接続の受信を止めたことを知らせる。
         見回るものが無くなったら止まる。
-        警告・案内はモーダルで、出ている間も次の刻みでここへ入り直す（_log_check）。
+        警告はモーダルで、出ている間も次の刻みでここへ入り直す（_log_check）。
         そのため、モーダルを出す前に状態を書き換え終え、出したあとは状態を
-        読み直す。
+        読み直す。受信を止めたことの案内はモーダルでない（_show_log_hold_notice）。
         """
         from PyQt6.QtWidgets import QMessageBox
         from core import log_recording
@@ -1840,23 +1844,27 @@ class TerminalWidget(QWidget):
                     "分をメモリに溜めて順に書き込みます。記録先が応答しないままだと、"
                     "使うメモリが増え続けます。保存先の接続を確認してください。"
                     % name)
-        # 関所のある接続（SSH / Telnet）で受信を止めた機器にも、一度だけ知らせる
-        # （数え方はシリアルと同じ）。知らせないと止まった理由がどこにも出ず、
-        # エコーの見えないまま打ち直すと機器へ二重に送る。止めている間は機器側が
-        # 待つので記録にも画面にも欠けは無く、メモリも増え続けない。そのため
-        # シリアルの警告ではなく案内にする。止めているかは機器ごとに読み直す
-        # （ほかの機器の知らせが開いている間に、入り直した見回りが再開させる）
+        # 関所のある接続（SSH / Telnet）で受信を止めた機器にも知らせる。知らせ
+        # ないと止まった理由がどこにも出ず、エコーの見えないまま打ち直すと機器へ
+        # 二重に送る。止めている間は機器側が待つので記録にも画面にも欠けは無く、
+        # メモリも増え続けない。そのため警告ではなく、モーダルでない案内にする。
+        # 出すのは 1 回の記録で一度だけ（数え方はシリアルと分ける）。遅いが応答
+        # する記録先では止めては再開するのを繰り返し、書き込み待ちが減るたびに
+        # 知らせる側へ戻すと、止めるたびにモーダルが出直していた（実測: 12 秒に
+        # 6 回。開いている間はどのタブにも打てない）
         for name in list(self._log_throttled):
-            if name in self._log_throttled and name not in self._log_lag_noticed:
-                self._log_lag_noticed.add(name)
-                self._show_log_lag_notice(
-                    name, QMessageBox.information,
+            if (name not in self._log_hold_noticed
+                    and not self._log_hold_notice_open(name)):
+                self._log_hold_noticed.add(name)
+                self._show_log_hold_notice(
+                    name,
                     "%s のログ記録で、記録先への書き込みが遅れているため、"
                     "この機器の受信を止めています（画面の表示も止まります）。\n\n"
                     "機器側に送信を待たせているので、画面にも記録にも欠けは"
                     "出ません。記録先が応答すると再開します。記録を停止しても"
                     "再開します（停止した記録には、停止までに受信した分を"
-                    "書き込みます）。\n\n"
+                    "書き込みます）。記録先の応答が遅いと、止めては再開するのを"
+                    "繰り返します（この案内は、この記録の間はもう出しません）。\n\n"
                     "止めている間も、打った文字は機器へ送られます。エコーは"
                     "再開してから表示されるので、打ち直さないでください。"
                     "保存先の接続を確認してください。" % name)
@@ -1874,10 +1882,10 @@ class TerminalWidget(QWidget):
             self._log_watch.stop()
 
     def _show_log_lag_notice(self, name: str, show, text: str) -> None:
-        """遅れの知らせを show（QMessageBox の警告か案内）で出す。
+        """遅れの知らせを show（QMessageBox の警告）で出す。
 
         同じ機器の知らせが開いている間は出さない。開いている間も見回りは動き、
-        遅いが応答する記録先では、止めては再開するのを繰り返す。出し直すと、
+        遅いが応答する記録先では、書き込み待ちが上下するのを繰り返す。出し直すと、
         開いている知らせの上にモーダルが入れ子に積み上がっていく。
         """
         if name in self._log_notices_open:
@@ -1887,6 +1895,34 @@ class TerminalWidget(QWidget):
             show(self, "ログ記録", text)
         finally:
             self._log_notices_open.discard(name)
+
+    def _show_log_hold_notice(self, name: str, text: str) -> None:
+        """受信を止めたことの案内を、モーダルでない QMessageBox で出す。
+
+        exec で出すと、利用者が閉じるまで、どのタブにも打てない。show() で
+        出してすぐ戻る。出した案内は _log_hold_notices に持ち、開いている間は
+        その機器へは出し直さない（_log_hold_notice_open）。端末の中には書かない
+        （show_notice は描き待ちを先に描き切るので、止めている意味が無くなる）。
+        """
+        from PyQt6.QtCore import Qt
+        from PyQt6.QtWidgets import QMessageBox
+        box = QMessageBox(QMessageBox.Icon.Information, "ログ記録", text,
+                          QMessageBox.StandardButton.Ok, self)
+        box.setWindowModality(Qt.WindowModality.NonModal)
+        box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self._log_hold_notices[name] = box
+        box.show()
+
+    def _log_hold_notice_open(self, name: str) -> bool:
+        """その機器の、受信を止めたことの案内が開いているか"""
+        box = self._log_hold_notices.get(name)
+        try:
+            if box is not None and box.isVisible():
+                return True
+        except RuntimeError:
+            pass            # 閉じて消えた（WA_DeleteOnClose）
+        self._log_hold_notices.pop(name, None)
+        return False
 
     def has_open_log_recordings(self) -> bool:
         """まだ閉じていない記録があるか（記録中と、停止して書き終えていない分）
@@ -2524,6 +2560,8 @@ class TerminalWidget(QWidget):
                     self._closing_logs.setdefault(tab_name, []).append(
                         [None, None, skipped])
                 self._log_files[tab_name] = log_file
+                # 受信を止めたことの案内は、記録ごとに一度出せる状態から始める
+                self._log_hold_noticed.discard(tab_name)
                 from core import log_recording
                 log_recording.start(tab_name, file_path)
                 # 開けたところまで来たら覚える（開けなければ except へ抜ける）

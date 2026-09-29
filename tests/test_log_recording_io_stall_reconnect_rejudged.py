@@ -99,12 +99,31 @@ class LogRecordingIoStallReconnectRejudgedTest(unittest.TestCase):
         from core import log_recording
         self.addCleanup(log_recording.stop, "dev")
         self.dir = tempfile.mkdtemp(prefix="netbelt-logstall-reconnect-")
+        from PyQt6.QtWidgets import QMessageBox
         self.warning = mock.patch("PyQt6.QtWidgets.QMessageBox.warning").start()
         self.information = mock.patch(
             "PyQt6.QtWidgets.QMessageBox.information").start()
+        # 止めたことの案内はモーダルでない QMessageBox の show() で出る。
+        # 出た順に本文を覚え、開いたままの案内は後のテストへ残さない
+        self.shown = []
+        real_show = QMessageBox.show
+
+        def recording_show(box):
+            self.shown.append((box.text(), box))
+            real_show(box)
+        mock.patch.object(QMessageBox, "show", recording_show).start()
         self.addCleanup(mock.patch.stopall)
+        self.addCleanup(self._close_boxes)
         self.files = []
         self.addCleanup(lambda: [f.open_all() for f in self.files])
+
+    def _close_boxes(self):
+        for _, box in self.shown:
+            try:
+                if box.isVisible():
+                    box.accept()
+            except RuntimeError:
+                pass            # 閉じて消えた
 
     def _widget(self):
         from ui.terminal_widget import TerminalWidget
@@ -161,8 +180,7 @@ class LogRecordingIoStallReconnectRejudgedTest(unittest.TestCase):
         return fed
 
     def _hold_notices(self):
-        return [c for c in self.information.call_args_list
-                if len(c.args) > 2 and "受信を止めて" in str(c.args[2])]
+        return [text for text, _ in self.shown if "受信を止めて" in text]
 
     def test_a_reconnect_does_not_carry_over_the_hold_once_below_the_limit(self):
         """記録待ちが上限を下回ってから再接続したら、次の接続は止めずに読めて描かれること。"""

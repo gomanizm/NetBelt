@@ -9,17 +9,23 @@
 （_check_log_writers の `name not in self._output_gates`）。利用者は止まった理由が
 分からず、エコーの見えないまま打ち直すと機器へ二重に送る。
 
-どう直したか（作り手の親の決定）: 関所のある接続でも、止めたときに一度だけ
+どう直したか（作り手の親の決定）: 関所のある接続でも、止めたときに
 『記録先への書き込みが遅れているため、この機器の受信を止めています』の趣旨を
-その機器の名前つきで知らせる。仕組みはシリアルの知らせに合わせた（見回りが
-出す。知らせた機器は _log_lag_noticed に入れ、書き込み待ちが PENDING_LOW_WATER
-まで減ったら、次に止めたときにまた一度知らせる）。止めている間も機器側が
+その機器の名前つきで知らせる（見回りが出す）。止めている間も機器側が
 待つので記録にも画面にも欠けは無く、メモリも増え続けないので、シリアルの
-警告（QMessageBox.warning）ではなく案内（QMessageBox.information）で出す。
+警告（QMessageBox.warning）ではなく案内で出す。
 シリアル向けの『画面は進めたまま…』の警告は、関所のある接続には出さない
 （tests/test_log_recording_io_stall_no_gate.py）。
+初めはシリアルと同じ数え方（書き込み待ちが PENDING_LOW_WATER まで減ったら、
+次に止めたときにまた知らせる）で、QMessageBox.information（モーダル）で出して
+いた。遅いが応答する記録先では止めるたびにモーダルが出直したので（5 周目の
+検査役の指摘。tests/test_log_recording_io_stall_hold_notice_modeless.py）、
+いまは 1 回の記録（start_log_recording から停止・中止まで）で一度だけ、
+モーダルでない案内（QMessageBox を show()）で出す。追いついてからまた止めても
+同じ記録のうちは出し直さず、記録を始め直したら、また一度出す。
 
 このテストでは上限をインスタンスで小さくして（256 KiB / 64 KiB）確かめる。
+案内は QMessageBox.show を見張って数える（モーダルの information は出ない）。
 """
 import builtins
 import os
@@ -90,12 +96,33 @@ class LogRecordingIoStallHoldNoticeTest(unittest.TestCase):
         from core import log_recording
         self.addCleanup(log_recording.stop, "dev")
         self.dir = tempfile.mkdtemp(prefix="netbelt-logstall-notice-")
+        from PyQt6.QtWidgets import QMessageBox
         self.warning = mock.patch("PyQt6.QtWidgets.QMessageBox.warning").start()
         self.information = mock.patch(
             "PyQt6.QtWidgets.QMessageBox.information").start()
+        # show() で出た案内を、出た順に（題, 本文, モーダルか）で覚える
+        self.shown = []
+        self.boxes = []
+        real_show = QMessageBox.show
+
+        def recording_show(box):
+            self.shown.append((box.windowTitle(), box.text(), box.isModal()))
+            self.boxes.append(box)
+            real_show(box)
+        mock.patch.object(QMessageBox, "show", recording_show).start()
         self.addCleanup(mock.patch.stopall)
+        self.addCleanup(self._close_boxes)
         self.release = threading.Event()
         self.addCleanup(self.release.set)
+
+    def _close_boxes(self):
+        """開いたままの案内を、後のテストへ残さない。"""
+        for box in self.boxes:
+            try:
+                if box.isVisible():
+                    box.accept()
+            except RuntimeError:
+                pass            # 閉じて消えた
 
     def _widget(self):
         from ui.terminal_widget import TerminalWidget
@@ -107,8 +134,8 @@ class LogRecordingIoStallHoldNoticeTest(unittest.TestCase):
         w.tab_widget.setCurrentWidget(w._terminals["dev"])
         return w
 
-    def _start(self, w):
-        path = os.path.join(self.dir, "dev.log")
+    def _start(self, w, filename="dev.log"):
+        path = os.path.join(self.dir, filename)
         real_open = builtins.open
 
         def fake_open(file, mode="r", *args, **kwargs):
@@ -144,8 +171,8 @@ class LogRecordingIoStallHoldNoticeTest(unittest.TestCase):
         return fed
 
     def _hold_notices(self):
-        return [c for c in self.information.call_args_list
-                if len(c.args) > 2 and "受信を止めて" in str(c.args[2])]
+        """出た『受信を止めて』の案内（題, 本文, モーダルか）"""
+        return [shown for shown in self.shown if "受信を止めて" in shown[1]]
 
     def _caught_up(self, w, gate):
         return (gate.is_set() and not w._pending_output.get("dev")
@@ -161,13 +188,14 @@ class LogRecordingIoStallHoldNoticeTest(unittest.TestCase):
 
         self.assertTrue(self._wait_until(lambda: self._hold_notices(), 2.0),
                         "記録先の詰まりで受信を止めたのに、何も知らせなかった")
-        notice = self._hold_notices()[0]
-        self.assertEqual(notice.args[1], "ログ記録")
-        self.assertIn("dev", notice.args[2])
-        self.assertIn("記録先への書き込みが遅れている", notice.args[2])
+        title, text, modal = self._hold_notices()[0]
+        self.assertEqual(title, "ログ記録")
+        self.assertIn("dev", text)
+        self.assertIn("記録先への書き込みが遅れている", text)
         # 解く手立てと、打った文字の行き先を案内する
-        self.assertIn("記録を停止", notice.args[2])
-        self.assertIn("打った文字", notice.args[2])
+        self.assertIn("記録を停止", text)
+        self.assertIn("打った文字", text)
+        self.assertFalse(modal, "案内がモーダルで出た")
 
         # 止めたままでも、知らせは一度だけ
         _pump(500)
@@ -188,16 +216,18 @@ class LogRecordingIoStallHoldNoticeTest(unittest.TestCase):
                              "止めている間の記録が欠けた・崩れた")
         self.assertIn("L%06d" % (fed - 1), w._terminals["dev"].toPlainText())
         self.assertEqual(len(self._hold_notices()), 1)
-        self.assertEqual(self.information.call_count, 1, "ほかの案内が出た")
+        self.assertEqual(len(self.shown), 1, "ほかの案内が出た")
+        self.assertEqual(self.information.call_count, 0, "モーダルの案内が出た")
 
-    def test_a_new_hold_after_catching_up_notifies_once_more(self):
-        """書き込み待ちが追いついたあと、もう一度止めたら、また一度だけ知らせること。"""
+    def test_a_new_hold_is_noticed_again_only_in_a_new_recording(self):
+        """追いついてからまた止めても同じ記録のうちは知らせ直さず、記録を始め直して止めたら、また一度だけ知らせること。"""
         w = self._widget()
         self._start(w)
         gate = w.output_gate("dev")
         fed = self._feed_until_held(w, gate, 0)
         self.assertTrue(self._wait_until(lambda: self._hold_notices(), 2.0),
                         "記録先の詰まりで受信を止めたのに、何も知らせなかった")
+        self._close_boxes()             # 利用者が閉じる
         self.release.set()
         self.assertTrue(self._wait_until(lambda: self._caught_up(w, gate), 10.0),
                         "前提: 追いついた")
@@ -205,12 +235,27 @@ class LogRecordingIoStallHoldNoticeTest(unittest.TestCase):
         self.assertEqual(len(self._hold_notices()), 1, "追いつくまでに知らせを繰り返した")
 
         self.release.clear()            # 記録先がまた応答しなくなる
+        fed = self._feed_until_held(w, gate, fed)
+        _pump(500)
+        self.assertEqual(len(self._hold_notices()), 1,
+                         "同じ記録のうちに、また止めたことを知らせ直した")
+
+        # 記録を停止すると止めが解ける（記録先は詰まったまま）。別のファイルへ
+        # 始め直して、また止まったら、その記録では一度だけ知らせる
+        w.stop_log_recording("dev")
+        self.assertTrue(self._wait_until(
+            lambda: gate.is_set() and "dev" not in w._log_throttled, 3.0),
+            "前提: 記録を停止したら止めが解けた")
+        self._start(w, "dev2.log")
         self._feed_until_held(w, gate, fed)
         self.assertTrue(self._wait_until(
             lambda: len(self._hold_notices()) == 2, 2.0),
-            "追いついたあとにまた受信を止めたのに、知らせなかった")
+            "記録を始め直してまた受信を止めたのに、知らせなかった")
         _pump(300)
         self.assertEqual(len(self._hold_notices()), 2, "知らせを繰り返した")
+        self.assertEqual([modal for _, _, modal in self._hold_notices()],
+                         [False, False], "案内がモーダルで出た")
+        self.assertEqual(self.information.call_count, 0)
         self.assertEqual(self.warning.call_count, 0)
 
 
