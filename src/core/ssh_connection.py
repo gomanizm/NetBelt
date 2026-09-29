@@ -791,6 +791,9 @@ class SSHConnection(QObject):
         # 送信の背圧（has_pending_sends）。接続が成立したときに、その
         # チャネルに束縛して作る
         self._drain_watcher: Optional[DrainWatcher] = None
+        # その見張りを始められないときの調べ直し（_retry_drain）を予約済みか。
+        # 予約はいつも 1 本だけにする（呼ばれたときに外す）
+        self._drain_retry_pending = False
         # 送信ウィンドウに入り切らず、まだ書いていない分（_write_carry）。
         # 端末に渡す物が無くても、書けるようになったらここで書き出す
         self._carry = b""
@@ -1375,7 +1378,7 @@ class SSHConnection(QObject):
             if not self.is_connected or channel is None:
                 self._carry = b""   # 切れた接続の残りは捨てる
                 return False
-            if watcher is not None and watcher.check():
+            if watcher is not None and self._drain_backlogged(watcher):
                 return True   # ウィンドウが 0・鍵交換中・TCP へ書けない・書いている最中
             room = channel.out_window_size
             if watcher is None or not isinstance(room, int) or room <= 0:
@@ -1386,7 +1389,7 @@ class SSHConnection(QObject):
             if watcher is not None:
                 writer = self._writer_for(channel)
                 if (not writer.write(head, self._WRITE_WAIT_SECONDS)
-                        and watcher.check()):
+                        and self._drain_backlogged(watcher)):
                     return True   # 待たされている。書き終われば send_drained で続きを
                 if self._report_write_error():
                     return False
@@ -1447,7 +1450,35 @@ class SSHConnection(QObject):
         watcher = self._drain_watcher
         if watcher is None:
             return False
-        return self._write_carry() or watcher.check()
+        return self._write_carry() or self._drain_backlogged(watcher)
+
+    def _drain_backlogged(self, watcher) -> bool:
+        """watcher.check() と同じ（待たずに書けないなら見張りを始めて True。GUI スレッドから呼ぶ）
+
+        見張りのスレッドを作れない（Thread.start の RuntimeError）ときも True を
+        返して待たせ、GUI スレッドのタイマーで調べ直す（_retry_drain）。例外を
+        そのまま投げると、打鍵は持ち越しに残ったまま send_drained が出ず、
+        端末の送信の列も止まったままだった（保留した端末の大きさだけで待たせる
+        ときにも起きた）。いま書くと、鍵交換中などは書けるまで GUI が止まる。
+        予約済みなら足さない（呼ばれるたびに足すと、調べ直しが増えていく）。
+        """
+        try:
+            return watcher.check()
+        except RuntimeError:
+            if not self._drain_retry_pending:
+                self._drain_retry_pending = True
+                QTimer.singleShot(int(DrainWatcher.POLL_SECONDS * 1000),
+                                  self._retry_drain)
+            return True
+
+    @pyqtSlot()
+    def _retry_drain(self):
+        """予約した調べ直し（送信の見張りを始められなかったとき）。書けるなら send_drained を出す"""
+        self._drain_retry_pending = False
+        watcher = self._drain_watcher
+        if watcher is None or self._drain_backlogged(watcher):
+            return   # 後始末済み・まだ書けない（見張りか、次の調べ直しが知らせる）
+        self._announce_drained()
 
     def _send_backlogged(self, channel) -> bool:
         """channel へ待たずに 1 バイトも書けないなら True（見張りのスレッドからも呼ぶ）

@@ -4,7 +4,7 @@ import socket
 import threading
 import time
 from typing import Optional
-from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QObject, QTimer, pyqtSignal, pyqtSlot
 
 from .send_backpressure import DrainWatcher, socket_writable, wait_writable
 from .sockets import tcp_port_number
@@ -22,6 +22,9 @@ class TelnetConnection(QObject):
     # 待たずに書けなかったソケットが、また書けるようになった（端末の
     # resume_send_queue へ繋ぐ）。見張りのスレッドから出すのでキュー接続で届く
     send_drained = pyqtSignal()
+    # 送信の見張りを始められなかったので、GUI スレッドで調べ直してほしい
+    # （_drain_backlogged。受信スレッドから出すとキュー接続で届く）
+    _drain_retry_wanted = pyqtSignal()
     
     def __init__(self, host: str, port: int, username: str = "", password: str = "", 
                  parent=None):
@@ -63,6 +66,9 @@ class TelnetConnection(QObject):
         # 送信の背圧（has_pending_sends）。接続が成立したときに、その
         # ソケットに束縛して作る
         self._drain_watcher: Optional[DrainWatcher] = None
+        # その見張りを始められないときの調べ直し（_retry_drain）を予約済みか。
+        # 予約はいつも 1 本だけにする（GUI スレッドだけが触る）
+        self._drain_retry_pending = False
         # 送る列: 交渉の応答（_out_replies）と、渡された送信（_out_data）のうち、
         # まだソケットへ書いていない分。応答を先に書く。錠が取れない・待たずに
         # 書けないときはここに残し、書けるようになったら（send_drained）
@@ -71,6 +77,7 @@ class TelnetConnection(QObject):
         self._out_data = bytearray()
         self._out_lock = threading.Lock()
         self.send_drained.connect(self._write_pending_when_drained)
+        self._drain_retry_wanted.connect(self._schedule_drain_retry)
 
     def set_read_gate(self, gate) -> None:
         """受信を止める合図（threading.Event）を受け取る
@@ -294,7 +301,7 @@ class TelnetConnection(QObject):
                     self._write_lock.release()
                 if not (self._out_replies or self._out_data):
                     return False
-            if watcher.check():
+            if self._drain_backlogged(watcher):
                 return True
             # 錠が空いて書けるようになった。もう一度書く
 
@@ -355,7 +362,43 @@ class TelnetConnection(QObject):
         except OSError as e:
             self._report_send_error(e)
             return False
-        return watcher.check()
+        return self._drain_backlogged(watcher)
+
+    def _drain_backlogged(self, watcher) -> bool:
+        """watcher.check() と同じ（待たずに書けないなら見張りを始めて True）
+
+        見張りのスレッドを作れない（Thread.start の RuntimeError）ときも True を
+        返して送る列に残し、GUI スレッドのタイマーで調べ直す（_retry_drain）。
+        例外をそのまま投げると、送信は『送信エラー』として切断に、受信
+        スレッドの交渉の応答は『読み取りエラー』として切断になり、端末の送信の
+        列は send_drained が来ないまま止まっていた。GUI スレッドと受信スレッドの
+        両方から呼ぶので、予約はシグナルで GUI スレッドに頼む。
+        """
+        try:
+            return watcher.check()
+        except RuntimeError:
+            try:
+                self._drain_retry_wanted.emit()
+            except RuntimeError:
+                pass   # 捨てられた接続（C++ 側が消えている）
+            return True
+
+    @pyqtSlot()
+    def _schedule_drain_retry(self):
+        """調べ直しを予約する（GUI スレッドで受ける。予約済みなら足さない）"""
+        if not self._drain_retry_pending:
+            self._drain_retry_pending = True
+            QTimer.singleShot(int(DrainWatcher.POLL_SECONDS * 1000),
+                              self._retry_drain)
+
+    @pyqtSlot()
+    def _retry_drain(self):
+        """予約した調べ直し（送信の見張りを始められなかったとき）。書けるなら send_drained を出す"""
+        self._drain_retry_pending = False
+        watcher = self._drain_watcher
+        if watcher is None or self._drain_backlogged(watcher):
+            return   # 後始末済み・まだ書けない（見張りか、次の調べ直しが知らせる）
+        self._announce_drained()
 
     def _send_backlogged(self, sock) -> bool:
         """sock へ待たずに書けないなら True（見張りの判定）

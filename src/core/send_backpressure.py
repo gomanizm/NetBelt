@@ -73,6 +73,11 @@ class DrainWatcher:
         """いま待たずに書けないか。書けないなら見張りを始めて True を返す
 
         止めた後は False を返す。切断済みの接続で端末を待たせ続けないため。
+        見張りのスレッドを作れない（Thread.start の RuntimeError）ときは、
+        始まっていないスレッドを見張り中の印に残さずに、その例外を投げる。
+        残すと、以後の check が見張りを始めず知らせも来ないまま待たせ続け、
+        stop の join も失敗していた。待たせ方は呼び出し側が決める（次の
+        check でまた始められる）。
         """
         if self._stopped or not self._busy():
             return False
@@ -80,7 +85,11 @@ class DrainWatcher:
             if not self._stopped and self._thread is None:
                 self._thread = threading.Thread(
                     target=self._run, name="netbelt-send-drain", daemon=True)
-                self._thread.start()
+                try:
+                    self._thread.start()
+                except RuntimeError:
+                    self._thread = None
+                    raise
         return True
 
     def _run(self):
@@ -102,9 +111,15 @@ class DrainWatcher:
             self._notify()
 
     def stop(self, timeout: float = 1.0) -> None:
-        """見張りを止め、終わるまで最大 timeout 秒待つ（以後は知らせない）"""
+        """見張りを止め、終わるまで最大 timeout 秒待つ（以後は知らせない）
+
+        動いていないスレッド（始まっていない・終わった）は待たない。join は
+        始まっていないスレッドで RuntimeError になり、後始末（接続の
+        dispose）が Transport やソケットを閉じる前に止まっていた。
+        """
         with self._lock:
             self._stopped = True
             thread = self._thread
-        if thread is not None and thread is not threading.current_thread():
+        if (thread is not None and thread.is_alive()
+                and thread is not threading.current_thread()):
             thread.join(timeout)
