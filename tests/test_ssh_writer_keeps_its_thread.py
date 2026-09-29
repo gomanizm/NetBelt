@@ -11,6 +11,14 @@
 待ってから終わる。その間に渡された物は同じスレッドが書く。止めれば
 （dispose・繋ぎ直し）、待っているスレッドもすぐ終わる。直したあとの同じ
 測定は、打鍵 0.07〜0.09 ms、貼り付け 0.62〜0.64 秒。
+
+スレッドの本数を数えるテストは、待ち（_LINGER_SECONDS）を 30 秒にしてから
+数える。既定の 1 秒のままだと、混んだ機械でテストのスレッドが受け渡しの間に
+1 秒を超えて止まったとき、書き手は正しく終わって次の受け渡しで 2 本目が
+始まり、『1 != 2』で落ちていた（1d9d5c5 で、受け渡しの呼び出し側を 10 回目の
+前に 1.3 秒止めると、数える 2 件とも落ちた）。待ちを長くしても、受け渡しごとに
+スレッドを作れば本数で、待っている書き手を起こし損ねれば書き終わりの待ちで
+落ちる。
 """
 import os
 import socket
@@ -97,13 +105,16 @@ class _ChannelCase(unittest.TestCase):
 
 class WriterKeepsItsThreadTest(_ChannelCase):
     def test_consecutive_hand_overs_use_one_thread(self):
+        from core.ssh_connection import _ChannelWriter
         channel = self._channel()
         writer = self._writer(channel)
         expected = []
-        with _WriterThreads() as threads:
+        # 待ちを長くする（テストのスレッドが受け渡しの間に止まっても数え違えない）
+        with mock.patch.object(_ChannelWriter, "_LINGER_SECONDS", 30.0), \
+                _WriterThreads() as threads:
             for i in range(50):
                 data = b"chunk%d" % i
-                # 待っている書き手を起こし損ねると、待ちの終わり（1 秒）まで
+                # 待っている書き手を起こし損ねると、待ちの終わり（30 秒）まで
                 # 書かれない。それより短く待つ
                 self.assertTrue(writer.write(data, 0.5),
                                 "書き込みが終わらない（%d 個目）" % i)
@@ -202,13 +213,16 @@ class _QtCase(_ChannelCase):
 
 class TypingKeepsTheThreadTest(_QtCase):
     def test_typing_does_not_start_a_thread_per_key(self):
+        from core.ssh_connection import _ChannelWriter
         channel = self._channel()
         conn = self._session(channel)
-        with _WriterThreads() as threads:
+        # 待ちを長くする（テストのスレッドが打鍵の間に止まっても数え違えない）
+        with mock.patch.object(_ChannelWriter, "_LINGER_SECONDS", 30.0), \
+                _WriterThreads() as threads:
             for ch in "show running-config\r":
                 conn.send_command(ch)
                 # ふだんは渡したその場で書き終わる。混んだ機械でも、待っている
-                # 書き手を起こし損ねたとき（待ちの終わりの 1 秒まで書かれない）
+                # 書き手を起こし損ねたとき（待ちの終わりの 30 秒まで書かれない）
                 # より短い間に書き終わる
                 self._pump(0.5, until=lambda: not conn.has_pending_sends())
                 self.assertFalse(conn.has_pending_sends(),
