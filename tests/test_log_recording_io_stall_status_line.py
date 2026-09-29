@@ -41,6 +41,12 @@ QMessageBox を 10ms ごとに探す。キーは、本物のキーボードと�
 （7 周目 term の検査役の変異 raise_only）。本物の Windows で前に出すと、活性化を
 伴ってキーの横取りへ戻りうる。LogRecordingDialog の raise_ / activateWindow /
 show / showNormal / setFocus / open / exec を数える偽物に替えて、0 回を確かめる。
+
+停止した記録だけが遅れている間も窓を出さないこと: 描き待ちが無いときに停止した
+記録は、すぐ閉じ終わりの待ち（_closing_writers）へ移り、書き込み待ちとして数え
+られない。描き待ちを残したまま停止すると、停止した記録は描き終わるまで
+_closing_logs に残り、上限を超えた書き込み待ちを持つ（ダイアログは無い）。
+その状態で見回りを回しても窓を出さないことを確かめる（検査役の変異 closingwin）。
 """
 import builtins
 import os
@@ -697,6 +703,45 @@ class LogRecordingIoStallStatusLineTest(unittest.TestCase):
         self.assertEqual(self._stop_and_read(w, "ser", ser_path),
                          _chunk("ser", 0, ser_fed).replace("\r\n", "\n"),
                          "遅れている間の記録が欠けた・崩れた")
+        self.assertEqual(self._windows(), [], "窓を出した")
+
+    def test_a_stopped_serial_recording_left_over_the_limit_opens_no_window(self):
+        """描き待ちを残したまま停止したシリアルの記録が、上限を超えた書き込み待ちを持ったまま詰まっていても、窓は出さないこと。記録は欠けないこと。"""
+        from core import log_recording
+        w = self._widget(["ser"])
+        release = self._stalled()
+        path = self._start(w, "ser", "ser.log", release)
+        fed = self._feed_serial_over(w, "ser", 0)
+        self.assertTrue(self._wait_until(lambda: self._line(w, "ser"), 2.0),
+                        "前提: 記録中ダイアログに状態の行が出た")
+
+        # 受信が描画を上回っている最中に停止する（描き待ちを残す）
+        w.queue_output("ser", _chunk("ser", fed, self.LINES))
+        fed += self.LINES
+        w.stop_log_recording("ser")
+        self.assertNotIn("ser", w._log_dialogs, "前提: 記録中ダイアログは無い")
+        self.assertIn("ser", w._closing_logs,
+                      "前提: 停止した記録が、描き待ちの分を書くまで残っている")
+        self.assertGreaterEqual(w._log_backlog("ser"), self.HIGH,
+                                "前提: 停止した記録の書き込み待ちが上限を超えている")
+        # この状態で見回りを回す（本来は 100ms ごと。描き終えると閉じ終わりの
+        # 待ちへ移って数えなくなるので、ここで確かめる）
+        w._check_log_writers()
+        self.assertEqual(self._windows(), [],
+                         "停止した記録の書き込み待ちの遅れに窓を出した")
+        _pump(500)
+        self.assertFalse(release.is_set(), "前提: 停止した記録は詰まったまま")
+        self.assertEqual(self._windows(), [],
+                         "停止した記録の書き込み待ちの遅れに窓を出した")
+
+        release.set()
+        self.assertTrue(self._wait_until(
+            lambda: log_recording.device_using(path) is None, 10.0),
+            "詰まりが解けても、停止した記録を閉じ終えなかった")
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(f.read(), _chunk("ser", 0, fed).replace("\r\n", "\n"),
+                             "停止した記録が欠けた・崩れた")
+        self.assertIn("ser%06d" % (fed - 1), w._terminals["ser"].toPlainText())
         self.assertEqual(self._windows(), [], "窓を出した")
 
 
