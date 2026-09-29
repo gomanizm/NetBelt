@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Callable, Optional
 from paramiko.common import cMSG_CHANNEL_WINDOW_ADJUST
 from paramiko.message import Message
-from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QObject, QTimer, pyqtSignal, pyqtSlot
 
 from .send_backpressure import DrainWatcher, socket_writable
 from .unsendable import unsendable_notice
@@ -1538,8 +1538,18 @@ class SSHConnection(QObject):
             self._size_watcher = DrainWatcher(
                 lambda: self._transport_backlogged(channel),
                 self._announce_size_writable)
-        if self._size_watcher.check():
-            return   # 書けるようになったら _size_writable でここへ戻ってくる
+        try:
+            if self._size_watcher.check():
+                return   # 書けるようになったら _size_writable でここへ戻ってくる
+        except RuntimeError:
+            # 見張りのスレッドを作れない。開始できなかった見張りは捨て（残すと
+            # 見張り中の印が残って知らせが来ず、あとの打鍵もずっと待たされ、
+            # dispose も失敗する）、GUI スレッドのタイマーで調べ直す（いま
+            # 書くと、書けるまで GUI が止まる）
+            self._size_watcher = None
+            QTimer.singleShot(int(DrainWatcher.POLL_SECONDS * 1000),
+                              self._send_terminal_size)
+            return
         self._size_unsent = False
         self._writer_for(channel).send_size(
             self.term_cols, self.term_rows, self._WRITE_WAIT_SECONDS)
