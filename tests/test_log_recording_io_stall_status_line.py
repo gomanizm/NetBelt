@@ -29,6 +29,12 @@ exec / open を開かずにすぐ戻る偽物に替えて数え、show は数え
 QMessageBox を 10ms ごとに探す。キーは、本物のキーボードと同じく、そのとき
 フォーカスのあるウィジェット（QApplication.focusWidget()）へ送る。上限は
 インスタンスで小さくする（256 KiB / 64 KiB）。
+
+状態の行は切れずに全部見えること（7 周目 term の検査役の指摘。5fcd235 で実測）:
+記録中ダイアログは表示した時点の大きさのままで、隠していた行（折り返しあり）を
+後から出しても、窓は最小の高さ（1 行分）までしか伸びず、2 行目から先が切れていた
+（offscreen で行の高さ 25、要る高さ 54。Windows のフォントで 36 と 78）。行の
+高さが、その幅で要る高さ（heightForWidth）以上あることを確かめる。
 """
 import builtins
 import os
@@ -564,6 +570,69 @@ class LogRecordingIoStallStatusLineTest(unittest.TestCase):
             self.assertEqual(f.read(), _chunk("dev", 0, dev_fed).replace("\r\n", "\n"))
         with open(ser_path, encoding="utf-8") as f:
             self.assertEqual(f.read(), _chunk("ser", 0, ser_fed).replace("\r\n", "\n"))
+        self.assertEqual(self._windows(), [], "窓を出した")
+
+    def _assert_line_fits(self, w, name, before):
+        """その機器の状態の行が、折り返した 2 行目から先まで切れずに見えていること。
+
+        before は行を出す前のダイアログの位置と大きさ。位置と幅は変えないこと。
+        """
+        dialog = w._log_dialogs[name]
+        label = dialog.status_label
+        need = label.heightForWidth(label.width())
+        self.assertGreater(need, label.fontMetrics().lineSpacing() * 1.5,
+                           "前提: %s の状態の行が折り返している" % name)
+        self.assertGreaterEqual(
+            label.height(), need,
+            "%s の状態の行が切れている（行の高さ %d、その幅で要る高さ %d）"
+            % (name, label.height(), need))
+        self.assertTrue(dialog.rect().contains(label.geometry()),
+                        "%s の状態の行がダイアログからはみ出している" % name)
+        after = dialog.geometry()
+        self.assertEqual((after.x(), after.y(), after.width()),
+                         (before.x(), before.y(), before.width()),
+                         "%s の状態の行を出すときに、ダイアログを動かした・幅を変えた"
+                         % name)
+
+    def test_the_line_fits_in_the_dialog(self):
+        """止めている行とシリアルの遅れの行が、記録中ダイアログの中で切れずに全部見えること。記録と画面は欠けないこと。"""
+        w = self._widget(["dev", "ser"])
+        dev_release = self._stalled()
+        ser_release = self._stalled()
+        dev_path = self._start(w, "dev", "dev.log", dev_release)
+        ser_path = self._start(w, "ser", "ser.log", ser_release)
+        gate = w.output_gate("dev")
+        _pump(50)
+        before = {name: w._log_dialogs[name].geometry() for name in ("dev", "ser")}
+
+        dev_fed = self._feed_until_held(w, gate, "dev", 0)
+        ser_fed = self._feed_serial_over(w, "ser", 0)
+        self.assertTrue(self._wait_until(
+            lambda: self._line(w, "dev") and self._line(w, "ser"), 2.0),
+            "前提: どちらの記録中ダイアログにも状態の行が出た")
+        self._assert_held_line(self._line(w, "dev"))
+        self.assertIn("メモリに溜めて", self._line(w, "ser"))
+        _pump(100)
+        self._assert_line_fits(w, "dev", before["dev"])
+        self._assert_line_fits(w, "ser", before["ser"])
+
+        dev_release.set()
+        ser_release.set()
+        self.assertTrue(self._wait_until(
+            lambda: self._caught_up(w, gate, "dev")
+            and not w._pending_output.get("ser") and w._log_backlog("ser") == 0,
+            10.0), "詰まりが解けても追いつかなかった")
+        self.assertTrue(self._wait_until(
+            lambda: self._line(w, "dev") == "" and self._line(w, "ser") == "", 2.0),
+            "追いついたのに状態の行を消さなかった")
+        self.assertEqual(self._stop_and_read(w, "dev", dev_path),
+                         _chunk("dev", 0, dev_fed).replace("\r\n", "\n"),
+                         "止めている間の記録が欠けた・崩れた")
+        self.assertEqual(self._stop_and_read(w, "ser", ser_path),
+                         _chunk("ser", 0, ser_fed).replace("\r\n", "\n"),
+                         "遅れている間の記録が欠けた・崩れた")
+        self.assertIn("dev%06d" % (dev_fed - 1), w._terminals["dev"].toPlainText())
+        self.assertIn("ser%06d" % (ser_fed - 1), w._terminals["ser"].toPlainText())
         self.assertEqual(self._windows(), [], "窓を出した")
 
 

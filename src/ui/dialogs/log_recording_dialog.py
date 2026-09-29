@@ -76,6 +76,9 @@ class LogRecordingDialog(QDialog):
             theme.band_style(self, bold=True, font_size="9pt"))
         self.status_label.hide()
         layout.addWidget(self.status_label)
+        # 行を消したあとの余った高さは、行のあった所に空けておく（set_status
+        # は伸ばしたダイアログを縮めない。ほかの行の間が広がらないように）
+        layout.addStretch()
         
         # 注意事項ラベル
         note_label = QLabel(
@@ -139,6 +142,14 @@ class LogRecordingDialog(QDialog):
             return
         self.status_label.setText(text)
         self.status_label.setVisible(bool(text))
+        # 折り返した行が切れないよう、足りなければ高さだけ伸ばす。窓は
+        # 最小の高さ（1 行分）までしか自分では伸びず、2 行目から先が切れて
+        # いた。幅と、利用者が広げた大きさは変えない。消しても縮めない
+        # （止めては再開するたびに停止ボタンの位置が上下しないように）。
+        # resize は大きさを変えるだけで、前に出さず活性化もしない
+        need = self.heightForWidth(self.width())
+        if need > self.height():
+            self.resize(self.width(), need)
 
     def _on_stop(self):
         """停止ボタンクリック時の処理"""
