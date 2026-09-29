@@ -10,10 +10,15 @@
   取って移動を追い越す。頼んだ順は [..., '/D', '/B']、current_path は '/B' で、
   /D への移動が知らせも無く取り消された。窓は 2 つのロック区間の間の数行だけ。
 
-直し方:
-  自動更新の場所は、番号を進めるのと同じロック区間の中で選ぶ
-  （list_directory(refresh=True)）。移動がその前なら自動更新は /D を頼み、
-  後なら /D のほうが新しい番号を持つ。
+直し方（今の形は d77b1a0 から）:
+  自動更新（list_directory(refresh=True)）は先に番号を取り、場所は一覧の
+  スレッドが通信のロックを取った時点で選ぶ（_pick_refresh_path）。場所を
+  読むのは必ず番号を取ったあとなので、番号より前の移動なら自動更新も /D を
+  頼み（/D の一覧が機器に頼まれるのを待ってから選ぶ）、番号を取ったあとの
+  移動なら /D のほうが新しい番号を持つので、自動更新の一覧は届いても
+  捨てられる。どちらでも移動は取り消されない。場所を番号より先に別の
+  ロック区間で読む形（e34c1ac）に戻すと、このテストは落ちる（current_path
+  が '/B'、頼んだ順 ['/B', '/D', '/B']）。
 """
 import os
 import shutil
@@ -81,7 +86,9 @@ class AutoRefreshTicketRaceTest(unittest.TestCase):
         return False
 
     def test_a_move_between_reading_and_ticketing_is_not_cancelled(self):
-        """自動更新が場所を選んだ直後に入った /D への移動が、取り消されないこと。"""
+        """自動更新が最初に _listing_seq_lock を離した直後に入った /D への移動が、
+        取り消されないこと（そこは e34c1ac では場所を読んだ直後、今は番号を
+        取った直後）。"""
         from PyQt6.QtCore import Qt
         from core.sftp_manager import SFTPManager
         m = SFTPManager()
