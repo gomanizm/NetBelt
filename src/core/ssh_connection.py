@@ -799,6 +799,9 @@ class SSHConnection(QObject):
         self._size_unsent = False
         # その大きさを送れるようになるのを待つ見張り（_send_terminal_size）
         self._size_watcher: Optional[DrainWatcher] = None
+        # 見張りを始められないときの調べ直し（_retry_terminal_size）を予約
+        # 済みか。予約はいつも 1 本だけにする（呼ばれたときに外す）
+        self._size_retry_pending = False
         # データとその大きさを GUI スレッドの外で書く書き手（_writer_for）
         self._writer: Optional[_ChannelWriter] = None
         self.send_drained.connect(self._write_carry_when_drained)
@@ -1545,14 +1548,23 @@ class SSHConnection(QObject):
             # 見張りのスレッドを作れない。開始できなかった見張りは捨て（残すと
             # 見張り中の印が残って知らせが来ず、あとの打鍵もずっと待たされ、
             # dispose も失敗する）、GUI スレッドのタイマーで調べ直す（いま
-            # 書くと、書けるまで GUI が止まる）
+            # 書くと、書けるまで GUI が止まる）。予約済みなら足さない（失敗の
+            # たびに足すと、大きさが変わった回数だけ調べ直しが増えていく）
             self._size_watcher = None
-            QTimer.singleShot(int(DrainWatcher.POLL_SECONDS * 1000),
-                              self._send_terminal_size)
+            if not self._size_retry_pending:
+                self._size_retry_pending = True
+                QTimer.singleShot(int(DrainWatcher.POLL_SECONDS * 1000),
+                                  self._retry_terminal_size)
             return
         self._size_unsent = False
         self._writer_for(channel).send_size(
             self.term_cols, self.term_rows, self._WRITE_WAIT_SECONDS)
+
+    @pyqtSlot()
+    def _retry_terminal_size(self):
+        """予約した調べ直し（_send_terminal_size の見張りを始められなかったとき）"""
+        self._size_retry_pending = False
+        self._send_terminal_size()
 
     def _announce_size_writable(self):
         """見張りのスレッドから、保留した大きさを送れるようになったことを知らせる"""

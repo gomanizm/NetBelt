@@ -22,7 +22,8 @@ DrainWatcher.check は開始できなかったスレッドを「見張り中」�
 paramiko サーバで、1 秒の鍵交換の間 set_terminal_size が 1.0 秒戻らなかった）。
 
 どう直したか。大きさの見張りを始められないときは、開始に失敗した見張りを捨て、
-GUI スレッドのタイマーで（見張りと同じ間隔で）調べ直す。書けるようになったら、
+GUI スレッドのタイマーで（見張りと同じ間隔で）調べ直す（予約はいつも 1 本だけ。
+その間に大きさが何度変わっても増やさない）。書けるようになったら、
 いつもどおり大きさを書き手へ渡し、そのあとで打鍵が続く。保留している間は
 これまでどおり打鍵を待たせるので、追い越されない。GUI は待たない。
 """
@@ -191,6 +192,54 @@ class SizeWatcherCannotStartTest(unittest.TestCase):
                         "鍵交換中に、GUI スレッドが大きさを書いて止まった")
         self.assertEqual([("resize", 132, 43)], channel.calls,
                          "スレッドを作れないと、鍵交換のあとに大きさが届かない")
+
+    def test_repeated_resizes_keep_a_single_retry(self):
+        """見張りを始められない間に何度大きさが変わっても、調べ直しは 1 本だけ
+
+        b103c45 では、失敗のたびにタイマーの連鎖が 1 本ずつ増え、100 回の
+        set_terminal_size で Transport を毎秒約 7,000 回調べ続けた（鍵交換が
+        終わるまで）。調べ直しの間隔は見張りと同じ（POLL_SECONDS）なので、
+        1 本なら window 秒の間に調べるのは window / POLL_SECONDS 回ほど。
+        """
+        from core.send_backpressure import DrainWatcher
+        conn, channel = self._session()
+        polls = [0]
+        get_transport = channel.get_transport
+
+        def counting_get_transport():
+            polls[0] += 1
+            return get_transport()
+        channel.get_transport = counting_get_transport
+
+        channel.transport.clear_to_send.clear()   # 鍵交換中
+        with mock.patch.object(threading.Thread, "start",
+                               _drain_watcher_start_fails_on_the_gui_thread):
+            for i in range(100):
+                try:
+                    conn.set_terminal_size(80 + i, 24)
+                except RuntimeError:
+                    pass   # アプリでは excepthook が記録して続ける
+                self.app.processEvents()
+            polls[0] = 0
+            window = 0.3
+            self._pump(window)
+            polled = polls[0]
+
+            channel.transport.clear_to_send.set()  # 鍵交換が終わる
+            self._pump(3.0, until=lambda: channel.calls)
+            self._pump(0.1)
+            polls[0] = 0
+            self._pump(0.3)
+            polled_after = polls[0]
+
+        limit = int(window / DrainWatcher.POLL_SECONDS) + 10
+        self.assertLessEqual(polled, limit,
+                             "見張りを始められない間、大きさが変わるたびに"
+                             "調べ直しの連鎖が増えた")
+        self.assertEqual([("resize", 179, 24)], channel.calls,
+                         "鍵交換のあと、最後の大きさが 1 回だけ届かない")
+        self.assertEqual(0, polled_after,
+                         "大きさを送ったあとも、調べ直しが続いている")
 
     def test_dispose_closes_the_channel_after_the_watcher_failed(self):
         conn, channel = self._session()
