@@ -30,6 +30,7 @@ from ui import theme
 from typing import Dict, Union, Optional
 from datetime import datetime
 import os
+import time
 
 class DetachableTabBar(QTabBar):
     """タブを下方向へ十分ドラッグすると、そのタブを別ウィンドウへ切り離すタブバー。"""
@@ -1244,7 +1245,8 @@ class MainWindow(QMainWindow):
         if self.sftp_panel.current_device == device_name:
             self.sftp_panel.clear()
 
-    def _let_sftp_finish(self, device_name: str) -> None:
+    def _let_sftp_finish(self, device_name: str,
+                         deadline: Optional[float] = None) -> None:
         """SSH を閉じる前に、その機器の SFTP の進行中の操作を上限つきで待つ
 
         後始末は SSH を SFTP より先に閉じる（_drop_sftp_manager 参照）。
@@ -1254,13 +1256,16 @@ class MainWindow(QMainWindow):
         進捗が 100% に見えた直後に閉じても起きる）。知らせは画面に出ない。
         新しい操作を止め、いま走っている操作が手を離すのを待つ。待つだけで
         何も書かないので、相手が TCP まで詰まっていても止まるのは
-        SFTPManager._DISCONNECT_WAIT_SECONDS まで。
+        SFTPManager._DISCONNECT_WAIT_SECONDS まで。1 回の後始末で呼ばれる
+        2 回目以降（タブの × から _on_connection_closed へ入る）と、あとの
+        disconnect は、最初の期限の残りだけ待つ（SFTPManager.quiesce 参照）。
+        deadline は、複数台で同じ期限を使うとき（closeEvent）に渡す。
         """
         sftp_mgr = self.sftp_managers.get(device_name)
         if sftp_mgr is None:
             return
         try:
-            sftp_mgr.quiesce()
+            sftp_mgr.quiesce(deadline)
         except Exception as e:
             print(f"[SFTP] {device_name} の転送の終わりを待てませんでした: {e}")
 
@@ -3099,9 +3104,11 @@ for details.
         # その先の _on_connection_closed が切断バナーを端末へ書くので、
         # まだ開いている記録へ終了時の案内が混ざる。
         # SFTP より先に閉じる（_drop_sftp_manager 参照）。その前に進行中の
-        # 転送を待つ（_let_sftp_finish 参照）
+        # 転送を待つ（_let_sftp_finish 参照）。全台で同じ期限を使い、待ちを
+        # 台数ぶん積み重ねない（どの機器の転送も同じ時刻から上限まで待てる）
+        deadline = time.monotonic() + SFTPManager._DISCONNECT_WAIT_SECONDS
         for device_name in list(self.sftp_managers.keys()):
-            self._let_sftp_finish(device_name)
+            self._let_sftp_finish(device_name, deadline)
         closed = list(self.connections.values())
         for device_name in list(self.connections.keys()):
             self._dispose_connection(device_name)

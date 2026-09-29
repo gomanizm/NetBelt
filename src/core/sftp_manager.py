@@ -2,6 +2,7 @@
 import os
 import posixpath
 import threading
+import time
 import uuid
 from typing import List, Dict, Optional, Callable
 from PyQt6.QtCore import QObject, pyqtSignal
@@ -79,6 +80,9 @@ class SFTPManager(QObject):
         self._listing_seq_lock = threading.Lock()
         # 最後に頼んだ一覧の場所（_refresh_listing が使う。_listing_seq_lock で守る）
         self._listing_path = None
+        # 後始末で待つ期限（time.monotonic() の値）。最初の quiesce が決め、
+        # そのあとの quiesce / disconnect は残りだけ待つ（_teardown_wait）
+        self._teardown_deadline: Optional[float] = None
         self._listing_done.connect(self._on_listing_done)
     
     # GUI スレッドから直接呼ぶ操作が、転送の終わりを待つ最大時間。
@@ -303,19 +307,44 @@ class SFTPManager(QObject):
             self.error_occurred.emit(f"SFTP接続エラー: {str(e)}")
             return False
     
-    def quiesce(self) -> bool:
+    def _teardown_wait(self) -> float:
+        """後始末で、進行中の操作をあと何秒待ってよいか
+
+        quiesce の前（SFTP の失敗で畳む・遅れて開いたセッションを閉じる）は
+        これまでどおり _DISCONNECT_WAIT_SECONDS。quiesce のあとは、その期限
+        までの残り（過ぎていれば 0 で、待たずに取れるかだけ見る）。
+        """
+        if self._teardown_deadline is None:
+            return self._DISCONNECT_WAIT_SECONDS
+        return max(0.0, self._teardown_deadline - time.monotonic())
+
+    def quiesce(self, deadline: Optional[float] = None) -> bool:
         """新しい操作を止め、進行中の操作が手を離すのを上限つきで待つ
 
         機器へは何も書かない。後始末で SSH の接続を閉じる前に呼ぶ
-        （MainWindow._let_sftp_finish 参照）。disconnect() と同じ上限
-        （_DISCONNECT_WAIT_SECONDS）まで待ち、クライアントはまだ閉じない。
+        （MainWindow._let_sftp_finish 参照）。クライアントはまだ閉じない。
+
+        待つのは、最初の quiesce で決めた期限まで。そのあとの quiesce と
+        disconnect は残りだけ待つ。転送スレッドが手元の I/O で止まっていると
+        SSH を閉じてもロックを離さないので、呼ぶたびに上限まで待つと、
+        タブを閉じるだけで GUI が上限の 3 倍止まっていた（実測 9 秒）。
+
+        Args:
+            deadline: 待つ期限（time.monotonic() の値）。省略すると、いまから
+                _DISCONNECT_WAIT_SECONDS 後。複数台をまとめて閉じるとき
+                （MainWindow.closeEvent）は同じ期限を渡し、待ちを台数ぶん
+                積み重ねない。
 
         Returns:
-            bool: 進行中の操作が上限までに終わった（または無かった）なら True
+            bool: 進行中の操作が期限までに終わった（または無かった）なら True
         """
         # 新しい操作をここで止める（各メソッドが先頭で見ている）
         self.is_connected = False
-        if not self._sftp_lock.acquire(timeout=self._DISCONNECT_WAIT_SECONDS):
+        if self._teardown_deadline is None:
+            if deadline is None:
+                deadline = time.monotonic() + self._DISCONNECT_WAIT_SECONDS
+            self._teardown_deadline = deadline
+        if not self._sftp_lock.acquire(timeout=self._teardown_wait()):
             return False
         self._sftp_lock.release()
         return True
@@ -333,8 +362,9 @@ class SFTPManager(QObject):
 
         # 空くのを無期限には待たない。タブを閉じるときやアプリ終了時に
         # GUI スレッドから呼ばれるので、応答しない機器への転送中だと
-        # 待った分だけアプリが固まる（終了できなくなる）。
-        acquired = self._sftp_lock.acquire(timeout=self._DISCONNECT_WAIT_SECONDS)
+        # 待った分だけアプリが固まる（終了できなくなる）。quiesce のあとは
+        # その期限の残りだけ待つ（_teardown_wait）
+        acquired = self._sftp_lock.acquire(timeout=self._teardown_wait())
         try:
             client, self.sftp_client = self.sftp_client, None
             self.ssh_client = None
