@@ -16,6 +16,14 @@
 覚えておき、食い違ったときは案内の末尾にその名前を足す。完全一致の行で
 食い違ったときの案内は今までどおり。
 
+その後、旧版が "[host]:22" で保存した行を ssh-keygen -H でハッシュ化した
+形（|1|…）で、案内がファイルに無い平文の名前を載せていた（b2858c4 で実測:
+案内の末尾が『…次の行です（同じ接続先の行です）: [127.0.0.1]:22』で、
+その名前はファイルに 0 件）。22 番の旧名の読み替えは paramiko の lookup
+（ハッシュ化名とも照合する）で引くのに、返す名前は組み立てた平文の
+"[host]:22" だったため。直し方: その読み替えでも、一致した行に書かれた
+綴りを返す（ほかの綴りの読み替えと同じ）。
+
 名前解決は差し替えて localhost のテスト用サーバへ向けるので、例の
 ホスト名（sw1.example.com）を実際に引くことはない。
 """
@@ -158,6 +166,25 @@ class BadHostKeyOtherSpellingNoteTest(unittest.TestCase):
                 self.assertIn(name, note,
                               "読み替えに使った行を案内していない: %r" % errors)
                 self.assertIn("大文字小文字やポートの書き方", note, errors)
+
+    def test_hashed_legacy_port_22_line_is_named_as_written(self):
+        """ハッシュ化した "[host]:22" の行は、ファイルにある綴り（|1|…）で案内すること。
+
+        組み立てた平文の "[host]:22" はファイルに無いので、案内に載せない。
+        """
+        for title, host in (("address", "127.0.0.1"), ("name", LOWER)):
+            with self.subTest(title):
+                hashed = HostKeys.hash_host("[%s]:22" % host)
+                errors = self._refused_errors(
+                    self._line(hashed, self.key_a), host)
+                note = errors[0][len(PLAIN_MESSAGE):]
+                self.assertIn("大文字小文字やポートの書き方", note, errors)
+                self.assertIn(hashed, note,
+                              "ファイルに書かれた綴りを案内していない: %r"
+                              % errors)
+                self.assertNotIn("[%s]:22" % host, note,
+                                 "ファイルに無い名前を案内している: %r"
+                                 % errors)
 
     def test_exact_line_keeps_the_plain_message(self):
         """完全一致の行で食い違ったときの案内は今までどおりであること。"""

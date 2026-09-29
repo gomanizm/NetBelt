@@ -174,11 +174,18 @@ def _add_other_spelling_keys(keys, host, port, written_port=None):
     if keys.lookup(server_name) is not None:
         return []
     if port == 22:
-        legacy = keys.lookup("[%s]:22" % host)
+        legacy_name = "[%s]:22" % host
+        legacy = keys.lookup(legacy_name)
         if legacy is not None:
+            # lookup はハッシュ化名とも照合するので、組み立てた平文の名前は
+            # ファイルに無いことがある。一致した行に書かれた綴り（|1|… を
+            # 含む）を返す（下のほかの綴りの読み替えと同じ）
+            written = [next((name for name in entry.hostnames
+                             if _hostnames_match([name], legacy_name)), None)
+                       for entry in keys._entries]
             for keytype in legacy.keys():
                 keys.add(host, keytype, legacy[keytype])
-            return ["[%s]:22" % host]
+            return list(dict.fromkeys(n for n in written if n is not None))
     used = []
     for entry in list(keys._entries):
         name = next((name for name in entry.hostnames
