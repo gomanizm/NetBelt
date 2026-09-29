@@ -1089,7 +1089,16 @@ class TerminalWidget(QWidget):
                 if self.tab_widget.tabText(i) == device_name:
                     self.tab_widget.setCurrentIndex(i)
                     # 前の接続から届いて描いていない出力は、前の画面へ描き切る
-                    self._draw_pending_now(device_name)
+                    try:
+                        self._draw_pending_now(device_name)
+                    finally:
+                        # 記録先の詰まりで止めた受信（_log_throttled）を次の
+                        # 接続へ引き継がない。関所は機器名で持ち回されるので、
+                        # 引き継ぐと、書き込み待ちが上限を下回っていても再接続
+                        # した先が読めないままになる。記録がまだ詰まっていれば、
+                        # 次の接続の受信で _flush_pending_output が改めて判定する
+                        self._log_throttled.discard(device_name)
+                        self._update_output_gate(device_name)
                     # 再接続は新しいセッション。前の画面はそのまま記録と
                     # して文書に残し、端末状態 (パーサ・画面) は作り直す
                     self._attach_screen(self._terminals[device_name])
