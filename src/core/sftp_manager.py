@@ -439,13 +439,15 @@ class SFTPManager(QObject):
         def list_thread():
             import stat as stat_mod
             nonlocal path
+            # 失敗したときに外す控えの番号（自動更新は追った控えの番号）
+            destination_seq = None if refresh else seq
             try:
                 # ディレクトリ一覧を取得（転送中なら空くまで待つ）。失敗した
                 # 行き先の控えは、ロックを放す前に外す（下の except）
                 self._sftp_lock.acquire()
                 try:
                     if refresh:
-                        path = self._pick_refresh_path()
+                        path, destination_seq = self._pick_refresh_path()
                     # 待っているあいだに切断されたかもしれない。取得前の
                     # 確認だけでは足りない（起きたら None を触ることになる）。
                     # 黙って戻ると、一覧が変わらない理由が利用者に届かない。
@@ -490,7 +492,7 @@ class SFTPManager(QObject):
                 except Exception:
                     # 放してから外すと、ロックを待っていた自動更新が、失敗した
                     # 移動先を控えから選んでしまう
-                    self._forget_failed_destination(seq)
+                    self._forget_failed_destination(destination_seq)
                     raise
                 finally:
                     # 頼み終えた印は、控えを外したあと・ロックを放す前に立てる
@@ -533,26 +535,31 @@ class SFTPManager(QObject):
                 
             except Exception as e:
                 # ロックの外（変換など）で失敗したときも同じく外す
-                self._forget_failed_destination(seq)
+                self._forget_failed_destination(destination_seq)
                 self._fail("ディレクトリ一覧取得エラー", e)
         
         # バックグラウンドスレッドで実行
         threading.Thread(target=list_thread, daemon=True).start()
     
-    def _forget_failed_destination(self, seq: int):
-        """失敗した一覧が行き先の控えを置いた要求なら、控えを外す
+    def _forget_failed_destination(self, seq: Optional[int]):
+        """失敗した一覧の控えの番号が、まだ行き先の控えのものなら控えを外す
 
         失敗した移動先を、自動更新が頼み続けないように（今の場所へ戻る）。
+        控えを置いた要求の失敗でも、控えを追った自動更新の失敗でも外す。
         あとに自動更新が続いていても外す。あとの移動が控えを置き換えて
-        いれば、その移動の控えは残す。
+        いれば、その移動の控えは残す。seq が None（控えを追わなかった
+        自動更新）なら何もしない。
         """
+        if seq is None:
+            return
         with self._listing_seq_lock:
             if seq == self._listing_path_seq:
                 self._listing_path = None
 
-    def _pick_refresh_path(self) -> str:
+    def _pick_refresh_path(self):
         """自動更新が頼む場所を選ぶ。通信のロックを持って呼び、持ったまま戻る
 
+        戻り値は (場所, 追った控えの番号)。今の場所なら番号は None。
         行き先の控えがあればその場所、無ければ（移動が失敗した）今の場所。
         控えを置いた要求の一覧がまだ機器に頼まれていなければ、ロックを
         一度放してそれが済むのを待ち、選び直す。先に同じ場所を頼むと、
@@ -565,10 +572,11 @@ class SFTPManager(QObject):
             with self._listing_seq_lock:
                 path = self._listing_path
                 fetched = self._listing_path_fetched
+                followed = self._listing_path_seq
                 if path is None:
-                    return self.current_path
+                    return self.current_path, None
             if fetched.is_set():
-                return path
+                return path, followed
             self._sftp_lock.release()
             fetched.wait()
             self._sftp_lock.acquire()
