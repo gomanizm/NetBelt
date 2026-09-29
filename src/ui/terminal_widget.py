@@ -565,7 +565,9 @@ class InteractiveTerminal(QTextEdit):
 
         self.key_pressed.emit(chunk)
 
-        # 受け取ったその場で送る接続（SSH・Telnet）なら、もう送り出している
+        # 接続が書き終えていれば、もう送り出している（Telnet はその場で書く。
+        # SSH は書き手のスレッドが書き終えていれば。終えていなければ、
+        # send_drained で再開した _drain_send_queue の先頭で知らせる）
         if not self._connection_busy():
             self._notify_sent()
         if self._send_queue or self._sent_callback is not None:

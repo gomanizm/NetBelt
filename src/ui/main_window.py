@@ -1196,7 +1196,8 @@ class MainWindow(QMainWindow):
     def _attach_send_backpressure(terminal, conn) -> None:
         """接続が待たずに書けるときだけ、端末が次の区切りを渡すようにする
 
-        SSH / Telnet は渡された区切りをその場で書く。読むのが遅い機器へ
+        Telnet は渡された区切りをその場で書き、SSH は書き手のスレッドへ渡して
+        書き終わりを短く待つ（書き終わるまでは書けない扱い）。読むのが遅い機器へ
         大きく貼り付けると、受信ウィンドウや送信バッファが空かないまま
         時間切れになり、送信エラーとして切断していた（実機の IOSv で 16KB が
         途中で切れた）。接続の has_pending_sends を端末へ渡し、書けるように
