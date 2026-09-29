@@ -23,8 +23,11 @@ rule_exists(name, program=<自exe>) を見て、最初に真になった時点�
 どう直したか: 1 回目の確認で許可が見えても、それが昇格した add の結果か、
 delete より前からあった許可かは見分けられない。そこで、
   - 見えなかった確認のすぐ後で見えた（delete の後の add まで終わった）ときだけ、
-    その場で完了とする（初めて足すときは今までどおりすぐ返る）
+    その場で完了とする（初めて足すときも、1 回目の確認が add より前なら
+    今までどおり見えた時点で返る）
   - 見えたままのときは最後（6 回目）の確認まで待ち、最後にも見えたら完了とする
+    （初めて足すときでも、add まで 1 回目の確認より前に終わると、既存の許可が
+    見えたままのときと見分けられないので最後まで待つ）
   - 見えていた許可が消えたまま最後まで戻らなければ失敗とし、既存の規則が
     消えたことを文言で知らせる（管理者の経路の _SELF_RULES_DELETED と同じ一言）
   - 昇格した delete → add は、1 回目の確認（0.25 秒後）より前に終わるのが
@@ -40,7 +43,11 @@ delete より前からあった許可かは見分けられない。そこで、
 か、ShellExecuteW しか持たない偽の ctypes を使う（test_firewall_self_program_path.py）
 ので、そちらへ替えると前者は本物の UAC と netsh を起こし、後者は失敗する。
 残る限界: 昇格した delete が確認の期間（約 1.5 秒と show 6 回分）より後に
-走ったときは、今までどおり見分けられない。
+走ったときは、今までどおり見分けられない。確認が一時的に失敗し（netsh の
+rc!=0 など）、その直後に delete より前の既存の許可が見えたときも、途中で
+完了とする（31b45ee と同じ）。起動前の確認で無かったことを根拠に途中で完了と
+する案は採らない。その確認が一時的に失敗すると、delete より前に完了と返す
+経路が増えるため（test_a_failed_pre_check_does_not_make_done_early）。
 """
 import subprocess
 import sys
@@ -70,11 +77,13 @@ class _Elevated:
     show は今ある規則から netsh の verbose 出力（英語）を作る。
     """
 
-    def __init__(self, pre_existing, delete_at, add_at, add_ok):
+    def __init__(self, pre_existing, delete_at, add_at, add_ok, pre_check_fails=False):
         self.rules = [fw._self_rule_name()] if pre_existing else []
         self.delete_at = delete_at
         self.add_at = add_at
         self.add_ok = add_ok
+        # 起動前の show を一時的に失敗させる（netsh の rc!=0）
+        self.pre_check_fails = pre_check_fails
         self.launches = []
         self.sleeps = []
         self.shows = 0
@@ -116,6 +125,8 @@ class _Elevated:
         self.shows += 1
         if not self.launches:
             self.shows_before_launch += 1
+            if self.pre_check_fails:
+                return subprocess.CompletedProcess(args, 1, b"An error occurred.\r\n", b"")
         name = next(a[len("name="):] for a in args if a.startswith("name="))
         if name not in self.rules:
             return subprocess.CompletedProcess(args, 1, NO_MATCH, b"")
@@ -228,12 +239,33 @@ class ElevatedSelfRuleVerdictTest(unittest.TestCase):
                          "add を確かめた後も待ち続けている: %r" % elevated.waited)
 
     def test_a_first_time_add_is_still_reported_as_soon_as_it_shows(self):
-        """対照: 初めて足すとき（既存の許可が無い）は今までどおり見えた時点で完了"""
+        """対照: 初めて足すとき（既存の許可が無い）、見えなかった確認の後で見えたら、
+        今までどおりその時点で完了"""
         ok, msg, finished, elevated = self._run(
             pre_existing=False, delete_at=1, add_at=2, add_ok=True)
         self.assertTrue(ok, msg)
         self.assertTrue(finished)
         self.assertEqual(len(elevated.waited), 2, elevated.waited)
+
+    def test_a_failed_pre_check_does_not_make_done_early(self):
+        """起動前の確認が一時的に失敗しても、delete より前に完了と返さないこと
+
+        起動前の確認は文言にだけ使う。これを「既存の許可は無い」の根拠にして
+        1 回目に見えた時点で完了とすると、その確認が一時的に失敗しただけで、
+        delete より前の既存の許可を見て完了と返し、そのあと許可が消える。
+        """
+        ok, msg, _finished, elevated = self._run(
+            pre_existing=True, delete_at=3, add_at=3, add_ok=False,
+            pre_check_fails=True)
+        # 前提: 起動前に 1 回見て失敗し、最後には自exe の許可が残っていない
+        self.assertEqual(elevated.shows_before_launch, 1)
+        self.assertEqual(elevated.rules, [])
+        self.assertFalse(
+            ok, "起動前の確認の失敗を「既存の許可は無い」と読み、delete より前"
+                "（sleep %d 回目）に「完了」と返した: %s"
+                % (len(elevated.waited), msg))
+        self.assertIn("削除済み", msg,
+                      "見えていた許可が消えたことが文言に出ていない: %s" % msg)
 
     def test_a_rule_that_never_shows_keeps_the_old_message(self):
         """対照: 一度も見えなければ、今までどおりの失敗の文言"""
