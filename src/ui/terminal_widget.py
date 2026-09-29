@@ -880,6 +880,10 @@ class TerminalWidget(QWidget):
         self._log_throttled = set()
         # 書き込み待ちが上限を超えた（関所のある接続は受信を止めた）と知らせた機器
         self._log_lag_noticed = set()
+        # その遅れの知らせが開いている機器。開いている間は、その機器へは出し直さない
+        # （見回りは開いている間も動くので、止めては再開する遅い記録先では、
+        # 出し直すたびにモーダルが入れ子に積み上がる）
+        self._log_notices_open = set()
         self._log_dialogs: Dict[str, object] = {}  # 機器名 -> ログ記録ダイアログ
         # ターミナルの外観設定。_create_terminal が参照するので _create_ui より先に持つ
         self._terminal_settings = dict(self.DEFAULT_TERMINAL_SETTINGS)
@@ -906,10 +910,20 @@ class TerminalWidget(QWidget):
         self._output_timer.setSingleShot(True)
         self._output_timer.setInterval(0)
         self._output_timer.timeout.connect(self._flush_pending_output)
-        # 記録先が詰まっている間だけ、書き込みスレッドを見回る（_check_log_writers）
+        # 記録先が詰まっている間だけ、書き込みスレッドを見回る（_check_log_writers）。
+        # 本体は刻み（_log_watch）から単発のタイマー（_log_check）へ渡して動かす。
+        # 本体は知らせをモーダルで出し、Qt はスロットが入れ子のループにいる間、
+        # 同じタイマーを配り直さない。刻みのスロットで出すと、開いている間は
+        # 見回りが一度も動かず、記録先が戻っても止めた機器は OK を押すまで
+        # 再開しなかった（実測: 5.5 秒開いたままで呼び出しは 0 回）。単発の
+        # タイマーは刻みのたびに掛け直すので、開いている間も次の刻みで動く
         self._log_watch = QTimer(self)
         self._log_watch.setInterval(100)
-        self._log_watch.timeout.connect(self._check_log_writers)
+        self._log_check = QTimer(self)
+        self._log_check.setSingleShot(True)
+        self._log_check.setInterval(0)
+        self._log_check.timeout.connect(self._check_log_writers)
+        self._log_watch.timeout.connect(self._log_check.start)
         self._create_ui()
     
     def _create_ui(self):
@@ -1784,7 +1798,9 @@ class TerminalWidget(QWidget):
         閉じ終えた記録の使用中の登録を外す。止めた機器を再開させ、関所の無い
         接続の書き込み待ちの遅れと、関所のある接続の受信を止めたことを知らせる。
         見回るものが無くなったら止まる。
-        警告・案内はモーダルで、出ている間にここへ入り直すことがある。
+        警告・案内はモーダルで、出ている間も次の刻みでここへ入り直す（_log_check）。
+        そのため、モーダルを出す前に状態を書き換え終え、出したあとは状態を
+        読み直す。
         """
         from PyQt6.QtWidgets import QMessageBox
         from core import log_recording
@@ -1817,8 +1833,8 @@ class TerminalWidget(QWidget):
                     and name not in self._log_lag_noticed
                     and self._log_backlog(name) >= self.PENDING_HIGH_WATER):
                 self._log_lag_noticed.add(name)
-                QMessageBox.warning(
-                    self, "ログ記録",
+                self._show_log_lag_notice(
+                    name, QMessageBox.warning,
                     "%s のログ記録で、記録先への書き込みが遅れています。\n\n"
                     "この接続は受信を止められないため、画面は進めたまま、記録する"
                     "分をメモリに溜めて順に書き込みます。記録先が応答しないままだと、"
@@ -1828,12 +1844,13 @@ class TerminalWidget(QWidget):
         # （数え方はシリアルと同じ）。知らせないと止まった理由がどこにも出ず、
         # エコーの見えないまま打ち直すと機器へ二重に送る。止めている間は機器側が
         # 待つので記録にも画面にも欠けは無く、メモリも増え続けない。そのため
-        # シリアルの警告ではなく案内にする
+        # シリアルの警告ではなく案内にする。止めているかは機器ごとに読み直す
+        # （ほかの機器の知らせが開いている間に、入り直した見回りが再開させる）
         for name in list(self._log_throttled):
-            if name not in self._log_lag_noticed:
+            if name in self._log_throttled and name not in self._log_lag_noticed:
                 self._log_lag_noticed.add(name)
-                QMessageBox.information(
-                    self, "ログ記録",
+                self._show_log_lag_notice(
+                    name, QMessageBox.information,
                     "%s のログ記録で、記録先への書き込みが遅れているため、"
                     "この機器の受信を止めています（画面の表示も止まります）。\n\n"
                     "機器側に送信を待たせているので、画面にも記録にも欠けは"
@@ -1855,6 +1872,21 @@ class TerminalWidget(QWidget):
                 isinstance(h, LogWriter) and h.failure is not None
                 for h in self._log_files.values()):
             self._log_watch.stop()
+
+    def _show_log_lag_notice(self, name: str, show, text: str) -> None:
+        """遅れの知らせを show（QMessageBox の警告か案内）で出す。
+
+        同じ機器の知らせが開いている間は出さない。開いている間も見回りは動き、
+        遅いが応答する記録先では、止めては再開するのを繰り返す。出し直すと、
+        開いている知らせの上にモーダルが入れ子に積み上がっていく。
+        """
+        if name in self._log_notices_open:
+            return
+        self._log_notices_open.add(name)
+        try:
+            show(self, "ログ記録", text)
+        finally:
+            self._log_notices_open.discard(name)
 
     def has_open_log_recordings(self) -> bool:
         """まだ閉じていない記録があるか（記録中と、停止して書き終えていない分）
