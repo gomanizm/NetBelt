@@ -342,13 +342,19 @@ def ensure_self_program_allow():
         rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", "cmd.exe", cmd, None, 0)
         if int(rc) <= 32:
             return False, "UACが承認されず未設定: " + name
-        # 昇格プロセスは非同期で、終わりを待つ手段が無い。allow ルールの反映を
-        # 短時間リトライ確認する。見えた許可が、昇格した add の結果か、delete
-        # より前からあった許可かは見分けられない。1 回目に見えた時点で完了と
-        # すると、そのあと delete が既存の許可を消し、add が失敗したときに
-        # 「完了」のあとで許可が消える（実測）。見えなかった確認のすぐ後で
-        # 見えた（delete の後の add まで終わった）ときだけ途中で完了とし、
-        # 見えたままなら最後の確認まで待つ。回数と間隔（待つ上限）は変えない
+        # ShellExecuteW は起動したプロセスのハンドルを返さないので、昇格した
+        # cmd.exe の終わりも終了コードも分からない。ShellExecuteExW と
+        # SEE_MASK_NOCLOSEPROCESS なら待てるが採らなかった: 441ea02 からある
+        # テストは本物の shell32 の ShellExecuteW だけを差し替えているので、
+        # 替えるとテストが本物の UAC と netsh を起こす
+        # （tests/test_firewall_self_rule_elevated_verdict.py）。
+        # 代わりに allow ルールの反映を短時間リトライ確認する。見えた許可が、
+        # 昇格した add の結果か、delete より前からあった許可かは見分けられない。
+        # 1 回目に見えた時点で完了とすると、そのあと delete が既存の許可を消し、
+        # add が失敗したときに「完了」のあとで許可が消える（模擬で再現）。
+        # 見えなかった確認のすぐ後で見えた（delete の後の add まで終わった）
+        # ときだけ途中で完了とし、見えたままなら最後の確認まで待つ。回数と
+        # 間隔（待つ上限）は変えない
         import time
         seen = []
         for _ in range(6):
