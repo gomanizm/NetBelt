@@ -23,6 +23,13 @@
 の 6 件はすべて通った）。既定の待ちは
 test_default_linger_outlasts_back_to_back_hand_overs で、停止に左右されない
 よう値そのものを確かめる。
+
+数える 2 件が書き終わりを待つ上限は 5 秒にした。待ちが 1 秒だった頃に、
+それより短くするために決めた 0.5 秒のままだと、混んだ機械で書き手の側が
+0.5 秒を超えて止まったとき、本体は正しく書き終えるのに『書き終わらない』で
+落ちていた（f800d3c で、偽のチャネルの 12 回目の書き込みを 0.7 秒止めると、
+数える 2 件とも落ちた）。待ちは 30 秒なので、書き手を起こし損ねれば 5 秒の
+上限で落ちる。
 """
 import os
 import socket
@@ -131,12 +138,13 @@ class WriterKeepsItsThreadTest(_ChannelCase):
             for i in range(50):
                 data = b"chunk%d" % i
                 # 待っている書き手を起こし損ねると、待ちの終わり（30 秒）まで
-                # 書かれない。それより短く待つ
-                self.assertTrue(writer.write(data, 0.5),
+                # 書かれない。それより十分短く、書き手の側が混んで止まるより
+                # 長く待つ
+                self.assertTrue(writer.write(data, 5.0),
                                 "書き込みが終わらない（%d 個目）" % i)
                 expected.append(("data", data))
                 if i % 10 == 9:
-                    writer.send_size(80 + i, 24, 0.5)
+                    writer.send_size(80 + i, 24, 5.0)
                     expected.append(("size", (80 + i, 24)))
 
         self.assertEqual(expected, channel.writes, "渡した順に書かれていない")
@@ -239,12 +247,12 @@ class TypingKeepsTheThreadTest(_QtCase):
                 conn.send_command(ch)
                 # ふだんは渡したその場で書き終わる。混んだ機械でも、待っている
                 # 書き手を起こし損ねたとき（待ちの終わりの 30 秒まで書かれない）
-                # より短い間に書き終わる
-                self._pump(0.5, until=lambda: not conn.has_pending_sends())
+                # より十分短い間（5 秒）に書き終わる
+                self._pump(5.0, until=lambda: not conn.has_pending_sends())
                 self.assertFalse(conn.has_pending_sends(),
                                  "打鍵 %r が書き終わらない" % ch)
             conn.set_terminal_size(132, 43)
-            self._pump(0.5, until=lambda: len(channel.writes) > 20)
+            self._pump(5.0, until=lambda: len(channel.writes) > 20)
 
         self.assertEqual(
             [("data", ch.encode()) for ch in "show running-config\r"]
