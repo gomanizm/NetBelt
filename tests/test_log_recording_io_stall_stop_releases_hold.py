@@ -74,6 +74,13 @@ def _chunk(first, count):
     return "".join("L%06d %s\r\n" % (i, "y" * 50) for i in range(first, first + count))
 
 
+def _close_notices(owner):
+    """owner を親にして開いたままの案内（QMessageBox）を閉じる（後のテストへ残さない）。"""
+    from PyQt6.QtWidgets import QMessageBox
+    for box in owner.findChildren(QMessageBox):
+        box.close()
+
+
 class LogRecordingIoStallStopReleasesHoldTest(unittest.TestCase):
     HIGH = 256 * 1024
     LOW = 64 * 1024
@@ -91,6 +98,11 @@ class LogRecordingIoStallStopReleasesHoldTest(unittest.TestCase):
         self.dir = tempfile.mkdtemp(prefix="netbelt-logstall-stop-")
         self.warning = mock.patch("PyQt6.QtWidgets.QMessageBox.warning").start()
         mock.patch("PyQt6.QtWidgets.QMessageBox.information").start()
+        # 受信を止めたことの案内はモーダルでない（show() で出す）。exec の
+        # モーダルへ戻る退行があっても、ここで止まったままにならないように、
+        # exec はすぐ戻す（案内の出方は test_log_recording_io_stall_hold_notice*.py
+        # で確かめる）
+        mock.patch("PyQt6.QtWidgets.QMessageBox.exec", return_value=0).start()
         self.addCleanup(mock.patch.stopall)
         self.release = threading.Event()
         self.addCleanup(self.release.set)
@@ -99,6 +111,7 @@ class LogRecordingIoStallStopReleasesHoldTest(unittest.TestCase):
         from ui.terminal_widget import TerminalWidget
         w = TerminalWidget()
         self.addCleanup(w.close)
+        self.addCleanup(_close_notices, w)
         w.PENDING_HIGH_WATER = self.HIGH
         w.PENDING_LOW_WATER = self.LOW
         w.create_terminal_tab("dev")
