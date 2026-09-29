@@ -277,6 +277,12 @@ def _self_rule_name():
 # 通らないのに完了と読める（実測）
 _BLOCK_NOT_CHECKED = "既存のブロック規則の除去は確認していません"
 
+# 管理者の経路で delete が既存の規則を消したあと、add が失敗したときに添える
+# 一言。delete は自exe の受信規則を許可も含めて消すので、そのまま「追加に
+# 失敗」とだけ返すと、初回のプロンプトが作った許可なども消えたことが
+# 画面から分からない（実測）
+_SELF_RULES_DELETED = "自exe向けの既存の受信規則は削除済みです。手動で受信許可を追加してください"
+
 
 def ensure_self_program_allow():
     """自 exe 宛の受信ブロックを削除し受信許可を追加する（ブロックは許可を上書きするため）。
@@ -297,12 +303,16 @@ def ensure_self_program_allow():
     # 未昇格時は ShellExecuteW で delete+add(allow) をまとめて昇格実行する。
     try:
         if is_admin():
-            # delete は該当する規則が無ければ rc!=0 なので結果は見ない
-            _netsh(["advfirewall", "firewall", "delete", "rule", "name=all", "dir=in",
-                    'program=' + prog])
+            # delete は該当する規則が無ければ rc!=0 なので成否の判定には使わない。
+            # rc=0（一致する規則を消した）は、add の失敗を知らせる文言にだけ使う
+            deleted = _netsh(["advfirewall", "firewall", "delete", "rule", "name=all",
+                              "dir=in", 'program=' + prog]).returncode == 0
             r = _netsh(["advfirewall", "firewall", "add", "rule", "name=" + name, "dir=in",
                         "action=allow", 'program=' + prog, "profile=any", "enable=yes"])
             if r.returncode != 0:
+                if deleted:
+                    return False, "自exe受信許可の追加に失敗（%s）: %s" % (
+                        _SELF_RULES_DELETED, name)
                 return False, "自exe受信許可の追加に失敗: " + name
             return True, "自exe受信許可を追加（%s）: %s" % (_BLOCK_NOT_CHECKED, name)
         # 未昇格: cmd.exe /c 経由で delete+add(allow) を昇格実行（& をシェルに解釈させる）。
