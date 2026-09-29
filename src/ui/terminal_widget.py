@@ -878,7 +878,7 @@ class TerminalWidget(QWidget):
         self._closing_writers: list = []
         # 記録の書き込み待ちが溜まって、描くのと受信を止めている機器
         self._log_throttled = set()
-        # 関所の無い接続で、書き込み待ちが上限を超えたと知らせた機器
+        # 書き込み待ちが上限を超えた（関所のある接続は受信を止めた）と知らせた機器
         self._log_lag_noticed = set()
         self._log_dialogs: Dict[str, object] = {}  # 機器名 -> ログ記録ダイアログ
         # ターミナルの外観設定。_create_terminal が参照するので _create_ui より先に持つ
@@ -1773,8 +1773,9 @@ class TerminalWidget(QWidget):
         スレッドで起きた書き込みの失敗を、次の受信を待たずに知らせる
         （知らせないと、利用者は記録できていると思って作業を続ける）。
         閉じ終えた記録の使用中の登録を外す。止めた機器を再開させ、関所の無い
-        接続の書き込み待ちの遅れを知らせる。見回るものが無くなったら止まる。
-        警告はモーダルで、出ている間にここへ入り直すことがある。
+        接続の書き込み待ちの遅れと、関所のある接続の受信を止めたことを知らせる。
+        見回るものが無くなったら止まる。
+        警告・案内はモーダルで、出ている間にここへ入り直すことがある。
         """
         from PyQt6.QtWidgets import QMessageBox
         from core import log_recording
@@ -1814,6 +1815,25 @@ class TerminalWidget(QWidget):
                     "分をメモリに溜めて順に書き込みます。記録先が応答しないままだと、"
                     "使うメモリが増え続けます。保存先の接続を確認してください。"
                     % name)
+        # 関所のある接続（SSH / Telnet）で受信を止めた機器にも、一度だけ知らせる
+        # （数え方はシリアルと同じ）。知らせないと止まった理由がどこにも出ず、
+        # エコーの見えないまま打ち直すと機器へ二重に送る。止めている間は機器側が
+        # 待つので記録にも画面にも欠けは無く、メモリも増え続けない。そのため
+        # シリアルの警告ではなく案内にする
+        for name in list(self._log_throttled):
+            if name not in self._log_lag_noticed:
+                self._log_lag_noticed.add(name)
+                QMessageBox.information(
+                    self, "ログ記録",
+                    "%s のログ記録で、記録先への書き込みが遅れているため、"
+                    "この機器の受信を止めています（画面の表示も止まります）。\n\n"
+                    "機器側に送信を待たせているので、画面にも記録にも欠けは"
+                    "出ません。記録先が応答すると再開します。記録を停止しても"
+                    "再開します（停止した記録には、停止までに受信した分を"
+                    "書き込みます）。\n\n"
+                    "止めている間も、打った文字は機器へ送られます。エコーは"
+                    "再開してから表示されるので、打ち直さないでください。"
+                    "保存先の接続を確認してください。" % name)
         handles = list(self._log_files.values()) + [
             entry[0] for entries in self._closing_logs.values()
             for entry in entries]
@@ -1953,7 +1973,8 @@ class TerminalWidget(QWidget):
                 # この機器だけ描くのを止めて受信の関所を閉じる。機器側が待つので
                 # 記録も画面も欠けず、書き込み待ちがメモリに積み上がり続けない
                 # （利用者の決定）。減ったら _check_log_writers が再開させる。
-                # 停止した記録は数えない（_held_log_backlog）。
+                # 停止した記録は数えない（_held_log_backlog）。止めたことの
+                # 知らせは見回りが一度だけ出す。
                 # 関所の無い接続（シリアル）は止めない。受信は止まらないので、
                 # 止めると描き待ちが上限なく増えるだけになる（知らせは見回りが出す）
                 if device_name in self._output_gates and (
