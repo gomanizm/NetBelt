@@ -31,6 +31,16 @@ test_default_linger_outlasts_back_to_back_hand_overs で、停止に左右され
 落ちていた（上限が 0.5 秒だった版で、偽のチャネルの 12 回目の書き込みを
 0.7 秒止めると、数える 2 件とも落ちた）。待ちは 30 秒なので、書き手を
 起こし損ねれば 5 秒の上限で落ちる。
+
+ほかの件も、書き手を待つ上限（書き終わり・スレッドの終わり）を 5 秒に
+そろえた。止めてから書き手が終わるまでの上限が 1 秒、ほかの上限が 2 秒
+だった版では、本体は正しく動くのに、止まる長さしだいで落ちていた。stop の
+直後にテストのスレッドが 1.3 秒止まると止める件が、書き手が終わる直前に
+2.5 秒止まると止める件・後始末の件・待ちが尽きて終わる件が、書き手の
+12 回目の書き込みが 3 秒止まると待ち終わりと受け渡しが重なる件が落ちた。
+確かめる不具合が起きれば 5 秒では終わらない。渡した物を誰も書かなければ
+書き終わらず、stop・後始末が待っている書き手を起こさなければ、書き手は
+差し替えた待ちの 30 秒まで残る。
 """
 import os
 import socket
@@ -159,17 +169,20 @@ class WriterKeepsItsThreadTest(_ChannelCase):
         writer = self._writer(channel)
         with mock.patch.object(_ChannelWriter, "_LINGER_SECONDS", 30.0), \
                 _WriterThreads() as threads:
-            self.assertTrue(writer.write(b"x", 2.0))
+            self.assertTrue(writer.write(b"x", 5.0))
             self.assertEqual(1, len(threads.started), "前提: 書き手のスレッドが無い")
             thread = threads.started[0]
 
             started = time.perf_counter()
             writer.stop()
-            thread.join(2.0)
+            # 待っている書き手を起こし損ねると、待ちの終わり（30 秒）まで
+            # 残る。それより十分短く、混んだ機械で止まるより長い 5 秒を
+            # 上限にする（掛かった時間を示せるよう、join はもう少し待つ）
+            thread.join(10.0)
             elapsed = time.perf_counter() - started
 
         self.assertFalse(thread.is_alive(), "止めたのに、書き手のスレッドが残っている")
-        self.assertLess(elapsed, 1.0, "止めてから書き手が終わるまで %.2f 秒" % elapsed)
+        self.assertLess(elapsed, 5.0, "止めてから書き手が終わるまで %.2f 秒" % elapsed)
         self.assertTrue(writer.write(b"y", 0.2), "止めたあとの受け渡しが待たされた")
         self.assertEqual([("data", b"x")], channel.writes, "止めたあとに書いた")
 
@@ -179,14 +192,14 @@ class WriterKeepsItsThreadTest(_ChannelCase):
         writer = self._writer(channel)
         with mock.patch.object(_ChannelWriter, "_LINGER_SECONDS", 0.05), \
                 _WriterThreads() as threads:
-            self.assertTrue(writer.write(b"a", 2.0))
+            self.assertTrue(writer.write(b"a", 5.0))
             first = threads.started[0]
-            first.join(2.0)
+            first.join(5.0)
             self.assertFalse(first.is_alive(),
                              "次が来ないのに、書き手のスレッドが終わらない")
             self.assertFalse(writer.busy())
 
-            self.assertTrue(writer.write(b"b", 2.0),
+            self.assertTrue(writer.write(b"b", 5.0),
                             "スレッドが終わったあとの受け渡しが書かれない")
 
         self.assertEqual([("data", b"a"), ("data", b"b")], channel.writes)
@@ -201,7 +214,7 @@ class WriterKeepsItsThreadTest(_ChannelCase):
         with mock.patch.object(_ChannelWriter, "_LINGER_SECONDS", 0.002):
             for i in range(300):
                 data = b"%d," % i
-                self.assertTrue(writer.write(data, 2.0),
+                self.assertTrue(writer.write(data, 5.0),
                                 "受け渡しが書かれないまま残った（%d 個目）" % i)
                 expected.append(("data", data))
                 time.sleep((i % 4) * 0.001)
@@ -270,9 +283,9 @@ class TypingKeepsTheThreadTest(_QtCase):
                 _WriterThreads() as threads:
             conn.send_command("x")
             self.assertEqual(1, len(threads.started), "前提: 書き手のスレッドが無い")
-            self._pump(2.0, until=lambda: channel.writes)
+            self._pump(5.0, until=lambda: channel.writes)
             conn.dispose()
-            threads.started[0].join(2.0)
+            threads.started[0].join(5.0)
 
         self.assertFalse(threads.started[0].is_alive(),
                          "後始末のあとも、書き手のスレッドが残っている")
