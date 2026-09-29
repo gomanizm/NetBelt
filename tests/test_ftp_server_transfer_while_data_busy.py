@@ -21,6 +21,20 @@
 パネルのログへ理由を出す。ファイルは開かず、開始も通知しない。続いている転送は
 そのまま最後まで進む。張っただけで待っているデータ接続（cmd が None）は、
 今までどおり 125 で使える（対照）。
+
+向きの違う転送コマンドも同じく断る。441ea02 で実測（127.0.0.1 のみ）した壊れ方は
+同じ向きより重く、
+  4) RETR big.bin の転送中に STOR keep.cfg（125）: keep.cfg が 40 バイトから
+     0 バイトに切り詰められ、big.bin は 393216 バイトで止まってクライアントの
+     recv が時間切れになった。通知は [開始 big, 開始 keep, 完了 keep] で、
+     big.bin の行が残った（APPE では keep.cfg は残ったが、同じく止まった）
+  5) STOR up.bin の受信中に RETR keep.cfg（125）: 最終応答が来ずに時間切れ、
+     up.bin は 2000 バイト中 1000 バイト、行 [up.bin, keep.cfg] と予約が残った
+     （LIST では up.bin は 0 バイト、行と予約が残った）
+だった。以前は同じ向きの組み合わせしか見ていなかったので、425 の条件を同じ向き
+だけ（dc.receive と送ったコマンドの向きが揃うときだけ）に絞っても、FTP の
+テストは 1 件も落ちなかった（実測）。下の向きの違う 4 件は、その絞り方では
+125 で受け付けて落ちる。
 """
 import ftplib
 import os
@@ -216,6 +230,68 @@ class TransferWhileDataBusyTest(_FtpServerCase):
         self.assertEqual(self.read("up.cfg"), b"UP" * 50)
         self.assertEqual([e for e in self.events if e[0] != "progress"],
                          [("started", "up.cfg"), ("complete", "up.cfg")])
+
+    # --- 向きの違う転送コマンド（4・5）
+    KEEP = b"KEEP-CONF-" * 4
+
+    def _seed_keep(self):
+        with open(self.real("keep.cfg"), "wb") as seed:
+            seed.write(self.KEEP)
+
+    def _check_upload_refused_during_download(self, verb):
+        self._seed_keep()
+        ftp = self.client()
+        data, received = self._start_big_download(ftp)
+        refused = self._command(ftp, verb + " keep.cfg")
+        self.assertTrue(refused.startswith("425"),
+                        "送信中のデータ接続で %s を受け付けた: %s" % (verb, refused))
+        self.assertEqual(self.read("keep.cfg"), self.KEEP,
+                         "断った %s の保存先が書き換えられた" % verb)
+        self._finish_big_download(ftp, data, received, refused)
+        self.assertEqual(self.read("keep.cfg"), self.KEEP)
+        self.assertEqual(self.m._uploads, {}, "予約が残った")
+        self.assertIsNotNone(self._wait_activity("別の転送", verb + " /keep.cfg"),
+                             "断った理由がパネルのログに出ていない: %r" % self.activity)
+
+    def test_a_stor_while_a_download_is_running_is_refused(self):
+        self._check_upload_refused_during_download("STOR")
+
+    def test_an_appe_while_a_download_is_running_is_refused(self):
+        self._check_upload_refused_during_download("APPE")
+
+    def _check_download_refused_during_upload(self, line):
+        self._seed_keep()
+        ftp = self.client()
+        data = self._open_data(ftp)
+        resp = ftp.sendcmd("STOR up.cfg")
+        self.assertTrue(resp.startswith("125"), resp)
+        data.sendall(b"U" * 1000)
+        # 進捗が出た＝データ接続で up.cfg を受けている
+        deadline = time.monotonic() + 5.0
+        while ("progress", "up.cfg") not in self.events:
+            self.assertLess(time.monotonic(), deadline,
+                            "前提: up.cfg の受信が始まっていない")
+            self._pump(0.05)
+        refused = self._command(ftp, line)
+        self.assertTrue(refused.startswith("425"),
+                        "受信中のデータ接続で %s を受け付けた: %s" % (line, refused))
+        data.sendall(b"u" * 1000)
+        data.close()
+        self.assertTrue(ftp.voidresp().startswith("226"))
+        self._sync(ftp)
+        self.assertEqual(self.read("up.cfg"), b"U" * 1000 + b"u" * 1000,
+                         "受けている途中のアップロードが欠けた")
+        self.assertEqual(self.read("keep.cfg"), self.KEEP)
+        self.assertEqual([e for e in self.events if e[0] != "progress"],
+                         [("started", "up.cfg"), ("complete", "up.cfg")])
+        self.assertEqual(self.m._tx, {}, "開始のまま残った行がある")
+        self.assertEqual(self.m._uploads, {}, "予約が残った")
+
+    def test_a_retr_while_an_upload_is_running_is_refused(self):
+        self._check_download_refused_during_upload("RETR keep.cfg")
+
+    def test_a_list_while_an_upload_is_running_is_refused(self):
+        self._check_download_refused_during_upload("LIST")
 
 
 if __name__ == "__main__":
