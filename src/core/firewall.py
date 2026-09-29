@@ -280,8 +280,8 @@ _BLOCK_NOT_CHECKED = "既存のブロック規則の除去は確認していま�
 # 管理者の経路で delete が既存の規則を消したあと、add が失敗したときに添える
 # 一言。delete は自exe の受信規則を許可も含めて消すので、そのまま「追加に
 # 失敗」とだけ返すと、初回のプロンプトが作った許可なども消えたことが
-# 画面から分からない（実測）。昇格の経路でも、見えていた許可が消えたまま
-# 戻らないときに添える
+# 画面から分からない（実測）。昇格の経路でも、起動前にあった許可や見えて
+# いた許可が消えたまま戻らないときに添える
 _SELF_RULES_DELETED = "自exe向けの既存の受信規則は削除済みです。手動で受信許可を追加してください"
 
 
@@ -329,6 +329,12 @@ def ensure_self_program_allow():
         if "%" in prog:
             return False, ("実行ファイルのパスに % が含まれるため自exe受信許可を"
                            "自動設定できません（手動で追加してください）: " + prog)
+        # 起動の前に、自exe 向けのこの名前の許可が既にあるかを見ておく。netsh は
+        # 1 回約 0.05 秒（実測）なので、昇格した delete → add は 1 回目の確認
+        # より前に終わるのが普通で、既存の許可が消えて add が失敗しても、下の
+        # 確認では一度も見えない。名前の違う自exe 向けの規則（Windows の初回の
+        # プロンプトが作る規則など）は見ない（受信規則の一覧は約 0.3 秒かかる）
+        existed = rule_exists(name, program=prog)
         import ctypes
         cmd = ('/c netsh advfirewall firewall delete rule name=all dir=in '
                'program="{0}" & netsh advfirewall firewall add rule name="{1}" dir=in '
@@ -355,8 +361,9 @@ def ensure_self_program_allow():
         if seen[-1]:
             return True, "自exe受信許可を追加（管理者昇格。%s）: %s" % (
                 _BLOCK_NOT_CHECKED, name)
-        if any(seen):
-            # 見えていた許可が消えたまま戻らない（delete は効き、add は見えない）
+        if existed or any(seen):
+            # 起動前にあった許可や見えていた許可が、消えたまま戻らない
+            # （delete は効き、add は見えない）
             return False, "自exe受信許可を要求したが反映を確認できず（%s）: %s" % (
                 _SELF_RULES_DELETED, name)
         # 反映を確認できないものを成功にすると「通らないのに完了」と出る

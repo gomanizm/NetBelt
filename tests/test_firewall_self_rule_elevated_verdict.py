@@ -27,7 +27,12 @@ delete より前からあった許可かは見分けられない。そこで、
   - 見えたままのときは最後（6 回目）の確認まで待ち、最後にも見えたら完了とする
   - 見えていた許可が消えたまま最後まで戻らなければ失敗とし、既存の規則が
     消えたことを文言で知らせる（管理者の経路の _SELF_RULES_DELETED と同じ一言）
-確認の間隔と回数（0.25 秒 × 6 回）は変えず、GUI スレッドで待つ上限は延ばさない。
+  - 昇格した delete → add は、1 回目の確認（0.25 秒後）より前に終わるのが
+    普通の順序（この PC の netsh は 1 回約 0.05 秒）。既存の許可が消えて add が
+    失敗しても確認では一度も見えないので、起動の前に 1 回だけ既存の許可を
+    見ておき、あったのに最後まで見えなければ同じ一言を添える
+起動後の確認の間隔と回数（0.25 秒 × 6 回）は変えず、昇格した処理を待つ上限は
+延ばさない。増えるのは起動前（UAC の前）の show 1 回（約 0.05 秒）だけ。
 
 子プロセスの終わりを待つ案（ShellExecuteExW の SEE_MASK_NOCLOSEPROCESS）は
 採らなかった。441ea02 からある既存のテストは、本物の shell32 の ShellExecuteW
@@ -73,6 +78,7 @@ class _Elevated:
         self.launches = []
         self.sleeps = []
         self.shows = 0
+        self.shows_before_launch = 0   # 昇格した処理を起動する前の show
         self.thread = threading.get_ident()
 
     @property
@@ -108,6 +114,8 @@ class _Elevated:
         if args[:4] != ["advfirewall", "firewall", "show", "rule"]:
             raise AssertionError("未昇格のまま netsh で規則を変えようとした: %r" % (args,))
         self.shows += 1
+        if not self.launches:
+            self.shows_before_launch += 1
         name = next(a[len("name="):] for a in args if a.startswith("name="))
         if name not in self.rules:
             return subprocess.CompletedProcess(args, 1, NO_MATCH, b"")
@@ -171,6 +179,27 @@ class ElevatedSelfRuleVerdictTest(unittest.TestCase):
                 self.assertIn("手動", msg, "手動での追加を促していない: %s" % msg)
                 self.assertTrue(msg.endswith(": " + fw._self_rule_name()), msg)
 
+    def test_an_existing_allow_lost_before_the_first_check_is_reported(self):
+        """既存の許可が 1 回目の確認より前に消え add が失敗したときも、消えたことを知らせること
+
+        この順序（delete → add が 1 回目の確認の前に終わる）が普通で、確認では
+        許可が一度も見えない。3ffabc4 では文言が「反映を確認できず」だけで、
+        既存の許可が消えたことが画面から分からなかった（模擬で再現）。
+        """
+        ok, msg, _finished, elevated = self._run(
+            pre_existing=True, delete_at=1, add_at=1, add_ok=False)
+        # 前提: 最後には自exe の許可が残っていない
+        self.assertEqual(elevated.rules, [])
+        self.assertFalse(ok, msg)
+        self.assertIn("削除済み", msg,
+                      "既存の許可が消えたことが文言に出ていない: %s" % msg)
+        self.assertIn("手動", msg, "手動での追加を促していない: %s" % msg)
+        self.assertTrue(msg.endswith(": " + fw._self_rule_name()), msg)
+        # 既存の許可は、昇格した処理を起動する前に見ていること（起動した後に
+        # 見ると、昇格した delete と競って、消えた後の状態を見ることがある）
+        self.assertGreaterEqual(elevated.shows_before_launch, 1,
+                                "起動前に既存の許可を見ていない")
+
     def test_done_is_not_returned_before_the_elevated_add_ran(self):
         """既存の許可があるとき、完了は昇格した add が終わった後でだけ返すこと"""
         timelines = (
@@ -215,11 +244,16 @@ class ElevatedSelfRuleVerdictTest(unittest.TestCase):
                          + fw._self_rule_name())
 
     def test_the_wait_on_the_gui_thread_is_not_longer(self):
-        """確認の間隔と回数（GUI スレッドで待つ上限）を延ばしていないこと"""
+        """確認の間隔と回数（GUI スレッドで待つ上限）を延ばしていないこと
+
+        起動の前に既存の許可を見る show は 1 回まで（UAC の前。約 0.05 秒）。
+        起動した後の確認は 31b45ee と同じく 0.25 秒 × 6 回まで。
+        """
         timelines = (
             dict(pre_existing=True, delete_at=2, add_at=2, add_ok=False),
             dict(pre_existing=True, delete_at=9, add_at=9, add_ok=True),
             dict(pre_existing=False, delete_at=1, add_at=9, add_ok=True),
+            dict(pre_existing=True, delete_at=1, add_at=1, add_ok=False),
         )
         for timeline in timelines:
             with self.subTest(**timeline):
@@ -227,7 +261,9 @@ class ElevatedSelfRuleVerdictTest(unittest.TestCase):
                 waited = elevated.waited
                 self.assertLessEqual(len(waited), CHECKS, waited)
                 self.assertTrue(all(s <= INTERVAL for s in waited), waited)
-                self.assertLessEqual(elevated.shows, CHECKS)
+                self.assertLessEqual(elevated.shows_before_launch, 1)
+                self.assertLessEqual(
+                    elevated.shows - elevated.shows_before_launch, CHECKS)
 
 
 if __name__ == "__main__":
