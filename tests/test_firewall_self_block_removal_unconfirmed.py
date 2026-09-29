@@ -102,8 +102,11 @@ class SelfProgramAllowMessageTest(unittest.TestCase):
                                   return_value=42), \
                 mock.patch.object(fw, "_netsh", netsh):
             ok, msg = fw.ensure_self_program_allow()
-        # 前提: 確かめているのは許可規則の show だけ
-        self.assertEqual(netsh.calls, ["show"])
+        # 前提: 確かめているのは許可規則の show だけ（回数は問わない。見えた
+        # 許可が既存のものか区別できないので、見えたままなら最後まで確かめる。
+        # test_firewall_self_rule_elevated_verdict.py）
+        self.assertTrue(netsh.calls)
+        self.assertEqual(set(netsh.calls), {"show"}, netsh.calls)
         self._assert_block_removal_not_claimed(ok, msg)
         self.assertIn("昇格", msg, "昇格の経路であることが文言から落ちている: %s" % msg)
 

@@ -280,7 +280,8 @@ _BLOCK_NOT_CHECKED = "既存のブロック規則の除去は確認していま�
 # 管理者の経路で delete が既存の規則を消したあと、add が失敗したときに添える
 # 一言。delete は自exe の受信規則を許可も含めて消すので、そのまま「追加に
 # 失敗」とだけ返すと、初回のプロンプトが作った許可なども消えたことが
-# 画面から分からない（実測）
+# 画面から分からない（実測）。昇格の経路でも、見えていた許可が消えたまま
+# 戻らないときに添える
 _SELF_RULES_DELETED = "自exe向けの既存の受信規則は削除済みです。手動で受信許可を追加してください"
 
 
@@ -335,15 +336,29 @@ def ensure_self_program_allow():
         rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", "cmd.exe", cmd, None, 0)
         if int(rc) <= 32:
             return False, "UACが承認されず未設定: " + name
-        # 昇格プロセスは非同期。allow ルールの反映を短時間リトライ確認する。
+        # 昇格プロセスは非同期で、終わりを待つ手段が無い。allow ルールの反映を
+        # 短時間リトライ確認する。見えた許可が、昇格した add の結果か、delete
+        # より前からあった許可かは見分けられない。1 回目に見えた時点で完了と
+        # すると、そのあと delete が既存の許可を消し、add が失敗したときに
+        # 「完了」のあとで許可が消える（実測）。見えなかった確認のすぐ後で
+        # 見えた（delete の後の add まで終わった）ときだけ途中で完了とし、
+        # 見えたままなら最後の確認まで待つ。回数と間隔（待つ上限）は変えない
         import time
+        seen = []
         for _ in range(6):
             time.sleep(0.25)
             # 名前だけで確かめると、旧配置先向けの同名ルールが残っている
             # 環境で、新しい exe への add が失敗していても「完了」と出る
-            if rule_exists(name, program=prog):
-                return True, "自exe受信許可を追加（管理者昇格。%s）: %s" % (
-                    _BLOCK_NOT_CHECKED, name)
+            seen.append(bool(rule_exists(name, program=prog)))
+            if seen[-2:] == [False, True]:
+                break
+        if seen[-1]:
+            return True, "自exe受信許可を追加（管理者昇格。%s）: %s" % (
+                _BLOCK_NOT_CHECKED, name)
+        if any(seen):
+            # 見えていた許可が消えたまま戻らない（delete は効き、add は見えない）
+            return False, "自exe受信許可を要求したが反映を確認できず（%s）: %s" % (
+                _SELF_RULES_DELETED, name)
         # 反映を確認できないものを成功にすると「通らないのに完了」と出る
         return False, "自exe受信許可を要求したが反映を確認できず: " + name
     except Exception as e:
