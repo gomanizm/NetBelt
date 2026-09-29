@@ -30,6 +30,7 @@ class _Core:
         self.ops = 0            # 積んだがまだ終えていない操作の数
         self.backlog = 0        # 積んだがまだ書いていない文字数
         self.written = 0        # ファイル上で増えたバイト数（書けた分だけ）
+        self.unflushed = 0      # write は戻ったが、まだ flush / close が戻っていないバイト数
         self.error = None       # スレッドで起きた最初の失敗
         self.call_started = None    # いまのファイルの呼び出しに入った時刻（外なら None）
 
@@ -50,14 +51,21 @@ class _Core:
                     if op == "write":
                         self.f.write(text)
                         # テキストモードなので LF は os.linesep に直ってから
-                        # UTF-8 で書かれる。記録中ダイアログはこの値を見せる
-                        # （GUI スレッドから os.path.getsize を呼ばないため）
-                        self.written += len(
+                        # UTF-8 で書かれる。行バッファリングでも、改行の無い
+                        # 文字列（プロンプトなど）は write が戻っても Python の
+                        # バッファに残り、記録先へ出るのは続く flush / close。
+                        # それが戻るまでは書けた数に入れない
+                        self.unflushed += len(
                             text.replace("\n", os.linesep).encode("utf-8"))
-                    elif op == "flush":
-                        self.f.flush()
                     else:
-                        self.f.close()
+                        if op == "flush":
+                            self.f.flush()
+                        else:
+                            self.f.close()
+                        # 記録中ダイアログはこの値を見せる
+                        # （GUI スレッドから os.path.getsize を呼ばないため）
+                        self.written += self.unflushed
+                        self.unflushed = 0
             except Exception as e:
                 if self.error is None:
                     self.error = e
