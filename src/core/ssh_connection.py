@@ -583,6 +583,71 @@ class HostKeyMismatchError(Exception):
     """同じ接続先の別の鍵が known_hosts にある。上書きせず接続を中止する"""
 
 
+class _WindowChangeSender:
+    """window-change を GUI スレッドの外で書く送り役（1 つのチャネルに束縛する）
+
+    paramiko の resize_pty は、Transport へ書くと待たされる間（鍵交換中・
+    TCP へ書けない）戻らない。書けるかを先に調べても、調べた直後に
+    Transport のスレッドが鍵交換を始めると、書き込みは鍵交換が終わるまで
+    （最長 30 秒）待ち、GUI スレッドで書くとその間は画面も切断の操作も
+    止まっていた。書くのはこのスレッドに任せる。書き込みが待たされている
+    間に渡された大きさは、それが終わってから最後の 1 つだけを書く。
+    """
+
+    def __init__(self, channel):
+        self.channel = channel
+        self._lock = threading.Lock()
+        self._size = None          # まだ書いていない最後の大きさ
+        self._running = False      # 書き手のスレッドが動いている
+        self._stopped = False
+        self._idle = threading.Event()
+        self._idle.set()
+
+    def send(self, cols: int, rows: int, wait: float) -> None:
+        """大きさを渡し、書き終わるのを最大 wait 秒だけ待つ
+
+        前の書き込みがまだ終わっていなければ待たない（それは待たされて
+        いる。終わったら、ここで渡した最後の大きさを書く）。
+        """
+        with self._lock:
+            if self._stopped:
+                return
+            self._size = (cols, rows)
+            if self._running:
+                return
+            self._running = True
+            self._idle.clear()
+        try:
+            threading.Thread(target=self._run, name="netbelt-window-change",
+                             daemon=True).start()
+        except RuntimeError:
+            # スレッドを作れない。書けないまま「書いている最中」に残さない
+            with self._lock:
+                self._running = False
+                self._idle.set()
+            return
+        self._idle.wait(wait)
+
+    def _run(self):
+        while True:
+            with self._lock:
+                size, self._size = self._size, None
+                if size is None or self._stopped:
+                    self._running = False
+                    self._idle.set()
+                    return
+            try:
+                self.channel.resize_pty(width=size[0], height=size[1])
+            except Exception:
+                pass   # 通知に失敗しても接続はそのまま続ける
+
+    def stop(self) -> None:
+        """以後は書かない（書いている最中の 1 つは、閉じた接続で終わる）"""
+        with self._lock:
+            self._stopped = True
+            self._size = None
+
+
 class SSHConnection(QObject):
     """SSH接続を管理するクラス"""
     
@@ -648,6 +713,8 @@ class SSHConnection(QObject):
         self._size_unsent = False
         # その大きさを送れるようになるのを待つ見張り（_send_terminal_size）
         self._size_watcher: Optional[DrainWatcher] = None
+        # その大きさを GUI スレッドの外で書く送り役（_send_terminal_size）
+        self._size_sender: Optional[_WindowChangeSender] = None
         self.send_drained.connect(self._write_carry_when_drained)
         self._size_writable.connect(self._send_terminal_size)
 
@@ -1126,6 +1193,9 @@ class SSHConnection(QObject):
         size_watcher, self._size_watcher = self._size_watcher, None
         if size_watcher is not None:
             size_watcher.stop()
+        size_sender, self._size_sender = self._size_sender, None
+        if size_sender is not None:
+            size_sender.stop()
         # 書き残しは捨てる（繋ぎ直した先へ古い残りを書かない）
         self._carry = b""
         self._size_unsent = False
@@ -1275,6 +1345,10 @@ class SSHConnection(QObject):
         except RuntimeError:
             pass   # 捨てられた接続（C++ 側が消えている）
 
+    # GUI スレッドが、送り役の window-change の書き終わりを待つ上限（秒）。
+    # 書き込みが待たされても、GUI が止まるのはここまで
+    _SIZE_SEND_WAIT_SECONDS = 0.1
+
     def set_terminal_size(self, cols: int, rows: int):
         """端末の大きさを機器へ伝える (RFC 4254 6.7 window-change)。
 
@@ -1300,26 +1374,40 @@ class SSHConnection(QObject):
         （_size_writable）で最後の大きさを送る。送信の背圧の見張り
         （send_drained）はチャネルの窓が空くまで待つので、それに頼ると、
         機器が読まずに窓が 0 のままの間は送られず、機器側の端末の大きさが
-        古いままだった（window-change は窓と関係なく書ける）。送信の背圧の見張り
-        が無い（接続の手順を通っていない）ときは待てないので、これまでどおり
-        その場で送る。
+        古いままだった（window-change は窓と関係なく書ける）。
+        書けると判定したあとも、書くのは送り役のスレッド（_WindowChangeSender）
+        に任せる。判定の直後に鍵交換が始まると、書き込みは鍵交換が終わるまで
+        待つため（GUI が止まっていた。実測 3 秒、最長 30 秒）。ふだんは 1ms
+        もかからずに書き終わるので、書き終わりを _SIZE_SEND_WAIT_SECONDS まで
+        待ち、これまでどおり大きさを伝えてから次の打鍵を送る順序にする。
+        送信の背圧の見張りが無い（接続の手順を通っていない）ときは、これまで
+        どおりその場で送る。
         """
         channel = self.channel
         if not self._size_unsent or not self.is_connected or channel is None:
             return
-        if self._drain_watcher is not None:
-            if self._size_watcher is None:
-                # このチャネルに束縛する（dispose で止めて捨てる）
-                self._size_watcher = DrainWatcher(
-                    lambda: self._transport_backlogged(channel),
-                    self._announce_size_writable)
-            if self._size_watcher.check():
-                return   # 書けるようになったら _size_writable でここへ戻ってくる
+        if self._drain_watcher is None:
+            self._size_unsent = False
+            try:
+                channel.resize_pty(width=self.term_cols, height=self.term_rows)
+            except Exception:
+                pass
+            return
+        if self._size_watcher is None:
+            # このチャネルに束縛する（dispose で止めて捨てる）
+            self._size_watcher = DrainWatcher(
+                lambda: self._transport_backlogged(channel),
+                self._announce_size_writable)
+        if self._size_watcher.check():
+            return   # 書けるようになったら _size_writable でここへ戻ってくる
         self._size_unsent = False
-        try:
-            channel.resize_pty(width=self.term_cols, height=self.term_rows)
-        except Exception:
-            pass
+        sender = self._size_sender
+        if sender is None or sender.channel is not channel:
+            # 送り役もこのチャネルに束縛する（ほかの接続のチャネルへ書かない）
+            if sender is not None:
+                sender.stop()
+            sender = self._size_sender = _WindowChangeSender(channel)
+        sender.send(self.term_cols, self.term_rows, self._SIZE_SEND_WAIT_SECONDS)
 
     def _announce_size_writable(self):
         """見張りのスレッドから、保留した大きさを送れるようになったことを知らせる"""
