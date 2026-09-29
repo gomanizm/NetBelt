@@ -203,6 +203,18 @@ class MixedDirectionQueueTest(_FtpServerCase):
                     [("started", "b.cfg"), ("interrupted", "b.cfg"),
                      ("started", "hold.cfg"), ("complete", "hold.cfg")])
 
+    def test_stor_after_a_queued_retr_of_the_same_file(self):
+        # 同じファイルの RETR を捨てると、その片付けがこの接続の転送（_tx_*）を
+        # 降ろす。ftp_STOR が捨てるより先にアップロードの _tx_* を設定すると、
+        # それが消えて、名前の空の行ができ、進捗も出なくなる（変異で実測）
+        ftp = self.client()
+        self._queue(ftp, "RETR b.cfg", "STOR b.cfg")
+        resp, got = self._send_queued(ftp, HOLD)
+        transfer = (resp, got, self.read("b.cfg"))
+        self._check(ftp, transfer, ("226", b"", HOLD),
+                    [("started", "b.cfg"), ("interrupted", "b.cfg"),
+                     ("started", "b.cfg"), ("complete", "b.cfg")])
+
     def test_list_after_a_queued_stor_drops_the_stor(self):
         ftp = self.client()
         self._queue(ftp, "STOR hold.cfg", "LIST")

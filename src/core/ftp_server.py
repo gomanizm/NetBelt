@@ -516,6 +516,7 @@ class FTPServerManager(QObject):
                         mgr._release_uploads(self, file)
                 if result is not None:
                     self._leave_overwritten_stor(prev, file)
+                    # _tx_* を設定する前に呼ぶ（同じファイルの RETR を捨てると _forget_tx が走る）
                     self._leave_queued_send(prev)
                     self._tx_name = os.path.basename(file); self._tx_total = 0  # アップロードは総サイズ不明
                     self._tx_dir = "upload"; self._tx_last = 0.0; self._tx_path = file
