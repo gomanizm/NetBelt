@@ -259,6 +259,121 @@ class WaitingWriteTest(_QtCase):
         self.assertEqual(b"", conn._carry, "失敗のあとも書き残しが残った")
 
 
+class _NarrowWindowChannel(_WaitingChannel):
+    """窓が 4 バイトのチャネル（区切りの残りを持ち越しに残す）"""
+
+    out_window_size = 4
+
+
+class FailureLandsBetweenTheChecksTest(_QtCase):
+    """待たされた書き込みの失敗が、次の区切りを渡す直前に着地する場合
+
+    _write_carry は先頭で失敗を知らせてから、ループの中で判定
+    （_send_backlogged）を見て次の区切りを書き手へ渡す。判定は、失敗を
+    まだ知らせていない書き手を「書ける」とする（失敗を知らせるため）。
+    先頭の確認と判定の間に失敗が着地すると、失敗を知らせる前に次の区切り
+    を書き手へ渡し、機器には前半の抜けた後半だけが届いていた（41cac56）。
+    """
+
+    def test_nothing_after_the_failed_chunk_is_written(self):
+        from core.send_backpressure import DrainWatcher
+        from core.ssh_connection import SSHConnection
+        a, b = socket.socketpair()
+        self.addCleanup(a.close)
+        self.addCleanup(b.close)
+        channel = _NarrowWindowChannel(
+            _FakeTransport(a),
+            fail=OSError("Key-exchange timed out waiting for key negotiation"))
+        self.addCleanup(channel.release.set)
+        conn = SSHConnection("192.0.2.1", 22, "admin")
+        conn.channel = channel
+        conn.is_connected = True
+        conn._drain_watcher = DrainWatcher(
+            lambda: conn._send_backlogged(channel), conn._announce_drained)
+        self.addCleanup(conn.dispose)
+        errors = []
+        conn.error_occurred.connect(errors.append)
+
+        self._timed_send(conn, "abcdefgh")
+        self.assertEqual(b"efgh", conn._carry,
+                         "前提: 窓に入らない後半が持ち越しに残っていない")
+        self.assertTrue(conn._writer.busy(), "前提: 前半の書き込みが待たされていない")
+
+        original = SSHConnection._report_write_error
+        landed = []
+
+        def report_then_the_write_fails(self_):
+            result = original(self_)
+            if not result and not landed:
+                # 先頭の確認が「失敗なし」を返した直後に、待たされていた
+                # 書き込みが失敗し、書き手が空く
+                landed.append(True)
+                channel.release.set()
+                end = time.time() + 2
+                while ((not self_._writer.failed() or self_._writer.busy())
+                       and time.time() < end):
+                    time.sleep(0.001)
+            return result
+
+        with mock.patch.object(SSHConnection, "_report_write_error",
+                               report_then_the_write_fails):
+            conn.has_pending_sends()        # 端末が次の区切りを渡す前に聞く
+        self.assertTrue(landed, "前提: 先頭の確認の直後に失敗を着地させられていない")
+        self._pump(0.3)
+        conn.has_pending_sends()
+        self._pump(0.3)
+
+        self.assertEqual([], channel.writes,
+                         "失敗した区切りの続きが、機器へ書かれた（前半が抜けたまま届く）")
+        self.assertEqual(
+            ["送信エラー: Key-exchange timed out waiting for key negotiation"],
+            errors, "失敗が 1 回だけ知らされていない")
+        self.assertEqual(b"", conn._carry, "失敗のあとも書き残しが残った")
+
+    def test_the_writer_refuses_data_until_the_failure_is_taken(self):
+        from core.ssh_connection import _ChannelWriter
+        a, b = socket.socketpair()
+        self.addCleanup(a.close)
+        self.addCleanup(b.close)
+        channel = _WaitingChannel(_FakeTransport(a), fail=OSError("reset"))
+        channel.release.set()
+        writer = _ChannelWriter(channel)
+        writer.write(b"x", 2.0)
+        self.assertTrue(writer.failed(), "前提: 書き込みが失敗していない")
+
+        writer.write(b"y", 2.0)             # 失敗をまだ取り出していない
+        writer.send_size(100, 30, 2.0)
+        self.assertFalse(writer.busy())
+        self.assertEqual([("size", (100, 30))], channel.writes,
+                         "失敗を知らせる前に、続きのデータを書いた")
+
+        self.assertIsInstance(writer.take_error(), OSError)
+        self.assertTrue(writer.write(b"z", 2.0))
+        self.assertEqual([("size", (100, 30)), ("data", b"z")], channel.writes,
+                         "失敗を知らせたあとの送信が書かれない")
+
+    def test_data_handed_during_the_failing_write_is_not_written(self):
+        from core.ssh_connection import _ChannelWriter
+        a, b = socket.socketpair()
+        self.addCleanup(a.close)
+        self.addCleanup(b.close)
+        channel = _WaitingChannel(_FakeTransport(a), fail=OSError("reset"))
+        self.addCleanup(channel.release.set)
+        writer = _ChannelWriter(channel)
+        self.assertFalse(writer.write(b"x", 0.05), "前提: 書き込みが待たされていない")
+        self.assertFalse(writer.write(b"y", 0.0))   # 待たされている間に渡した
+
+        channel.release.set()               # 待たされていた書き込みが失敗する
+        end = time.time() + 2
+        while writer.busy() and time.time() < end:
+            time.sleep(0.005)
+
+        self.assertFalse(writer.busy())
+        self.assertTrue(writer.failed())
+        self.assertEqual([], channel.writes,
+                         "失敗した書き込みの続きを、失敗を知らせる前に書いた")
+
+
 class _FastChannel(_WaitingChannel):
     """待たずに書けるチャネル（偽物）"""
 

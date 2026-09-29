@@ -622,7 +622,12 @@ class _ChannelWriter:
         return error
 
     def write(self, data: bytes, wait: float) -> bool:
-        """データを渡し、書き終わるのを最大 wait 秒だけ待つ。書き終えたら True"""
+        """データを渡し、書き終わるのを最大 wait 秒だけ待つ。書き終えたら True
+
+        前のデータの書き込みの失敗を取り出していない間は、受け取らずに True を
+        返す（失敗した区切りの続きだけを機器へ届けない。知らせるのは
+        呼び出し側の SSHConnection._report_write_error）。
+        """
         return self._hand_over(wait, data=data)
 
     def send_size(self, cols: int, rows: int, wait: float) -> None:
@@ -637,6 +642,11 @@ class _ChannelWriter:
         with self._lock:
             if self._stopped:
                 return True
+            if self._error is not None:
+                # 失敗をまだ知らせていない: 続きのデータは書かない
+                if size is None:
+                    return True
+                data = b""
             self._data += data
             if size is not None:
                 self._size = size
@@ -672,6 +682,7 @@ class _ChannelWriter:
                 except Exception as e:
                     with self._lock:
                         self._error = e
+                        self._data = b""   # 失敗した区切りの続きは書かない
                 continue
             try:
                 self.channel.resize_pty(width=size[0], height=size[1])
