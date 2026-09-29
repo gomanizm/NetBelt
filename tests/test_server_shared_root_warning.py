@@ -13,8 +13,8 @@ SFTPServerManager._open_writers・TFTPServer._wrq_targets とサーバーごと�
 直し方（利用者の決定 B）: 共通の予約台帳へ直すのは 1.3.2 の範囲を超えるので、
 起動は断らずに、起動したサーバーのルートが動いている他のサーバーのルートと
 同じか入れ子なら、起動したパネルのログへ警告を出す（MainWindow が 3 つの
-マネージャの started を受けて比べる）。比べるのは realpath → normcase した
-パス（予約の鍵と同じ考え方）。
+マネージャの started を受けて比べる）。比べるのは abspath → normcase した
+パス（ディスクに触れない。test_server_shared_root_check_off_disk.py 参照）。
 """
 import os
 import socket

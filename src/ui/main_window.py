@@ -2534,10 +2534,16 @@ class MainWindow(QMainWindow):
         プロトコルをまたいだ同じ名前への同時アップロードは断れず、どれも成功と
         報告されたまま中身が混ざる（実測）。共通の予約にするのは大きいので、
         起動は断らずに、起動したパネルのログへ知らせるだけにする。
-        比べ方は予約の鍵と同じ（realpath → normcase）
+        比べるのはルートの文字列だけ（abspath → normcase）。realpath は
+        ルートを開いて最終パスを問い合わせるので、動いている別サーバーの
+        ルートが応答しない共有だと GUI スレッドが固まり、切れた共有では
+        OSError（WinError 64 など）がスロットの外へ出て「予期しないエラー」に
+        なっていた（実測）。警告だけなので、ジャンクションや
+        シンボリックリンクを通した同じフォルダまでは追わない
         """
         def key(panel):
-            return os.path.normcase(os.path.realpath(panel.root_dir_edit.text().strip()))
+            # abspath は文字列とカレントディレクトリだけで決め、ディスクに触れない
+            return os.path.normcase(os.path.abspath(panel.root_dir_edit.text().strip()))
         servers = self._file_servers()
         started = [s for s in servers if s[2] is self.sender()]
         if not started:
