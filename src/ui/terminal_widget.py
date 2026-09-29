@@ -2089,8 +2089,12 @@ class TerminalWidget(QWidget):
         ハンドルを先に外すので、警告は失敗のたびではなく一度だけ出る。
         """
         from PyQt6.QtWidgets import QMessageBox
+        from core import log_recording
 
         handle = self._log_files.pop(device_name, None)
+        if handle is not None:
+            # 閉じ終わるまで使用中のまま。停止した記録として案内させる
+            log_recording.mark_stopped(device_name, getattr(handle, "name", None))
         # 停止して書き終えていない前の記録の登録は残す。壊れたハンドルは
         # 閉じるのも失敗しうるが、知らせるのは下の 1 回だけ
         self._close_log_file(device_name, handle,
@@ -2292,28 +2296,23 @@ class TerminalWidget(QWidget):
             return os.path.expanduser("~")
         return logs_dir
 
-    def _recording_device_using(self, file_path: str):
-        """file_path を記録先にしている機器名を返す（無ければ None）
+    def _refuse_log_file_in_use(self, title: str, file_path: str) -> bool:
+        """file_path が記録先なら知らせて断る（断ったら True）
 
         記録中のファイルを別の記録や全ログ保存の保存先に選ぶと、open('w')
         で記録済みの内容が消え、以降は両者の書き込みが混在する。保存先を
         決めた直後にここで見て拒否する。
 
-        判定そのものは core.log_recording に置いてある。端末以外の画面
+        判定と案内文は core.log_recording に置いてある。端末以外の画面
         （SNMP のエクスポートなど）も同じ判定を使う必要があるため。
         """
-        from core import log_recording
-        return log_recording.device_using(file_path)
-
-    def _warn_log_file_in_use(self, title: str, file_path: str, device_name: str):
-        """記録中のファイルが選ばれたことを知らせる"""
         from PyQt6.QtWidgets import QMessageBox
-        QMessageBox.warning(
-            self,
-            title,
-            f"このファイルは {device_name} のログ記録に使用中です:\n{file_path}\n"
-            "別のファイルを選ぶか、先にそのログ記録を停止してください。"
-        )
+        from core import log_recording
+        message = log_recording.in_use_message(file_path)
+        if message is None:
+            return False
+        QMessageBox.warning(self, title, message)
+        return True
 
     def save_current_log(self):
         """現在アクティブなターミナルのログを保存"""
@@ -2397,9 +2396,7 @@ class TerminalWidget(QWidget):
                 self, "ログ保存", file_path, selected_filter, default_filename)
 
             if file_path:
-                in_use_by = self._recording_device_using(file_path)
-                if in_use_by is not None:
-                    self._warn_log_file_in_use("ログ保存", file_path, in_use_by)
+                if self._refuse_log_file_in_use("ログ保存", file_path):
                     return
 
                 # プログレスダイアログを表示してログを保存
@@ -2473,9 +2470,7 @@ class TerminalWidget(QWidget):
             self, "ログ記録", file_path, selected_filter, default_filename)
 
         if file_path:
-            in_use_by = self._recording_device_using(file_path)
-            if in_use_by is not None:
-                self._warn_log_file_in_use("ログ記録", file_path, in_use_by)
+            if self._refuse_log_file_in_use("ログ記録", file_path):
                 return
 
             try:
@@ -2569,6 +2564,10 @@ class TerminalWidget(QWidget):
             # ハンドルと「記録中」ダイアログが残り、記録を始め直そうとしても
             # 「既にログ記録中です。」で断られる（止める手段が無くなる）。
             handle = self._log_files.pop(tab_name)
+            # 書き終えて閉じるまでは使用中のまま。その間に選ばれても「停止
+            # してください」と案内しないよう、停止したことを覚えさせる
+            from core import log_recording
+            log_recording.mark_stopped(tab_name, getattr(handle, "name", None))
             # 停止より前に受信して、まだ描いていない分がある（受信が描画を
             # 上回って溜まっている最中の停止）。受信した分は記録に入れるので、
             # 描き進んでそこへ届くまで閉じずに預ける（_write_logs が書いて

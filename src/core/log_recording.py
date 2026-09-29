@@ -9,12 +9,15 @@
 ここへ集める。
 """
 import os
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 # 機器名 -> [(記録先のパス, 記録を始めたときの実体), ...]。停止したが、停止より
 # 前に受信した分をまだ書いている記録も含む（その間に同じ機器で次の記録を
 # 始めると、1 台で 2 つになる）。実体は os.stat の結果（掴めなければ None）
 _recording: Dict[str, List[Tuple[str, Optional[os.stat_result]]]] = {}
+# そのうち停止して書き終えていない記録の (機器名, 記録先のパス)。断るときの
+# 案内を、記録中のものと分けるのに使う（in_use_message）
+_stopped: Set[Tuple[str, Optional[str]]] = set()
 
 
 def _stat(file_path: str) -> Optional[os.stat_result]:
@@ -37,6 +40,17 @@ def start(device_name: str, file_path: str) -> None:
         (file_path, _stat(file_path)))
 
 
+def mark_stopped(device_name: str, file_path: Optional[str]) -> None:
+    """その機器の記録先を、停止して書き終えていないものとして覚える
+
+    停止した記録の登録は、停止より前に受信した分を書き終えて閉じるまで残る
+    （stop で外れ、そのとき印も外れる）。そのファイルを選ばれたときに
+    「先にそのログ記録を停止してください」と案内すると、すでに停止して
+    いるので利用者は従いようがない。
+    """
+    _stopped.add((device_name, file_path))
+
+
 def stop(device_name: str, file_path: Optional[str] = None) -> None:
     """その機器の記録先を忘れる（記録していなくても呼んでよい）
 
@@ -49,10 +63,13 @@ def stop(device_name: str, file_path: Optional[str] = None) -> None:
             break
     if file_path is None or not entries:
         _recording.pop(device_name, None)
+    _stopped.difference_update(
+        [key for key in _stopped if key[0] == device_name
+         and (file_path is None or key[1] == file_path)])
 
 
-def device_using(file_path: str) -> Optional[str]:
-    """file_path を記録先にしている機器名を返す（無ければ None）
+def _entry_using(file_path: str) -> Optional[Tuple[str, str]]:
+    """file_path を記録先にしている登録の (機器名, 登録したパス)。無ければ None
 
     まず実体で比べる。8.3 短縮名・ハードリンク・ジャンクション・UNC と
     割り当てドライブなど、同じファイルを指す別表記は文字列比較では一致せず、
@@ -67,8 +84,36 @@ def device_using(file_path: str) -> Optional[str]:
         for path, known in entries:
             if found is not None and known is not None:
                 if os.path.samestat(known, found):
-                    return device_name
+                    return device_name, path
                 continue
             if os.path.normcase(os.path.abspath(path)) == wanted:
-                return device_name
+                return device_name, path
     return None
+
+
+def device_using(file_path: str) -> Optional[str]:
+    """file_path を記録先にしている機器名を返す（無ければ None）"""
+    entry = _entry_using(file_path)
+    return entry[0] if entry is not None else None
+
+
+def in_use_message(file_path: str) -> Optional[str]:
+    """file_path が記録先なら、保存・記録を断るときの案内文を返す（無ければ None）
+
+    端末の記録・全ログ保存と、SNMP・Syslog・サーバーパネルのエクスポートが
+    同じ文で断る。判定は device_using と同じで、stat するのは 1 回だけ
+    （応答しない記録先のファイルが選ばれることがあるので、2 度 stat しない）。
+    停止して書き終えていない記録のファイルには「停止してください」と案内
+    しない（mark_stopped）。
+    """
+    entry = _entry_using(file_path)
+    if entry is None:
+        return None
+    if entry in _stopped:
+        return ("このファイルは、停止した %s のログ記録が、停止より前に受信した"
+                "分をまだ書き込んでいます:\n%s\n書き終えるまで（記録先が応答"
+                "するまで）は使えません。別のファイルを選んでください。"
+                % (entry[0], file_path))
+    return ("このファイルは %s のログ記録に使用中です:\n%s\n"
+            "別のファイルを選ぶか、先にそのログ記録を停止してください。"
+            % (entry[0], file_path))

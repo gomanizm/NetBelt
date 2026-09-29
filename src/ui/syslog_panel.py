@@ -763,14 +763,10 @@ class SyslogPanel(QWidget):
         （SNMPPanel._refuse_if_recording と同じ判定）
         """
         from core import log_recording
-        device_name = log_recording.device_using(file_path)
-        if device_name is None:
+        message = log_recording.in_use_message(file_path)
+        if message is None:
             return False
-        QMessageBox.warning(
-            self, title,
-            "このファイルは %s のログ記録に使用中です:\n%s\n"
-            "別のファイルを選ぶか、先にそのログ記録を停止してください。"
-            % (device_name, file_path))
+        QMessageBox.warning(self, title, message)
         return True
 
     @staticmethod

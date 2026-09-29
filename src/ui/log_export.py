@@ -93,13 +93,9 @@ def export_log_text(panel, text: str, stem: str,
         return None
 
     from core import log_recording
-    device_name = log_recording.device_using(file_path)
-    if device_name is not None:
-        QMessageBox.warning(
-            panel, title,
-            "このファイルは %s のログ記録に使用中です:\n%s\n"
-            "別のファイルを選ぶか、先にそのログ記録を停止してください。"
-            % (device_name, file_path))
+    message = log_recording.in_use_message(file_path)
+    if message is not None:
+        QMessageBox.warning(panel, title, message)
         return None
 
     # 末尾に改行を足す。無いと最後の1行が次に追記した内容とつながる
