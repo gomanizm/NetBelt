@@ -68,6 +68,14 @@ class LogRecordingDialog(QDialog):
         self.bytes_label.setStyleSheet("font-size: 10pt;")
         layout.addWidget(self.bytes_label)
         self._update_byte_count()
+
+        # 記録先の詰まりなど、いまの状態（何も無ければ隠す。set_status）
+        self.status_label = QLabel()
+        self.status_label.setWordWrap(True)
+        self.status_label.setStyleSheet(
+            theme.band_style(self, bold=True, font_size="9pt"))
+        self.status_label.hide()
+        layout.addWidget(self.status_label)
         
         # 注意事項ラベル
         note_label = QLabel(
@@ -119,6 +127,18 @@ class LogRecordingDialog(QDialog):
         """
         size = self.size_provider() if self.size_provider is not None else 0
         self.bytes_label.setText(f"記録したバイト数: {size:,} バイト")
+
+    def set_status(self, text: str) -> None:
+        """状態の行を text にする（空なら消して隠す）。
+
+        記録先の詰まりの知らせに使う（TerminalWidget の見回りが呼ぶ）。
+        ダイアログを前に出さず、活性化もしない。打っている最中にキーの
+        行き先が移ると、残りの文字が捨てられ、Enter が機器へ届かない。
+        """
+        if text == self.status_label.text():
+            return
+        self.status_label.setText(text)
+        self.status_label.setVisible(bool(text))
 
     def _on_stop(self):
         """停止ボタンクリック時の処理"""

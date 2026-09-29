@@ -100,10 +100,9 @@ class LogRecordingIoStallWatchTest(unittest.TestCase):
         self.dir = tempfile.mkdtemp(prefix="netbelt-logstall-watch-")
         self.warning = mock.patch("PyQt6.QtWidgets.QMessageBox.warning").start()
         mock.patch("PyQt6.QtWidgets.QMessageBox.information").start()
-        # 受信を止めたことの案内はモーダルでない（show() で出す）。exec の
-        # モーダルへ戻る退行があっても、ここで止まったままにならないように、
-        # exec はすぐ戻す（案内の出方は test_log_recording_io_stall_hold_notice*.py
-        # で確かめる）
+        # 記録先の詰まりの知らせは窓を出さない（記録中ダイアログの状態の行。
+        # test_log_recording_io_stall_status_line.py ほか）。窓を出す退行が
+        # あっても、ここで止まったままにならないように、exec はすぐ戻す
         mock.patch("PyQt6.QtWidgets.QMessageBox.exec", return_value=0).start()
         self.addCleanup(mock.patch.stopall)
 

@@ -15,8 +15,9 @@ PENDING_LOW_WATER まで減ったら再開する。
 いればその機器を描かずに関所を閉じる。見回り（_check_log_writers）が、減ったら
 関所を開け直して描画を再開させる。停止して書き終えていない記録の分は数えない
 （数えると、記録を停止しても止めたままになった。4 周目 term。
-test_log_recording_io_stall_stop_releases_hold.py）。止めたことは、見回りが
-一度だけ案内する（警告ではない。test_log_recording_io_stall_hold_notice.py）。
+test_log_recording_io_stall_stop_releases_hold.py）。止めている間は、見回りが
+記録中ダイアログの状態の行に出す（窓は出さない。
+test_log_recording_io_stall_hold_notice.py）。
 
 このテストでは上限をインスタンスで小さくして（256 KiB / 64 KiB）確かめる。
 """
@@ -98,10 +99,9 @@ class LogRecordingIoStallBackpressureTest(unittest.TestCase):
         self.dir = tempfile.mkdtemp(prefix="netbelt-logstall-bp-")
         self.warning = mock.patch("PyQt6.QtWidgets.QMessageBox.warning").start()
         mock.patch("PyQt6.QtWidgets.QMessageBox.information").start()
-        # 受信を止めたことの案内はモーダルでない（show() で出す）。exec の
-        # モーダルへ戻る退行があっても、ここで止まったままにならないように、
-        # exec はすぐ戻す（案内の出方は test_log_recording_io_stall_hold_notice*.py
-        # で確かめる）
+        # 記録先の詰まりの知らせは窓を出さない（記録中ダイアログの状態の行。
+        # test_log_recording_io_stall_status_line.py ほか）。窓を出す退行が
+        # あっても、ここで止まったままにならないように、exec はすぐ戻す
         mock.patch("PyQt6.QtWidgets.QMessageBox.exec", return_value=0).start()
         self.addCleanup(mock.patch.stopall)
 

@@ -16,7 +16,9 @@ PENDING_LOW_WATER（64 KiB）まで減ったときだけなので、記録先が
 で前の画面へ描き切ったあと、その機器の止め（_log_throttled）を外して関所を
 開け直す。前の接続の止めは引き継がず、記録がまだ詰まっていれば、次の接続の
 受信で改めて判定する（上限を超えていれば、また止める）。記録と画面を欠かさない
-性質は保つ。
+性質は保つ。止めていることの知らせは窓を出さず、記録中ダイアログの状態の行に
+出す（6 周目。tests/test_log_recording_io_stall_status_line.py）。止めを外したら
+行も消え、次の接続でまた止めたら、また出る。
 
 このテストでは上限をインスタンスで小さくして（256 KiB / 64 KiB）確かめる。
 """
@@ -101,8 +103,8 @@ class LogRecordingIoStallReconnectRejudgedTest(unittest.TestCase):
         self.dir = tempfile.mkdtemp(prefix="netbelt-logstall-reconnect-")
         from PyQt6.QtWidgets import QMessageBox
         self.warning = mock.patch("PyQt6.QtWidgets.QMessageBox.warning").start()
-        # 止めたことの案内はモーダルでない QMessageBox の show() で出る。
-        # 出た順に本文を覚え、開いたままの案内は後のテストへ残さない
+        # 止めたことの知らせは窓を出さない。QMessageBox の show() で出たら
+        # 出た順に本文を覚え、開いたままの窓は後のテストへ残さない
         self.shown = []
         # モーダルで出した案内（information、または exec）は、開かずにすぐ戻して
         # 本文を覚える（本物は利用者が閉じるまで戻らないので、モーダルへ戻る
@@ -191,7 +193,21 @@ class LogRecordingIoStallReconnectRejudgedTest(unittest.TestCase):
         return fed
 
     def _hold_notices(self):
+        """窓で出した『受信を止めて』の知らせ"""
         return [text for text, _ in self.shown if "受信を止めて" in text]
+
+    @staticmethod
+    def _line(w):
+        """dev の記録中ダイアログの状態の行（表に出ていなければ ""。ダイアログか行が無ければ None）"""
+        dialog = w._log_dialogs.get("dev")
+        label = getattr(dialog, "status_label", None)
+        if label is None:
+            return None
+        return label.text() if label.isVisibleTo(dialog) else ""
+
+    def _held_line(self, w):
+        line = self._line(w)
+        return line if line and "受信を止めて" in line else None
 
     def test_a_reconnect_does_not_carry_over_the_hold_once_below_the_limit(self):
         """記録待ちが上限を下回ってから再接続したら、次の接続は止めずに読めて描かれること。"""
@@ -216,6 +232,7 @@ class LogRecordingIoStallReconnectRejudgedTest(unittest.TestCase):
         _pump(300)
         self.assertIn("dev", w._log_throttled,
                       "前提: 同じ接続のままなら、再開の水位までは止めたまま")
+        self.assertTrue(self._held_line(w), "前提: 止めている間は状態の行が出ている")
 
         w.create_terminal_tab("dev")            # 記録は止めずに再接続
         self.assertIn("L%06d" % (fed - 1), w._terminals["dev"].toPlainText(),
@@ -224,6 +241,8 @@ class LogRecordingIoStallReconnectRejudgedTest(unittest.TestCase):
                         "前の接続で止めた受信を、再接続した次の接続へ引き継いだ"
                         "（書き込み待ち %d 文字は上限 %d を下回っている）"
                         % (writer.backlog, self.HIGH))
+        self.assertTrue(self._wait_until(lambda: self._line(w) == "", 2.0),
+                        "止めを外したのに、状態の行を消さなかった: %r" % self._line(w))
         # 次の接続のログイン後の出力（プロンプトまで。上限を超えない量）
         after = 64
         w.queue_output("dev", _chunk(0, after, "N"))
@@ -244,26 +263,29 @@ class LogRecordingIoStallReconnectRejudgedTest(unittest.TestCase):
                 "再接続の前後の記録が欠けた・崩れた")
         self.assertEqual(self.warning.call_count, 0)
         self.assertEqual(self.modal_notices, [], "案内をモーダルで出した")
+        self.assertEqual(self._hold_notices(), [], "止めたことを窓で知らせた")
 
     def test_a_reconnect_while_still_over_the_limit_holds_the_new_link_again(self):
-        """記録待ちが上限を超えたままなら、次の接続の受信で改めて止め、解けたら欠けなく描くこと。"""
+        """記録待ちが上限を超えたままなら、次の接続の受信で改めて止め（状態の行も出す）、解けたら欠けなく描くこと。"""
         from core import log_recording
         w = self._widget()
         path, logfile = self._start(w)
         gate = w.output_gate("dev")
         fed = self._hold(w, gate)
         self.assertTrue(self._wait_until(
-            lambda: self._hold_notices() or self.modal_notices, 2.0),
-            "前提: 止めたことを知らせた")
+            lambda: self._held_line(w) or self._hold_notices() or self.modal_notices,
+            2.0), "前提: 止めたことを知らせた")
         self.assertEqual(self.modal_notices, [], "案内をモーダルで出した")
+        self.assertEqual(self._hold_notices(), [], "止めたことを窓で知らせた")
 
         w.create_terminal_tab("dev")            # 記録は止めずに再接続
         after = self._feed_while_open(w, gate, 0, 1.0, tag="N")
         _pump(300)
         self.assertFalse(gate.is_set(), "記録がまだ詰まっているのに、次の接続の受信を止めない")
         self.assertIn("dev", w._log_throttled)
-        self.assertEqual(len(self._hold_notices()), 1,
-                         "同じ詰まりのうちに、止めたことの知らせを繰り返した")
+        self.assertTrue(self._wait_until(lambda: self._held_line(w), 2.0),
+                        "次の接続でまた止めたのに、状態の行を出さなかった")
+        self.assertEqual(self._hold_notices(), [], "止めたことを窓で知らせた")
 
         logfile.open_all()
         self.assertTrue(self._wait_until(

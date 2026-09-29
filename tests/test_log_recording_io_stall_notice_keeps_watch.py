@@ -1,4 +1,4 @@
-"""見回りの知らせ（遅れの案内・警告、書き込みの失敗の警告）が開いている間も、止めた機器を再開させることを検証する（4 周目 term の (1) の手直し）。
+"""見回りの警告（書き込みの失敗）が開いている間も、止めた機器を再開させ、記録中ダイアログの状態の行を書き換え続けることを検証する（4 周目 term の (1) の手直し）。
 
 何が起きていたか（123bde6 で実測。scratchpad\\cx132e-term-fix2\\probe_modal.py と
 probe_serial_modal.py。上限 256 KiB / 64 KiB）: 見回り（_check_log_writers）は、
@@ -13,25 +13,21 @@ Qt は、スロットが入れ子のイベントループにいる間、同じ�
 
 どう直したか: 見回りの本体は、刻みのタイマーから単発のタイマー（_log_check）へ
 渡して動かす。単発のタイマーは刻みのたびに掛け直すので、知らせが開いている間も、
-次の刻みで本体が動く。同じ機器の遅れの知らせが開いている間は、その機器へは
-出し直さない（止めては再開する遅い記録先で、モーダルが入れ子に積み上がらない
-ように）。止めたことの案内を出すかは、機器ごとに止めているかを読み直して決める
-（ほかの機器の知らせが開いている間に再開した機器へ、閉じたあとで『受信を止めて
-います』と知らせない）。
+次の刻みで本体が動く。
 
-その後（5 周目の検査役の指摘。tests/test_log_recording_io_stall_hold_notice_modeless.py）、
-止めたことの案内はモーダルでない QMessageBox を show() で出すようにし、1 回の
-記録で一度だけにした。モーダルのまま残るのは警告（シリアルの遅れ、書き込みの
-失敗）。止めたことの案内のテストは、案内を開いたままにして同じ性質（開いている
-間も再開する、開いている間も閉じたあとも出し直さない）を確かめる。ほかの機器の
-モーダルが開いている間に再開した機器へ知らせないことは、シリアルの遅れの警告を
-開いた形で確かめる。
+その後、記録先の詰まりの知らせ（受信を止めたこと、シリアルの遅れ）は窓を出さず、
+記録中ダイアログの状態の行に出すようにした（6 周目の検査役の指摘。窓は出た瞬間に
+キーの行き先を奪う。tests/test_log_recording_io_stall_status_line.py）。見回りが
+モーダルで出すのは、書き込みの失敗の警告だけになった。このテストは、止めた機器が
+利用者の操作を待たずに再開すること、シリアルの遅れの行が出ている間も別のタブの
+止めた機器が再開すること、失敗の警告が開いている間も再開して状態の行を消し、
+閉じたあとで『受信を止めて』を出し直さないことを確かめる。
 
 警告は、入れ子のイベントループを回してから戻る偽物に替える（本物のモーダルと
-同じく、開いている間は呼んだスロットへ戻らない）。止めたことの案内は
-QMessageBox.show を見張って数える。information と QMessageBox.exec は、開かずに
-すぐ戻る偽物に替え、モーダルで出た案内として数える（モーダルへ戻る退行が
-あっても、止まったままにならずに落ちる）。上限はインスタンスで小さくする。
+同じく、開いている間は呼んだスロットへ戻らない）。information と
+QMessageBox.exec は開かずにすぐ戻る偽物に替えて数え、QMessageBox.show は
+数えてから本物を呼ぶ（記録先の詰まりの知らせで窓を出したら、どれかの数で落ちる）。
+上限はインスタンスで小さくする。
 """
 import builtins
 import os
@@ -95,7 +91,7 @@ class LogRecordingNoticeKeepsWatchTest(unittest.TestCase):
     HIGH = 256 * 1024
     LOW = 64 * 1024
     LINES = 512            # 1 回に受信させる行数（約 30 KB）
-    OPEN_FOR = 5.0         # 知らせを開いたままにする上限（秒）
+    OPEN_FOR = 5.0         # 警告を開いたままにする上限（秒）
 
     @classmethod
     def setUpClass(cls):
@@ -106,10 +102,10 @@ class LogRecordingNoticeKeepsWatchTest(unittest.TestCase):
     def setUp(self):
         from PyQt6.QtWidgets import QMessageBox
         self.dir = tempfile.mkdtemp(prefix="netbelt-logstall-keepwatch-")
-        # 出た案内を、出た順に覚える（題, 本文, モーダルか）
+        # 出た窓を、出た順に覚える（題, 本文, モーダルか）
         self.shown = []
         self.boxes = []
-        # モーダルで出した案内（information、または exec）も覚える。どちらも
+        # モーダルで出した窓（information、または exec）も覚える。どちらも
         # 開かずにすぐ戻す（本物は利用者が閉じるまで戻らないので、モーダルへ
         # 戻る退行があるとテストが止まったままになる）
         self.execs = []
@@ -138,7 +134,7 @@ class LogRecordingNoticeKeepsWatchTest(unittest.TestCase):
         self.fed = {}
 
     def _close_boxes(self):
-        """開いたままの案内を閉じる（利用者が閉じる。後のテストへ残さない）。"""
+        """開いたままの窓を閉じる（後のテストへ残さない）。"""
         for box in self.boxes:
             try:
                 if box.isVisible():
@@ -146,29 +142,28 @@ class LogRecordingNoticeKeepsWatchTest(unittest.TestCase):
             except RuntimeError:
                 pass            # 閉じて消えた
 
-    def _hold_notices(self):
-        """出た『受信を止めて』の案内（題, 本文, モーダルか）"""
-        return [shown for shown in self.shown if "受信を止めて" in shown[1]]
+    def _assert_no_window(self):
+        """記録先の詰まりの知らせで窓を出していないこと"""
+        self.assertEqual(self.shown, [], "記録先の詰まりを知らせるのに窓を出した")
+        self.assertEqual(self.information.call_count, 0, "モーダルの窓を出した")
+        self.assertEqual(self.execs, [], "窓を exec のモーダルで出した")
 
-    def _open_hold_boxes(self):
-        """いま開いている『受信を止めて』の案内"""
-        opened = []
-        for box in self.boxes:
-            try:
-                if box.isVisible() and "受信を止めて" in box.text():
-                    opened.append(box)
-            except RuntimeError:
-                pass
-        return opened
+    @staticmethod
+    def _line(w, name):
+        """その機器の記録中ダイアログの状態の行（表に出ていなければ ""。ダイアログか行が無ければ None）"""
+        dialog = w._log_dialogs.get(name)
+        label = getattr(dialog, "status_label", None)
+        if label is None:
+            return None
+        return label.text() if label.isVisibleTo(dialog) else ""
 
-    def _wait_for_open_hold_box(self):
-        """止めたことの案内が開くのを待って返す（モーダルで出たら落とす）。"""
-        def modal_notices():
-            return [text for _, text, modal in self._hold_notices() if modal]
-        self._wait_until(lambda: self._open_hold_boxes() or modal_notices(), 2.0)
-        self.assertEqual(modal_notices(), [], "案内をモーダルで出した")
-        self.assertTrue(self._open_hold_boxes(), "前提: 止めたことの案内が開いた")
-        return self._open_hold_boxes()[0]
+    def _held_line(self, w, name):
+        line = self._line(w, name)
+        return line if line and "受信を止めて" in line else None
+
+    def _lag_line(self, w, name):
+        line = self._line(w, name)
+        return line if line and "メモリに溜めて" in line else None
 
     def _widget(self, names):
         from core import log_recording
@@ -226,13 +221,17 @@ class LogRecordingNoticeKeepsWatchTest(unittest.TestCase):
                 and w._log_backlog(name) == 0)
 
     def _open_until_resumed(self, w, gate, seen, text):
-        """知らせの偽物の中身: 開いたまま記録先を戻し、閉じる前に再開するかを見る。"""
+        """警告の偽物の中身: 開いたまま記録先を戻し、閉じる前に再開するかを見る。"""
         seen["text"] = text
         seen["held"] = "dev" in w._log_throttled and not gate.is_set()
+        seen["line_when_opened"] = self._held_line(w, "dev")
         _pump(200)
         self.release.set()
         seen["resumed"] = self._wait_until(
             lambda: self._caught_up(w, gate, "dev"), self.OPEN_FOR)
+        # 開いている間も、見回りは状態の行を書き換える（再開したら消す）
+        seen["line_cleared"] = self._wait_until(
+            lambda: self._line(w, "dev") == "", 2.0)
 
     def _assert_recorded_in_full(self, w, path, name):
         from core import log_recording
@@ -246,29 +245,27 @@ class LogRecordingNoticeKeepsWatchTest(unittest.TestCase):
         self.assertIn("%s%06d" % (name, self.fed[name] - 1),
                       w._terminals[name].toPlainText())
 
-    def test_the_device_resumes_while_its_hold_notice_is_open(self):
-        """止めたことの案内が開いている間に記録先が戻ったら、閉じるのを待たずに再開すること。"""
+    def test_the_device_resumes_without_any_window_being_closed(self):
+        """止めている間は状態の行を出すだけで、記録先が戻ったら、利用者が何も閉じなくても再開して行を消すこと。"""
         w = self._widget(["dev"])
         path = self._start(w, "dev", self.release)
         gate = w.output_gate("dev")
         self._feed_until_held(w, gate, "dev")
-        box = self._wait_for_open_hold_box()
-        seen = {}
-        # 案内は開いたまま（利用者は閉じていない）、記録先が戻る
-        self._open_until_resumed(w, gate, seen, box.text())
-        self.assertTrue(seen["held"], "前提: 案内が開いたときは止めていた")
-        self.assertTrue(box.isVisible(), "前提: 再開を見届けるまで案内は開いたまま")
-        self.assertTrue(seen["resumed"],
-                        "案内が開いている間は見回りが動かず、記録先が戻っても、"
-                        "閉じるまで受信・描画を再開しなかった")
-        self.assertEqual(len(self._hold_notices()), 1)
-        self.assertEqual(self.information.call_count, 0, "案内をモーダルで出した")
-        self.assertEqual(self.execs, [], "案内を exec のモーダルで出した")
+        self.assertTrue(self._wait_until(lambda: self._held_line(w, "dev"), 2.0),
+                        "前提: 止めたことを状態の行に出した")
+        _pump(200)
+        self.release.set()
+        self.assertTrue(self._wait_until(lambda: self._caught_up(w, gate, "dev"),
+                                         self.OPEN_FOR),
+                        "記録先が戻っても受信・描画を再開しなかった")
+        self.assertTrue(self._wait_until(lambda: self._line(w, "dev") == "", 2.0),
+                        "再開したのに状態の行を消さなかった")
+        self._assert_no_window()
         self.assertEqual(self.warning.call_count, 0)
         self._assert_recorded_in_full(w, path, "dev")
 
-    def test_a_held_device_resumes_while_the_serial_lag_warning_is_open(self):
-        """シリアルの遅れの警告が開いている間に、別のタブの止めた機器の記録先が戻ったら、再開すること。"""
+    def test_a_held_device_resumes_while_the_serial_lag_line_is_shown(self):
+        """シリアルの遅れの行が出ている間に、別のタブの止めた機器の記録先が戻ったら、再開すること（窓は出さない）。"""
         w = self._widget(["ser", "dev"])
         ser_release = threading.Event()
         self.addCleanup(ser_release.set)
@@ -278,30 +275,29 @@ class LogRecordingNoticeKeepsWatchTest(unittest.TestCase):
         self._feed_until_held(w, gate, "dev")
         self.assertFalse(gate.is_set(), "前提: dev の受信を止めた")
         self.assertNotIn("ser", w._output_gates, "前提: ser には関所が無い")
-        seen = {}
-        self.warning.side_effect = (
-            lambda parent, title, text, *a, **k:
-            self._open_until_resumed(w, gate, seen, text))
 
-        # シリアルの受信は止まらない。記録待ちが上限を超えて警告が出るまで渡す
+        # シリアルの受信は止まらない。記録待ちが上限を超えて遅れの行が出るまで渡す
         end = time.perf_counter() + 4.0
-        while not seen and time.perf_counter() < end:
+        while not self._lag_line(w, "ser") and time.perf_counter() < end:
             first = self.fed.get("ser", 0)
             w.queue_output("ser", _chunk("ser", first, self.LINES))
             self.fed["ser"] = first + self.LINES
             _pump(20)
-        self.assertTrue(self._wait_until(lambda: "resumed" in seen,
-                                         self.OPEN_FOR + 3.0),
-                        "前提: シリアルの遅れの警告が開いて閉じた")
-        self.assertIn("ser", seen["text"])
-        self.assertIn("画面は進めたまま", seen["text"])
-        self.assertTrue(seen["held"], "前提: 警告が開いたときは dev を止めていた")
-        self.assertTrue(seen["resumed"],
-                        "シリアルの遅れの警告が開いている間は見回りが動かず、"
-                        "別のタブの止めた機器が、記録先が戻っても閉じるまで"
-                        "再開しなかった")
-        self.assertEqual(self.warning.call_count, 1)
-        self.assertEqual(self.execs, [], "案内を exec のモーダルで出した")
+        self.assertTrue(self._lag_line(w, "ser"), "前提: シリアルの遅れの行が出た")
+        self.assertTrue(self._wait_until(lambda: self._held_line(w, "dev"), 2.0),
+                        "前提: dev の止めたことの行が出た")
+
+        self.release.set()
+        self.assertTrue(self._wait_until(lambda: self._caught_up(w, gate, "dev"),
+                                         self.OPEN_FOR),
+                        "シリアルの遅れの行が出ている間に、別のタブの止めた機器が、"
+                        "記録先が戻っても再開しなかった")
+        self.assertTrue(self._wait_until(lambda: self._line(w, "dev") == "", 2.0),
+                        "dev は再開したのに状態の行を消さなかった")
+        self.assertTrue(self._lag_line(w, "ser"),
+                        "ser はまだ詰まっているのに遅れの行を消した")
+        self._assert_no_window()
+        self.assertEqual(self.warning.call_count, 0, "遅れを警告の窓で出した")
         self._assert_recorded_in_full(w, path, "dev")
 
     def test_a_held_device_resumes_while_a_write_failure_warning_is_open(self):
@@ -341,92 +337,72 @@ class LogRecordingNoticeKeepsWatchTest(unittest.TestCase):
         self.assertEqual(self.execs, [], "案内を exec のモーダルで出した")
         self._assert_recorded_in_full(w, path, "dev")
 
-    def test_a_device_held_again_while_its_notice_is_open_is_not_noticed_again(self):
-        """案内が開いたまま、再開した機器がまた止まっても、案内を出し直さないこと（閉じたあとも、同じ記録のうちは出し直さない）。"""
+    def test_a_device_held_again_shows_the_line_again(self):
+        """再開して行を消したあと、同じ記録でまた止まったら、また行を出すこと（窓は出さない）。"""
         w = self._widget(["dev"])
         path = self._start(w, "dev", self.release)
         gate = w.output_gate("dev")
         self._feed_until_held(w, gate, "dev")
-        box = self._wait_for_open_hold_box()
-        seen = {}
-        self._open_until_resumed(w, gate, seen, box.text())
-        self.assertTrue(seen["resumed"],
-                        "案内が開いている間は見回りが動かず、記録先が戻っても、"
-                        "閉じるまで受信・描画を再開しなかった")
-        # 開いたままの間に、記録先がまた応答しなくなって止まる
+        self.assertTrue(self._wait_until(lambda: self._held_line(w, "dev"), 2.0),
+                        "前提: 止めたことを状態の行に出した")
+        self.release.set()
+        self.assertTrue(self._wait_until(lambda: self._caught_up(w, gate, "dev"), 10.0),
+                        "詰まりが解けても受信・描画を再開しなかった")
+        self.assertTrue(self._wait_until(lambda: self._line(w, "dev") == "", 2.0),
+                        "再開したのに状態の行を消さなかった")
+        # 記録先がまた応答しなくなって止まる
         # （遅い記録先では、止めては再開するのを繰り返す）
         self.release.clear()
         self._feed_until_held(w, gate, "dev")
-        self.assertIn("dev", w._log_throttled, "前提: 案内が開いたまま、また止めた")
+        self.assertIn("dev", w._log_throttled, "前提: また止めた")
+        self.assertTrue(self._wait_until(lambda: self._held_line(w, "dev"), 2.0),
+                        "また止めたのに、状態の行を出さなかった")
         _pump(500)          # 見回りが何回か動く
-        self.assertTrue(box.isVisible(), "前提: 案内は開いたまま")
-        self.assertEqual(len(self._hold_notices()), 1, "開いている間に案内を出し直した")
-        self.assertEqual(self.information.call_count, 0, "案内をモーダルで出した")
-        self.assertEqual(self.execs, [], "案内を exec のモーダルで出した")
-        self._close_boxes()     # 利用者が閉じる
-        _pump(300)
-        self.assertEqual(len(self._hold_notices()), 1,
-                         "閉じたあと、同じ記録のうちに案内を繰り返した")
+        self.assertTrue(self._held_line(w, "dev"), "止めている間に状態の行を消した")
+        self._assert_no_window()
 
         self.release.set()
         self.assertTrue(self._wait_until(lambda: self._caught_up(w, gate, "dev"), 10.0),
                         "詰まりが解けても受信・描画を再開しなかった")
         self._assert_recorded_in_full(w, path, "dev")
 
-    def test_a_device_resumed_while_another_notice_is_open_is_not_told_it_is_held(self):
-        """ほかの機器の警告が開いている間に再開した機器へ、閉じたあとで『受信を止めています』と知らせないこと。"""
-        w = self._widget(["ser", "dev"])
-        ser_release = threading.Event()
-        self.addCleanup(ser_release.set)
-        self._start(w, "ser", ser_release)      # 関所の無い接続（シリアルの形）
+    def test_a_device_resumed_while_a_failure_warning_is_open_is_not_shown_as_held(self):
+        """ほかの機器の失敗の警告が開いている間に再開した機器は、開いている間に行を消し、閉じたあとも『受信を止めて』を出さないこと。"""
+        w = self._widget(["bad", "dev"])
+        bad_release = threading.Event()
+        self.addCleanup(bad_release.set)
+        error = OSError(64, "The specified network name is no longer available")
+        self._start(w, "bad", bad_release, fail=error)
         path = self._start(w, "dev", self.release)
-        gate = w.output_gate("dev")             # dev だけ関所あり
-        # dev を止め、ser の記録待ちが上限を超えるまで見回りの本体を動かさない
-        # （同じ回の見回りで、ser の警告のあとに dev へ知らせる順番が来るようにする）
-        w._log_check.blockSignals(True)
+        gate = w.output_gate("dev")
+        w.queue_output("bad", "line\r\n")
+        self.assertTrue(self._wait_until(lambda: w._log_files["bad"].busy, 2.0),
+                        "前提: bad の記録先が詰まった")
         self._feed_until_held(w, gate, "dev")
-        end = time.perf_counter() + 4.0
-        while (w._log_backlog("ser") < self.HIGH
-               and time.perf_counter() < end):
-            first = self.fed.get("ser", 0)
-            w.queue_output("ser", _chunk("ser", first, self.LINES))
-            self.fed["ser"] = first + self.LINES
-            _pump(20)
-        self.assertIn("dev", w._log_throttled, "前提: dev の受信を止めた")
-        self.assertGreaterEqual(w._log_backlog("ser"), self.HIGH,
-                                "前提: ser の記録待ちが上限を超えた")
-        self.assertEqual(self._hold_notices(), [], "前提: まだ見回りは知らせていない")
+        self.assertTrue(self._wait_until(lambda: self._held_line(w, "dev"), 2.0),
+                        "前提: 止めたことを状態の行に出した")
         seen = {}
+        self.warning.side_effect = (
+            lambda parent, title, text, *a, **k:
+            self._open_until_resumed(w, gate, seen, text))
 
-        def warn(parent, title, text, *args, **kwargs):
-            seen["text"] = text
-            seen["held"] = "dev" in w._log_throttled
-            # 開いている間に dev の記録先が戻る。見回りより先に書き終える
-            # （イベントループを回さずに待つ）ので、入り直した見回りは、
-            # dev へ知らせる前に再開させる
-            self.release.set()
-            w._log_files["dev"].wait(3.0)
-            seen["resumed"] = self._wait_until(
-                lambda: self._caught_up(w, gate, "dev"), self.OPEN_FOR)
-        self.warning.side_effect = warn
-        w._log_check.blockSignals(False)
-
+        bad_release.set()
         self.assertTrue(self._wait_until(lambda: "resumed" in seen,
-                                         self.OPEN_FOR + 3.0),
-                        "前提: シリアルの遅れの警告が開いて閉じた")
-        self.assertIn("ser", seen["text"])
-        self.assertIn("画面は進めたまま", seen["text"])
-        self.assertTrue(seen["held"], "前提: 警告が開いたときは dev を止めていた")
+                                         self.OPEN_FOR + 5.0),
+                        "前提: 書き込みの失敗の警告が開いて閉じた")
+        self.assertIn("bad", seen["text"])
+        self.assertTrue(seen["line_when_opened"], "前提: 警告が開いたときは行が出ていた")
         self.assertTrue(seen["resumed"],
                         "警告が開いている間は見回りが動かず、dev が、"
                         "記録先が戻っても閉じるまで再開しなかった")
+        self.assertTrue(seen["line_cleared"],
+                        "警告が開いている間に dev が再開したのに、状態の行を消さなかった")
         _pump(300)
-        self.assertEqual(self._hold_notices(), [],
-                         "警告を閉じたあと、もう再開した機器へ『受信を止めて"
-                         "います』と知らせた")
+        self.assertEqual(self._line(w, "dev"), "",
+                         "警告を閉じたあと、もう再開した機器に『受信を止めて"
+                         "います』と出した")
+        self._assert_no_window()
         self.assertEqual(self.warning.call_count, 1)
-        self.assertEqual(self.information.call_count, 0)
-        self.assertEqual(self.execs, [], "案内を exec のモーダルで出した")
         self._assert_recorded_in_full(w, path, "dev")
 
 
