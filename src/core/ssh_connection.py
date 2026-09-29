@@ -794,7 +794,8 @@ class SSHConnection(QObject):
         # 送信ウィンドウに入り切らず、まだ書いていない分（_write_carry）。
         # 端末に渡す物が無くても、書けるようになったらここで書き出す
         self._carry = b""
-        # まだ機器へ伝えていない端末の大きさがあるか（_send_terminal_size）
+        # まだ機器へ伝えていない端末の大きさがあるか（_send_terminal_size）。
+        # ある間は、あとのデータも書き手へ渡さない（_send_backlogged）
         self._size_unsent = False
         # その大きさを送れるようになるのを待つ見張り（_send_terminal_size）
         self._size_watcher: Optional[DrainWatcher] = None
@@ -1452,6 +1453,9 @@ class SSHConnection(QObject):
         送信を待たせる）と、TCP へ書けることを見る。状態を読むだけで書かない。
         書き手（_ChannelWriter）が前の書き込みを終えていない間も True。
         書き手の失敗を知らせていなければ False（送らせて送信エラーを知らせる）。
+        保留した端末の大きさ（_size_unsent）がある間も True。あとから来た
+        打鍵が window-change を追い越さないように、大きさの見張りがそれを
+        書き手へ渡すまで待たせる（渡したあとは、書き手が渡された順に書く）。
         """
         try:
             if channel.closed or not self.is_connected:
@@ -1462,6 +1466,8 @@ class SSHConnection(QObject):
                     return False
                 if writer.busy():
                     return True
+            if self._size_unsent:
+                return True
             transport = channel.get_transport()
             if not transport.clear_to_send.is_set():
                 return True
