@@ -332,11 +332,12 @@ class ElevatedSelfRuleVerdictTest(unittest.TestCase):
         self.assertEqual(msg, "自exe受信許可を要求したが反映を確認できず: "
                          + fw._self_rule_name())
 
-    def test_the_wait_on_the_gui_thread_is_not_longer(self):
-        """確認の間隔と回数（GUI スレッドで待つ上限）を延ばしていないこと
+    def test_the_checks_after_the_launch_do_not_wait_longer(self):
+        """起動した後の確認の間隔と回数（昇格した処理を待つ上限）を延ばしていないこと
 
-        起動の前に既存の許可を見る show は 1 回まで（UAC の前。約 0.05 秒）。
-        起動した後の確認は 31b45ee と同じく 0.25 秒 × 6 回まで。
+        起動した後の確認は 31b45ee と同じく 0.25 秒 × 6 回まで。起動の前に
+        既存の許可を見る show は 1 回まで許す（UAC の前。約 0.05 秒）ので、
+        GUI スレッドを止める時間の合計は 31b45ee より show 1 回分長い。
         """
         timelines = (
             dict(pre_existing=True, delete_at=2, add_at=2, add_ok=False),
