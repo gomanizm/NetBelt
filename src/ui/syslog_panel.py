@@ -250,7 +250,8 @@ class SyslogTableModel(QAbstractTableModel):
         """
         try:
             return len(self.messages) >= int(self.max_messages)
-        except (TypeError, ValueError):
+        except (OverflowError, TypeError, ValueError):
+            # OverflowError は無限大（json の 1e309 / Infinity）
             return False
 
     def add_message(self, msg: SyslogMessage):
@@ -393,7 +394,9 @@ class SyslogPanel(QWidget):
             return SyslogPanel.DEFAULT_MAX_MESSAGES
         try:
             limit = int(value)
-        except (TypeError, ValueError):
+        except (OverflowError, TypeError, ValueError):
+            # json は 1e309 / Infinity を float の inf に読み、int() は
+            # OverflowError を投げる。受けないとパネル（MainWindow）の構築が失敗する
             return SyslogPanel.DEFAULT_MAX_MESSAGES
         return limit if limit >= 1 else SyslogPanel.DEFAULT_MAX_MESSAGES
 
@@ -760,14 +763,10 @@ class SyslogPanel(QWidget):
         （SNMPPanel._refuse_if_recording と同じ判定）
         """
         from core import log_recording
-        device_name = log_recording.device_using(file_path)
-        if device_name is None:
+        message = log_recording.in_use_message(file_path)
+        if message is None:
             return False
-        QMessageBox.warning(
-            self, title,
-            "このファイルは %s のログ記録に使用中です:\n%s\n"
-            "別のファイルを選ぶか、先にそのログ記録を停止してください。"
-            % (device_name, file_path))
+        QMessageBox.warning(self, title, message)
         return True
 
     @staticmethod

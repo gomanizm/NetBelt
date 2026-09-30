@@ -284,9 +284,13 @@ REM Microsoft.PowerShell.Archive が選ばれる（tests/test_updater_psmodulepa
 REM PowerShell 7 のターミナルから NetBelt を起動した利用者も同じ道を通る。
 REM そこで 5.1 の標準の置き場所だけにする。利用者が足した置き場所も使わない
 REM （Archive の別の版が選ばれると、下の角括弧の逃がし方の前提が崩れる）。
-REM 呼び出し元の値は控えておき、[6/6] で NetBelt を起動し直す前に戻す。
-set "CALLER_PSMODULEPATH=!PSModulePath!"
-set "PSModulePath=%SystemRoot%\system32\WindowsPowerShell\v1.0\Modules"
+rem Only the three powershell calls get that path, each inside its own
+rem setlocal, and the caller's value is left alone for the restarted
+rem NetBelt. It used to be saved with a set line and put back before the
+rem restart, but cmd silently skips a line longer than 8191 characters
+rem after expansion: a long PSModulePath was dropped from the restarted
+rem NetBelt. setlocal and endlocal copy the environment without a
+rem command line, and the powershell exit code survives endlocal.
 
 REM ZIPファイルを展開
 echo [4/6] ZIPファイルを展開中...
@@ -333,7 +337,10 @@ REM 展開まで進む形は変えていない。
 set "PS_ZIP=!ZIP_FILE!"
 set "PS_DEST=!TEMP_DIR!"
 set "PS_SHA=!ZIP_SHA!"
+setlocal
+set "PSModulePath=%SystemRoot%\system32\WindowsPowerShell\v1.0\Modules"
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$rc = 1; try { $fs = [IO.File]::Open($env:PS_ZIP, 'Open', 'Read', 'Read') } catch { Write-Host 'エラー:' $_.Exception.Message; exit 1 }; try { if ($env:PS_SHA) { if ((Get-FileHash -InputStream $fs -Algorithm SHA256 -ErrorAction Stop).Hash -ne $env:PS_SHA) { exit 2 } }; $env:PS_DEST = $env:PS_DEST -replace '([\[\]`])', '`$1'; Expand-Archive -LiteralPath $env:PS_ZIP -DestinationPath $env:PS_DEST -Force; $rc = 0 } catch { Write-Host 'エラー:' $_.Exception.Message } finally { $fs.Close() }; exit $rc"
+endlocal
 if errorlevel 2 goto :zip_sha_mismatch
 if errorlevel 1 goto :zip_expand_failed
 goto :zip_expanded
@@ -420,6 +427,27 @@ REM インストール先へ直接上書きし、途中で止まると起動で�
 REM だけが残った（実測）。そのうえ「含まれていません」と事実と逆の
 REM 報告をしていた。走査は短いので少し待ってやり直し、それでも
 REM 移せなければ、インストール先へ何も書かずに止める。
+rem xcopy silently skips a source of 260 characters or more and still
+rem returns 0, so a long TEMP left the new bundled files next to the old
+rem exe, blamed on the app still running. Stop before anything in the
+rem install folder is written. The staged name is longer than any file
+rem in the release, so its two paths are the ones to check.
+set "PATH_TOO_LONG="
+set "NB_LEN=!SOURCE_DIR!\!STAGED_NAME!"
+if not "!NB_LEN:~259,1!"=="" set "PATH_TOO_LONG=!NB_LEN!"
+set "NB_LEN=!STAGED_PATH!"
+if not "!NB_LEN:~259,1!"=="" set "PATH_TOO_LONG=!NB_LEN!"
+if defined PATH_TOO_LONG (
+    echo エラー: パスが長すぎるため、更新を当てられません
+    echo   場所: !PATH_TOO_LONG!
+    echo   260 文字以上のパスは、コピーで黙って飛ばされます。
+    echo   インストール先のファイルは何も変えていません。TEMP（または
+    echo   インストール先）を短い場所へ移すか、新しい ZIP を手で展開してください。
+    rd /s /q "!TEMP_DIR!" 2>nul
+    call :drop_apply_copy
+    pause
+    exit /b 1
+)
 set "REN_TRY=0"
 :stage_exe
 set /a REN_TRY+=1
@@ -524,6 +552,13 @@ if errorlevel 1 goto :lock_busy
 set "PS_LOCK=!LOCK_DIR!"
 call :lock_is_stale
 if errorlevel 1 goto :lock_busy
+rem A run that stalled for over ten minutes while holding the take-over
+rem marker may have lost it to another run meanwhile. Only the current
+rem holder may grab the install marker: otherwise this run went on to
+rem reclaim and write its own marker, which the real holder then grabbed
+rem as stale, and two updates wrote the install folder at once.
+call :takeover_is_mine
+if errorlevel 1 goto :lock_busy
 ren "!LOCK_DIR!" "!LOCK_OLD_NAME!" 2>nul
 if not exist "!LOCK_OLD!" goto :lock_busy
 set "PS_LOCK=!LOCK_OLD!"
@@ -582,7 +617,10 @@ REM 誰の目印かを中へ書く。:release_lock は中身が自分の識別�
 REM 外す。識別子は親が md で確保した作業フォルダの名前（STAMP）。
 REM 括弧で囲むのは、STAMP が数字で終わると echo の直前の 1 桁が
 REM リダイレクト先のハンドル番号として読まれてしまうため。
-(echo !STAMP!)>"!LOCK_DIR!\holder.txt" 2>nul
+rem The outer parentheses matter: if the folder was reclaimed while this
+rem run was stalled right after md, the failed output redirection is
+rem reported before the trailing nul redirect on the same line applies.
+((echo !STAMP!)>"!LOCK_DIR!\holder.txt") 2>nul
 if exist "!LOCK_DIR!\holder.txt" set "LOCK_STAMPED=1"
 
 REM 前の実行が置き去りにした一時名の exe を片付ける。差し替えが 5 回とも
@@ -665,9 +703,6 @@ if not exist "!APP_PATH!" (
     pause
     exit /b 1
 )
-REM PSModulePath を呼び出し元の値へ戻す（[4/6] の手前の注を参照）。
-REM 起動し直す NetBelt の環境は、更新の前と変えない。
-set "PSModulePath=!CALLER_PSMODULEPATH!"
 cmd /d /c exit 0
 start "" "!APP_PATH!"
 if errorlevel 1 set "LAUNCH_FAILED=1"
@@ -776,7 +811,9 @@ REM 別の更新の目印にも、利用者が置いたものにも当たらな�
 :release_lock_sweep
 set /a LOCK_PASS+=1
 set "LOCK_OWNER="
-set /p LOCK_OWNER=<"!LOCK_DIR!\holder.txt" 2>nul
+rem In parentheses: on the second pass the folder is usually gone, and
+rem a failed input redirection is reported before the trailing nul redirect.
+(set /p LOCK_OWNER=<"!LOCK_DIR!\holder.txt") 2>nul
 if "!LOCK_OWNER!"=="!STAMP!" rd /s /q "!LOCK_DIR!" 2>nul
 for /d %%o in ("!APP_DIR!NetBelt-update-lock.*.old") do call :release_lock_old "%%~fo"
 if !LOCK_PASS! lss 2 goto :release_lock_sweep
@@ -784,7 +821,9 @@ exit /b 0
 
 :release_lock_old
 set "LOCK_OWNER="
-set /p LOCK_OWNER=<"%~1\holder.txt" 2>nul
+rem In parentheses, as in :release_lock_sweep: a .old left without a
+rem holder.txt would otherwise print a missing-file line on every pass.
+(set /p LOCK_OWNER=<"%~1\holder.txt") 2>nul
 if "!LOCK_OWNER!"=="!STAMP!" rd /s /q "%~1" 2>nul
 exit /b 0
 
@@ -839,7 +878,8 @@ REM 誰の目印かを中へ書く（:lock_claimed と同じ形。理由は :rel
 REM holder.txt 入りのフォルダは :lock_is_foreign が更新の目印と見るので、
 REM 置き土産の回収の判定は変わらない。
 set "TAKEOVER_STAMPED="
-(echo !STAMP!)>"!TAKEOVER_DIR!\holder.txt" 2>nul
+rem Outer parentheses as in :lock_claimed.
+((echo !STAMP!)>"!TAKEOVER_DIR!\holder.txt") 2>nul
 if exist "!TAKEOVER_DIR!\holder.txt" set "TAKEOVER_STAMPED=1"
 exit /b 0
 
@@ -862,9 +902,20 @@ rd /s /q "!TAKEOVER_DIR!" 2>nul
 exit /b 0
 :release_takeover_owned
 set "LOCK_OWNER="
-set /p LOCK_OWNER=<"!TAKEOVER_DIR!\holder.txt" 2>nul
+rem In parentheses, as in :release_lock_sweep: the marker may already have
+rem been reclaimed by another run, and the missing path would be printed.
+(set /p LOCK_OWNER=<"!TAKEOVER_DIR!\holder.txt") 2>nul
 if "!LOCK_OWNER!"=="!STAMP!" rd /s /q "!TAKEOVER_DIR!" 2>nul
 exit /b 0
+
+rem errorlevel 0 while the take-over marker is still this run's. Without
+rem a holder.txt there is nothing to check, as in :release_takeover.
+:takeover_is_mine
+if not defined TAKEOVER_STAMPED exit /b 0
+set "LOCK_OWNER="
+(set /p LOCK_OWNER=<"!TAKEOVER_DIR!\holder.txt") 2>nul
+if "!LOCK_OWNER!"=="!STAMP!" exit /b 0
+exit /b 1
 
 REM ================================================================
 REM 目印が古い（＝異常終了の置き土産）かを見る（call で呼ぶ）
@@ -873,6 +924,8 @@ REM PS_LOCK に見るフォルダを入れて呼ぶ。古ければ errorlevel 0�
 REM なければ 1。フォルダの更新日時は holder.txt を書いた時刻＝確保した
 REM 時刻になる。回収では 2 回呼ぶ（つかむ前と、つかんだ後）。
 :lock_is_stale
+setlocal
+set "PSModulePath=%SystemRoot%\system32\WindowsPowerShell\v1.0\Modules"
 powershell -NoProfile -ExecutionPolicy Bypass -Command "try { $d = Get-Item -LiteralPath $env:PS_LOCK -Force -ErrorAction Stop; if ($d.LastWriteTime -lt (Get-Date).AddMinutes(-10)) { exit 0 } } catch { }; exit 1"
 exit /b !errorlevel!
 
@@ -884,5 +937,7 @@ REM errorlevel 0、見えれば 1。目印は md の直後なら空、holder.txt
 REM 書いた後ならそれが入っている。ファイル、または holder.txt の無い
 REM 中身つきフォルダは、利用者が置いたものとして扱う。
 :lock_is_foreign
+setlocal
+set "PSModulePath=%SystemRoot%\system32\WindowsPowerShell\v1.0\Modules"
 powershell -NoProfile -ExecutionPolicy Bypass -Command "try { $i = Get-Item -LiteralPath $env:PS_LOCK -Force -ErrorAction Stop; if (-not $i.PSIsContainer) { exit 0 }; if (Test-Path -LiteralPath (Join-Path $i.FullName 'holder.txt')) { exit 1 }; if (@(Get-ChildItem -LiteralPath $i.FullName -Force -ErrorAction SilentlyContinue).Count -gt 0) { exit 0 } } catch { }; exit 1"
 exit /b !errorlevel!

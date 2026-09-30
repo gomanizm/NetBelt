@@ -270,9 +270,30 @@ def _self_rule_name():
     return "{0} - app inbound (self)".format(_RULE_PREFIX)
 
 
+# 自exe受信許可の成功の文言に添える但し書き。ブロック規則の delete は対象が
+# 無くても rc!=0 なので結果で判断できず、昇格の経路も許可規則の存在しか
+# 確かめていない。GPO で配られたブロック規則はローカルの delete では消えず、
+# Windows はブロックを許可より優先するので、「保証」と言い切ると受信が
+# 通らないのに完了と読める（実測）
+_BLOCK_NOT_CHECKED = "既存のブロック規則の除去は確認していません"
+
+# 管理者の経路で delete が既存の規則を消したあと、add が失敗したときに添える
+# 一言。delete は自exe の受信規則を許可も含めて消すので、そのまま「追加に
+# 失敗」とだけ返すと、初回のプロンプトが作った許可なども消えたことが
+# 画面から分からない（実測）。昇格の経路でも、起動前にあった許可や見えて
+# いた許可が消えたまま戻らないときに添える
+_SELF_RULES_DELETED = "自exe向けの既存の受信規則は削除済みです。手動で受信許可を追加してください"
+
+
 def ensure_self_program_allow():
     """自 exe 宛の受信ブロックを削除し受信許可を追加する（ブロックは許可を上書きするため）。
-    Windows かつ frozen のときのみ実行。冪等。未昇格なら UAC 昇格で netsh 実行。"""
+    Windows かつ frozen のときのみ実行。冪等。未昇格なら UAC 昇格で netsh 実行。
+    ブロックの削除は試みるだけで、消えたかは確かめない（_BLOCK_NOT_CHECKED）。
+
+    netsh の delete rule は action を引数に取らない（付けると『'action' is not a
+    valid argument』で何もしない。実測）。name=all と program= で自 exe の受信
+    規則を許可も含めてすべて消し、その後の add で許可（全プロファイル）を
+    作り直す。add より後に消すと、足した許可まで消える。"""
     if not is_windows():
         return True, "非Windowsのためスキップ"
     prog = _self_program()
@@ -280,19 +301,24 @@ def ensure_self_program_allow():
         return True, "開発実行のためスキップ（frozen時のみ有効）"
     name = _self_rule_name()
     # netsh の program 指定ルールを、既存の add/delete と同じ昇格経路で処理する。
-    # 未昇格時は ShellExecuteW で delete(block)+add(allow) をまとめて昇格実行する。
+    # 未昇格時は ShellExecuteW で delete+add(allow) をまとめて昇格実行する。
     try:
         if is_admin():
-            # delete は該当ブロックが無ければ rc!=0 なので結果は見ない
-            _netsh(["advfirewall", "firewall", "delete", "rule", "name=all", "dir=in",
-                    "action=block", 'program=' + prog])
+            # delete は該当する規則が無ければ rc!=0 なので成否の判定には使わない。
+            # rc=0（一致する規則を消した）は、add の失敗を知らせる文言にだけ使う
+            deleted = _netsh(["advfirewall", "firewall", "delete", "rule", "name=all",
+                              "dir=in", 'program=' + prog]).returncode == 0
             r = _netsh(["advfirewall", "firewall", "add", "rule", "name=" + name, "dir=in",
                         "action=allow", 'program=' + prog, "profile=any", "enable=yes"])
             if r.returncode != 0:
+                if deleted:
+                    return False, "自exe受信許可の追加に失敗（%s）: %s" % (
+                        _SELF_RULES_DELETED, name)
                 return False, "自exe受信許可の追加に失敗: " + name
-            return True, "自exe受信許可を保証: " + name
-        # 未昇格: cmd.exe /c 経由で delete(block)+add(allow) を昇格実行（& をシェルに解釈させる）。
+            return True, "自exe受信許可を追加（%s）: %s" % (_BLOCK_NOT_CHECKED, name)
+        # 未昇格: cmd.exe /c 経由で delete+add(allow) を昇格実行（& をシェルに解釈させる）。
         # ShellExecuteW(lpFile="netsh") は netsh を直接起動するため & がシェル区切りにならず add が実行されない。
+        # && にしない（消す規則が無いと delete は rc!=0 で、add が走らなくなる）。
         #
         # cmd.exe は二重引用符の中でも %VAR% を展開するので、置き場所の名前に
         # 定義済みの環境変数名が %..% の形で含まれていると、delete も add も
@@ -303,21 +329,64 @@ def ensure_self_program_allow():
         if "%" in prog:
             return False, ("実行ファイルのパスに % が含まれるため自exe受信許可を"
                            "自動設定できません（手動で追加してください）: " + prog)
+        # 起動の前に、自exe 向けのこの名前の許可が既にあるかを見ておく。netsh は
+        # 1 回約 0.05 秒（実測）なので、昇格した delete → add は 1 回目の確認
+        # より前に終わるのが普通で、既存の許可が消えて add が失敗しても、下の
+        # 確認では一度も見えない。名前の違う自exe 向けの規則（Windows の初回の
+        # プロンプトが作る規則など）は見ない（受信規則の一覧は約 0.3 秒かかる）
+        existed = rule_exists(name, program=prog)
         import ctypes
-        cmd = ('/c netsh advfirewall firewall delete rule name=all dir=in action=block '
+        cmd = ('/c netsh advfirewall firewall delete rule name=all dir=in '
                'program="{0}" & netsh advfirewall firewall add rule name="{1}" dir=in '
                'action=allow program="{0}" profile=any enable=yes').format(prog, name)
         rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", "cmd.exe", cmd, None, 0)
         if int(rc) <= 32:
             return False, "UACが承認されず未設定: " + name
-        # 昇格プロセスは非同期。allow ルールの反映を短時間リトライ確認する。
+        # ShellExecuteW は起動したプロセスのハンドルを返さないので、昇格した
+        # cmd.exe の終わりも終了コードも分からない。ShellExecuteExW と
+        # SEE_MASK_NOCLOSEPROCESS なら待てるが採らなかった: 441ea02 からある
+        # tests/test_firewall_rule_state.py と tests/test_firewall_self_program_match.py
+        # は本物の shell32 の ShellExecuteW だけを差し替えているので、替えると
+        # テストが本物の UAC と netsh を起こす（ShellExecuteW しか持たない偽の
+        # ctypes を使う tests/test_firewall_self_program_path.py は失敗する）。
+        # 代わりに allow ルールの反映を短時間リトライ確認する。見えた許可が、
+        # 昇格した add の結果か、delete より前からあった許可かは見分けられない。
+        # 1 回目に見えた時点で完了とすると、そのあと delete が既存の許可を消し、
+        # add が失敗したときに「完了」のあとで許可が消える（模擬で再現）。
+        # 見えなかった確認の後で見えたときも途中で完了としない。見えなかった
+        # のが show の一時的な失敗（rc!=0）だと、次に見えたのは delete より
+        # 前の既存の許可でありうる（模擬で再現）。いつも最後の確認で決める。
+        # 回数と間隔（待つ上限）は変えないが、どの順序でも上限まで待つ。
+        # 残る限界: 昇格した delete が確認の期間より後に走ると、既存の許可を
+        # 見て完了とする（起動前の確認で無かったことを根拠に途中で完了とすると、
+        # その確認の一時的な失敗で、delete より前に完了と返す経路が増える）
         import time
+        seen = []
         for _ in range(6):
             time.sleep(0.25)
             # 名前だけで確かめると、旧配置先向けの同名ルールが残っている
             # 環境で、新しい exe への add が失敗していても「完了」と出る
-            if rule_exists(name, program=prog):
-                return True, "自exe受信許可を追加(昇格): " + name
+            seen.append(bool(rule_exists(name, program=prog)))
+        if seen[-1]:
+            return True, "自exe受信許可を追加（管理者昇格。%s）: %s" % (
+                _BLOCK_NOT_CHECKED, name)
+        # 起動前にあった許可や見えていた許可が、消えたまま戻らない（delete は
+        # 効き、add は見えない）ときに一言を添える。ただし起動前に無く、
+        # 最後の 1 回だけ見えないときは添えない。見えていたのは add が作った
+        # 許可のはずで（add の後に delete は走らない）、最後の 1 回だけ見えない
+        # のは show の一時的な失敗と見分けられない。起動前にあったときは
+        # 添える（5 回目と 6 回目の確認の間に delete が走り add が失敗した
+        # 場合と見分けられない）
+        # 判定の限界: 一言は起動前の確認と 6 回の確認の真偽だけで決めるので、
+        # 観測が同じになる順序どうしは、許可が本当に残っているかで分けられない。
+        # 初めて足して最後の 2 回の show が一時的に失敗すると、許可は残って
+        # いるのに添える。起動前の確認が一時的に失敗し、既存の許可が消えて
+        # add が失敗すると、消えたのが 1 回目の確認より前（普通の順序）でも、
+        # 5 回目と 6 回目の確認の間でも添えない（それぞれと同じ観測になる
+        # 順序は tests/test_firewall_self_rule_elevated_verdict.py の docstring）
+        if existed or (any(seen) and not seen[-2]):
+            return False, "自exe受信許可を要求したが反映を確認できず（%s）: %s" % (
+                _SELF_RULES_DELETED, name)
         # 反映を確認できないものを成功にすると「通らないのに完了」と出る
         return False, "自exe受信許可を要求したが反映を確認できず: " + name
     except Exception as e:
@@ -330,8 +399,16 @@ def combine_results(results, success_message=None):
     失敗した操作があれば、その msg を返す（複数なら " / " で連結）。成功した
     操作の msg を返すと、失敗の理由が画面に出ず print にしか残らない。
     すべて成功したときは success_message（省略時は最初の操作の msg）を返す。
+    そこに但し書き（_BLOCK_NOT_CHECKED）が無く、ほかの操作の msg にあれば、
+    その msg を " / " で添える。自exe の許可はポートの許可の後ろに並ぶので、
+    最初の msg だけだと但し書きが print にしか残らず、パネルには但し書きの
+    無い「完了」が出ていた（実測: SFTP・SNMP）
     """
     failed = [msg for ok, msg in results if not ok]
     if failed:
         return False, " / ".join(failed)
-    return True, (results[0][1] if success_message is None else success_message)
+    shown = results[0][1] if success_message is None else success_message
+    if _BLOCK_NOT_CHECKED not in shown:
+        shown = " / ".join([shown] + [msg for _ok, msg in results
+                                      if _BLOCK_NOT_CHECKED in msg])
+    return True, shown

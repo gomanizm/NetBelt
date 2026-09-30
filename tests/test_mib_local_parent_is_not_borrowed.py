@@ -40,10 +40,14 @@ sys.path.insert(0, "src")
 
 NL = "\r\n"
 
-# A-MIB の shared は複数添字なので抽出から落ちる。B-MIB も shared を持つ
+# A-MIB の shared は右辺の先頭（aMissing）の取り込み元が無く、OID が
+# 本当に決まらない。B-MIB も shared を持つ。1.3.1 までの例は複数添字の
+# { aRoot 0 1 } だったが、1.3.2 から右辺を全部読むので A-MIB 自身の
+# 1.3.6.1.4.1.1111.0.1 に決まる（tests/test_mib_parent_of_the_same_name.py）
 A_MIB = ("A-MIB DEFINITIONS ::= BEGIN" + NL
+         + "IMPORTS aMissing FROM A-SMI;" + NL
          + "aRoot OBJECT IDENTIFIER ::= { enterprises 1111 }" + NL
-         + "shared OBJECT IDENTIFIER ::= { aRoot 0 1 }" + NL
+         + "shared OBJECT IDENTIFIER ::= { aMissing 1 }" + NL
          + "aAlarm OBJECT IDENTIFIER ::= { shared 1 }" + NL
          + "END" + NL)
 

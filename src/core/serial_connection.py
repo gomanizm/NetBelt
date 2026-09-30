@@ -10,6 +10,8 @@ import queue
 import threading
 import time
 
+from .unsendable import unsendable_notice
+
 
 class _WriterHandoff:
     """ポートを閉じる役を、後始末と送信スレッドのどちらか一方に決める印。
@@ -334,8 +336,17 @@ class SerialConnection(QObject):
         # 画面が止まる（9600 baud で 512 文字 ≈ 0.5 秒、300 baud ≈ 17 秒）。
         # 送信スレッドへ積んで、ここではすぐ戻る。順序はキューが保つ
         # コマンドを送信（改行は含めない - ターミナル側で処理済み）
+        try:
+            data = command.encode('utf-8')
+        except UnicodeEncodeError as e:
+            # 送れない文字（孤立したサロゲート）。例外をスロットの外へ流すと、
+            # この区切りだけが黙って消え、前後の行が繋がって実行される。
+            # 何も送らずに知らせる（貼り付けは端末の入口で丸ごと断っている）
+            self.output_received.emit(
+                "\r\n%s\r\n" % unsendable_notice(command, e.start))
+            return
         self._ensure_write_thread()
-        self._send_queue.put(command.encode('utf-8'))
+        self._send_queue.put(data)
 
     def has_pending_sends(self) -> bool:
         """送信スレッドへ渡して、まだ書き終えていない送信があるか

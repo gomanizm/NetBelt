@@ -1,0 +1,54 @@
+name: Tests
+
+# リリースの門番（build-release.yml の Run tests）と同じ環境で、PR と main への
+# push のたびにテストを走らせる。手元（日本語の Windows・cp932・Python 3.12・
+# pwsh なし・一般ユーザー）とランナー（Python 3.11・pwsh の中・管理者・TEMP が
+# 8.3 短縮名）は違い、1.3.1 はタグを打ってから初めて 12 件が落ちた。
+# リリースとずれないことは tests/test_ci_tests_workflow.py が確かめる。
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# 1 回 25 分ほどかかる。PR へ続けて push したら古い実行は止める
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    runs-on: windows-latest
+    # 既定の 360 分だと、モーダルなどで固まったときに 6 時間止まる
+    timeout-minutes: 60
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v7
+
+    - name: Set up Python
+      uses: actions/setup-python@v7
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Install test tools
+      run: |
+        pip install pytest==9.1.1
+
+    # shell は既定（pwsh）のまま。リリースと同じく pwsh の中で走らせないと、
+    # PSModulePath を継ぐ updater.bat の失敗のような差が見えない。
+    # GITHUB_TOKEN は渡さない（製品は環境変数の GITHUB_TOKEN を読んで送る）。
+    # -rs は見送りの理由を出す（手元とランナーで見送られるテストが違う）。
+    - name: Run tests
+      env:
+        QT_QPA_PLATFORM: offscreen
+      run: |
+        python -m pytest -q -rs

@@ -249,7 +249,14 @@ class SFTPServerPanel(QWidget):
     
     def _on_stop_server(self):
         """サーバーを停止"""
-        self.sftp_server.stop()
+        if not self.sftp_server.stop():
+            # 保存先で止まったままの転送やファイル操作（削除・改名・SETSTAT・
+            # mkdir・rmdir）が残った。終わるまで次の起動を断るので、押す前に
+            # 分かるよう停止の時点でログへ出す（モーダルは起動の断りと 2 重に
+            # なるので出さない）
+            self._add_log("警告: 書き込み中だった転送（または削除・名前の変更などの"
+                          "ファイル操作）が終わっていません。保存先を掴んだままの"
+                          "可能性があり、終わるまで起動できません")
         
         # UI更新
         self.start_btn.setVisible(True)

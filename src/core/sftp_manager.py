@@ -2,6 +2,7 @@
 import os
 import posixpath
 import threading
+import time
 import uuid
 from typing import List, Dict, Optional, Callable
 from PyQt6.QtCore import QObject, pyqtSignal
@@ -77,6 +78,15 @@ class SFTPManager(QObject):
         # （list_directory は転送スレッドからも呼ばれるのでロックで守る）
         self._listing_seq = 0
         self._listing_seq_lock = threading.Lock()
+        # 行き先の控え: 自動更新ではない最後の一覧の要求の場所と、その番号と、
+        # その要求が機器に頼み終えた印（_pick_refresh_path が使う。
+        # _listing_seq_lock で守る）
+        self._listing_path = None
+        # 後始末で待つ期限（time.monotonic() の値）。最初の quiesce が決め、
+        # そのあとの quiesce / disconnect は残りだけ待つ（_teardown_wait）
+        self._teardown_deadline: Optional[float] = None
+        self._listing_path_seq = 0
+        self._listing_path_fetched = None
         self._listing_done.connect(self._on_listing_done)
     
     # GUI スレッドから直接呼ぶ操作が、転送の終わりを待つ最大時間。
@@ -207,6 +217,46 @@ class SFTPManager(QObject):
         self.error_occurred.emit(f"SFTP接続エラー: {reason}")
         return False
 
+    def _open_sftp_within_deadline(self, ssh_client):
+        """open_sftp() を CHANNEL_TIMEOUT_SECONDS まで待つ（過ぎたら TimeoutError）
+
+        paramiko の open_sftp() は subsystem 要求の返事も VERSION も期限なしで
+        待つ（settimeout は開けたあとにしか掛けられない）。SFTP だけ黙る機器
+        では connect が戻らず、知らせも出ないまま SFTP 非対応の機器と見分けが
+        つかなくなる。内側のスレッドで呼び、期限で待つのをやめる（利用者の
+        決定: 案 W）。期限のあとで開けたクライアントはそのスレッドが閉じる。
+        内側のスレッドと機器側のチャンネルは、応答が来るか SSH が切れるまで残る。
+        """
+        box = {}
+        box_lock = threading.Lock()
+
+        def opener():
+            try:
+                client = ssh_client.open_sftp()
+            except Exception as e:
+                with box_lock:
+                    box["error"] = e
+                return
+            with box_lock:
+                if not box.get("abandoned"):
+                    box["client"] = client
+                    return
+            try:
+                client.close()   # 待つのをやめたあとに開けた。誰も使わない
+            except Exception:
+                pass
+
+        worker = threading.Thread(target=opener, daemon=True)
+        worker.start()
+        worker.join(self.CHANNEL_TIMEOUT_SECONDS)
+        with box_lock:
+            if "client" in box:
+                return box["client"]
+            if "error" in box:
+                raise box["error"]
+            box["abandoned"] = True
+        raise TimeoutError(f"機器が{self.CHANNEL_TIMEOUT_SECONDS:g}秒応答しません")
+
     def connect(self, ssh_client: paramiko.SSHClient) -> bool:
         """
         SFTP接続を開始（既存のSSHクライアントを使用）
@@ -222,9 +272,9 @@ class SFTPManager(QObject):
                 self.error_occurred.emit("SSHクライアントが無効です")
                 return False
             
-            # SSHクライアントからSFTPセッションを取得
+            # SSHクライアントからSFTPセッションを取得（期限つき）
             self.ssh_client = ssh_client
-            self.sftp_client = ssh_client.open_sftp()
+            self.sftp_client = self._open_sftp_within_deadline(ssh_client)
             # 応答待ちに期限を入れる。ここより後の normalize を含め、
             # このチャンネル越しの全操作が期限切れで socket.timeout を
             # 投げるようになり、各操作の except がエラー通知へ変える
@@ -261,6 +311,48 @@ class SFTPManager(QObject):
             self.error_occurred.emit(f"SFTP接続エラー: {str(e)}")
             return False
     
+    def _teardown_wait(self) -> float:
+        """後始末で、進行中の操作をあと何秒待ってよいか
+
+        quiesce の前（SFTP の失敗で畳む・遅れて開いたセッションを閉じる）は
+        これまでどおり _DISCONNECT_WAIT_SECONDS。quiesce のあとは、その期限
+        までの残り（過ぎていれば 0 で、待たずに取れるかだけ見る）。
+        """
+        if self._teardown_deadline is None:
+            return self._DISCONNECT_WAIT_SECONDS
+        return max(0.0, self._teardown_deadline - time.monotonic())
+
+    def quiesce(self, deadline: Optional[float] = None) -> bool:
+        """新しい操作を止め、進行中の操作が手を離すのを上限つきで待つ
+
+        機器へは何も書かない。後始末で SSH の接続を閉じる前に呼ぶ
+        （MainWindow._let_sftp_finish 参照）。クライアントはまだ閉じない。
+
+        待つのは、最初の quiesce で決めた期限まで。そのあとの quiesce と
+        disconnect は残りだけ待つ。転送スレッドが手元の I/O で止まっていると
+        SSH を閉じてもロックを離さないので、呼ぶたびに上限まで待つと、
+        タブを閉じるだけで GUI が上限の 3 倍止まっていた（実測 9 秒）。
+
+        Args:
+            deadline: 待つ期限（time.monotonic() の値）。省略すると、いまから
+                _DISCONNECT_WAIT_SECONDS 後。複数台をまとめて閉じるとき
+                （MainWindow.closeEvent）は同じ期限を渡し、待ちを台数ぶん
+                積み重ねない。
+
+        Returns:
+            bool: 進行中の操作が期限までに終わった（または無かった）なら True
+        """
+        # 新しい操作をここで止める（各メソッドが先頭で見ている）
+        self.is_connected = False
+        if self._teardown_deadline is None:
+            if deadline is None:
+                deadline = time.monotonic() + self._DISCONNECT_WAIT_SECONDS
+            self._teardown_deadline = deadline
+        if not self._sftp_lock.acquire(timeout=self._teardown_wait()):
+            return False
+        self._sftp_lock.release()
+        return True
+
     def disconnect(self):
         """SFTP接続を切断
 
@@ -274,8 +366,9 @@ class SFTPManager(QObject):
 
         # 空くのを無期限には待たない。タブを閉じるときやアプリ終了時に
         # GUI スレッドから呼ばれるので、応答しない機器への転送中だと
-        # 待った分だけアプリが固まる（終了できなくなる）。
-        acquired = self._sftp_lock.acquire(timeout=self._DISCONNECT_WAIT_SECONDS)
+        # 待った分だけアプリが固まる（終了できなくなる）。quiesce のあとは
+        # その期限の残りだけ待つ（_teardown_wait）
+        acquired = self._sftp_lock.acquire(timeout=self._teardown_wait())
         try:
             client, self.sftp_client = self.sftp_client, None
             self.ssh_client = None
@@ -313,12 +406,14 @@ class SFTPManager(QObject):
         self.current_path = path
         self.file_list_ready.emit(file_list)
 
-    def list_directory(self, path: str = None):
+    def list_directory(self, path: str = None, *, refresh: bool = False):
         """
         ディレクトリ内のファイル一覧を取得（バックグラウンド）
         
         Args:
             path: ディレクトリパス（Noneの場合は現在のパス）
+            refresh: 変更のあとの自動更新（_refresh_listing）。path は使わず、
+                通信のロックを取った時点で場所を選ぶ（_pick_refresh_path）
         """
         if not self.is_connected or not self.sftp_client:
             self.error_occurred.emit("SFTP接続がありません")
@@ -329,15 +424,30 @@ class SFTPManager(QObject):
 
         # 発行の順番を控える。これより新しい要求が出ていたら、この一覧は
         # 届いても捨てられる
+        fetched = None
         with self._listing_seq_lock:
             self._listing_seq += 1
             seq = self._listing_seq
+            if not refresh:
+                # 自動更新は行き先を変えないので控えを置かない。機器に
+                # 頼み終えたら fetched を立てる（自動更新がそれを待つ）
+                fetched = threading.Event()
+                self._listing_path = path
+                self._listing_path_seq = seq
+                self._listing_path_fetched = fetched
 
         def list_thread():
             import stat as stat_mod
+            nonlocal path
+            # 失敗したときに外す控えの番号（自動更新は追った控えの番号）
+            destination_seq = None if refresh else seq
             try:
-                # ディレクトリ一覧を取得（転送中なら空くまで待つ）
-                with self._sftp_lock:
+                # ディレクトリ一覧を取得（転送中なら空くまで待つ）。失敗した
+                # 行き先の控えは、ロックを放す前に外す（下の except）
+                self._sftp_lock.acquire()
+                try:
+                    if refresh:
+                        path, destination_seq = self._pick_refresh_path()
                     # 待っているあいだに切断されたかもしれない。取得前の
                     # 確認だけでは足りない（起きたら None を触ることになる）。
                     # 黙って戻ると、一覧が変わらない理由が利用者に届かない。
@@ -379,6 +489,16 @@ class SFTPManager(QObject):
                                 raise
                             continue
                         link_modes[item.filename] = getattr(target, "st_mode", None)
+                except Exception:
+                    # 放してから外すと、ロックを待っていた自動更新が、失敗した
+                    # 移動先を控えから選んでしまう
+                    self._forget_failed_destination(destination_seq)
+                    raise
+                finally:
+                    # 頼み終えた印は、控えを外したあと・ロックを放す前に立てる
+                    if fetched is not None:
+                        fetched.set()
+                    self._sftp_lock.release()
                 
                 # ファイル情報をリストに変換
                 file_list = []
@@ -414,10 +534,63 @@ class SFTPManager(QObject):
                 self._listing_done.emit(seq, path, file_list)
                 
             except Exception as e:
+                # ロックの外（変換など）で失敗したときも同じく外す
+                self._forget_failed_destination(destination_seq)
                 self._fail("ディレクトリ一覧取得エラー", e)
         
         # バックグラウンドスレッドで実行
         threading.Thread(target=list_thread, daemon=True).start()
+    
+    def _forget_failed_destination(self, seq: Optional[int]):
+        """失敗した一覧の控えの番号が、まだ行き先の控えのものなら控えを外す
+
+        失敗した移動先を、自動更新が頼み続けないように（今の場所へ戻る）。
+        控えを置いた要求の失敗でも、控えを追った自動更新の失敗でも外す。
+        あとに自動更新が続いていても外す。あとの移動が控えを置き換えて
+        いれば、その移動の控えは残す。seq が None（控えを追わなかった
+        自動更新）なら何もしない。
+        """
+        if seq is None:
+            return
+        with self._listing_seq_lock:
+            if seq == self._listing_path_seq:
+                self._listing_path = None
+
+    def _pick_refresh_path(self):
+        """自動更新が頼む場所を選ぶ。通信のロックを持って呼び、持ったまま戻る
+
+        戻り値は (場所, 追った控えの番号)。今の場所なら番号は None。
+        行き先の控えがあればその場所、無ければ（移動が失敗した）今の場所。
+        控えを置いた要求の一覧がまだ機器に頼まれていなければ、ロックを
+        一度放してそれが済むのを待ち、選び直す。先に同じ場所を頼むと、
+        読めない移動先では同じ失敗を 2 回知らせ、今の場所も取り直さない。
+        待つ相手は自動更新ではない（ロックしか待たない）ので待ち合わない。
+        番号を取ったあとに選ぶので、選んだあとの移動はこれより新しい番号を
+        持ち、この一覧は届いても捨てられる（移動を取り消さない）。
+        """
+        while True:
+            with self._listing_seq_lock:
+                path = self._listing_path
+                fetched = self._listing_path_fetched
+                followed = self._listing_path_seq
+                if path is None:
+                    return self.current_path, None
+            if fetched.is_set():
+                return path, followed
+            self._sftp_lock.release()
+            fetched.wait()
+            self._sftp_lock.acquire()
+
+    def _refresh_listing(self):
+        """変更のあとの自動更新。行き先の控えの場所の一覧を取り直す
+
+        current_path は一覧が GUI に届いたときにしか変わらない。移動の一覧が
+        届く前に current_path を頼み直すと、一覧は最後に頼んだ分だけを採る
+        ので、古い場所の一覧が移動先を追い越して移動を黙って取り消す。
+        控えが無ければ（移動が失敗した）今の場所を取り直す。場所は通信の
+        ロックを取った時点で選ぶ（_pick_refresh_path）。
+        """
+        self.list_directory(refresh=True)
     
     # _remote_probe が返す、送る直前のリモートの状態
     _REMOTE_MISSING = "missing"
@@ -843,6 +1016,18 @@ class SFTPManager(QObject):
                         timed_out_note[0] = "（%s）" % unknown_outcome_note()
                         return
                     except (AttributeError, IOError) as first_error:
+                        if not overwrite and self._channel_closed():
+                            # 機器が SFTP のチャンネルを閉じていた。閉じた
+                            # チャンネルの OSError('Socket is closed') は送る前に
+                            # 上がるので、改名の要求は届いていない。「既にある」と
+                            # 推して上書きへ誘わず、閉じたことを伝えて畳む
+                            keep_tmp[0] = True
+                            raise _DroppedConnection(
+                                "リモートの '%s' へ置き換える前に SFTP のチャンネルが"
+                                "閉じられました。最終名には触れていません。転送した"
+                                "内容は機器の一時名 %s に残っています: %s"
+                                % (remote_name, tmp_remote,
+                                   str(first_error) or first_error.__class__.__name__))
                         if not overwrite:
                             # 非 posix の rename が断る理由の筆頭は
                             # 「既にある」。上書きの確認を経ていない送信で
@@ -948,7 +1133,7 @@ class SFTPManager(QObject):
                 self.transfer_complete.emit(f"アップロード完了: {os.path.basename(local_path)}")
                 
                 # ディレクトリ一覧を更新
-                self.list_directory(self.current_path)
+                self._refresh_listing()
                 
             except Exception as e:
                 # 送りかけの一時ファイルを機器に残さない（できる範囲で。切断後は
@@ -1016,13 +1201,18 @@ class SFTPManager(QObject):
         with cls._download_targets_lock:
             cls._download_targets.discard(key)
 
-    def download_file(self, remote_path: str, local_path: str):
+    def download_file(self, remote_path: str, local_path: str,
+                      overwrite: Optional[bool] = None):
         """
         ファイルをダウンロード（バックグラウンド）
         
         Args:
             remote_path: リモートファイルパス
             local_path: ローカルファイルパス
+            overwrite: 利用者が保存先の上書きを承認したか。True なら既存を
+                置き換え、False なら保存先があれば置き換えずに断る（呼ぶ前の
+                確認のあとに外で作られた保存先も含む）。None なら下のとおり
+                呼ばれた時点の有無から推し量る（パネルは必ず明示して渡す）
 
         同じ保存先へのダウンロードが進行中（順番待ちを含む）なら、断って
         何もしない。保存ダイアログの上書き確認はその時点で有るものしか
@@ -1041,9 +1231,11 @@ class SFTPManager(QObject):
             self.error_occurred.emit("SFTP接続がありません")
             return
         
-        # 保存ダイアログが上書きを確認したかどうかの手掛かり。ここは
-        # ダイアログの直後（GUI スレッド）なので、まだ誰も割り込んでいない
-        overwrite_granted = os.path.exists(local_path)
+        # 上書きが承認されたか。渡されなければ、保存ダイアログが確認した
+        # かどうかを呼ばれた時点の有無から推し量る（確認のあと、ここまでに
+        # 外で作られた保存先は承認済みと読んでしまうので、明示が望ましい）
+        overwrite_granted = (os.path.exists(local_path) if overwrite is None
+                             else bool(overwrite))
 
         target_key = self._download_target_key(local_path)
         with self._download_targets_lock:
@@ -1162,7 +1354,7 @@ class SFTPManager(QObject):
             return
         self.transfer_complete.emit(f"ディレクトリ作成: {os.path.basename(path)}")
         # ディレクトリ一覧を更新（ロックを離してから）
-        self.list_directory(self.current_path)
+        self._refresh_listing()
     
     def delete_item(self, path: str, is_dir: bool = False):
         """
@@ -1196,7 +1388,7 @@ class SFTPManager(QObject):
             return
         self.transfer_complete.emit(f"削除完了: {os.path.basename(path)}")
         # ディレクトリ一覧を更新（ロックを離してから）
-        self.list_directory(self.current_path)
+        self._refresh_listing()
     
     def rename_item(self, old_path: str, new_path: str):
         """
@@ -1224,7 +1416,7 @@ class SFTPManager(QObject):
             return
         self.transfer_complete.emit(f"名前変更完了: {os.path.basename(new_path)}")
         # ディレクトリ一覧を更新（ロックを離してから）
-        self.list_directory(self.current_path)
+        self._refresh_listing()
     
     def change_permissions(self, path: str, mode: int):
         """
@@ -1252,7 +1444,7 @@ class SFTPManager(QObject):
             return
         self.transfer_complete.emit(f"パーミッション変更完了: {os.path.basename(path)}")
         # ディレクトリ一覧を更新（ロックを離してから）
-        self.list_directory(self.current_path)
+        self._refresh_listing()
 
     def inspect_link_target(self, path: str):
         """シンボリックリンクの先の mode と名前を読む（GUI スレッドから呼ぶ）

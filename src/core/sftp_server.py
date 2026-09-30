@@ -1,4 +1,6 @@
 """SFTP サーバー実装"""
+import contextlib
+import logging
 import os
 import socket
 import threading
@@ -13,6 +15,103 @@ from .ftp_server import UNDECRYPTABLE_PASSWORD_MESSAGE
 # 停止のあとも書き込みが生き残っている間に、次の起動を断る理由の文言。
 # 生き残りは保存先のファイルを握ったままなので、TFTP と同じ扱いにする
 from .tftp_server import PREVIOUS_STOP_INCOMPLETE_MESSAGE
+
+
+class _LogLimiter:
+    """診断の行（print）を種類ごとに間引く。
+
+    認証済みの相手が同じ要求を繰り返すだけで、要求ごとの行が際限なく出る
+    （実測: 3 秒で 2808 行ずつ・約 1.7GB/時）。exe では標準出力が上限も回転も
+    無いログファイルなので、ディスクを埋められる。種類ごとに WINDOW_SECONDS
+    あたり LIMIT 行まで出し、超えた分は数えるだけにする。省いた件数は、次の
+    窓の最初の行の前か、flush()（サーバーの停止）で 1 行にして出す。
+    接続ごとの行（接続・切断・エラー・上限で断った接続）も同じく通す。
+    認証なしの接続→即切断だけでも 1 接続につき 3 行出る
+    （実測: 5 秒で 2787 接続・約 608MB/時）
+    """
+
+    WINDOW_SECONDS = 60.0
+    LIMIT = 100
+    # 1 行の長さの上限（文字）。行数だけを数えると、認証済みの相手は名前を
+    # 長くするだけで 1 行を伸ばせる（例外の文言にパスが入る。実測: 約 32K
+    # 文字の名前で 1 行約 32.8KB・rename は約 65KB、1 分の窓で約 29.5MB）。
+    # 超えた分は切り、切った文字数を添える
+    MAX_LINE_CHARS = 500
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._windows = {}   # 種類 -> [窓の始まり, 出した行数, 省いた行数]
+        self._now = time.monotonic
+
+    def log(self, kind, text):
+        now = self._now()
+        lines = []
+        with self._lock:
+            window = self._windows.get(kind)
+            if window is None or now - window[0] >= self.WINDOW_SECONDS:
+                if window is not None and window[2]:
+                    lines.append(self._summary(kind, window[2]))
+                window = self._windows[kind] = [now, 0, 0]
+            if window[1] < self.LIMIT:
+                window[1] += 1
+                lines.append(self._clip(text))
+            else:
+                window[2] += 1
+        for line in lines:
+            print(line)
+
+    def _clip(self, text):
+        """MAX_LINE_CHARS を超えた行を切り、切った文字数を添える"""
+        over = len(text) - self.MAX_LINE_CHARS
+        if over <= 0:
+            return text
+        return "%s...(+%d chars)" % (text[:self.MAX_LINE_CHARS], over)
+
+    def flush(self):
+        """省いたまま出していない件数を出し、窓を空にする"""
+        with self._lock:
+            omitted = [(kind, window[2])
+                       for kind, window in self._windows.items() if window[2]]
+            self._windows.clear()
+        for kind, count in omitted:
+            print(self._summary(kind, count))
+
+    def _summary(self, kind, count):
+        return ("[SFTP Server] %s: %d more line(s) suppressed (limit %d per %ds)"
+                % (kind, count, self.LIMIT, self.WINDOW_SECONDS))
+
+
+# サーバー全体で 1 つ（ログファイルは 1 つなので、接続ごとには分けない）
+_diag_log = _LogLimiter()
+
+
+def _log_limited(kind, text):
+    """要求ごとに出る診断行を出す（_LogLimiter で種類ごとに間引く）"""
+    _diag_log.log(kind, text)
+
+
+# サーバー側の Transport だけが使うロガー名（_handle_client で付け替える）。
+# 既定の paramiko.transport のままだと、バナーの前に切られるたびに
+# トレースバックが 1 行ずつ root へ上がり、logging.lastResort が stderr
+# （exe では上限の無いログファイル）へ書く。認証なしの接続→即切断だけで
+# 1 接続あたり約 1.8KB 出た。SSH クライアント側のロガーは変えない
+_PARAMIKO_SERVER_LOG = "paramiko.transport.sftp_server"
+
+
+class _LimitedLogHandler(logging.Handler):
+    """サーバー側の paramiko の記録を _log_limited へ渡す"""
+
+    def emit(self, record):
+        try:
+            _log_limited("paramiko", "[SFTP Server] paramiko %s: %s"
+                         % (record.levelname, record.getMessage()))
+        except Exception:
+            self.handleError(record)
+
+
+_paramiko_server_logger = logging.getLogger(_PARAMIKO_SERVER_LOG)
+_paramiko_server_logger.addHandler(_LimitedLogHandler(logging.WARNING))
+_paramiko_server_logger.propagate = False
 
 
 class _OpenWriters:
@@ -86,6 +185,35 @@ class _OpenWriters:
         with self._lock:
             self._entries[handle] = (threading.current_thread(), real_path)
 
+    @contextlib.contextmanager
+    def busy(self, real_path, stop_event=None):
+        """保存先を触っている最中（削除・改名・切り詰めなど）を一覧へ載せる。
+
+        書き込みハンドルと同じく alive() に出るので、共有フォルダで止まった
+        まま停止を迎えたスレッドを stop() が生き残りとして数え、次の start()
+        を断る。数えないと、後から戻った旧操作が新しい起動で受けた同名の
+        ファイルを消す・別名へ動かす。抜けたら外す。
+
+        パスの解決（realpath）の前から載せるので、real_path には SFTP の
+        パスも渡る（停止のときの print にしか使わない）。
+
+        stop_event（その起動の停止フラグ）が立っていれば、載せた後で断る
+        （IOError）。止まった STAT などの後ろに応答待ちなしで積まれた要求は、
+        停止の後にチャネルのバッファから読まれて実行される。stop() はフラグを
+        立ててから一覧を読むので、「載せる→フラグを見る」の順なら、どちらが
+        先でも停止に数えられるか、ここで断られる
+        """
+        token = object()
+        with self._lock:
+            self._entries[token] = (threading.current_thread(), real_path)
+        try:
+            if stop_event is not None and stop_event.is_set():
+                raise IOError("Refused, the server has been stopped")
+            yield
+        finally:
+            with self._lock:
+                self._entries.pop(token, None)
+
     def discard(self, handle):
         with self._lock:
             entry = self._entries.pop(handle, None)
@@ -128,14 +256,29 @@ class SFTPServerHandler(SFTPServerInterface):
     """SFTP サーバーハンドラー"""
     
     def __init__(self, server, root_dir, *args, open_writers=None,
-                 notify=None, **kwargs):
+                 notify=None, stop_event=None, **kwargs):
         super().__init__(server, *args, **kwargs)
         self.root_dir = os.path.abspath(root_dir)
         # 書き込み用に開いたハンドルを登録する先（SFTPServerManager の一覧）
         self._open_writers = open_writers
         # 利用者へ見せる出来事をパネルのログへ渡す口（1 行の文字列を受け取る）
         self._notify = notify
-        
+        # この接続を受けた起動の停止フラグ（立った後の変更の要求を断る）
+        self._stop_event = stop_event
+
+    def _busy(self, real_path):
+        """保存先を触る間、停止に見えるよう一覧へ載せる（_OpenWriters.busy）。
+
+        載せるのは操作の入口（パスを解決する前）から。共有フォルダでは
+        realpath も止まり得るので、最後の syscall の間だけ載せると、解決の
+        途中で止まったスレッドを停止が数えず、再起動の後に戻った旧操作が
+        新しく受けたファイルを消す・切り詰める。停止の後に届いた要求は
+        入口で断る（IOError）
+        """
+        if self._open_writers is None:
+            return contextlib.nullcontext()
+        return self._open_writers.busy(real_path, self._stop_event)
+
     def _get_real_path(self, path):
         """SFTP のパスを実際のファイルシステムパスに変換する（chroot を模擬）。
 
@@ -219,12 +362,13 @@ class SFTPServerHandler(SFTPServerInterface):
                     attr = SFTPAttributes.from_stat(stat_info, filename)
                     items.append(attr)
                 except Exception as e:
-                    print(f"[SFTP Server] list_folder skipped {filename}: {e}")
+                    _log_limited("list_folder skipped",
+                                 f"[SFTP Server] list_folder skipped {filename}: {e}")
                     continue
 
             return items
         except Exception as e:
-            print(f"[SFTP Server] list_folder error: {e}")
+            _log_limited("list_folder error", f"[SFTP Server] list_folder error: {e}")
             return SFTP_FAILURE
     
     def stat(self, path):
@@ -234,7 +378,7 @@ class SFTPServerHandler(SFTPServerInterface):
             stat_info = os.stat(real_path)
             return SFTPAttributes.from_stat(stat_info)
         except Exception as e:
-            print(f"[SFTP Server] stat error: {e}")
+            _log_limited("stat error", f"[SFTP Server] stat error: {e}")
             return SFTP_FAILURE
     
     def lstat(self, path):
@@ -257,7 +401,7 @@ class SFTPServerHandler(SFTPServerInterface):
             stat_info = os.lstat(real_path)
             return SFTPAttributes.from_stat(stat_info)
         except Exception as e:
-            print(f"[SFTP Server] lstat error: {e}")
+            _log_limited("lstat error", f"[SFTP Server] lstat error: {e}")
             return SFTP_FAILURE
     
     def open(self, path, flags, attr):
@@ -274,11 +418,31 @@ class SFTPServerHandler(SFTPServerInterface):
         相手の書きかけを 0 バイトに切り詰める）。それ以外の読み取りの open は
         妨げない。
         """
+        writing = bool(flags & (os.O_WRONLY | os.O_RDWR))
+        # 予約するのは書き込みか切り詰めを伴う open。モードとハンドルの
+        # 選び方は writing のまま（切り詰めだけの open は読み取り専用）
+        tracked = ((writing or bool(flags & os.O_TRUNC))
+                   and self._open_writers is not None)
+        # O_TRUNC は開く時点で切り詰めるので、パスを解決する前から、開いた
+        # ハンドルを一覧へ載せ終えるまで停止に見せる（_busy を参照）。
+        # 作成（O_CREAT / O_EXCL）も同じ。WRITE の無い CREATE や paramiko の
+        # 'x' は O_RDONLY|O_CREAT(|O_EXCL) で届き、os.open は空ファイルを作る
+        # （実測: 停止の後に積まれた分が再起動の後に作っていた）。予約は
+        # 掛けない（既存のファイルは変えないので、書き込み中でも妨げない）
+        guarded = tracked or bool(flags & (os.O_CREAT | os.O_EXCL))
+        try:
+            with (self._busy(path) if guarded else contextlib.nullcontext()):
+                return self._open(path, flags, writing, tracked)
+        except Exception as e:
+            # _open は自分で失敗を返すので、ここへ来るのは停止の後の要求だけ
+            _log_limited("open error", f"[SFTP Server] open error: {e}")
+            return SFTP_FAILURE
+
+    def _open(self, path, flags, writing, tracked):
+        """open の本体（writing と tracked は open がフラグから決めたもの）"""
         reserved = False
         try:
             real_path = self._get_real_path(path)
-
-            writing = bool(flags & (os.O_WRONLY | os.O_RDWR))
 
             # 親ディレクトリの用意は書き込み時のみ。
             # 読み取り目的の open で空ディレクトリを作らないため。
@@ -287,14 +451,11 @@ class SFTPServerHandler(SFTPServerInterface):
                 if dir_path and not os.path.exists(dir_path):
                     os.makedirs(dir_path)
 
-            # 予約するのは書き込みか切り詰めを伴う open。モードとハンドルの
-            # 選び方は writing のまま（切り詰めだけの open は読み取り専用）
-            tracked = ((writing or bool(flags & os.O_TRUNC))
-                       and self._open_writers is not None)
             if tracked and not self._open_writers.reserve(real_path):
                 # 開くと O_TRUNC が相手の書きかけを切り詰め、双方が成功で
                 # 終わるのに中身が混ざる。TFTP の同名 WRQ と同じく断る
-                print(f"[SFTP Server] open refused, already open for writing: {real_path}")
+                _log_limited("open refused",
+                             f"[SFTP Server] open refused, already open for writing: {real_path}")
                 if self._notify is not None:
                     self._notify("他の転送が書き込み中のため断りました: %s" % path)
                 return SFTP_FAILURE
@@ -330,47 +491,55 @@ class SFTPServerHandler(SFTPServerInterface):
             if reserved:
                 # 開けなかった。予約を残すと、その保存先へ二度と書けなくなる
                 self._open_writers.release(real_path)
-            print(f"[SFTP Server] open error: {e}")
+            _log_limited("open error", f"[SFTP Server] open error: {e}")
             return SFTP_FAILURE
 
     def remove(self, path):
         """ファイルを削除"""
         try:
+            # パスの解決から停止に見せる（_busy を参照）。
             # リンクの先ではなくリンク自体を消す
-            os.remove(self._get_link_path(path))
+            with self._busy(path):
+                os.remove(self._get_link_path(path))
             return SFTP_OK
         except Exception as e:
-            print(f"[SFTP Server] remove error: {e}")
+            _log_limited("remove error", f"[SFTP Server] remove error: {e}")
             return SFTP_FAILURE
     
     def rename(self, oldpath, newpath):
         """ファイル/ディレクトリ名を変更"""
         try:
+            # パスの解決から停止に見せる（_busy を参照）。
             # リンクの先ではなくリンク自体を改名する
-            os.rename(self._get_link_path(oldpath), self._get_link_path(newpath))
+            with self._busy("%s -> %s" % (oldpath, newpath)):
+                os.rename(self._get_link_path(oldpath),
+                          self._get_link_path(newpath))
             return SFTP_OK
         except Exception as e:
-            print(f"[SFTP Server] rename error: {e}")
+            _log_limited("rename error", f"[SFTP Server] rename error: {e}")
             return SFTP_FAILURE
     
     def mkdir(self, path, attr):
         """ディレクトリを作成"""
         try:
-            real_path = self._get_real_path(path)
-            os.mkdir(real_path)
+            # パスの解決から停止に見せる（_busy を参照）
+            with self._busy(path):
+                os.mkdir(self._get_real_path(path))
             return SFTP_OK
         except Exception as e:
-            print(f"[SFTP Server] mkdir error: {e}")
+            _log_limited("mkdir error", f"[SFTP Server] mkdir error: {e}")
             return SFTP_FAILURE
     
     def rmdir(self, path):
         """ディレクトリを削除"""
         try:
+            # パスの解決から停止に見せる（_busy を参照）。
             # リンクの先ではなくリンク自体を外す（ジャンクションは rmdir で外れる）
-            os.rmdir(self._get_link_path(path))
+            with self._busy(path):
+                os.rmdir(self._get_link_path(path))
             return SFTP_OK
         except Exception as e:
-            print(f"[SFTP Server] rmdir error: {e}")
+            _log_limited("rmdir error", f"[SFTP Server] rmdir error: {e}")
             return SFTP_FAILURE
     
     def chattr(self, path, attr):
@@ -383,7 +552,21 @@ class SFTPServerHandler(SFTPServerInterface):
         制限: uid/gid は Windows で意味を持たないので受け取っても無視する
         （この用途の SFTP クライアントは所有者を送ってこない）。開いている
         ハンドルへの FSETSTAT は paramiko の既定のまま「未対応」を返す。
+
+        パスの解決から終わりまでを停止に見せる（_busy を参照）。切り詰め
+        だけでなく、再起動の後に戻った旧 chmod・utime も、新しく受けた
+        ファイルを読み取り専用にする・日時を書き換える
         """
+        try:
+            with self._busy(path):
+                return self._chattr(path, attr)
+        except Exception as e:
+            # _chattr は自分で失敗を返すので、ここへ来るのは停止の後の要求だけ
+            _log_limited("chattr error", f"[SFTP Server] chattr error: {e}")
+            return SFTP_FAILURE
+
+    def _chattr(self, path, attr):
+        """chattr の本体"""
         try:
             real_path = self._get_real_path(path)
             if attr.st_size is not None:
@@ -394,7 +577,8 @@ class SFTPServerHandler(SFTPServerInterface):
                 if self._open_writers is not None:
                     reserved = self._open_writers.reserve_for_truncate(real_path)
                     if reserved is None:
-                        print(f"[SFTP Server] truncate refused, open for writing: {real_path}")
+                        _log_limited("truncate refused",
+                                     f"[SFTP Server] truncate refused, open for writing: {real_path}")
                         if self._notify is not None:
                             self._notify("他の転送が書き込み中のため断りました: %s" % path)
                         return SFTP_FAILURE
@@ -419,7 +603,7 @@ class SFTPServerHandler(SFTPServerInterface):
                 os.chmod(real_path, attr.st_mode)
             return SFTP_OK
         except Exception as e:
-            print(f"[SFTP Server] chattr error: {e}")
+            _log_limited("chattr error", f"[SFTP Server] chattr error: {e}")
             return SFTP_FAILURE
 
 
@@ -504,7 +688,7 @@ class SFTPServerManager(QObject):
         # 書き込みを断った通知（client_activity）も同じカウンタに数える。
         # 認証済みの相手が同じ名前への要求を繰り返すだけで、要求ごとに 1 件
         # 出る（実測: 5 秒で 10642 件）。数え違えないよう、この信号はすべて
-        # _emit_activity から出す
+        # 配送待ちに数えてから出す（_emit_activity と、省略件数の要約）
         self.max_pending_notices = 1000
         self._notice_lock = threading.Lock()
         self._pending_notices = 0
@@ -545,14 +729,17 @@ class SFTPServerManager(QObject):
         """切断を渡すかを決める。
 
         接続を届けた相手（shown が True）の切断は必ず渡す。接続を省いた相手
-        （False）のものは渡さずに省略件数へ足す。記録が無い（None）ものは
-        上限の範囲でだけ渡す
+        （False）のものは渡さずに省略件数へ足し、配送待ちが 0 ならその場で
+        要約を出す。記録が無い（None）ものは上限の範囲でだけ渡す
         """
         if shown:
             return self._take_notice(force=True)
         if shown is False:
             with self._notice_lock:
                 self._dropped_notices += 1
+                # 配送待ちが 0 だと、要約を出すきっかけ（次の配送）が来ない
+                dropped = self._take_summary()
+            self._emit_summary(dropped)
             return False
         return self._take_notice()
 
@@ -561,19 +748,33 @@ class SFTPServerManager(QObject):
         if self._take_notice():
             self.client_activity.emit(ip, message)
 
+    def _take_summary(self):
+        """配送待ちが 0 で省略件数があれば、要約の枠を取って件数を返す（無ければ 0）。
+
+        _notice_lock の中で呼ぶ。この 1 行も client_activity なので同じく数える
+        （FTP と同じ）。数えずに出すと、届いたときに他の通知の分まで戻してしまう。
+        枠は取り出すのと同じ錠の中で取る。錠を離してから取ると、その隙に
+        別スレッドが枠を埋めて要約ごと省かれ、件数が失われる
+        """
+        if self._pending_notices or not self._dropped_notices:
+            return 0
+        dropped, self._dropped_notices = self._dropped_notices, 0
+        self._pending_notices += 1
+        return dropped
+
+    def _emit_summary(self, dropped):
+        """_take_summary で枠を取った要約を出す（錠の外で呼ぶ）"""
+        if dropped:
+            self.client_activity.emit(
+                "", "表示が追いつかず %d 件の通知を省略しました" % dropped)
+
     def _on_notice_delivered(self, *_args):
         """GUI が通知を 1 件処理したので配送待ちを戻す（GUI スレッドで動く）"""
         with self._notice_lock:
             if self._pending_notices > 0:
                 self._pending_notices -= 1
-            dropped = 0
-            if self._pending_notices == 0:
-                dropped, self._dropped_notices = self._dropped_notices, 0
-        if dropped:
-            # この 1 行も client_activity なので同じく数える（FTP と同じ）。
-            # 数えずに出すと、届いたときに他の通知の分まで戻してしまう
-            self._emit_activity(
-                "", "表示が追いつかず %d 件の通知を省略しました" % dropped)
+            dropped = self._take_summary()
+        self._emit_summary(dropped)
 
     def _load_or_create_host_key(self):
         """ホストキーをユーザデータディレクトリから読み込む。無ければ生成して保存する。
@@ -761,16 +962,22 @@ class SFTPServerManager(QObject):
             thread.join(timeout=self.STOP_TIMEOUT_SECONDS)
         # 接続はすべて閉じた。書き込み用のハンドルを開いたまま生きている
         # スレッドは、切断に気づいて抜ける途中か、保存先への write()/close()
-        # の中で止まっている（共有フォルダの遅延・切断など）。前者を取り
-        # 違えないよう少しだけ待ち、それでも残った分を覚えて、消えるまで
-        # 次の start() を断る
+        # の中で止まっている（共有フォルダの遅延・切断など）。削除・改名・
+        # SETSTAT・mkdir・rmdir の最中（パスの解決から）のスレッドも同じ
+        # 一覧に載る（_OpenWriters.busy。停止フラグは上で立て終えているので、
+        # この後に載る要求は busy が断る）。
+        # 前者を取り違えないよう少しだけ待ち、それでも残った分を覚えて、
+        # 消えるまで次の start() を断る
         deadline = time.monotonic() + self.WRITER_STOP_TIMEOUT_SECONDS
         for writer, _path in self._open_writers.alive():
             writer.join(timeout=max(0.0, deadline - time.monotonic()))
         for writer, path in self._open_writers.alive():
-            print(f"[SFTP Server] Write still in progress after stop: {path}")
+            print(f"[SFTP Server] File operation still in progress after stop: {path}")
             if writer not in self._unfinished:
                 self._unfinished.append(writer)
+        # 間引いたまま出していない件数を残す（同じ種類の行がもう来なくても
+        # 失わない）
+        _diag_log.flush()
         self.stopped.emit()
         print("[SFTP Server] Server stopped")
         return self._previous_stop_finished()
@@ -879,11 +1086,14 @@ class SFTPServerManager(QObject):
                             client_socket.close()
                         except OSError:
                             pass
-                        print(f"[SFTP Server] Rejected {client_addr[0]}:"
-                              f"{client_addr[1]}: {reject_reason}")
+                        _log_limited("rejected",
+                                     f"[SFTP Server] Rejected {client_addr[0]}:"
+                                     f"{client_addr[1]}: {reject_reason}")
                         continue
 
-                    print(f"[SFTP Server] Client connected from {client_addr[0]}:{client_addr[1]}")
+                    # 接続ごとの行も間引く（_LogLimiter を参照）
+                    _log_limited("client connected",
+                                 f"[SFTP Server] Client connected from {client_addr[0]}:{client_addr[1]}")
 
                 except socket.timeout:
                     # タイムアウトは正常（停止チェックのため）
@@ -909,9 +1119,14 @@ class SFTPServerManager(QObject):
     def _handle_client(self, client_socket, client_addr):
         """クライアント接続を処理"""
         transport = None
+        # この接続を受けた起動の停止フラグ。起動し直した後の新しいフラグは
+        # 見ない（読んだ時点で停止が済んでいれば、ソケットはもう閉じている）
+        stop_event = self._stop_event
         try:
             # SSHトランスポートを作成
             transport = paramiko.Transport(client_socket)
+            # サーバー側のログは間引き口へ流す（_PARAMIKO_SERVER_LOG を参照）
+            transport.set_log_channel(_PARAMIKO_SERVER_LOG)
             # 認証前の接続に期限を持たせる。黙り込んだ相手が枠を占有し
             # 続けると、上限を入れても正規の接続が入れなくなる
             transport.banner_timeout = self.banner_timeout_seconds
@@ -924,12 +1139,14 @@ class SFTPServerManager(QObject):
             # paramiko の既定の ServerInterface.check_channel_subsystem_request は
             # ここで登録したハンドラを引いて起動する実装なので、登録しないと
             # クライアントの subsystem('sftp') 要求が拒否され、チャネルが閉じる。
-            # 断った書き込みなどは、相手の IP を添えてパネルのログへ出す
+            # 断った書き込みなどは、相手の IP を添えてパネルのログへ出す。
+            # 停止の後に積まれていた変更の要求は断る（_OpenWriters.busy）
             transport.set_subsystem_handler(
                 'sftp', SFTPServer, SFTPServerHandler, root_dir=self.root_dir,
                 open_writers=self._open_writers,
                 notify=lambda message, ip=client_addr[0]:
-                    self._emit_activity(ip, message))
+                    self._emit_activity(ip, message),
+                stop_event=stop_event)
             
             # SSHサーバーインターフェースを作成
             server = SSHServerInterface(self.username, self.password)
@@ -940,18 +1157,20 @@ class SFTPServerManager(QObject):
             # クライアントがチャネルを開くのを待つ
             channel = transport.accept(timeout=20)
             if channel is None:
-                print(f"[SFTP Server] No channel from {client_addr[0]}")
+                _log_limited("no channel",
+                             f"[SFTP Server] No channel from {client_addr[0]}")
                 return
             
             # SFTPServer の生成と起動は set_subsystem_handler 経由で paramiko が行う。
             # ここで手動生成しても start() されないため、転送は始まらない。
             
             # チャネルが閉じるまで待つ
-            while transport.is_active() and not self._stop_event.is_set():
+            while transport.is_active() and not stop_event.is_set():
                 threading.Event().wait(0.5)
             
         except Exception as e:
-            print(f"[SFTP Server] Client handler error: {e}")
+            _log_limited("client handler error",
+                         f"[SFTP Server] Client handler error: {e}")
         finally:
             if transport:
                 transport.close()
@@ -963,4 +1182,5 @@ class SFTPServerManager(QObject):
             # 「接続クライアント: N」が減らないまま残る
             if self._take_closing_notice(shown):
                 self.client_disconnected.emit(client_addr[0])
-            print(f"[SFTP Server] Client disconnected from {client_addr[0]}")
+            _log_limited("client disconnected",
+                         f"[SFTP Server] Client disconnected from {client_addr[0]}")

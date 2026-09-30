@@ -1,13 +1,18 @@
 """FTP サーバー（pyftpdlib ラッパ）。UI 通知は Qt シグナル。"""
+import errno
 import os
+import socket
 import threading
 import time
 
 from PyQt6.QtCore import QObject, pyqtSignal
 from pyftpdlib.authorizers import DummyAuthorizer
+from pyftpdlib.exceptions import _RetryError
 from pyftpdlib.handlers import FTPHandler, DTPHandler
 from pyftpdlib.servers import FTPServer as _PyFTPServer
 from pyftpdlib.ioloop import IOLoop as _PyIOLoop
+from pyftpdlib.ioloop import _ERRNOS_DISCONNECTED, _ERRNOS_RETRY
+from pyftpdlib.log import logger as _ftp_logger
 
 from .crypto import PasswordCrypto
 
@@ -24,6 +29,51 @@ PREVIOUS_STOP_INCOMPLETE_MESSAGE = (
     "前回の停止が完了していません（待受スレッドが終了しておらず、"
     "ポートが解放されていない可能性があります）。"
     "しばらく待ってからもう一度お試しください")
+
+# データ接続の TCP keepalive。この秒数黙ったら、この間隔で相手を確かめる
+# （Windows は 10 回で諦めて切る）。SFTP の keepalive_seconds と揃える
+DATA_KEEPALIVE_SECONDS = 30
+DATA_KEEPALIVE_INTERVAL_SECONDS = 5
+
+
+def _enable_keepalive(sock):
+    """データ接続に TCP keepalive を掛ける。掛けられない環境では何もしない。"""
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        if hasattr(socket, "SIO_KEEPALIVE_VALS"):
+            sock.ioctl(socket.SIO_KEEPALIVE_VALS,
+                       (1, DATA_KEEPALIVE_SECONDS * 1000,
+                        DATA_KEEPALIVE_INTERVAL_SECONDS * 1000))
+    except (AttributeError, OSError, ValueError):
+        pass
+
+
+# 受信中のデータ接続の recv が返したとき、相手が消えたとみなすエラー。
+# keepalive の確かめが尽きたときに返るのはこのどれか（OS による。localhost
+# では作れないので、どれが返るかは確かめていない）
+_DATA_LOST_ERRNOS = frozenset(
+    getattr(errno, name) for name in
+    ("ETIMEDOUT", "ENOTCONN", "ECONNABORTED", "ENETRESET") if hasattr(errno, name))
+
+# 黙っていた時間を比べるときの余裕（秒）。測るのは最後のデータを読んだ時刻から
+# RST を読んだ時刻までで、時計の粒度（Python 3.12 の Windows の time.monotonic は
+# 約 16 ミリ秒刻み）や読む時刻の遅れの分だけ、確かめへの RST でも
+# DATA_KEEPALIVE_SECONDS をわずかに下回って測れることがある
+_SILENCE_MARGIN_SECONDS = 1.0
+
+
+def _data_connection_lost(code, silent_seconds):
+    """受信中の recv のエラー code が、相手が消えたことを示すか。
+
+    RST（ECONNRESET）は、相手が SO_LINGER 0 で閉じたときなどにも届き、
+    これまで完了として扱ってきたので変えない。ただし keepalive の確かめは
+    DATA_KEEPALIVE_SECONDS 黙った後にしか送らないので、それほど黙った
+    後の RST は、再起動した相手が確かめに返したものとみなす
+    """
+    if code in _DATA_LOST_ERRNOS:
+        return True
+    return (code == errno.ECONNRESET and silent_seconds
+            >= DATA_KEEPALIVE_SECONDS - _SILENCE_MARGIN_SECONDS)
 
 
 class FTPServerManager(QObject):
@@ -54,13 +104,18 @@ class FTPServerManager(QObject):
         # 同じ鍵で持つ行の状態: 開始を届けた（shown）／配送待ちの上限で
         # 省いた（hidden）。_tx の値は表示名なので、そこへは混ぜられない
         self._tx_row = {}
+        # 同じ鍵で持つ行の番号。行を作るたびに新しい番号を振る。捨てた転送の
+        # 行を閉じるとき、それが自分の加わった行か（閉じられた後で別の接続が
+        # 作り直した行でないか）を見分ける
+        self._tx_ids = {}
+        self._tx_next_id = 0
         # GUI へ渡したまま、まだ処理されていない通知の件数の上限。
         # 接続と切断のたびに 1 件出るので、認証の要らない相手が接続して即切断を
         # 繰り返すと、GUI が他の処理で塞がっている間に Qt の配送キューへ際限なく
         # 積み上がる（パネルのログの行数上限が効くのは配送の後）。TFTP の
         # protocol_event と同じく、超過中は数えるだけにして、はけた時点で
         # 省略した件数を 1 行だけ出す。数え違えないよう、この信号はすべて
-        # _emit_activity から出す。
+        # 配送待ちに数えてから出す（_emit_activity と、省略件数の要約）。
         # 転送の通知（開始・進捗・完了・中断）も同じカウンタに数える。
         # 数えないと、機器が小さいファイルの RETR を連打するだけで、
         # 接続・切断と同じようにキューへ積み上がる
@@ -130,14 +185,17 @@ class FTPServerManager(QObject):
         """完了・中断を渡すかを決める。
 
         開始を届けた行を閉じる 1 件は必ず渡す。開始を省いた転送のものは
-        渡さずに省略件数へ足す。行の無いもの（台帳に無い＝束ねた相手が
-        先に閉じた）は上限の範囲でだけ渡す
+        渡さずに省略件数へ足し、配送待ちが 0 ならその場で要約を出す。行の
+        無いもの（台帳に無い＝束ねた相手が先に閉じた）は上限の範囲でだけ渡す
         """
         if row == "shown":
             return self._take_notice(force=True)
         if row == "hidden":
             with self._notice_lock:
                 self._dropped_notices += 1
+                # 配送待ちが 0 だと、要約を出すきっかけ（次の配送）が来ない
+                dropped = self._take_summary()
+            self._emit_summary(dropped)
             return False
         return self._take_notice()
 
@@ -146,16 +204,31 @@ class FTPServerManager(QObject):
         if self._take_notice():
             self.client_activity.emit(ip, message)
 
+    def _take_summary(self):
+        """配送待ちが 0 で省略件数があれば、要約の枠を取って件数を返す（無ければ 0）。
+
+        _notice_lock の中で呼ぶ。要約の枠は取り出すのと同じ錠の中で取る。
+        錠を離してから取ると、その隙に別スレッドが枠を埋めて要約ごと省かれ、
+        件数が失われる
+        """
+        if self._pending_notices or not self._dropped_notices:
+            return 0
+        dropped, self._dropped_notices = self._dropped_notices, 0
+        self._pending_notices += 1
+        return dropped
+
+    def _emit_summary(self, dropped):
+        """_take_summary で枠を取った要約を出す（錠の外で呼ぶ）"""
+        if dropped:
+            self.client_activity.emit("", "表示が追いつかず %d 件の通知を省略しました" % dropped)
+
     def _on_notice_delivered(self, *_args):
         """GUI が通知を 1 件処理したので配送待ちを戻す（GUI スレッドで動く）"""
         with self._notice_lock:
             if self._pending_notices > 0:
                 self._pending_notices -= 1
-            dropped = 0
-            if self._pending_notices == 0:
-                dropped, self._dropped_notices = self._dropped_notices, 0
-        if dropped:
-            self._emit_activity("", "表示が追いつかず %d 件の通知を省略しました" % dropped)
+            dropped = self._take_summary()
+        self._emit_summary(dropped)
 
     def _emit_started(self, ip, filename, total, direction, path=None, ftp_path=None):
         """開始を通知し、この転送の表示名を返す（束ねたときは既存の行の表示名）。
@@ -174,6 +247,8 @@ class FTPServerManager(QObject):
                                  if i == ip and d == direction]:
             name = ftp_path
         self._tx[key] = name
+        self._tx_next_id += 1
+        self._tx_ids[key] = self._tx_next_id
         shown = self._take_notice()
         self._tx_row[key] = "shown" if shown else "hidden"
         if shown:
@@ -198,6 +273,7 @@ class FTPServerManager(QObject):
         # 完了で解放し次の転送は新規行に
         key = (ip, path or filename, direction)
         name = self._tx.pop(key, display or filename)
+        self._tx_ids.pop(key, None)
         if self._take_closing_notice(self._tx_row.pop(key, None)):
             self.transfer_complete.emit(ip, name, int(done), int(total), direction)
 
@@ -209,8 +285,31 @@ class FTPServerManager(QObject):
         """
         key = (ip, path or filename, direction)
         name = self._tx.pop(key, display or filename)
+        self._tx_ids.pop(key, None)
         if self._take_closing_notice(self._tx_row.pop(key, None)):
             self.transfer_interrupted.emit(ip, name, direction)
+
+    def _drop_uploads(self, handler, ip, keep=None):
+        """handler の予約を keep（続いている受信の保存先）以外すべて外し、
+        ip からのその保存先のアップロード行を中断で閉じる。閉じた行のパスを返す。
+
+        待ち行列から捨てられた STOR の分。pyftpdlib は後の STOR で待ち行列を
+        上書きするので、手元に残るのは最後の 1 件だけで、それより前の分は
+        予約と行だけが残っている
+        """
+        keep_key = None if keep is None else self._upload_key(keep)
+        keys = {k for k, h in self._uploads.items()
+                if h is handler and k != keep_key}
+        for k in keys:
+            del self._uploads[k]
+        closed = []
+        if not keys:
+            return closed
+        for (i, path, d) in list(self._tx):
+            if i == ip and d == "upload" and self._upload_key(path) in keys:
+                self._emit_interrupted(ip, os.path.basename(path), "upload", path)
+                closed.append(path)
+        return closed
 
     # 匿名に与える権限。認証ユーザー用の "elradfmwMT" を使い回すと、
     # 資格情報なしでルート配下を上書き・削除・改名・フォルダ作成できる。
@@ -278,6 +377,44 @@ class FTPServerManager(QObject):
 
         class _ProgressDTP(DTPHandler):
             """データチャネルの送受信ごとに進捗を発火（TFTPと同じ見た目にするため）。"""
+            def __init__(self, sock, cmd_channel):
+                # 回線断などで黙って消えた書き手は、送るものの無いこちらの TCP
+                # では気づけず、予約が無通信の期限（DTPHandler.timeout = 300 秒）
+                # まで残って同じ名前へのアップロードを断り続けた。keepalive を
+                # 送れば確かめが尽きたところで recv がエラーになり、下の recv が
+                # 未完了として閉じて予約を外す。生きている相手は応答するだけ
+                # なので、黙っている転送は切らない
+                self._last_recv_at = time.monotonic()
+                _enable_keepalive(sock)
+                super().__init__(sock, cmd_channel)
+            def recv(self, buffer_size):
+                # pyftpdlib（ioloop.AsyncChat.recv）は ETIMEDOUT・ENOTCONN など
+                # 接続断のエラーを EOF と同じく扱い、受信中なら完了（226）にする。
+                # keepalive で切れた書き手の途中までのファイルが完了と記録される
+                # （実測: エラーを差し込むと 226 と完了）ので、相手が消えたときは
+                # 未完了（426）で閉じる。それ以外は pyftpdlib と同じ扱い
+                if not self.receive:
+                    return super().recv(buffer_size)
+                try:
+                    data = self.socket.recv(buffer_size)
+                except OSError as err:
+                    if _data_connection_lost(
+                            err.errno, time.monotonic() - self._last_recv_at):
+                        self._resp = ("426 Connection lost; transfer aborted.",
+                                      _ftp_logger.info)
+                        self.close()   # on_incomplete_file_received が予約を外す
+                        return b""
+                    if err.errno in _ERRNOS_DISCONNECTED:
+                        self.handle_close()
+                        return b""
+                    if err.errno in _ERRNOS_RETRY:
+                        raise _RetryError from err
+                    raise
+                if not data:
+                    self.handle_close()   # 通常の EOF（完了）
+                    return b""
+                self._last_recv_at = time.monotonic()
+                return data
             def send(self, data):
                 result = super().send(data)
                 try: self.cmd_channel._emit_tx_progress(self.get_transmitted_bytes())
@@ -294,6 +431,48 @@ class FTPServerManager(QObject):
 
         class _Handler(FTPHandler):
             dtp_handler = _ProgressDTP
+            # データ接続を使う転送コマンド
+            _TRANSFER_COMMANDS = ("STOR", "APPE", "STOU", "RETR",
+                                  "LIST", "NLST", "MLSD")
+
+            def pre_process_command(self, line, cmd, arg):
+                # REST の位置を 0 に戻すのは pyftpdlib の ftp_STOR / ftp_RETR の
+                # 先頭だけ。権限で断る 550（ftp_* を呼ばずに戻る）や APPE / STOU
+                # の 450 は位置を残し、次の REST 無しの STOR / RETR が途中から
+                # 書く・返していた（実測）。REST は直後の転送コマンドにだけ効く
+                # （RFC 959）ので、転送コマンドを終えたら結果によらず戻す。
+                # データ接続を使う一覧（LIST / NLST / MLSD）も転送コマンドで、
+                # pyftpdlib は位置を読まずに残す（REST → LIST の後の RETR が
+                # 途中から返していた）。PASV・TYPE などは消費しない
+                try:
+                    return super().pre_process_command(line, cmd, arg)
+                finally:
+                    if cmd in self._TRANSFER_COMMANDS:
+                        self._restart_position = 0
+
+            def process_command(self, cmd, *args, **kwargs):
+                # データ接続で転送が進んでいる間に次の転送コマンドを受けると、
+                # pyftpdlib はそのデータ接続で 125 を返し、送受信するファイル
+                # （file_obj）を途中で差し替える。先の転送の行が開始のまま残り
+                # （取り切った RETR も完了にならず、同じ名前の取り直しが束ねられて
+                # 開始が出ない）、STOR は受けた中身が 2 つのファイルに分かれて
+                # 完了は後の名前だけになっていた（実測）。転送中は断る。張った
+                # だけで待っているデータ接続（cmd が None）は今までどおり使える
+                dc = self.data_channel
+                if (cmd in self._TRANSFER_COMMANDS and not self._closed
+                        and dc is not None and dc.cmd is not None):
+                    arg = args[0] if args else ""
+                    msg = "Data connection busy: another transfer is in progress."
+                    self.respond("425 " + msg)
+                    self.log_cmd(cmd, arg, 425, msg)
+                    if arg and cmd != "STOU":   # STOU 以外は実パスになっている
+                        arg = self.fs.fs2ftp(arg)
+                    mgr._emit_activity(
+                        self.remote_ip,
+                        ("データ接続で別の転送が進行中のため断りました: %s %s"
+                         % (cmd, arg)).rstrip())
+                    return
+                super().process_command(cmd, *args, **kwargs)
 
             def ftp_RETR(self, file):
                 result = super().ftp_RETR(file)  # 成功時はftpパスを返す
@@ -305,6 +484,9 @@ class FTPServerManager(QObject):
                     self._tx_display = mgr._emit_started(
                         self.remote_ip, self._tx_name, self._tx_total, "download",
                         file, self.fs.fs2ftp(file))
+                    # 加わった行（束ねたときは既存の行）の番号
+                    self._tx_row_id = mgr._tx_ids.get(
+                        (self.remote_ip, file, "download"))
                 return result
 
             def ftp_STOR(self, file, mode="w"):
@@ -324,6 +506,7 @@ class FTPServerManager(QObject):
                                        % self.fs.fs2ftp(file))
                     return None
                 result = None
+                prev = self._in_dtp_queue
                 try:
                     result = super().ftp_STOR(file, mode)
                 finally:
@@ -332,12 +515,57 @@ class FTPServerManager(QObject):
                         # 同じ保存先へ誰も書けない
                         mgr._release_uploads(self, file)
                 if result is not None:
+                    self._leave_overwritten_stor(prev, file)
+                    # _tx_* を設定する前に呼ぶ（同じファイルの RETR を捨てると _forget_tx が走る）
+                    self._leave_queued_send(prev)
                     self._tx_name = os.path.basename(file); self._tx_total = 0  # アップロードは総サイズ不明
                     self._tx_dir = "upload"; self._tx_last = 0.0; self._tx_path = file
                     self._tx_display = mgr._emit_started(
                         self.remote_ip, self._tx_name, 0, "upload",
                         file, self.fs.fs2ftp(file))
                 return result
+
+            def ftp_STOU(self, line):
+                prev = self._in_dtp_queue
+                result = super().ftp_STOU(line)
+                self._leave_overwritten_stor(prev)
+                self._leave_queued_send(prev)
+                return result
+
+            def _leave_queued_send(self, prev):
+                """受信を待ち行列に積んだ（prev から変わった）とき、待っていた送信を捨てる。
+
+                pyftpdlib は受信と送信の待ち行列を別々に持ち、データ接続が来ると
+                送信の方だけを使う。RETR・一覧の後に STOR / APPE / STOU を受けると、
+                データ接続では先の RETR が返されて送った中身は書かれず、受信の方が
+                予約と行ごと残って次のデータ接続に結びついていた（実測）。後の
+                転送コマンドを残し、先の送信は RETR の上書きと同じく片付ける
+                """
+                if self._in_dtp_queue is prev or self._out_dtp_queue is None:
+                    return
+                out_q, self._out_dtp_queue = self._out_dtp_queue, None
+                self._leave_queued_retr(out_q)
+
+            def _leave_overwritten_stor(self, prev, keep=None):
+                """待ち行列の受信（prev）が後の STOR / APPE / STOU で上書きされていたら片付ける。
+
+                pyftpdlib は、データ接続を待っている STOR の後に来たこれらで
+                待ち行列を上書きし、先の方を黙って捨てる（ファイルも閉じない）。
+                後の方を送り切っても先の行が開始のまま残り、同じ名前の上げ直しが
+                その行に束ねられて開始が出なかった（実測）。REIN / USER / ABOR と
+                同じく片付け、予約は keep（新しく待ちにした保存先）だけ残す。
+                同じパスの積み直しは、行も予約もそのまま
+                """
+                if prev is None or self._in_dtp_queue is prev:
+                    return
+                self._abandon_queued(prev, None, keep)
+                # 大文字小文字だけ違う名前などで同じ保存先を積み直すと、予約は
+                # 同じなので上で外れないが、行はパスごとなので先の方が残る
+                old = getattr(prev[0], "name", None)
+                if keep is not None and old != keep and (
+                        self.remote_ip, old, "upload") in mgr._tx:
+                    mgr._emit_interrupted(self.remote_ip, os.path.basename(old),
+                                          "upload", old, self._display_for(old))
 
             def _display_for(self, file):
                 """file の転送について開始時に受け取った表示名。別の転送なら None"""
@@ -364,7 +592,27 @@ class FTPServerManager(QObject):
                 LIST / NLST）もある。消さずに残すと、それらの進捗が
                 直前に終わった転送の名前・方向で出てしまう
                 """
-                self._tx_name = None; self._tx_path = None
+                self._tx_name = None; self._tx_path = None; self._tx_row_id = None
+
+            def _may_close_row(self, file):
+                """待ち行列から捨てた RETR（file）の行を閉じてよいか。
+
+                台帳の行は同じ IP の接続で共有する（機器のプローブを束ねる）ので、
+                鍵だけで閉じると、束ねた別の接続が取得中の行や、別の接続が閉じた
+                後で作り直した行まで中断にしていた（実測）。この接続が加わった
+                行がまだ開いていて、その行に加わったほかの（切断していない）
+                接続が無いときだけ閉じる。ほかの接続は、転送中のものも待ち行列に
+                置いているだけのものも数える（閉じずに残すのは、この片付けを
+                入れる前と同じ扱い）
+                """
+                row_id = getattr(self, "_tx_row_id", None)
+                if row_id is None or mgr._tx_ids.get(
+                        (self.remote_ip, file, "download")) != row_id:
+                    return False
+                return not any(
+                    h is not self and isinstance(h, _Handler)
+                    and getattr(h, "_tx_row_id", None) == row_id
+                    for h in list(self.ioloop.socket_map.values()))
 
             def on_file_sent(self, file):
                 try: total = os.path.getsize(file)
@@ -393,11 +641,99 @@ class FTPServerManager(QObject):
             def close(self):
                 # STOR を受けたがデータ接続が来ないまま相手が去ると（受動ポートが
                 # 塞がれているなど）、pyftpdlib はファイルを閉じるだけで上の
-                # コールバックを呼ばない。予約が残ると同じ名前へ書けなくなる
+                # コールバックを呼ばない。予約が残ると同じ名前へ書けなくなる。
+                # 待っていた STOR / APPE の行も開始のまま残り、中断が出ず、
+                # 上げ直しがその行に束ねられていた（実測: 150 の後の切断・QUIT）。
+                # pyftpdlib は待ち行列を消すので、先に控えて REIN / ABOR と同じく
+                # 片付ける。待っていた RETR の行は残す（機器のプローブ＝接続→
+                # RETR→即切断を 1 行に束ねる設計。
+                # tests/test_ftp_server_abandoned_retr_shared_row.py）
+                queued = None
+                if not getattr(self, "_closed", True):
+                    queued = getattr(self, "_in_dtp_queue", None)
                 try:
                     super().close()
                 finally:
-                    mgr._release_uploads(self)
+                    try:
+                        if queued is not None:
+                            self._abandon_queued(queued, None)
+                    finally:
+                        mgr._release_uploads(self)
+            def _abandon_queued(self, in_q, out_q, keep=None):
+                """待ち行列から捨てた転送を片付ける（REIN / USER / ABOR、STOR / STOU の上書き、切断）。
+
+                pyftpdlib はそのファイルを閉じず、上の未完了のコールバックも
+                呼ばない。予約が制御接続を閉じるまで残って同じ保存先へ誰も
+                書けず、行も開始のまま残って、後の一覧の進捗がその名前で出て
+                いた（実測）。ファイルを閉じ、この接続の予約を keep（続いている
+                受信の保存先）以外すべて外し、捨てた転送の行を中断で閉じる
+                """
+                if in_q and in_q[0] is not None:
+                    try: in_q[0].close()
+                    except Exception: pass
+                closed = mgr._drop_uploads(self, self.remote_ip, keep)
+                if out_q is not None:
+                    self._leave_queued_retr(out_q)
+                if getattr(self, "_tx_path", None) in closed:
+                    self._forget_tx()
+            def _leave_queued_retr(self, out_q, keep_row=False):
+                """待ち行列から外れた送信（out_q）のファイルを閉じ、RETR ならその行を離れる。
+
+                行は _may_close_row が許すときだけ中断で閉じる。keep_row なら
+                行に加わったままにする（同じファイルの RETR を積み直した）
+                """
+                f = out_q[2]
+                if f is not None:
+                    try: f.close()
+                    except Exception: pass
+                if f is None or out_q[3] != "RETR" or keep_row:
+                    return
+                file = f.name
+                if self._may_close_row(file):
+                    mgr._emit_interrupted(self.remote_ip, os.path.basename(file),
+                                          "download", file, self._display_for(file))
+                # 閉じなくても、この接続はもうその行に加わっていない
+                self._tx_row_id = None
+                if getattr(self, "_tx_path", None) == file:
+                    self._forget_tx()
+            def push_dtp_data(self, data, isproducer=False, file=None, cmd=None):
+                # pyftpdlib は、データ接続を待っている送信の後に来た転送コマンド
+                # （RETR・LIST など）で待ち行列を上書きし、先の RETR を黙って
+                # 捨てる（ファイルも閉じない）。その行が開始のまま残り、同じ名前の
+                # 取り直しも束ねられて開始が出なかった（実測）。上書きされた RETR は
+                # ここで片付ける。同じファイルの RETR の積み直しは同じ行のまま
+                prev = self._out_dtp_queue
+                super().push_dtp_data(data, isproducer, file, cmd)
+                if self._out_dtp_queue is not prev and self._in_dtp_queue is not None:
+                    # 待っていた受信（STOR など）も捨てる。データ接続は送信の方
+                    # だけを使うので、受信の方が予約と行ごと残り、次のデータ接続に
+                    # 結びついていた（実測: 次の取得が 425 で断られ、閉じると
+                    # 何も受けていない STOR が 0 バイトで完了になった）
+                    in_q, self._in_dtp_queue = self._in_dtp_queue, None
+                    self._abandon_queued(in_q, None)
+                if prev is None or self._out_dtp_queue is prev:
+                    return
+                self._leave_queued_retr(prev, keep_row=(
+                    file is not None and prev[2] is not None
+                    and prev[2].name == file.name))
+            def flush_account(self):
+                # REIN と認証済みの USER は待ち行列を捨てる。進行中の転送は
+                # RFC 959 どおり最後まで続くので、その保存先の予約だけは残す
+                in_q, out_q = self._in_dtp_queue, self._out_dtp_queue
+                super().flush_account()
+                dc = self.data_channel   # 残っていれば続いている転送
+                keep = (dc.file_obj.name if dc is not None and dc.receive
+                        and dc.file_obj is not None else None)
+                self._abandon_queued(in_q, out_q, keep)
+            def ftp_ABOR(self, line):
+                # ABOR は直前の転送コマンドを取り消す（RFC 959）が、pyftpdlib は
+                # データ接続の受け口を閉じるだけで待ち行列を残す。予約と行が
+                # 残り、後で張ったデータ接続が取り消した転送を受け取っていた
+                # （実測: ABOR 後の LIST に RETR したファイルの中身が流れた）
+                in_q, out_q = self._in_dtp_queue, self._out_dtp_queue
+                super().ftp_ABOR(line)   # 続いていたデータ接続はここで閉じる
+                self._in_dtp_queue = self._out_dtp_queue = None
+                self._abandon_queued(in_q, out_q)
             def on_connect(self):
                 mgr._emit_activity(self.remote_ip, "接続")
             def on_disconnect(self):
@@ -517,6 +853,7 @@ class FTPServerManager(QObject):
         self.is_running = False
         self._tx.clear()
         self._tx_row.clear()
+        self._tx_ids.clear()
         self.stopped.emit()
 
     def fix_firewall(self, port=21, passive_ports=(50100, 50150)):

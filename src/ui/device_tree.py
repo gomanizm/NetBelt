@@ -36,6 +36,11 @@ class DeviceTree(QWidget):
     
     # 一般的なボーレート値
     BAUD_RATES = [300, 1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600]
+
+    # 自動検出で作った「コンソール接続」グループに付ける印。手編集の config に
+    # 同じ名前のグループがあっても取り違えないよう、名前ではなくこれで探す。
+    # UserRole は機器データの置き場（値のあるグループは機器として扱われる）
+    CONSOLE_GROUP_ROLE = Qt.ItemDataRole.UserRole + 1
     
     def __init__(self):
         super().__init__()
@@ -134,6 +139,7 @@ class DeviceTree(QWidget):
         
         # コンソール接続グループを作成
         console_group = QTreeWidgetItem(self.tree, ["コンソール接続"])
+        console_group.setData(0, self.CONSOLE_GROUP_ROLE, True)
         
         # 各シリアルポートをアイテムとして追加
         for port_info in serial_ports:
@@ -173,11 +179,16 @@ class DeviceTree(QWidget):
             else self._console_group_expanded)
 
     def _find_console_group(self) -> Optional[QTreeWidgetItem]:
-        """ツリーにある「コンソール接続」グループを返す（無ければ None）"""
+        """自動検出で作った「コンソール接続」グループを返す（無ければ None）
+
+        手編集の config に同じ名前のグループがあると、名前で探したときに
+        そちらを取り除いてしまう（ポートの抜き差しやボーレートの変更で、
+        設定のグループが一覧から消えていた）ので、作ったときの印で探す。
+        """
         root = self.tree.invisibleRootItem()
         for i in range(root.childCount()):
             item = root.child(i)
-            if item.text(0) == "コンソール接続":
+            if item.data(0, self.CONSOLE_GROUP_ROLE):
                 return item
         return None
 
@@ -407,6 +418,9 @@ class DeviceTree(QWidget):
             delete_action = menu.addAction("削除")
             menu.addSeparator()
             duplicate_action = menu.addAction("複製")
+            # 先に同じ名前のグループがあると、複製の既定の入れ先（グループ名で
+            # 探す）は先に並んでいる方になるので、灰色にする（_is_shadowed_group）
+            duplicate_action.setEnabled(not self._is_shadowed_group(parent))
             baudrate_actions = []
         
         hide_action = self._add_hide_action(menu)
@@ -496,6 +510,12 @@ class DeviceTree(QWidget):
             # Defaultグループは削除不可
             if group_name != "Default":
                 delete_action = menu.addAction("グループを削除")
+            # 先に同じ名前のグループがあると、名前で探す編集・削除はそちらを
+            # 書き換えるので、灰色にして選べなくする（_is_shadowed_group）
+            if self._is_shadowed_group(group_item):
+                for action in (edit_action, delete_action):
+                    if action is not None:
+                        action.setEnabled(False)
         hide_action = self._add_hide_action(menu)
 
         try:
@@ -510,6 +530,19 @@ class DeviceTree(QWidget):
         elif action == delete_action and delete_action is not None:
             self.group_delete_requested.emit(group_name)
     
+    def _is_shadowed_group(self, group_item: QTreeWidgetItem) -> bool:
+        """先に同じ名前のグループが並んでいるかを返す。
+
+        設定のグループは名前で探す（ConfigManager.get_group は先頭を返す）。
+        手編集の config.json で同じ名前のグループが並ぶと、後ろの方で頼んだ
+        グループの編集・削除や、そこへのドロップ・そこにある機器の複製が、
+        先に並んでいる別のグループを書き換えていた（実測）。後ろの方からは
+        受け付けない。
+        """
+        root = self.tree.invisibleRootItem()
+        return any(root.child(i).text(0) == group_item.text(0)
+                   for i in range(root.indexOfChild(group_item)))
+
     def _set_baudrate(self, port: str, baudrate: int):
         """
         シリアルポートのボーレートを設定
@@ -639,6 +672,12 @@ class DeviceTree(QWidget):
             event.ignore()
             return
         
+        # 先に同じ名前のグループがあると、名前で探す移動はそちらへ入るので断る
+        if self._is_shadowed_group(target_parent if target_parent is not None
+                                   else target_item):
+            event.ignore()
+            return
+
         # 同じグループ内での移動は無視
         if source_group_name == target_group_name:
             event.ignore()

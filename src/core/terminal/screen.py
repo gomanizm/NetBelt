@@ -18,7 +18,13 @@ XTerm Control Sequences。
 (右端まで届かない形で) 書き直すと印が外れ、履歴・コピー・ログでは次の
 行との間に改行が入る。印字が複数回に分かれて届いた場合も、右端までの
 書き直しが途中で切れると印は外れる。続きの行そのものが無くなる命令
-(ED 0・IL・DL・スクロール) では、その場で印を外す。
+(ED 0・IL・DL・スクロール) では、その場で印を外す。0 行目の上 (履歴へ
+送った最後の行) も同じ扱いで、0 行目へ別の行が来たときと、0 行目を
+空行へ置き換えたとき (0 行目より下からの ED 1・ED 2・原点からの ED 0・
+RIS) に閉じる (_break_history。代替画面にいる間は閉じない)。0 行目を
+その場で消すだけの EL・0 行目での ED 1・0 行目の途中からの ED 0 では、
+0 行目が丸ごと空白になっても閉じない (画面の中の行を EL で消したときと
+同じく、上の行の印に触らない)。
 
 DECOM (ESC[?6h) は保持しない。有効なら CUP・VPA の行番号は
 スクロール範囲の上端から数えるべきだが、ここでは常に画面の
@@ -113,6 +119,10 @@ class Screen(object):
         self._new_history = collections.deque()
         self._new_history_lines = 0     # 差分に入っている論理行の数
         self._history_dropped = False
+        # 最後に記録した履歴の行が、折り返しで画面の 0 行目へ続いている
+        self._history_open = False
+        # 描画側へ渡し済みのその行を、文書の上で閉じてほしい
+        self._history_break = False
         self.title = ""
         self.responses = []             # 機器へ送り返す応答 (DSR/DA)
         self.reset()
@@ -210,6 +220,7 @@ class Screen(object):
         する必要があるので、印付きの行は 1 回の描画単位ぶんの入力で
         抑えられており、上限に数えなくても青天井にはならない。
         """
+        self._history_open = wrapped
         self._new_history.append((line, wrapped))
         if not wrapped:
             self._new_history_lines += 1
@@ -230,6 +241,30 @@ class Screen(object):
         dropped = self._history_dropped
         self._history_dropped = False
         return dropped
+
+    def take_history_break(self):
+        """渡し済みの履歴の最後の行を文書の上で閉じるべきかを返して忘れる。"""
+        brk = self._history_break
+        self._history_break = False
+        return brk
+
+    def _break_history(self):
+        """0 行目へ別の行が来たので、履歴の最後の行はもう 0 行目へ続かない。
+
+        画面の中なら _drop_mark_above や行頭からの印字が上の行の印を外すが、
+        0 行目の上は履歴で、印ごと記録済み。描画側へまだ渡していなければ
+        差分の最後の行の印を外し、渡し済みなら描画側へ知らせる。代替画面に
+        いる間は閉じない (戻ればメイン画面の 0 行目は元の続きのまま)。
+        消去が 0 行目を空行へ置き換えたとき (_erase_display・RIS) も呼ぶ。
+        """
+        if self.alt_active or not self._history_open:
+            return
+        self._history_open = False
+        if self._new_history:
+            self._new_history[-1] = (self._new_history[-1][0], False)
+            self._new_history_lines += 1
+        else:
+            self._history_break = True
 
     def take_dirty(self):
         """描き直しが要る行番号を返して忘れる。"""
@@ -290,6 +325,7 @@ class Screen(object):
             alt, alt_marks = self._other, self._other_wrapped
             keep_row = self.cursor_row
 
+        pushed = 0                      # 履歴へ送った行の数
         while len(main) > rows:
             if keep_row < len(main) - 1 and all(c == BLANK for c in main[-1]):
                 main.pop()
@@ -299,6 +335,25 @@ class Screen(object):
                 self._record_new_history(self.history[-1],
                                          main_marks.pop(0))
                 keep_row = max(0, keep_row - 1)
+                pushed += 1
+        if pushed:
+            # メイン画面の DECSC (ESC 7 / ?1048h) の保存行も、履歴へ送った
+            # ぶんだけ上へずらす (代替画面にいる間は裏の _other_saved)。
+            # 生きているカーソルと、代替画面にいる間の 1049 の保存は
+            # keep_row で追っている。47l / 1047l で先にメイン画面へ戻った
+            # あとも残る 1049 の保存 (あとの 1049l が使う) はここでずらす。
+            # ずらさないと ESC 8 / 1049l が控えた行より下の受信済みの行へ
+            # 戻って潰す
+            saved = self._other_saved if self.alt_active else self._saved
+            saved = (max(0, saved[0] - pushed),) + saved[1:]
+            if self.alt_active:
+                self._other_saved = saved
+            else:
+                self._saved = saved
+                if self._saved_main:
+                    self._saved_main = (
+                        (max(0, self._saved_main[0] - pushed),)
+                        + self._saved_main[1:])
         while len(main) < rows:
             main.append([BLANK] * cols)
             main_marks.append(False)
@@ -336,8 +391,14 @@ class Screen(object):
         # 桁」で行を切って、右端の外に書かれていた 旧桁 - 新桁 文字が
         # 画面からも文書からも消える。持ち越しが要るのは、直したかった
         # 「右端の 1 文字が上書きされる」が起きる行数だけの変更
-        self._pending_wrap = (self._pending_wrap and logical_col >= cols
-                              and cols >= was_cols)
+        keep_wait = logical_col >= cols and cols >= was_cols
+        if self._pending_wrap and not keep_wait:
+            # 待ちを解いたカーソルは、印字した右端のセルにはもう居ない
+            # (広げると 1 つ右、狭めると右端の外に残ったセルより左)。
+            # 最終桁へ印字した覚えを残すと、1 桁だけ広げたときに結合文字
+            # が足した空白へ付く (_join_previous)
+            self._printed_at_last_col = False
+        self._pending_wrap = self._pending_wrap and keep_wait
         self.dirty = set(range(rows))
         self._reflowed = True
 
@@ -386,8 +447,9 @@ class Screen(object):
                 # 時点で折り返しが無効なら捨てて右端へ重ねる
                 self._pending_wrap = False
             if self._pending_wrap:      # 右端の 1 文字あとの折り返し
+                wrap_col = self.cursor_col
                 self.cursor_col = 0
-                self._linefeed(from_wrap=True)
+                self._linefeed(from_wrap=True, wrap_col=wrap_col)
                 from_wrap = True
             if width == 2 and self.cursor_col + 1 >= self.cols:
                 # 全角が右端の 1 セルに収まらない。xterm と同じく右端は
@@ -412,6 +474,8 @@ class Screen(object):
                 # 折り返しで来たのではなく行頭から書き始めた。ここは
                 # 新しい論理行の先頭なので、前の行の古い印を落とす
                 self.wrapped[self.cursor_row - 1] = False
+            elif self.cursor_col == 0:
+                self._break_history()   # 0 行目の上は履歴の最後の行
             if entry_row != self.cursor_row:
                 entry_row = self.cursor_row
                 entry_mark = self.wrapped[entry_row]
@@ -468,12 +532,15 @@ class Screen(object):
             if self._pending_wrap and not self.autowrap:
                 self._pending_wrap = False  # 戻した折り返し待ち (_print_chars)
             if self._pending_wrap:      # 右端の 1 文字あとの折り返し
+                wrap_col = self.cursor_col
                 self.cursor_col = 0
-                self._linefeed(from_wrap=True)
+                self._linefeed(from_wrap=True, wrap_col=wrap_col)
                 entry_row = None        # 行が変わった (巻き上げも含む)
             elif self.cursor_col == 0 and self.cursor_row:
                 # 行頭から書き始めた。前の行の古い印を落とす (_print_chars)
                 self.wrapped[self.cursor_row - 1] = False
+            elif self.cursor_col == 0:
+                self._break_history()   # 0 行目 (_print_chars)
             row, col = self.cursor_row, self.cursor_col
             if entry_row != row:
                 entry_row = row
@@ -508,13 +575,15 @@ class Screen(object):
         右端で折り返し待ちなら今のセル、そうでなければ 1 つ左のセル。
         折り返しが無効 (ESC[?7l) なら右端で印字してもカーソルが動かず
         折り返し待ちも立たないので、直前の印字が最終桁へ届いていたとき
-        だけ今のセルを選ぶ。最終桁に居るだけ (手前まで印字して進んだ・
-        TAB で止まった・CUP で来た) なら、そこはまだ空白なので 1 つ左。
+        だけ今のセルを選ぶ。その覚えは、あとで ESC[?7h で折り返しを戻し
+        ても使う (xterm も最後に書いたセルへ付ける)。最終桁に居るだけ
+        (手前まで印字して進んだ・TAB で止まった・CUP で来た) なら、そこは
+        まだ空白なので 1 つ左。
         そこが全角の継続セルなら、その全角本体へ繋げる。前に文字が無い
         (行頭) ときと、セルが MAX_CELL_TEXT まで伸びているときは捨てる。
         """
         line = self.lines[self.cursor_row]
-        at_last_col = (not self.autowrap and self._printed_at_last_col
+        at_last_col = (self._printed_at_last_col
                        and self.cursor_col == self.cols - 1)
         i = (self.cursor_col if self._pending_wrap or at_last_col
              else self.cursor_col - 1)
@@ -543,17 +612,25 @@ class Screen(object):
             self._pending_wrap = False
             self._printed_at_last_col = False
         elif ch == "\t":
-            self.cursor_col = min(self.cols - 1,
-                                  (self.cursor_col // 8 + 1) * 8)
-            self._pending_wrap = False
-            self._printed_at_last_col = False
+            # 右端で折り返し待ちなら何もしない。xterm の TAB も桁を動かす
+            # だけで待ちを解かない。解くと、右端のままのカーソルへ続く
+            # 1 文字が受信済みの右端の文字を黙って潰す。折り返しが無効なら
+            # (DECRC で戻した待ち) 待ちは次の印字で捨てられるので、今まで
+            # どおり動いて解く。残すと、広げたあとに右端より手前で戻った
+            # 待ちの桁へ次の文字が重なる
+            if not (self._pending_wrap and self.autowrap):
+                self.cursor_col = min(self.cols - 1,
+                                      (self.cursor_col // 8 + 1) * 8)
+                self._pending_wrap = False
+                self._printed_at_last_col = False
         elif ch == "\x0e":              # SO: G1 へ
             self._charset = ")"
         elif ch == "\x0f":              # SI: G0 へ
             self._charset = "("
         # BEL・NUL などは何もしない
 
-    def _linefeed(self, from_wrap=False):
+    def _linefeed(self, from_wrap=False, wrap_col=None):
+        """改行する。wrap_col は折り返し待ちから折り返したときの、待っていた桁。"""
         self._pending_wrap = False
         self._printed_at_last_col = False       # 行が変わる (_join_previous)
         # 折り返しで送られたのか、機器が改行を送ったのかを覚える
@@ -566,7 +643,16 @@ class Screen(object):
             # おくと 1 行の途中へ古い文字や空白の塊が差し込まれる。
             # 「行の長さ = 折り返し位置」という前提をここで回復する。
             # 機器が送った改行 (from_wrap=False) では触らない。
-            del self.lines[self.cursor_row][self.cols:]
+            line = self.lines[self.cursor_row]
+            end = self.cols
+            # 復元で戻した待ち (右端で保存 → 窓を広げる → 復元) は右端より
+            # 手前で立つ。その右が広げたときの埋め草の空白だけなら、待って
+            # いた桁の次で切る。残すと 1 本の行の途中へ空白の塊が入る。
+            # 広げたあとに受信した文字が右にあれば消さない (今までどおり)
+            if (wrap_col is not None and wrap_col + 1 < end
+                    and _is_blank(line[wrap_col + 1:end])):
+                end = wrap_col + 1
+            del line[end:]
         if self.cursor_row == self.scroll_bottom:
             self._scroll_up(1, from_wrap=from_wrap)
         elif self.cursor_row + 1 < self.rows:
@@ -620,7 +706,10 @@ class Screen(object):
             self.lines.insert(self.scroll_top, self._blank_line())
             self.wrapped.insert(self.scroll_top, False)
         # 範囲の上端へ空行が割り込んだ。1 つ上の行の続きはそこには無い
+        # (上端が画面の先頭なら、1 つ上は履歴の最後の行)
         self._drop_mark_above(self.scroll_top)
+        if self.scroll_top == 0:
+            self._break_history()
         # 下端も同じ。下端にあった行は範囲の外へ続きを置いたまま捨てられ、
         # 代わりに 1 つ上の行が上がってくる。その行の続きは今捨てた行
         # なので、印を残すと範囲の外の行と 1 行に繋がる
@@ -764,6 +853,7 @@ class Screen(object):
             # 中身は記録しない)
             self._switch_screen(False, with_cursor=False)
             self._record_screen()
+            self._break_history()   # 0 行目も白紙になる (ED 2 と同じ)
             self.reset()
         # = > \ H などは表示を変えない
 
@@ -1038,6 +1128,17 @@ class Screen(object):
                 self.lines[r] = self._blank_line()
                 self.wrapped[r] = False
         self.dirty.update(rng)
+        if rng and rng.start == 0:
+            # 0 行目を空行へ置き換えた (カーソルが 0 行目より下の ED 1・
+            # ED 2・原点からの ED 0)。履歴の最後の行の続きはもう無いので、
+            # IL・SD で 0 行目へ別の行が来たときと同じく閉じる。閉じないと、
+            # 0 行目の行頭以外へ来た次の出力が履歴の行へ繋がる。中身の
+            # ある画面は上の _record_screen が記録して閉じ済みなので、
+            # 効くのは記録しない ED 1 と、消す前から空白だった画面。
+            # カーソルが 0 行目の ED 1 と 0 行目の途中からの ED 0 は 0 行目を
+            # その場で消すだけで、右端まで消えても EL と同じく閉じない
+            # (ここへは来ない)
+            self._break_history()
         # 走査で「残りは全部空白」と分かった ED 0 / ED 1 のあとも画面は
         # 丸ごと空白。ここで覚え直さないと、窓や文字の大きさを変えたあと
         # (set_size が落とす) や代替画面から戻ったあとの連打で、毎回また
@@ -1134,6 +1235,10 @@ class Screen(object):
         # もう下に無いので印を外す。残すと、無関係な 2 つの論理行が履歴・
         # コピー・文書で 1 行に繋がる
         self._drop_mark_above(self.cursor_row)
+        if insert and self.cursor_row == 0:
+            # 0 行目へ空行が来た。1 つ上は履歴の最後の行。DL は 0 行目
+            # そのものを履歴へ送る (その行が新しい最後の行) ので閉じない
+            self._break_history()
         if insert:
             # IL は範囲の下端の行を、続きを範囲の外へ置いたまま捨てて
             # 1 つ上の行を下端へ上げる。上がってきた行の続きは今捨てた行

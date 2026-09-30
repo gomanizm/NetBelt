@@ -386,7 +386,18 @@ class SFTPPanel(QWidget):
         なるうえ、切断を知らせるモーダルが開いている最中に一覧が消える。
         行はそのまま残し、切れたことだけ出す。
         """
-        self.status_label.setText(self.DROPPED_TEXT)
+        self._show_dropped()
+
+    def _show_dropped(self):
+        """畳んだあとに届いた通知で、切断の表示を出す（既に出ていれば残す）
+
+        畳んだあとの通知（disconnected・順番待ちの失敗・遅れた一覧・完了）は
+        別々のスレッドから届き、順は決まらない。既に切断の表示が出ていれば
+        書き直さない。書き直すと、先に届いた完了の知らせが消える
+        （_on_transfer_complete を参照）。
+        """
+        if not self.status_label.text().endswith(self.DROPPED_TEXT):
+            self.status_label.setText(self.DROPPED_TEXT)
 
     def _begin(self):
         """操作を始めた時点の「相手」と「場所」を控える。
@@ -499,7 +510,7 @@ class SFTPPanel(QWidget):
         if self._manager_is_live():
             self.status_label.setText(f"{len(file_list)} 項目")
         else:
-            self.status_label.setText(self.DROPPED_TEXT)
+            self._show_dropped()
     
     def _reset_progress(self):
         """進捗バーを片付ける
@@ -555,7 +566,14 @@ class SFTPPanel(QWidget):
             message: 完了メッセージ
         """
         self.progress_bar.setVisible(False)
-        self.status_label.setText(message)
+        if self._manager_is_live():
+            self.status_label.setText(message)
+        else:
+            # 畳んだあとに届いた完了。ダウンロードは保存先を確定してから
+            # 知らせるので、その間にロック待ちの一覧が畳むと disconnected が
+            # 先に届く。完了だけを書くと切断の表示が消え、切断の表示だけに
+            # すると完了の知らせが消える（完了にはモーダルが無い）。両方出す
+            self.status_label.setText("%s。%s" % (message, self.DROPPED_TEXT))
     
     def _on_error(self, error_message: str):
         """
@@ -565,7 +583,13 @@ class SFTPPanel(QWidget):
             error_message: エラーメッセージ
         """
         self.progress_bar.setVisible(False)
-        self.status_label.setText(f"エラー: {error_message}")
+        if self._manager_is_live():
+            self.status_label.setText(f"エラー: {error_message}")
+        else:
+            # 畳んだあとに届いた失敗（ロック待ちだった転送など）。届く順は
+            # disconnected と前後するので、ここで書くと切断の表示が消える。
+            # 理由は下の警告で出す（_update_file_list の遅れた一覧と同じ扱い）
+            self._show_dropped()
         if self._closing:
             # 終了処理の途中。表示だけ残して戻る（_closing の説明を参照）
             return
@@ -813,19 +837,45 @@ class SFTPPanel(QWidget):
             self.SFTP_SETTING_DEFAULTS["default_download_path"])
         suggested = os.path.join(download_dir, file_info['name'])
         
-        local_path, _ = QFileDialog.getSaveFileName(
-            self,
-            "ファイルを保存",
-            suggested,
-            "すべてのファイル (*.*)"
-        )
-        
-        if local_path:
+        # 上書きの確認は保存ダイアログに任せず、ここで行う。ダイアログの確認に
+        # 任せると承認したかどうかが download_file へ届かず、呼ばれた時点の
+        # 有無から推し量るので、確認のあと外で作られた保存先を「承認済み」と
+        # 読んで置き換える（利用者の決定: 「いいえ」なら保存ダイアログを開き直す）
+        while True:
+            local_path, _ = QFileDialog.getSaveFileName(
+                self,
+                "ファイルを保存",
+                suggested,
+                "すべてのファイル (*.*)",
+                options=QFileDialog.Option.DontConfirmOverwrite
+            )
+            if not local_path:
+                return
             if not self._still_on(manager):
                 self._abandon("ダウンロード")
                 return
-            remote_path = self._remote_path(base_path, file_info['name'])
-            manager.download_file(remote_path, local_path)
+            overwrite = os.path.exists(local_path)
+            if not overwrite:
+                break
+            reply = QMessageBox.question(
+                self,
+                "上書き確認",
+                "'%s' が既にあります。上書きしますか？\n%s"
+                % (os.path.basename(local_path), local_path),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                if not self._still_on(manager):
+                    self._abandon("ダウンロード")
+                    return
+                break
+            # 選び直してもらう（ネイティブの確認で「いいえ」を押したときと同じ）
+            suggested = local_path
+        remote_path = self._remote_path(base_path, file_info['name'])
+        # 承認したかどうかをそのまま渡す。承認していなければ、このあと外で
+        # 作られた保存先も download_file が置き換えずに断る
+        manager.download_file(remote_path, local_path, overwrite=overwrite)
     
     def _on_create_directory(self, pinned=None):
         """新規ディレクトリ作成"""

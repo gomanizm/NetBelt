@@ -199,6 +199,10 @@ class SNMPPanel(QWidget):
         # 後者を使う。保存時の入力欄を使うと、A の結果が B の記録になる
         self._request_host = ""
         self._result_host = ""
+        # ポートも同じ持ち方をする。同じホストの別ポートから採った結果を、
+        # 書き出したファイルで区別できるようにする
+        self._request_port = None
+        self._result_port = None
         
         self._init_ui()
         
@@ -618,6 +622,23 @@ class SNMPPanel(QWidget):
             self.trap_v3_priv_combo.currentData(),
             self.trap_v3_priv_password_edit.text())
 
+    def _trap_community_input_error(self):
+        """
+        Trap 受信が何も受け付けない設定なら、その説明を返す（無ければ None）
+
+        Community が空（空白だけも core が落とす）で v3 ユーザも無いと、
+        登録する資格情報が 1 つも無いまま受信が始まり、「受信中」と出るのに
+        1 件も受けない（実測）。v3 の検査と同じ理由で、実行前に止める。
+        「両方」で v3 ユーザがあれば、v3 は受けられるので止めない。
+        """
+        version = self.trap_version_combo.currentText()
+        if version == 'v3' or self.trap_community_edit.text().strip():
+            return None
+        if version == '両方' and self.trap_v3_username_edit.text().strip():
+            return None
+        return ("v1/v2c の Trap を受けるには Community を入力してください。\n"
+                "v3 だけを受けるならバージョンを「v3」にしてください。")
+
     def _collect_trap_v3_users(self) -> list:
         """
         Trap 受信用の v3 ユーザ定義を組み立てる
@@ -654,7 +675,9 @@ class SNMPPanel(QWidget):
         if version == 'v3':
             params.update(self._collect_v3_params())
         else:
-            params['community'] = self.community_edit.text()
+            # 前後の空白は落とす。Trap 受信は登録時に落としている
+            # （_clean_communities）ので、同じ入力がタブで別の値にならない
+            params['community'] = self.community_edit.text().strip()
         return params
     
     def _on_preset_changed(self, preset: str):
@@ -687,6 +710,7 @@ class SNMPPanel(QWidget):
         if not self.snmp_manager.snmp_get(host, oids, **params):
             return
         self._request_host = host
+        self._request_port = params['port']
         self.status_label.setText("GET実行中...")
         self._show_stop_button(True)
     
@@ -710,6 +734,7 @@ class SNMPPanel(QWidget):
         if not self.snmp_manager.snmp_walk(host, oid, **params):
             return
         self._request_host = host
+        self._request_port = params['port']
         self.status_label.setText("WALK実行中...")
         self._show_stop_button(True)
 
@@ -740,14 +765,10 @@ class SNMPPanel(QWidget):
         で自分のオフセットから書き続けるので、双方のファイルが壊れる。
         """
         from core import log_recording
-        device_name = log_recording.device_using(file_path)
-        if device_name is None:
+        message = log_recording.in_use_message(file_path)
+        if message is None:
             return False
-        QMessageBox.warning(
-            self, title,
-            "このファイルは %s のログ記録に使用中です:\n%s\n"
-            "別のファイルを選ぶか、先にそのログ記録を停止してください。"
-            % (device_name, file_path))
+        QMessageBox.warning(self, title, message)
         return True
 
     @staticmethod
@@ -789,13 +810,14 @@ class SNMPPanel(QWidget):
 
     def _on_export_clicked(self):
         """GET/WALK 結果をエクスポート（Trap と同じく txt/csv/json）"""
-        # 行・ホスト・途中までの理由は、ダイアログを開く前にまとめて固定し、
+        # 行・ホスト・ポート・途中までの理由は、ダイアログを開く前にまとめて固定し、
         # 書き出しへ引数で渡す。モーダルダイアログはネストしたイベント
         # ループで queued シグナルを処理するので、開いている間に次の WALK が
         # 完走すると self は次の結果に変わる。行だけ先に取ってホストと理由を
         # 後から self で読むと、前の途中までの行に「完走」と次のホストが付く
         results = self.result_model.get_all_results()
         host = self._result_host
+        port = self._result_port
         reason = self._last_partial_reason
         if not results:
             QMessageBox.information(self, "情報", "エクスポートするデータがありません。")
@@ -825,11 +847,14 @@ class SNMPPanel(QWidget):
             # _export_format と同じ）
             fmt = self._export_format(file_path)
             if fmt == "csv":
-                self._export_results_to_csv(file_path, results, host, reason)
+                self._export_results_to_csv(file_path, results, host, reason,
+                                            port=port)
             elif fmt == "json":
-                self._export_results_to_json(file_path, results, host, reason)
+                self._export_results_to_json(file_path, results, host, reason,
+                                             port=port)
             else:
-                self._export_results_to_txt(file_path, results, host, reason)
+                self._export_results_to_txt(file_path, results, host, reason,
+                                            port=port)
             # 書き終えてから覚える（取り消し・失敗では変えない）
             save_defaults.remember(self.config_manager, file_path)
             QMessageBox.information(self, "成功", "SNMP結果をエクスポートしました:\n" + file_path)
@@ -922,11 +947,12 @@ class SNMPPanel(QWidget):
         return "'" + text
 
     def _export_results_to_csv(self, file_path: str, results, host: str,
-                               reason):
+                               reason, port=None):
         """CSV形式で GET/WALK 結果を書き出す
 
-        host / reason は呼び出し側が結果と同時に固定した値。ここで self を
-        読むと、ダイアログを開いている間に届いた次の結果のものになる
+        host / reason / port は呼び出し側が結果と同時に固定した値。ここで
+        self を読むと、ダイアログを開いている間に届いた次の結果のものになる。
+        port が None なら（渡されなければ）ポートの行は書かない
         """
         import csv
         # BOM 付き（utf-8-sig）。日本語版 Excel は BOM の無い UTF-8 の CSV を
@@ -944,18 +970,24 @@ class SNMPPanel(QWidget):
                 # "host"・TXT の「対象ホスト:」に当たるものが CSV だけ
                 # 抜けていて、ファイルを並べると取り違えても気づけなかった
                 f.write("# 対象ホスト: %s\r\n" % host)
+            if port is not None:
+                # 同じホストの別ポートから採った結果を区別できるよう、host
+                # とは別の行に残す（既定の 161 でも書く）
+                f.write("# 対象ポート: %d\r\n" % port)
             writer = csv.writer(f)
             writer.writerow(["OID", "Type", "Value"])
             for row in results:
                 writer.writerow([self._csv_safe(cell) for cell in row])
 
     def _export_results_to_json(self, file_path: str, results, host: str,
-                                reason):
-        """JSON形式で GET/WALK 結果を書き出す（host / reason は CSV と同じ）"""
+                                reason, port=None):
+        """JSON形式で GET/WALK 結果を書き出す（host / reason / port は CSV と同じ）"""
         import json
         data = {
             "exported_at": datetime.now().isoformat(),
             "host": host,
+            # ポートは host とは別のキー（host の意味は変えない）
+            **({"port": port} if port is not None else {}),
             "count": len(results),
             # 途中までの結果かどうか。機械で読む側が見落とさないよう明示する
             "complete": reason is None,
@@ -968,12 +1000,14 @@ class SNMPPanel(QWidget):
             json.dump(data, f, ensure_ascii=False, indent=2)
 
     def _export_results_to_txt(self, file_path: str, results, host: str,
-                               reason):
-        """テキスト形式で GET/WALK 結果を書き出す（host / reason は CSV と同じ）"""
+                               reason, port=None):
+        """テキスト形式で GET/WALK 結果を書き出す（host / reason / port は CSV と同じ）"""
         with atomic_text_write(file_path, encoding="utf-8") as f:
             f.write("SNMP GET/WALK 結果\n")
             f.write("エクスポート日時: " + datetime.now().strftime("%Y-%m-%d %H:%M:%S") + "\n")
             f.write("対象ホスト: " + host + "\n")
+            if port is not None:
+                f.write("対象ポート: %d\n" % port)
             f.write("件数: " + str(len(results)) + "\n")
             if reason:
                 f.write("注意: 途中まで（%s のため中断。全部ではありません）\n" % reason)
@@ -1006,6 +1040,10 @@ class SNMPPanel(QWidget):
         v3_error = self._trap_v3_input_error()
         if v3_error:
             QMessageBox.warning(self, "エラー", v3_error)
+            return
+        community_error = self._trap_community_input_error()
+        if community_error:
+            QMessageBox.warning(self, "エラー", community_error)
             return
         
         # Trap受信を開始
@@ -1310,6 +1348,7 @@ class SNMPPanel(QWidget):
             self.snmp_manager.operation_completed.connect(self._on_operation_completed)
             self.snmp_manager.operation_partial.connect(self._on_operation_partial)
             self.snmp_manager.operation_cancelled.connect(self._on_operation_cancelled)
+            self.snmp_manager.progress_update.connect(self._on_operation_progress)
             self.snmp_manager.trap_received.connect(self._on_trap_received)
             self.snmp_manager.trap_receiver_started.connect(self._on_trap_receiver_started)
             self.snmp_manager.trap_receiver_stopped.connect(self._on_trap_receiver_stopped)
@@ -1338,6 +1377,20 @@ class SNMPPanel(QWidget):
         """
         self._partial_reason = reason
 
+    def _on_operation_progress(self, message: str):
+        """WALK の途中経過（100 件ごとの件数）を表示へ出す
+
+        表は完了まで空なので、出さないと長い WALK の実行中に件数を知る
+        手段が無い（進捗を出すのは WALK だけ）。出すのは停止ボタンが出て
+        いて押せるとき（実行中で、停止を押す前）だけにし、「停止中…」と
+        結果の表示は上書きしない。isVisible() は使わない（パネル自体が
+        隠れていると偽になる）。進捗は結果と同じワーカーから queued で
+        積まれるので、結果より後に届くことは無い。
+        """
+        if self.stop_button.isHidden() or not self.stop_button.isEnabled():
+            return
+        self.status_label.setText("WALK実行中...（%s）" % message.rstrip("."))
+
     # 利用者が止めた結果の、途中までの理由。書き出しの partial_reason にも入る
     USER_CANCEL_REASON = "利用者が中断"
 
@@ -1352,6 +1405,7 @@ class SNMPPanel(QWidget):
         rows = list(rows)
         self.result_model.set_results(rows)
         self._result_host = self._request_host
+        self._result_port = self._request_port
         self._partial_reason = None
         self._last_partial_reason = self.USER_CANCEL_REASON
         self.status_label.setText(
@@ -1363,8 +1417,9 @@ class SNMPPanel(QWidget):
         self._show_stop_button(False)
         if success:
             self.result_model.set_results(result)
-            # 表の結果がどのホストのものかを、要求時の値で固定する
+            # 表の結果がどのホスト・ポートのものかを、要求時の値で固定する
             self._result_host = self._request_host
+            self._result_port = self._request_port
             # 直前に「途中で切れた」と知らされていれば、そう書く。
             # 一度使ったら忘れる（次の完走に持ち越さない）
             reason = getattr(self, "_partial_reason", None)

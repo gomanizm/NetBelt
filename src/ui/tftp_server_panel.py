@@ -7,8 +7,22 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtGui import QFont
 from core.tftp_server import TFTPServerManager
+from core.sockets import tcp_port_number
 from datetime import datetime
 from ui import log_export, plain_log, theme
+
+
+def _restore_port(spin, value):
+    """config.json のポートを欄へ戻す。使えない値なら欄の既定値のまま。
+
+    FTP パネルの同名の関数と同じ。手で書いた 2121.0 / 1e309（json は float に
+    読む）を setValue へ渡すと TypeError でパネル（MainWindow）の構築が失敗する。
+    範囲外も端へ寄せず既定値のままにする
+    """
+    port = tcp_port_number(value)
+    if port is not None and spin.minimum() <= port <= spin.maximum():
+        spin.setValue(port)
+
 
 class TFTPServerPanel(QWidget):
     """TFTPサーバー制御パネル"""
@@ -177,10 +191,12 @@ class TFTPServerPanel(QWidget):
         root_directory = settings.get("root_directory")
         # 既定は専用フォルダ。TFTP は無認証で 0.0.0.0 に待ち受けるため、
         # デスクトップ等の個人フォルダを既定にしてはいけない。
+        # 文字列でない値（手で書いた数や配列）も既定にする。setText へ渡すと
+        # TypeError でパネル（MainWindow）の構築が失敗する
+        if not isinstance(root_directory, str):
+            root_directory = ""
         self.root_dir_edit.setText(root_directory if root_directory else "./tftp_root")
-        port = settings.get("port")
-        if port:
-            self.port_spin.setValue(port)
+        _restore_port(self.port_spin, settings.get("port"))
         self.allow_upload_check.setChecked(bool(settings.get("allow_upload", True)))
         self.allow_download_check.setChecked(bool(settings.get("allow_download", True)))
 

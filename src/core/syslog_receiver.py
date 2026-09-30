@@ -292,12 +292,16 @@ class SyslogReceiver(QObject):
             dropped = self._dropped_since_notice
             if self._pending_messages == 0 and dropped:
                 self._dropped_since_notice = 0
+                # 要約の枠は取り出すのと同じ錠の中で取る（SFTP・FTP と同じ）。
+                # 錠を離してから _emit_message で取ると、その隙に受信の
+                # スレッドが枠を埋めて要約ごと捨てられ、件数が失われる
+                self._pending_messages += 1
             else:
                 dropped = 0
         if dropped:
             # 一覧に並ぶので、機器からの行と同じ RFC 3164 の形で組み立てる。
             # PRI 12 = facility 1 (user) / severity 4 (Warning)
-            self._emit_message(SyslogMessage(
+            self.message_received.emit(SyslogMessage(
                 "<12>%s NetBelt 受信が追いつかず %d 件を取りこぼしました"
                 % (datetime.now().strftime("%b %d %H:%M:%S"), dropped),
                 "127.0.0.1"))

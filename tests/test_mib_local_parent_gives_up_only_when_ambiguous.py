@@ -68,11 +68,15 @@ VENDOR_MIB = NL.join([
 CUSTOM_MIBS = json.dumps({"mibs": {"1.3.6.1.4.1.65001": "acmeRoot"}},
                          ensure_ascii=False)
 
-# 本当に曖昧な形（決定どおり諦める側）。A-MIB も B-MIB も shared を宣言
+# 本当に曖昧な形（決定どおり諦める側）。A-MIB も B-MIB も shared を宣言し、
+# A-MIB の shared は右辺の先頭（aMissing）の取り込み元が無くて決まらない。
+# 1.3.1 までの例は複数添字の { aRoot 0 1 } だったが、1.3.2 から右辺を全部
+# 読むので A-MIB 自身の OID に決まる（tests/test_mib_parent_of_the_same_name.py）
 A_MIB = NL.join([
     "A-MIB DEFINITIONS ::= BEGIN",
+    "IMPORTS aMissing FROM A-SMI;",
     "aRoot OBJECT IDENTIFIER ::= { enterprises 1111 }",
-    "shared OBJECT IDENTIFIER ::= { aRoot 0 1 }",
+    "shared OBJECT IDENTIFIER ::= { aMissing 1 }",
     "aAlarm OBJECT IDENTIFIER ::= { shared 1 }",
     "END",
     "",

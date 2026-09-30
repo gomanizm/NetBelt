@@ -13,8 +13,10 @@ Trap のバイト列を組み立てるヘルパもここに置く。複数のテ
 ModuleNotFoundError になる。conftest は pytest が必ず import できる。
 """
 import os
+import shutil
 import socket
 import sys
+import tempfile
 import threading
 
 import pytest
@@ -28,6 +30,87 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 _font_dir = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
 if os.path.isdir(_font_dir):
     os.environ.setdefault("QT_QPA_FONTDIR", _font_dir)
+
+
+# テストが作る一時フォルダは、セッションごとの 1 つのフォルダの中へ置き、
+# 終わりに丸ごと消す。mkdtemp の後始末を書いていないテストが多く（285 ファイル）、
+# 全件を 1 回流すと %TEMP% に 1,300〜1,700 個残っていた。MainWindow を作る
+# テストは、インストール済みの NetBelt と共用の %TEMP%\NetBeltUpdates にも
+# 触っていた（VersionManager.UPDATE_DIR は import の時点で決まるので、テストの
+# 収集より先に動く pytest_configure で切り替える）。
+# すでに %TEMP% にある物には触らない。止め損ねたスレッドや子プロセスが掴んで
+# いるファイルは消せずに残る（そのフォルダだけが残る）。
+# フォルダ名は短くする（nbt-xxxxxxxx。TEMP が 13 文字長くなる）。更新のテストは
+# TEMP の下へさらに掘り、updater.bat の xcopy は 260 文字を超えるファイルを
+# 黙って飛ばす（upd-04）。TEMP（このフォルダを含む）が 150 文字を超えるあたり
+# から、更新のテストが落ち始める（実測: 143 文字の TEMP で 2 件）。そのため
+# TEMP に 8.3 の短い名前があれば、その下に作る（GitHub のランナーの TEMP も
+# C:\Users\RUNNER~1\... の形）。短い名前の無い長い TEMP では、まだ落ちうる。
+_TEMP_VARS = ("TEMP", "TMP", "TMPDIR")
+_TEMP_SESSION_PREFIX = "nbt-"
+_temp_session = None
+
+
+def _short_path(path):
+    """path の 8.3 の短い名前（Windows だけ）。短くならなければ path のまま。"""
+    if sys.platform != "win32":
+        return path
+    try:
+        import ctypes
+        from ctypes import wintypes
+        # windll.kernel32 の関数の argtypes を書き換えると、同じ関数を使う
+        # テストへ移るので、自分用に読み込む
+        get = ctypes.WinDLL("kernel32").GetShortPathNameW
+        get.argtypes = (wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD)
+        get.restype = wintypes.DWORD
+        buf = ctypes.create_unicode_buffer(1024)
+        n = get(path, buf, len(buf))
+    except Exception:
+        return path
+    if 0 < n < len(buf) and len(buf.value) < len(path):
+        return buf.value
+    return path
+
+
+def _enter_temp_session():
+    """いまの一時フォルダ（8.3 の短い名前があればそちら）の下に nbt-* を作り、
+    以後の置き場にする。
+
+    子プロセスも同じ場所を使うよう、環境変数も向ける。戻り値は
+    _leave_temp_session に渡す。
+    """
+    path = tempfile.mkdtemp(prefix=_TEMP_SESSION_PREFIX,
+                            dir=_short_path(tempfile.gettempdir()))
+    state = {"dir": path, "tempdir": tempfile.tempdir,
+             "env": {key: os.environ.get(key) for key in _TEMP_VARS}}
+    for key in _TEMP_VARS:
+        os.environ[key] = path
+    tempfile.tempdir = path
+    return state
+
+
+def _leave_temp_session(state):
+    """_enter_temp_session の前へ戻し、作ったフォルダを中身ごと消す。"""
+    for key, value in state["env"].items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+    tempfile.tempdir = state["tempdir"]
+    shutil.rmtree(state["dir"], ignore_errors=True)
+
+
+def pytest_configure(config):
+    global _temp_session
+    if _temp_session is None:
+        _temp_session = _enter_temp_session()
+
+
+def pytest_unconfigure(config):
+    global _temp_session
+    if _temp_session is not None:
+        state, _temp_session = _temp_session, None
+        _leave_temp_session(state)
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -51,6 +134,100 @@ def qapp():
     if leftovers:
         print("\n[conftest] 終了時に非デーモンスレッドが残っています: %s"
               % ", ".join(t.name for t in leftovers))
+
+
+@pytest.fixture(scope="session", autouse=True)
+def default_config_outside_the_working_directory(tmp_path_factory):
+    """引数なしの ConfigManager() に、作業ディレクトリの config.json を使わせない。
+
+    ConfigManager の既定の config_path は作業ディレクトリからの相対の
+    "config.json" で、MainWindow・FTP/TFTP パネル・更新ダイアログは引数なしで
+    作る。差し替えずに窓を作るテスト（32 ファイル）は、リポジトリ直下の
+    config.json（ソースから起動したときの利用者の設定）を読み書きしていた。
+
+    セッションの間だけ、既定値をセッションの一時フォルダの config.json へ
+    差し替える。クラスは差し替えないので、クラス属性の参照は変わらない。
+    テストどうしで 1 つの設定を共有するのはこれまでと同じで、場所だけが
+    変わる。明示的なパスを渡す呼び出しと、自分で ConfigManager を差し替える
+    テストには影響しない。setUpClass で作る窓にも効くよう、セッションの
+    スコープにする。
+
+    ただし、テストが作業ディレクトリを移している（chdir）間は、これまで
+    どおり作業ディレクトリの "config.json" にする。自分の一時フォルダへ移り、
+    そこに置いた config.json を窓に読ませるテストがある
+    （test_config_invalid_devices.py の窓の 2 件。固定のパスにしたら、置いた
+    設定を読まずに落ちた）。既定値は Path() に渡った時点（ConfigManager を
+    作る時点）の作業ディレクトリで決まる。
+    """
+    from unittest import mock
+
+    src = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "src")
+    if src not in sys.path:
+        sys.path.insert(0, src)
+    try:
+        from core.config_manager import ConfigManager
+    except Exception:
+        yield
+        return
+    path = str(tmp_path_factory.mktemp("netbelt-config") / "config.json")
+    start = os.path.normcase(os.getcwd())
+
+    class _DefaultConfigPath:
+        """ConfigManager() の既定の config_path（os.PathLike）"""
+
+        def __fspath__(self):
+            if os.path.normcase(os.getcwd()) == start:
+                return path
+            return "config.json"
+
+        def __repr__(self):
+            return repr(self.__fspath__())
+
+    with mock.patch.object(ConfigManager.__init__, "__defaults__",
+                           (_DefaultConfigPath(),)):
+        yield
+
+
+def _file_mark(path):
+    """path の大きさと更新時刻（ns）。無ければ None"""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return st.st_size, st.st_mtime_ns
+
+
+def _what_happened(before, after):
+    """_file_mark の前後から起きたこと。何も起きていなければ None"""
+    if before == after:
+        return None
+    if before is None:
+        return "作られた"
+    if after is None:
+        return "消えた"
+    return "書き換わった"
+
+
+@pytest.fixture(autouse=True)
+def working_directory_config_left_alone(request):
+    """pytest を起動した場所の config.json に触ったテストを落とす。
+
+    上の既定値の差し替えは子プロセスには効かない。子プロセスで窓を作る
+    テストが cwd を渡し忘れると、作業ディレクトリ（リポジトリの直下。
+    ソースから起動したときの利用者の設定がある）に config.json を作る
+    （test_window_close_waits_for_mib_loader.py で実測。テストは通ったまま）。
+    テストの前後で作られた・書き換わった・消えたなら、そのテストを落とす。
+    同じ時にソースから起動したアプリが書き換えた場合も落ちる。
+    """
+    path = os.path.join(str(request.config.invocation_params.dir),
+                        "config.json")
+    before = _file_mark(path)
+    yield
+    happened = _what_happened(before, _file_mark(path))
+    if happened:
+        pytest.fail("このテストの間に、pytest を起動した場所の config.json が"
+                    "%s: %s" % (happened, path), pytrace=False)
 
 
 @pytest.fixture(autouse=True)

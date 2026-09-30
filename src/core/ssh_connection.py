@@ -9,9 +9,12 @@ import threading
 import time
 from pathlib import Path
 from typing import Callable, Optional
-from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
+from paramiko.common import cMSG_CHANNEL_WINDOW_ADJUST
+from paramiko.message import Message
+from PyQt6.QtCore import QObject, QTimer, pyqtSignal, pyqtSlot
 
 from .send_backpressure import DrainWatcher, socket_writable
+from .unsendable import unsendable_notice
 
 # known_hosts の読み書きを直列化する。同時に保存すると、あとから
 # os.replace した側が先の結果を丸ごと差し替えてしまう。旧 known_hosts の
@@ -60,6 +63,10 @@ def known_hosts_names(text):
         fields = fields[1:]
     if not fields:
         return []
+    if fields[0].endswith("]:") and len(fields) > 1:
+        # 旧版がポートを " 22" のまま書いた "[host]: 22 <種別> <鍵>" は、
+        # 名前欄が空白で割れている。次の欄とつないで 1 つの名前として返す
+        return (fields[0] + fields[1]).split(",")
     return fields[0].split(",")
 
 
@@ -77,6 +84,119 @@ def _hostnames_match(names, server_name):
             except Exception:
                 pass
     return False
+
+
+# ハッシュ化名の照合で、設定によらず候補にする旧版のポートの綴り（%d は
+# 接続先のポート）。旧版の paramiko へ渡った綴りは Windows の getaddrinfo が
+# 読める形（先頭の "+" と 0 の並び）なら何でもあり得るので、よくある形に
+# 数を限る。1 つ増やすごとに、ハッシュ化名 1 つあたり hash_host が 1〜2 回増える
+# （実測: ハッシュ化行 1 万行で未知の機器へ繋ぐと、この 3 つで読み替えが
+# 0.30 秒→0.52 秒、保存直前の確認が 0.85 秒→1.02 秒）
+_LEGACY_PORT_SPELLINGS = ("0%d", "00%d", "+%d")
+
+
+def _names_same_endpoint(name, host, port, ignore_case=True,
+                         written_port=None):
+    """known_hosts の名前 1 つが host:port を指すか（別の綴りも含む）。
+
+    完全一致とハッシュ化名のほかに、ポートを整数へそろえる前の版が
+    config.json の文字列のまま書いた "[host]:022"・"[host]:+22"・
+    "[host]:02202" のような綴りも、ポートを整数にそろえて同じ接続先と
+    みなす。22 番なら "host" と "[host]:22" もこの機器の名前。
+
+    ハッシュ化名からはポートを読み出せないので、候補の名前ごとに掛け直して
+    比べる。旧版がポートの文字列から組み立てた "[host]:<綴り>" の候補は、
+    written_port（整数へそろえる前の設定の文字列）と、設定によらない
+    よくある綴り（_LEGACY_PORT_SPELLINGS）。無いと "[host]:022" を
+    ハッシュ化した行が照合に使われず、TOFU が別の鍵を受け入れてパスワードが
+    届いていた（実測）。設定の文字列は、機器の編集で OK を押すだけで
+    整数になる（"022" は 22 で保存される）ので、それだけには頼らない。
+    それ以外の綴り（"+0022" など）でハッシュ化した行は、設定がその綴りの
+    あいだしか照合できない（元の綴りをハッシュ化名から取り戻せない。残る制限）。
+
+    ignore_case なら、ホスト名の大文字小文字は区別しない（OpenSSH と同じ）。
+    ハッシュ化名は設定の綴りのままと、小文字にそろえた綴りの両方で
+    掛け直して比べる（OpenSSH は小文字にしてから掛ける）。
+    """
+    try:
+        port = int(port)            # known_hosts_server_name と同じ読み方
+    except (TypeError, ValueError):
+        port = 22
+    fold = str.lower if ignore_case else str
+    lowered = fold(host)
+    if name.startswith("|1|"):
+        wanted = {known_hosts_server_name(h, port) for h in (host, lowered)}
+        spellings = {s % port for s in _LEGACY_PORT_SPELLINGS}
+        if port == 22:
+            spellings.add("22")
+        if (isinstance(written_port, str)
+                and tcp_port_number(written_port) == port):
+            spellings.add(written_port)
+        wanted.update("[%s]:%s" % (h, s)
+                      for h in (host, lowered) for s in spellings)
+        return any(_hostnames_match([name], w) for w in wanted)
+    if name.startswith("[") and "]:" in name:
+        name_host, _, name_port = name[1:].rpartition("]:")
+        return (fold(name_host) == lowered
+                and tcp_port_number(name_port) == port)
+    return port == 22 and fold(name) == lowered
+
+
+def _add_other_spelling_keys(keys, host, port, written_port=None):
+    """同じ接続先を別の綴りの名前で保存した鍵を、接続先名の鍵として keys へ足す。
+
+    paramiko 4.0.0 は known_hosts を引く名前を `port == 22`（整数との
+    比較）で決める。ポートを整数へそろえる前の版は、config.json の
+    文字列をそのまま渡していたので、その機器の鍵は "[host]:22" や
+    "[host]:022"・"[host]:+22"（22 番以外なら "[host]:02202" など）の
+    名前で保存されている。いまは "host" や "[host]:2202" で引くため
+    この行が使われず、更新後の最初の接続で TOFU が黙って別の鍵を
+    受け入れ、パスワードが相手へ届いていた（実測）。
+
+    ホスト名の大文字小文字だけが違う行も同じ。paramiko は名前を文字列の
+    まま比べるので、OpenSSH（小文字で書く）から写した行と大文字を含む
+    設定や、機器の編集で大文字小文字だけを変えた機器で同じことが
+    起きていた（実測）。
+
+    接続先名の鍵が無いときだけ読み替える。22 番は今までどおり
+    "[host]:22" の鍵を先に見る。それも無ければ、同じ接続先を指す
+    ほかの綴りの行（_names_same_endpoint）の鍵を、ファイルの順に
+    接続先名の鍵として足す（paramiko の照合は種別ごとに先頭の鍵を
+    使う）。読み替えはメモリ上だけで、known_hosts には書かない。
+    written_port は整数へそろえる前の設定のポート（ハッシュ化した旧版の
+    綴りの照合に使う。_names_same_endpoint 参照）。
+
+    Returns:
+        読み替えに使った行の名前（known_hosts に書かれた綴り）。鍵が
+        食い違ったときの案内に載せる。読み替えなければ空
+    """
+    server_name = known_hosts_server_name(host, port)
+    if keys.lookup(server_name) is not None:
+        return []
+    if port == 22:
+        legacy_name = "[%s]:22" % host
+        legacy = keys.lookup(legacy_name)
+        if legacy is not None:
+            # lookup はハッシュ化名とも照合するので、組み立てた平文の名前は
+            # ファイルに無いことがある。一致した行に書かれた綴り（|1|… を
+            # 含む）を返す（下のほかの綴りの読み替えと同じ）
+            written = [next((name for name in entry.hostnames
+                             if _hostnames_match([name], legacy_name)), None)
+                       for entry in keys._entries]
+            for keytype in legacy.keys():
+                keys.add(host, keytype, legacy[keytype])
+            return list(dict.fromkeys(n for n in written if n is not None))
+    used = []
+    for entry in list(keys._entries):
+        name = next((name for name in entry.hostnames
+                     if _names_same_endpoint(name, host, port,
+                                             written_port=written_port)),
+                    None)
+        if name is not None:
+            keys._entries.append(paramiko.hostkeys.HostKeyEntry(
+                [server_name], entry.key))
+            used.append(name)
+    return list(dict.fromkeys(used))
 
 
 def _iter_known_hosts_lines(path):
@@ -167,26 +287,76 @@ def load_known_hosts(hostkeys, path):
     lookup 経由でハッシュ化名（|1|salt|hash）とも照合するので、それを
     使うと「ハッシュ行＋同じ鍵の平文行」の平文行が畳まれ、別の機器の
     保存で利用者の書いた行が黙って消える（実測）。
+
+    同じ行があるかは (名前, 鍵種別, 鍵) の集合で引く。1 名前ごとに _entries
+    全体をたどると、名前がすべて異なる 1 万行で約 5,000 万回の比較になり、
+    保存のたびに錠の中で 2 回通るので 4 秒ほど他の接続を待たせていた（実測）。
     """
     from paramiko.hostkeys import HostKeyEntry
+    seen = _entry_names_and_keys(hostkeys._entries)
     for _lineno, _text, _raw, entry in _iter_known_hosts_lines(path):
         if entry is None:
             continue
         keytype = entry.key.get_name()
         blob = entry.key.asbytes()
         for name in entry.hostnames:
-            if any(name in e.hostnames and e.key.get_name() == keytype
-                   and e.key.asbytes() == blob
-                   for e in hostkeys._entries):
+            if (name, keytype, blob) in seen:
                 continue
+            seen.add((name, keytype, blob))
             # HostKeys.load 自身も _entries へ append する（paramiko 4.0.0）
             hostkeys._entries.append(HostKeyEntry([name], entry.key))
+
+
+def _entry_names_and_keys(entries):
+    """エントリの (名前, 鍵種別, 鍵) を集合にする（重複の判定用）"""
+    return {(name, e.key.get_name(), e.key.asbytes())
+            for e in entries if e.key is not None for name in e.hostnames}
 
 
 def _has_utf8_bom(path):
     """known_hosts の先頭に UTF-8 BOM があるか"""
     with open(str(path), "rb") as f:
         return f.read(len(codecs.BOM_UTF8)) == codecs.BOM_UTF8
+
+
+def _hashed_names_need_own_loader(path):
+    """ハッシュ化名（|1|salt|hash）の行があり、_HostKeysLoadedLinearly で読むべきか。
+
+    バイト列に "|1|" があるかだけを見る。コメントや注釈欄に偶然含まれて
+    いても、読み方は paramiko と同じなので害は無い。
+    """
+    return b"|1|" in Path(str(path)).read_bytes()
+
+
+class _HostKeysLoadedLinearly(paramiko.HostKeys):
+    """HostKeys.load の読み方のまま、1 行ごとの重複の判定だけを軽くした HostKeys。
+
+    HostKeys.load は 1 行ごとに check() → lookup で、それまでに読んだ
+    ハッシュ化名すべてに hash_host を掛け直すので、ハッシュ化行の後ろに
+    平文行が続くと行数の 2 乗で重くなる。読み方（既定の文字コード・
+    text モードの改行）は paramiko のまま使い、重複の判定だけを
+    load_known_hosts と同じ名前の文字列の比較にする。畳むのは同じ名前・
+    同じ鍵の行だけなので、照合（lookup）の結果は変わらない。
+    読み込みにだけ使い、照合は paramiko.HostKeys へ移してから行う。
+
+    判定は (名前, 鍵種別, 鍵) の集合で引く。HostKeys.load は _entries へ
+    足すだけなので、check() のたびに増えた分だけを集合へ足せば、読み込みの
+    重さは行数に比例する（1 行ごとに _entries 全体をたどると、名前がすべて
+    異なる 1 万行で約 5,000 万回の比較・約 2 秒。実測）。
+    """
+
+    def __init__(self, filename=None):
+        self._seen = set()
+        self._seen_count = 0        # _entries の何件目までを _seen に入れたか
+        super().__init__(filename)
+
+    def check(self, hostname, key):
+        if len(self._entries) < self._seen_count:
+            # 読み込み以外で減った（想定外）。数え直す
+            self._seen, self._seen_count = set(), 0
+        self._seen |= _entry_names_and_keys(self._entries[self._seen_count:])
+        self._seen_count = len(self._entries)
+        return (hostname, key.get_name(), key.asbytes()) in self._seen
 
 
 def _load_known_hosts_into_client(client, path, broken):
@@ -211,6 +381,13 @@ def _load_known_hosts_into_client(client, path, broken):
     なる（実測）。行ごとの点検は bytes で読むので「読めない行」は 0 件で、
     行番号も出ない。デコードだけは受け止めて、読める行を取り込む。
 
+    ハッシュ化名の行があるファイルは _HostKeysLoadedLinearly で読む。
+    paramiko の HostKeys.load は、ハッシュ化行の後ろに平文行が続くと行数の
+    2 乗で重くなる（実測: 交互に 2,000 行で 6.5 秒。この間 known_hosts の錠を
+    握ったまま）。読み方は paramiko のままなので、NetBelt が既定の文字コード
+    （日本語の Windows では cp932）で保存した日本語のホスト名も今までどおり
+    読める（UTF-8 で読む自前のローダでは文字化けして「未知」に戻る。実測）。
+
     Args:
         broken: unreadable_known_hosts_lines() の戻り値
     """
@@ -219,7 +396,19 @@ def _load_known_hosts_into_client(client, path, broken):
         load_known_hosts(client.get_host_keys(), path)
         return
     try:
-        client.load_host_keys(str(path))
+        if _hashed_names_need_own_loader(path):
+            loaded = _HostKeysLoadedLinearly()
+            client._host_keys_filename = None
+            try:
+                loaded.load(str(path))
+            finally:
+                # 途中で読めなくなっても、読めた行（既定の文字コードで読んだ
+                # 名前のまま）は残して下の読み直しで足す。client.load_host_keys
+                # と同じ。捨てると cp932 で保存した日本語名が読み直しで
+                # 文字化けし、その機器が「未知」に戻る（実測）
+                client.get_host_keys()._entries.extend(loaded._entries)
+        else:
+            client.load_host_keys(str(path))
     except UnicodeDecodeError:
         # paramiko は読む前に _host_keys_filename を覚える。読めたのは
         # 一部だけなので、その名前を見て書き出されないよう戻す
@@ -233,7 +422,7 @@ def _key_fingerprint(key):
     return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
 
 
-def _refuse_conflicting_host_key(path, hostname, key):
+def _refuse_conflicting_host_key(path, hostname, key, endpoint=None):
     """ディスクに同じ接続先の別の鍵があれば、上書きせず中止する。
 
     missing_host_key が呼ばれるのは「読み込んだ時点でこの接続先の鍵を
@@ -243,6 +432,13 @@ def _refuse_conflicting_host_key(path, hostname, key):
     自分の鍵で置き換えてしまい（実測: 3 行とも後から来た鍵になる）、
     先に登録した機器は次から BadHostKeyException で繋がらなくなる。
     黙って上書きするより、食い違いを伝えて止める。
+
+    endpoint（(host, port) か (host, port, 整数へそろえる前の設定のポート)）
+    があれば、完全一致の鍵が無いとき、読み込みの
+    ときと同じ規則（_add_other_spelling_keys）で、大文字小文字や旧版の
+    ポートの綴りが違う名前の鍵も見る。完全一致だけを見ていると、同時に
+    初回接続した別の接続が "SW1.EXAMPLE.COM <鍵 A>" を保存していても
+    気づかず、鍵 B の相手へパスワードが届いていた（実測）。
 
     Raises:
         HostKeyMismatchError: 同じ接続先に別の鍵が保存済みのとき
@@ -255,6 +451,12 @@ def _refuse_conflicting_host_key(path, hostname, key):
     # 扱いになり、他の機器の初回鍵まで保存されなくなる
     load_known_hosts(disk, path)
     stored = disk.lookup(hostname)
+    note = ""
+    if stored is None and endpoint is not None:
+        _add_other_spelling_keys(disk, *endpoint)
+        stored = disk.lookup(hostname)
+        note = ("\n名前の大文字小文字やポートの書き方が違う行も、同じ接続先の"
+                "行です。")
     if stored is None or disk.check(hostname, key):
         return
     raise HostKeyMismatchError(
@@ -264,12 +466,12 @@ def _refuse_conflicting_host_key(path, hostname, key):
         "  今回提示された鍵: %s %s\n"
         "%s\n"
         "機器を入れ替えたなどで変更が意図したものなら、known_hosts の"
-        "該当行を削除してから接続し直してください。"
+        "該当行を削除してから接続し直してください。%s"
         % (hostname,
            " / ".join("%s %s" % (name, _key_fingerprint(stored[name]))
                       for name in sorted(stored.keys())),
            key.get_name(), _key_fingerprint(key),
-           path))
+           path, note))
 
 
 def _write_known_hosts_file(hostkeys, preserved, tmp_path):
@@ -288,7 +490,7 @@ def _write_known_hosts_file(hostkeys, preserved, tmp_path):
                 f.write(raw + os.linesep.encode("ascii"))
 
 
-def _save_known_hosts(known_hosts_path, entry):
+def _save_known_hosts(known_hosts_path, entry, endpoint=None):
     """今回の 1 件を known_hosts へ書き足す（ほかの行はディスクの現状のまま）。
 
     接続開始時に読み込んだ client の HostKeys を丸ごと書き戻していた頃は、
@@ -307,12 +509,14 @@ def _save_known_hosts(known_hosts_path, entry):
     Args:
         entry: (接続先名, 提示された鍵)。書き足す 1 件。書き込む前に、
             同じ接続先の別の鍵がディスクに無いかを錠の中で確かめる
+        endpoint: (host, port[, 設定のポート])。確かめるときに別の綴りの
+            名前も見る（_refuse_conflicting_host_key）
     """
     path = Path(str(known_hosts_path))
     with _known_hosts_guard(path.parent):
         # 確かめてから書くまでを錠の中で通す。外で見ると、その間に
         # 別のプロセスが保存した鍵を見落とす
-        _refuse_conflicting_host_key(path, entry[0], entry[1])
+        _refuse_conflicting_host_key(path, entry[0], entry[1], endpoint)
         hostkeys = paramiko.HostKeys()
         preserved = []
         if path.exists():
@@ -345,13 +549,17 @@ class _TofuHostKeyPolicy(paramiko.MissingHostKeyPolicy):
     既知ホストで鍵が一致しない場合は paramiko が BadHostKeyException を送出する。
     """
 
-    def __init__(self, known_hosts_path):
+    def __init__(self, known_hosts_path, endpoint=None):
         self._known_hosts_path = known_hosts_path
+        # (host, port[, 設定のポート])。保存直前の食い違い確認で別の綴りの
+        # 名前も見る
+        self._endpoint = endpoint
 
     def missing_host_key(self, client, hostname, key):
         client.get_host_keys().add(hostname, key.get_name(), key)
         try:
-            _save_known_hosts(self._known_hosts_path, (hostname, key))
+            _save_known_hosts(self._known_hosts_path, (hostname, key),
+                              self._endpoint)
         except HostKeyMismatchError:
             # 食い違いは「保存できなかった」ではなく「保存してはいけない」。
             # 警告で済ませず、そのまま接続を中止させる（client はこのあと
@@ -375,6 +583,156 @@ class HostKeyMismatchError(Exception):
     """同じ接続先の別の鍵が known_hosts にある。上書きせず接続を中止する"""
 
 
+class _ChannelWriter:
+    """チャネルへの書き込み（データと window-change）を GUI スレッドの外で行う書き手（1 つのチャネルに束縛する）
+
+    paramiko の sendall・resize_pty は、Transport へ書くと待たされる間
+    （鍵交換中・TCP へ書けない）戻らない。書けるかを先に調べても、調べた
+    直後に Transport のスレッドが鍵交換を始めると、書き込みは鍵交換が
+    終わるまで（最長 30 秒）待ち、GUI スレッドで書くとその間は画面も切断の
+    操作も止まっていた。書くのはこのスレッドに任せ、渡された順に書く。
+    データは前の書き込みが終わってから渡される（SSHConnection._send_backlogged
+    が待たせる）。書き込みが待たされている間に渡された大きさは、それが
+    終わってから最後の 1 つだけを書く。
+    書き終えたスレッドは、次の受け渡しを _LINGER_SECONDS まで待ってから
+    終わる。打鍵・貼り付けの区切りごとにスレッドを作ると、そのたびに
+    0.2〜0.4 ms 余計に掛かり、localhost への貼り付けが 1.7 倍遅かった。
+    """
+
+    # 書き終えたあと、次の受け渡しを待つ時間（秒）
+    _LINGER_SECONDS = 1.0
+
+    def __init__(self, channel):
+        self.channel = channel
+        self._lock = threading.Lock()
+        self._wake = threading.Condition(self._lock)   # 待っている書き手を起こす
+        self._data = b""           # まだ書いていないデータ
+        self._size = None          # まだ書いていない最後の大きさ
+        self._error = None         # データの書き込みの失敗（GUI スレッドが取り出す）
+        self._running = False      # 書き手のスレッドが動いている（次を待つ間も）
+        self._stopped = False
+        self._idle = threading.Event()
+        self._idle.set()
+
+    def busy(self) -> bool:
+        """書いている最中か、まだ書いていない物がある"""
+        return not self._idle.is_set()
+
+    def failed(self) -> bool:
+        """データの書き込みの失敗を、まだ取り出していない"""
+        return self._error is not None
+
+    def take_error(self):
+        """データの書き込みの失敗を取り出す（無ければ None）"""
+        with self._lock:
+            error, self._error = self._error, None
+        return error
+
+    def write(self, data: bytes, wait: float) -> bool:
+        """データを渡し、書き終わるのを最大 wait 秒だけ待つ。書き終えたら True
+
+        前のデータの書き込みの失敗を取り出していない間は、受け取らずに True を
+        返す（失敗した区切りの続きだけを機器へ届けない。知らせるのは
+        呼び出し側の SSHConnection._report_write_error）。
+        """
+        return self._hand_over(wait, data=data)
+
+    def send_size(self, cols: int, rows: int, wait: float) -> None:
+        """大きさを渡し、書き終わるのを最大 wait 秒だけ待つ
+
+        前の書き込みがまだ終わっていなければ待たない（それは待たされて
+        いる。終わったら、ここで渡した最後の大きさを書く）。
+        """
+        self._hand_over(wait, size=(cols, rows))
+
+    def _hand_over(self, wait: float, data: bytes = b"", size=None) -> bool:
+        with self._lock:
+            if self._stopped:
+                return True
+            if self._error is not None:
+                # 失敗をまだ知らせていない: 続きのデータは書かない
+                if size is None:
+                    return True
+                data = b""
+            self._data += data
+            if size is not None:
+                self._size = size
+            if not self._idle.is_set():
+                return False   # 書いている最中。終わったら、ここで渡した物も書く
+            self._idle.clear()
+            start = not self._running
+            if start:
+                self._running = True
+            else:
+                self._wake.notify()   # 次を待っている書き手に書かせる
+        if start:
+            try:
+                threading.Thread(target=self._run, name="netbelt-channel-writer",
+                                 daemon=True).start()
+            except RuntimeError:
+                # スレッドを作れない。これまでどおりその場で書く（渡した物を
+                # 誰も書かないまま残さない）
+                self._run(linger=0.0)
+                return True
+        return self._idle.wait(wait)
+
+    def _run(self, linger=None):
+        if linger is None:
+            linger = self._LINGER_SECONDS
+        while True:
+            with self._lock:
+                data, size = self._next_locked(linger)
+            if data:
+                try:
+                    self.channel.sendall(data)
+                except Exception as e:
+                    with self._lock:
+                        self._error = e
+                        self._data = b""   # 失敗した区切りの続きは書かない
+            elif size is not None:
+                try:
+                    self.channel.resize_pty(width=size[0], height=size[1])
+                except Exception:
+                    pass   # 通知に失敗しても接続はそのまま続ける
+            else:
+                return
+
+    def _next_locked(self, linger: float):
+        """次に書く (データ, 大きさ) を取る（ロックを持って呼ぶ）
+
+        無ければ空いたことを知らせ、次の受け渡しを linger 秒まで待つ。
+        止められたか、待っても来なければ、スレッドを終える印に (b"", None)。
+        """
+        deadline = None
+        while not self._stopped:
+            # データから書く。データは書き手が空いているときにしか渡されない
+            # ので、残っている大きさはそのデータより後に渡された物
+            if self._data:
+                data, self._data = self._data, b""
+                return data, None
+            if self._size is not None:
+                size, self._size = self._size, None
+                return b"", size
+            self._idle.set()
+            now = time.monotonic()
+            if deadline is None:
+                deadline = now + linger
+            if now >= deadline:
+                break
+            self._wake.wait(deadline - now)
+        self._running = False
+        self._idle.set()
+        return b"", None
+
+    def stop(self) -> None:
+        """以後は書かない（書いている最中の 1 つは、閉じた接続で終わる）"""
+        with self._lock:
+            self._stopped = True
+            self._data = b""
+            self._size = None
+            self._wake.notify_all()   # 次を待っている書き手を終わらせる
+
+
 class SSHConnection(QObject):
     """SSH接続を管理するクラス"""
     
@@ -387,6 +745,9 @@ class SSHConnection(QObject):
     # resume_send_queue へ繋ぐ。接続自身も持ち越しを書くのに使う）。
     # 見張りのスレッドから出すのでキュー接続で届く
     send_drained = pyqtSignal()
+    # 保留した端末の大きさを、Transport へまた書けるようになったので送れる
+    # （_send_terminal_size。見張りのスレッドから出すのでキュー接続で届く）
+    _size_writable = pyqtSignal()
     
     def __init__(self, host: str, port: int, username: str, password: str = "", 
                  ssh_key: str = "", parent=None):
@@ -404,6 +765,8 @@ class SSHConnection(QObject):
         super().__init__(parent)
         self.host = host
         self.port = port
+        # 整数へそろえる前の設定のポート（文字列のとき）。connect() で覚える
+        self._written_port = None
         self.username = username
         self.password = password
         self.ssh_key = ssh_key
@@ -428,10 +791,24 @@ class SSHConnection(QObject):
         # 送信の背圧（has_pending_sends）。接続が成立したときに、その
         # チャネルに束縛して作る
         self._drain_watcher: Optional[DrainWatcher] = None
+        # その見張りを始められないときの調べ直し（_retry_drain）を予約済みか。
+        # 予約はいつも 1 本だけにする（呼ばれたときに外す）
+        self._drain_retry_pending = False
         # 送信ウィンドウに入り切らず、まだ書いていない分（_write_carry）。
         # 端末に渡す物が無くても、書けるようになったらここで書き出す
         self._carry = b""
+        # まだ機器へ伝えていない端末の大きさがあるか（_send_terminal_size）。
+        # ある間は、あとのデータも書き手へ渡さない（_send_backlogged）
+        self._size_unsent = False
+        # その大きさを送れるようになるのを待つ見張り（_send_terminal_size）
+        self._size_watcher: Optional[DrainWatcher] = None
+        # 見張りを始められないときの調べ直し（_retry_terminal_size）を予約
+        # 済みか。予約はいつも 1 本だけにする（呼ばれたときに外す）
+        self._size_retry_pending = False
+        # データとその大きさを GUI スレッドの外で書く書き手（_writer_for）
+        self._writer: Optional[_ChannelWriter] = None
         self.send_drained.connect(self._write_carry_when_drained)
+        self._size_writable.connect(self._send_terminal_size)
 
     def set_read_gate(self, gate) -> None:
         """受信を止める合図（threading.Event）を受け取る
@@ -494,36 +871,25 @@ class SSHConnection(QObject):
                 "（退避すると全機器が初回接続の扱いになります）。"
                 % (e, known_hosts_path))
         if broken:
-            self._refuse_or_warn_broken_lines(broken, known_hosts_path)
-        policy = _TofuHostKeyPolicy(known_hosts_path)
+            self._refuse_or_warn_broken_lines(broken, known_hosts_path, client)
+        policy = _TofuHostKeyPolicy(
+            known_hosts_path,
+            endpoint=(self.host, self.port, self._written_port))
         policy._on_save_error = lambda message: self.output_received.emit(
             "\r\n[NetBelt] 警告: %s\r\n" % message)
         client.set_missing_host_key_policy(policy)
 
-    def _use_legacy_port22_keys(self, client):
-        """旧版が "[host]:22" の名前で保存した鍵を、22 番の照合に使う。
+    def _use_other_spelling_keys(self, client):
+        """同じ接続先を別の綴りの名前で保存した鍵を、照合に使う。
 
-        paramiko 4.0.0 は known_hosts を引く名前を `port == 22`（整数との
-        比較）で決める。ポートを整数へそろえる前の版は、config.json の
-        文字列 "22" をそのまま渡していたので、その機器の鍵は "[host]:22" の
-        名前で保存されている。いまは "host" で引くためこの行が使われず、
-        更新後の最初の接続で TOFU が黙って別の鍵を受け入れ、パスワードが
-        相手へ届いていた（実測）。"host" の鍵が無いときだけ、"[host]:22" の
-        鍵を "host" の鍵として読み替える。読み替えはメモリ上だけで、
-        known_hosts には書かない。
+        規則は _add_other_spelling_keys（保存直前の食い違い確認も同じ規則）。
+        読み替えに使った行の名前を返す。
         """
-        if self.port != 22:
-            return
-        keys = client.get_host_keys()
-        if keys.lookup(self.host) is not None:
-            return
-        legacy = keys.lookup("[%s]:22" % self.host)
-        if legacy is None:
-            return
-        for keytype in legacy.keys():
-            keys.add(self.host, keytype, legacy[keytype])
+        return _add_other_spelling_keys(
+            client.get_host_keys(), self.host, self.port, self._written_port)
 
-    def _refuse_or_warn_broken_lines(self, broken, known_hosts_path):
+    def _refuse_or_warn_broken_lines(self, broken, known_hosts_path,
+                                     client=None):
         """読めない行を名指しで知らせ、その行が指す接続先なら接続を中止する。
 
         壊れた行を読み飛ばしたまま進むと、その接続先は初回接続の扱いに戻り、
@@ -535,18 +901,27 @@ class SSHConnection(QObject):
         Args:
             broken: unreadable_known_hosts_lines() の戻り値
             known_hosts_path: known_hosts のパス（案内に載せる）
+            client: 読める行を読み込み済みの SSHClient。完全一致の鍵が
+                あるかを見る
         """
         server_name = known_hosts_server_name(self.host, self.port)
-        names = [server_name]
-        if server_name == self.host:
-            # 22 番は、旧版が "[host]:22" の名前で残した行も照合に使う
-            # （_use_legacy_port22_keys）。その行が壊れていたときも、この
-            # 機器の行として中止する。警告だけで進むと TOFU が別の鍵を
-            # 受け入れ、パスワードが相手へ届く（実測）
-            names.append("[%s]:22" % self.host)
+        # 旧版が文字列のポートの名前（"[host]:22" や "[host]:022"）で残した
+        # 行や、大文字小文字だけが違う行も照合に使う
+        # （_use_other_spelling_keys）。その行が壊れていたときも、
+        # この機器の行として中止する。警告だけで進むと TOFU が別の鍵を
+        # 受け入れ、パスワードが相手へ届く（実測）。ただし大文字小文字を
+        # 区別しないのは、照合と同じく完全一致の鍵（22 番は "[host]:22" の
+        # 鍵も）が無いときだけ。あれば、その行は読めていても照合に使われない
+        ignore_case = True
+        if client is not None:
+            keys = client.get_host_keys()
+            ignore_case = keys.lookup(server_name) is None and not (
+                server_name == self.host
+                and keys.lookup("[%s]:22" % self.host) is not None)
         mine = [(no, text) for no, text, _ in broken
-                if any(_hostnames_match(known_hosts_names(text), name)
-                       for name in names)]
+                if any(_names_same_endpoint(name, self.host, self.port,
+                                            ignore_case, self._written_port)
+                       for name in known_hosts_names(text))]
         if mine:
             raise HostKeyStoreError(
                 "known_hosts に読めない行があり、%s の鍵を検証できないため"
@@ -713,6 +1088,8 @@ class SSHConnection(QObject):
         client = None       # 例外の後始末で閉じるため、try の外で用意する
         # client.connect() の中で作られた Transport。後始末で直接閉じる
         transports = []
+        # 照合に読み替えた別の綴りの行の名前（鍵が食い違ったときの案内用）
+        other_names = []
 
         def transport_factory(*args, **kwargs):
             transport = paramiko.Transport(*args, **kwargs)
@@ -736,6 +1113,10 @@ class SSHConnection(QObject):
                     "ポート番号 %r は使えないため、接続しませんでした。"
                     "機器の編集で 1〜65535 の整数を設定してください。"
                     % (self.port,))
+            if isinstance(self.port, str):
+                # 旧版はこの綴りのまま known_hosts の名前にしていた。
+                # ハッシュ化された行の照合に使う（_names_same_endpoint）
+                self._written_port = self.port
             self.port = port
 
             # 待っている間に dispose() が走ると self.client は None になる。
@@ -747,8 +1128,8 @@ class SSHConnection(QObject):
                 self._setup_host_keys(client)
             except HostKeyStoreError as e:
                 return self._fail(str(e))
-            self._use_legacy_port22_keys(client)
-            
+            other_names = self._use_other_spelling_keys(client)
+
             # 接続パラメータの準備
             connect_kwargs = {
                 'hostname': self.host,
@@ -853,15 +1234,27 @@ class SSHConnection(QObject):
         except paramiko.AuthenticationException:
             return self._fail(self._auth_failure_message(), client, transports)
         except paramiko.BadHostKeyException:
+            # 別の綴りの行の鍵で食い違ったなら、その行を名指しする。接続先の
+            # 綴りの行は known_hosts に無いので、消すべき行が見つけにくい
+            note = ""
+            if other_names:
+                note = ("\n照合に使ったのは、名前の大文字小文字やポートの書き方"
+                        "が違う次の行です（同じ接続先の行です）: %s"
+                        % ", ".join(other_names))
             return self._fail(
                 "ホストキーが変更されています(中間者攻撃の可能性)。"
-                "意図的な変更の場合は ~/.netbelt/known_hosts の該当ホスト行を削除してください。",
-                client, transports)
+                "意図的な変更の場合は ~/.netbelt/known_hosts の該当ホスト行を削除してください。"
+                + note, client, transports)
         except paramiko.SSHException as e:
             return self._fail(f"SSH接続エラー: {str(e)}", client, transports)
         except Exception as e:
             return self._fail(f"接続エラー: {str(e)}", client, transports)
     
+    # 後始末で、受信スレッドが自分で抜けるのを待つ上限（dispose 参照）。
+    # 受信スレッドは 0.01 秒の眠り（受信を止められている間は 0.05 秒）ごとに
+    # 止める印を見るので、抜けられるならこの間に抜ける
+    _READER_EXIT_WAIT_SECONDS = 0.2
+
     def dispose(self):
         """チャネルと SSHClient を閉じて資源を手放す（通知は出さない）
 
@@ -889,19 +1282,42 @@ class SSHConnection(QObject):
         watcher, self._drain_watcher = self._drain_watcher, None
         if watcher is not None:
             watcher.stop()
+        size_watcher, self._size_watcher = self._size_watcher, None
+        if size_watcher is not None:
+            size_watcher.stop()
+        writer, self._writer = self._writer, None
+        if writer is not None:
+            writer.stop()
         # 書き残しは捨てる（繋ぎ直した先へ古い残りを書かない）
         self._carry = b""
+        self._size_unsent = False
 
-        if self._read_thread and self._read_thread.is_alive():
-            self._read_thread.join(timeout=2)
+        # 受信スレッドはふだん短い眠りの間に抜けるので、まず短く待ち、手に
+        # している受信を渡し終えてから閉じる（記録を欠かさない）。抜けないのは
+        # 書き込みで止まっているとき: 相手が TCP まで受け取りを止めている間、
+        # 受信スレッドは WINDOW_ADJUST を書けるまで戻らず、ここで上限
+        # （2 秒）まで GUI スレッドが止まっていた。そのときは先に閉じて
+        # 書き込みを打ち切らせる（読み終えた分は、書く前に渡し済み。
+        # _recv_handing_over 参照）
+        reader = self._read_thread
+        if reader and reader.is_alive():
+            reader.join(timeout=self._READER_EXIT_WAIT_SECONDS)
+
+        # client（Transport）をチャネルより先に閉じる。channel.close は相手へ
+        # CHANNEL_CLOSE を書くので、相手が TCP まで受け取りを止めている間は
+        # 書けるまで戻らず、GUI スレッドが止まっていた（実測 7 秒。相手が
+        # 受け取らないままなら無期限）。Transport.close は書き込みを待たずに
+        # ソケットを閉じ、そのあとの channel.close は閉じ済みで何も書かない
+        if self.client:
+            self.client.close()
+            self.client = None
+
+        if reader and reader.is_alive():
+            reader.join(timeout=2)
 
         if self.channel:
             self.channel.close()
             self.channel = None
-
-        if self.client:
-            self.client.close()
-            self.client = None
 
     def disconnect(self):
         """SSH接続を切断（同じオブジェクトで繋ぎ直せる）"""
@@ -927,6 +1343,12 @@ class SSHConnection(QObject):
             # InteractiveTerminalからEnterキーは'\r'として送られてくる
             # 書き残しがあれば、その後ろへ足す（後から来た打鍵が追い越さない）
             self._carry += command.encode('utf-8')
+        except UnicodeEncodeError as e:
+            # 送れない文字（孤立したサロゲート）。切断として扱わず、何も
+            # 送らずに知らせる（貼り付けは端末の入口で丸ごと断っている）
+            self.output_received.emit(
+                "\r\n%s\r\n" % unsendable_notice(command, e.start))
+            return
         except Exception as e:
             self.error_occurred.emit(f"送信エラー: {str(e)}")
             return
@@ -940,21 +1362,38 @@ class SSHConnection(QObject):
         待つと、補充を遅らせる機器では補充が永遠に来ず、送信が止まっていた。
         書き切れずに残ったら見張りを始めて True を返す（続きは send_drained で）。
         send は送れたバイト数を返すだけなので、書くのは sendall にする。
+        書くのは書き手のスレッド（_ChannelWriter）に任せ、書き終わりを
+        _WRITE_WAIT_SECONDS まで待つ。「書ける」と判定した直後に鍵交換が
+        始まると、書き込みは鍵交換が終わるまで待つため（GUI が止まっていた。
+        実測 3 秒、最長 30 秒）。ふだんは 1ms もかからずに書き終わる。
+        書き終わらなければ見張りが待たせ、終われば send_drained で続きを書く。
+        書き手で起きた失敗も、ここで送信エラーとして知らせる。見張りが無い
+        （接続の手順を通っていない）ときは、これまでどおりその場で書く。
         """
         watcher = self._drain_watcher
+        if self._report_write_error():
+            return False
         while self._carry:
             channel = self.channel
             if not self.is_connected or channel is None:
                 self._carry = b""   # 切れた接続の残りは捨てる
                 return False
-            if watcher is not None and watcher.check():
-                return True   # ウィンドウが 0・鍵交換中・TCP へ書けない
+            if watcher is not None and self._drain_backlogged(watcher):
+                return True   # ウィンドウが 0・鍵交換中・TCP へ書けない・書いている最中
             room = channel.out_window_size
             if watcher is None or not isinstance(room, int) or room <= 0:
                 # 待てない（見張りが無い・窓が分からない・閉じた）: 全部を送り、
                 # 失敗は送信エラーとして知らせる（これまでどおり）
                 room = len(self._carry)
             head, self._carry = self._carry[:room], self._carry[room:]
+            if watcher is not None:
+                writer = self._writer_for(channel)
+                if (not writer.write(head, self._WRITE_WAIT_SECONDS)
+                        and self._drain_backlogged(watcher)):
+                    return True   # 待たされている。書き終われば send_drained で続きを
+                if self._report_write_error():
+                    return False
+                continue
             try:
                 channel.sendall(head)
             except Exception as e:
@@ -963,14 +1402,38 @@ class SSHConnection(QObject):
                 return False
         return False
 
+    def _writer_for(self, channel) -> _ChannelWriter:
+        """channel に書く書き手（チャネルが変わったら作り直し、ほかの接続へ書かない）"""
+        writer = self._writer
+        if writer is None or writer.channel is not channel:
+            if writer is not None:
+                writer.stop()
+            writer = self._writer = _ChannelWriter(channel)
+        return writer
+
+    def _report_write_error(self) -> bool:
+        """書き手のデータの書き込みの失敗を送信エラーとして知らせる（GUI スレッドから呼ぶ）"""
+        writer = self._writer
+        if writer is None or writer.channel is not self.channel:
+            return False
+        error = writer.take_error()
+        if error is None:
+            return False
+        self._carry = b""   # どこまで送れたか分からない
+        if self.is_connected:   # 切れた後（受信側が知らせ済み・後始末済み）は知らせない
+            self.error_occurred.emit(f"送信エラー: {str(error)}")
+        return True
+
     @pyqtSlot()
     def _write_carry_when_drained(self):
         """見張りが書けるようになったと知らせた（GUI スレッドで受ける）
 
         最後の区切りが入り切らず、端末に渡す物が無くなっていると、端末は
-        続きを呼ばない。書き残しはここで書く。
+        続きを呼ばない。書き残しはここで書く。詰まっている間に変わった
+        端末の大きさも、ここで送る。
         """
         self._write_carry()
+        self._send_terminal_size()
 
     def has_pending_sends(self) -> bool:
         """いま区切りを渡されても、待たずには書けないか（端末の set_send_backlog 用）
@@ -979,13 +1442,43 @@ class SSHConnection(QObject):
         チャネルの時間切れ（0.1 秒）で途中までしか送れずに失敗する。どこまで
         送れたかは分からないので、切断として扱うしかなかった（実機の IOSv で
         16KB の貼り付けが途中で切れた）。先に書き残しを書き、それが残るか、
-        ウィンドウが 0・鍵交換中・TCP へ書けない間は端末に次を渡させず、
-        未送信の分を端末の列に残す。空いたら send_drained で知らせる。
+        ウィンドウが 0・鍵交換中・TCP へ書けない・前の書き込みが終わって
+        いない・保留した端末の大きさがまだ送られていない間は端末に次を
+        渡させず、未送信の分を端末の列に残す。空いたら
+        send_drained で知らせる。
         """
         watcher = self._drain_watcher
         if watcher is None:
             return False
-        return self._write_carry() or watcher.check()
+        return self._write_carry() or self._drain_backlogged(watcher)
+
+    def _drain_backlogged(self, watcher) -> bool:
+        """watcher.check() と同じ（待たずに書けないなら見張りを始めて True。GUI スレッドから呼ぶ）
+
+        見張りのスレッドを作れない（Thread.start の RuntimeError）ときも True を
+        返して待たせ、GUI スレッドのタイマーで調べ直す（_retry_drain）。例外を
+        そのまま投げると、打鍵は持ち越しに残ったまま send_drained が出ず、
+        端末の送信の列も止まったままだった（保留した端末の大きさだけで待たせる
+        ときにも起きた）。いま書くと、鍵交換中などは書けるまで GUI が止まる。
+        予約済みなら足さない（呼ばれるたびに足すと、調べ直しが増えていく）。
+        """
+        try:
+            return watcher.check()
+        except RuntimeError:
+            if not self._drain_retry_pending:
+                self._drain_retry_pending = True
+                QTimer.singleShot(int(DrainWatcher.POLL_SECONDS * 1000),
+                                  self._retry_drain)
+            return True
+
+    @pyqtSlot()
+    def _retry_drain(self):
+        """予約した調べ直し（送信の見張りを始められなかったとき）。書けるなら send_drained を出す"""
+        self._drain_retry_pending = False
+        watcher = self._drain_watcher
+        if watcher is None or self._drain_backlogged(watcher):
+            return   # 後始末済み・まだ書けない（見張りか、次の調べ直しが知らせる）
+        self._announce_drained()
 
     def _send_backlogged(self, channel) -> bool:
         """channel へ待たずに 1 バイトも書けないなら True（見張りのスレッドからも呼ぶ）
@@ -993,10 +1486,23 @@ class SSHConnection(QObject):
         判定できないとき・閉じたときは False（送らせれば送信エラーとして知らせる）。
         送信ウィンドウが 0 でないことと、鍵交換中でないこと（その間 paramiko は
         送信を待たせる）と、TCP へ書けることを見る。状態を読むだけで書かない。
+        書き手（_ChannelWriter）が前の書き込みを終えていない間も True。
+        書き手の失敗を知らせていなければ False（送らせて送信エラーを知らせる）。
+        保留した端末の大きさ（_size_unsent）がある間も True。あとから来た
+        打鍵が window-change を追い越さないように、大きさの見張りがそれを
+        書き手へ渡すまで待たせる（渡したあとは、書き手が渡された順に書く）。
         """
         try:
             if channel.closed or not self.is_connected:
                 return False
+            writer = self._writer
+            if writer is not None and writer.channel is channel:
+                if writer.failed():
+                    return False
+                if writer.busy():
+                    return True
+            if self._size_unsent:
+                return True
             transport = channel.get_transport()
             if not transport.clear_to_send.is_set():
                 return True
@@ -1013,6 +1519,10 @@ class SSHConnection(QObject):
         except RuntimeError:
             pass   # 捨てられた接続（C++ 側が消えている）
 
+    # GUI スレッドが、書き手（_ChannelWriter）の書き終わりを待つ上限（秒）。
+    # 書き込みが待たされても、GUI が止まるのはここまで
+    _WRITE_WAIT_SECONDS = 0.1
+
     def set_terminal_size(self, cols: int, rows: int):
         """端末の大きさを機器へ伝える (RFC 4254 6.7 window-change)。
 
@@ -1023,10 +1533,127 @@ class SSHConnection(QObject):
         self.term_rows = rows
         if not self.is_connected or not self.channel:
             return
+        self._size_unsent = True
+        self._send_terminal_size()
+
+    @pyqtSlot()
+    def _send_terminal_size(self):
+        """覚えている大きさを送る。いま書くと待たされるなら送らずに残す（GUI スレッドから呼ぶ）
+
+        paramiko は window-change を Transport へ書くとき、書けるまで戻らない
+        （時間切れを無限に再試行する）。相手が TCP まで受け取りを止めている間や
+        鍵交換中に GUI スレッドから書くと、その間画面が止まっていた（実測
+        7 秒。相手が受け取らないままなら無期限）。その間は大きさだけを覚えて
+        専用の見張りを起こし、Transport へ書けるようになった知らせ
+        （_size_writable）で最後の大きさを送る。送信の背圧の見張り
+        （send_drained）はチャネルの窓が空くまで待つので、それに頼ると、
+        機器が読まずに窓が 0 のままの間は送られず、機器側の端末の大きさが
+        古いままだった（window-change は窓と関係なく書ける）。
+        書けると判定したあとも、書くのはデータと同じ書き手のスレッド
+        （_ChannelWriter）に任せる。判定の直後に鍵交換が始まると、書き込みは
+        鍵交換が終わるまで待つため（GUI が止まっていた。実測 3 秒、最長 30 秒）。
+        ふだんは 1ms もかからずに書き終わるので、書き終わりを
+        _WRITE_WAIT_SECONDS まで待ち、これまでどおり大きさを伝えてから次の
+        打鍵を送る順序にする。
+        送信の背圧の見張りが無い（接続の手順を通っていない）ときは、これまで
+        どおりその場で送る。
+        """
+        channel = self.channel
+        if not self._size_unsent or not self.is_connected or channel is None:
+            return
+        if self._drain_watcher is None:
+            self._size_unsent = False
+            try:
+                channel.resize_pty(width=self.term_cols, height=self.term_rows)
+            except Exception:
+                pass
+            return
+        if self._size_watcher is None:
+            # このチャネルに束縛する（dispose で止めて捨てる）
+            self._size_watcher = DrainWatcher(
+                lambda: self._transport_backlogged(channel),
+                self._announce_size_writable)
         try:
-            self.channel.resize_pty(width=cols, height=rows)
+            if self._size_watcher.check():
+                return   # 書けるようになったら _size_writable でここへ戻ってくる
+        except RuntimeError:
+            # 見張りのスレッドを作れない。開始できなかった見張りは捨て（残すと
+            # 見張り中の印が残って知らせが来ず、あとの打鍵もずっと待たされ、
+            # dispose も失敗する）、GUI スレッドのタイマーで調べ直す（いま
+            # 書くと、書けるまで GUI が止まる）。予約済みなら足さない（失敗の
+            # たびに足すと、大きさが変わった回数だけ調べ直しが増えていく）
+            self._size_watcher = None
+            if not self._size_retry_pending:
+                self._size_retry_pending = True
+                QTimer.singleShot(int(DrainWatcher.POLL_SECONDS * 1000),
+                                  self._retry_terminal_size)
+            return
+        self._size_unsent = False
+        self._writer_for(channel).send_size(
+            self.term_cols, self.term_rows, self._WRITE_WAIT_SECONDS)
+
+    @pyqtSlot()
+    def _retry_terminal_size(self):
+        """予約した調べ直し（_send_terminal_size の見張りを始められなかったとき）"""
+        self._size_retry_pending = False
+        self._send_terminal_size()
+
+    def _announce_size_writable(self):
+        """見張りのスレッドから、保留した大きさを送れるようになったことを知らせる"""
+        try:
+            self._size_writable.emit()
+        except RuntimeError:
+            pass   # 捨てられた接続（C++ 側が消えている）
+
+    @staticmethod
+    def _transport_backlogged(channel) -> bool:
+        """channel の Transport へいま書くと待たされるなら True（鍵交換中・TCP へ書けない）
+
+        チャネルの窓は見ない（window-change は窓と関係なく書ける）。
+        判定できないとき・閉じたときは False（書かせれば paramiko が失敗を
+        返す）。状態を読むだけで書かない。
+        """
+        try:
+            if channel.closed:
+                return False
+            transport = channel.get_transport()
+            if not transport.clear_to_send.is_set():
+                return True
+            return not socket_writable(transport.sock)
         except Exception:
-            pass
+            return False
+
+    @staticmethod
+    def _recv_handing_over(channel, nbytes: int, hand_over) -> bytes:
+        """channel.recv(nbytes) と同じに読み、WINDOW_ADJUST を書く前に hand_over(読んだ分) を呼ぶ
+
+        paramiko（4.0.0）の Channel.recv は、読んだ量がしきい値を超えると
+        WINDOW_ADJUST を Transport へ書き、書けるまで戻らない。相手が TCP まで
+        受け取りを止めている間に後始末（dispose）が Transport を閉じると、その
+        書き込みが EOFError になり、recv が読み終えていた分（4096 バイトまで）は
+        返らずに捨てられて、セッションの記録から欠けていた。ここでは同じ手順で
+        読み、渡してから書く。読み方・窓の数え方・書く内容は Channel.recv と
+        同じ。paramiko の Channel でないときは、これまでどおり recv で読む。
+        読み切って閉じていれば b"" を返す（渡す物は無い）。paramiko の版を
+        上げたら、tests/test_ssh_reader_chunk_kept_on_dispose.py で recv と
+        同じ WINDOW_ADJUST を書くことを確かめる（内部の名前を使っている）。
+        """
+        if not isinstance(channel, paramiko.Channel):
+            data = channel.recv(nbytes)
+            if data:
+                hand_over(data)
+            return data
+        data = channel.in_buffer.read(nbytes, channel.timeout)
+        if data:
+            hand_over(data)
+        ack = channel._check_add_window(len(data))
+        if ack > 0:
+            m = Message()
+            m.add_byte(cMSG_CHANNEL_WINDOW_ADJUST)
+            m.add_int(channel.remote_chanid)
+            m.add_int(ack)
+            channel.transport._send_user_message(m)
+        return data
 
     def _read_output(self):
         """バックグラウンドで出力を読み取る"""
@@ -1034,18 +1661,20 @@ class SSHConnection(QObject):
         # 受信ごとに復号すると、前半と後半がそれぞれ U+FFFD になり、
         # 画面にもセッションログにも化けたまま渡る
         decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
+
+        def hand_over(data):
+            text = decoder.decode(data)
+            # リアルタイムで出力（バッファリングなし）
+            if text:
+                self.output_received.emit(text)
+
         while not self._stop_reading and self.is_connected:
             try:
                 if self._wait_while_gated():
                     continue
                 if self.channel and self.channel.recv_ready():
-                    data = self.channel.recv(4096)
-                    if data:
-                        text = decoder.decode(data)
-                        # リアルタイムで出力（バッファリングなし）
-                        if text:
-                            self.output_received.emit(text)
-                    else:
+                    if not self._recv_handing_over(self.channel, 4096,
+                                                   hand_over):
                         # データがないのにrecv_readyがTrueの場合は接続が閉じられた
                         if self.is_connected:
                             self.is_connected = False

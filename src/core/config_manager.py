@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 from .crypto import PasswordCrypto
+from .unsendable import unsendable_index
 
 # ファイルロックの実装。依存パッケージは足さず、標準ライブラリだけで作る
 try:
@@ -50,11 +51,17 @@ def is_readable_macro(macro) -> bool:
     アプリごと落ちる。グループの auto_commands は _is_valid_auto_commands が
     同じ条件で弾いており、マクロにだけこの検査が無かった。
     commands キーが無いのは「コマンド未設定」なので、既定値 [] で通す。
+
+    各行が機器へ送れる（UTF-8 にできる）ことも見る。孤立したサロゲート
+    （手編集の config.json のエスケープ）を含む行は送る途中で断られ、
+    それより前の行だけが機器へ届く（core.unsendable）。GUI の編集からは
+    保存できないので、入ってくるのは手編集の config.json だけ。
     """
     return (isinstance(macro, dict)
             and isinstance(macro.get("name"), str)
             and isinstance(macro.get("commands", []), list)
-            and all(isinstance(c, str) for c in macro.get("commands", [])))
+            and all(isinstance(c, str) and unsendable_index(c) is None
+                    for c in macro.get("commands", [])))
 
 
 def count_macros_named(macros, name) -> int:
@@ -664,15 +671,16 @@ class ConfigManager:
         """同じ名前のグループが複数ある設定を読んだら、その名前を挙げて知らせる。
 
         グループもまた名前だけで探す（get_group は先頭の 1 件を返す）ので、
-        2 つ目以降の同名グループに入っている機器には update_device /
-        remove_device / move_device のどれも届かない。画面には並んでいるのに
-        操作だけが黙って失敗するため、機器名の重複と同じく名指しで知らせる。
+        機器を追加・移動する先は先に並んでいる方になる。後ろの方のグループの
+        編集・削除、そこへのドロップとそこにある機器の複製は接続先リストが
+        断る（DeviceTree の _is_shadowed_group。機器そのものの操作は接続先で
+        持ち主のグループを選ぶ。_group_of_device）。画面の見た目と違う
+        グループに当たるため、機器名の重複と同じく名指しで知らせる。
 
         黙って除外・改名すると利用者の機器やグループが消えるので、設定は
         書き換えない。直し方は画面から案内する。rename_group も get_group
         経由で 1 つ目しか掴まないが、その 1 つ目を別の名前にすれば重複は
-        解けるので、接続先リストの「グループを編集」で直せる（実測）。
-        変わるのが先に並んでいる方だということも添える。
+        解けるので、先に並んでいる方の「グループを編集」で直せる（実測）。
         """
         seen = set()
         duplicates = []
@@ -691,10 +699,11 @@ class ConfigManager:
         self._append_load_warning(
             "設定ファイル (config.json) に同じ名前のグループが複数あります: "
             + "、".join(duplicates)
-            + "\nグループも名前で探すため、2 つ目以降の同名グループにある機器は"
-              "編集も削除も移動もできません。接続先リストでどちらかのグループを"
-              "右クリックし「グループを編集」で別の名前にすると分かれます"
-              "（名前で探すため、変わるのは先に並んでいる方です）。"
+            + "\nグループは名前で探すため、機器を追加・移動する先は先に並んでいる"
+              "方になり、後ろの方のグループは編集も削除も、ドラッグで機器を"
+              "入れることも、そこにある機器を複製することもできません。"
+              "接続先リストで先に並んでいる方を右クリックし"
+              "「グループを編集」で別の名前にすると分かれます。"
               "config.json を直接直しても構いません。")
 
     def _notify_duplicate_device_names(self, config: Dict) -> None:
@@ -807,6 +816,21 @@ class ConfigManager:
         キーだけが送られる。list() できない値（数値など）は送信を仕掛ける
         QTimer のコールバックの中で TypeError になり、PyQt6 はスロット内の
         未捕捉例外で終了するため、接続した瞬間にアプリごと落ちる。
+        各行が機器へ送れる（UTF-8 にできる）ことも見る（is_readable_macro と同じ）。
+        """
+        return (isinstance(commands, list)
+                and all(isinstance(c, str) and unsendable_index(c) is None
+                        for c in commands))
+
+    @staticmethod
+    def _is_auto_commands_list(commands) -> bool:
+        """文字列だけの list かを返す（機器へ送れる文字かは見ない）。
+
+        GUI からの保存（add_group・set_group_auto_commands）はこれで見る。
+        送れない文字（孤立したサロゲート）は config.json（UTF-8）へも書けない
+        ので、保存の失敗になって変更は取り消され、画面は「保存できません
+        でした」と知らせる。_is_valid_auto_commands で先に断ると、
+        last_save_failed が立たず、理由の分からない「失敗しました」になる。
         """
         return (isinstance(commands, list)
                 and all(isinstance(c, str) for c in commands))
@@ -1078,7 +1102,8 @@ class ConfigManager:
                          "マクロ設定の「プリセット管理」で入れ直してください。")
         if broken_auto_commands:
             parts.append("設定ファイル (config.json) で自動実行コマンドが"
-                         "文字列の配列になっていないグループがあり、"
+                         "文字列の配列になっていない（または送れない文字を"
+                         "含む）グループがあり、"
                          "そのグループの自動実行を無効にしました。"
                          "グループの編集で入れ直してください: "
                          + "、".join(broken_auto_commands))
@@ -1245,9 +1270,10 @@ class ConfigManager:
         # ここだけ素通しにすると、そのセッションの間は
         # MainWindow._run_auto_commands が壊れた値をそのまま list() して
         # 送るので、接続した瞬間に 1 文字ずつが実機へ届く（実測）。
-        # None や空の値は「自動実行なし」なので今までどおり [] にそろえる
+        # None や空の値は「自動実行なし」なので今までどおり [] にそろえる。
+        # 送れない文字は保存の失敗として知らせる（_is_auto_commands_list）
         commands = auto_commands or []
-        if not self._is_valid_auto_commands(commands):
+        if not self._is_auto_commands_list(commands):
             print(f"エラー: グループ '{group_name}' の自動実行コマンドは"
                   f"文字列の配列で指定してください")
             return False
@@ -1351,8 +1377,9 @@ class ConfigManager:
         """
         self.last_save_failed = False
         # 文字列を渡されると list() が 1 文字ずつに分解する。そのまま保存すると
-        # 次の接続で 1 文字ずつが実機へ送られるので、書き込む前に断る
-        if not self._is_valid_auto_commands(commands):
+        # 次の接続で 1 文字ずつが実機へ送られるので、書き込む前に断る。
+        # 送れない文字は保存の失敗として知らせる（_is_auto_commands_list）
+        if not self._is_auto_commands_list(commands):
             print(f"エラー: グループ '{group_name}' の自動実行コマンドは"
                   f"文字列の配列で指定してください")
             return False
@@ -1503,16 +1530,17 @@ class ConfigManager:
         return False
 
     def remove_device(self, group_name: str, device_name: str,
-                      endpoint=None) -> bool:
+                      endpoint=None, device=None) -> bool:
         """機器を 1 件だけ削除（対象の機器が無いときも False）
 
         名前で絞ると、同じグループに同名が 2 台あるときに 2 台とも消える。
         画面の確認も完了も 1 台の話をするので、消えたことが伝わらない
         （remove_group は先頭の 1 件だけを消す形に揃っている）。
         endpoint には削除したい機器の接続先（device_endpoint() の戻り値）を
-        渡す。省略すると先頭の 1 件を消す。
+        渡す。省略すると先頭の 1 件を消す。device には削除したい機器の
+        データを渡す（同じ名前のグループの選び分けに使う。_group_of_device）。
         """
-        group = self.get_group(group_name)
+        group = self._group_of_device(group_name, device_name, endpoint, device)
         if not group:
             return False
 
@@ -1553,6 +1581,54 @@ class ConfigManager:
                 return matched[0]
         return found[0]
 
+    def _group_of_device(self, group_name: str, device_name: str,
+                         endpoint=None, device=None) -> Optional[Dict]:
+        """機器を操作するグループを、グループ名と機器の接続先から選ぶ（無ければ None）。
+
+        手編集の config.json では同じ名前のグループが並ぶ（読み込みは警告だけで
+        残す）。get_group() は先頭しか返さないので、2 つ目のグループの機器を
+        削除・編集・移動したつもりで、1 つ目にいる同名の機器が書き換わっていた
+        （実測）。同じ名前のグループが複数あって接続先を渡されたときは、その
+        機器を実際に持っているグループを選ぶ。接続先まで同じ機器を複数の
+        グループが持っているときは、device（画面の項目が持つ機器データ）と
+        中身が一致する機器を持つグループに絞る（接続先だけで断ると、先に
+        並んでいる方の機器まで操作できなくなっていた。実測）。それでも
+        決まらない・どれも持っていないときは、別の機器を書き換えないよう
+        None で断る。同じ名前のグループが無いときと接続先を省いたときは
+        get_group() と同じ。
+        """
+        groups = [g for g in self.get_groups() if g.get("name") == group_name]
+        if len(groups) <= 1 or endpoint is None:
+            return groups[0] if groups else None
+        holders = [g for g in groups
+                   if self._holds_device(g, device_name, endpoint)]
+        if len(holders) > 1 and isinstance(device, dict):
+            holders = [g for g in holders if device in g.get("devices", [])]
+        return holders[0] if len(holders) == 1 else None
+
+    @staticmethod
+    def _holds_device(group: Dict, device_name: str, endpoint) -> bool:
+        """そのグループに、名前も接続先も一致する機器がいるかを返す。"""
+        return any(isinstance(d, dict) and d.get("name") == device_name
+                   and device_endpoint(d) == endpoint
+                   for d in group.get("devices", []))
+
+    def device_group_is_ambiguous(self, group_name: str, device_name: str,
+                                  endpoint=None, device=None) -> bool:
+        """同じ名前のグループのどれの機器か決められずに断る機器なら True を返す。
+
+        _group_of_device が None で断るうち、同じ名前のグループの複数に名前も
+        接続先も同じ機器がいて 1 つに絞れないときだけ真にする。画面は、これが
+        真のときだけ失敗の案内に同名グループの訳と直し方を足す（グループ名が
+        並んでいるというだけで足すと、移動先の重複や保存の失敗で断ったときにも
+        改名へ誘導していた。実測）。
+        """
+        if endpoint is None or self._group_of_device(
+                group_name, device_name, endpoint, device) is not None:
+            return False
+        return sum(self._holds_device(g, device_name, endpoint)
+                   for g in self.get_groups() if g.get("name") == group_name) > 1
+
     def find_device_group(self, device_name: str) -> Optional[str]:
         """その名前の機器が属するグループ名を返す（無ければ None）"""
         for group in self.get_groups():
@@ -1563,7 +1639,7 @@ class ConfigManager:
 
     def update_device(self, group_name: str, old_name: str,
                       new_group_name: str, device_info: Dict,
-                      old_endpoint=None) -> bool:
+                      old_endpoint=None, old_device=None) -> bool:
         """機器を差し替える（改名・グループ移動を含む）。保存は 1 回。
 
         remove_device → add_device の 2 段階にすると、間の状態がディスクに
@@ -1574,9 +1650,15 @@ class ConfigManager:
         old_endpoint には編集前の機器の接続先（device_endpoint() の戻り値）を
         渡す。同じグループに同名が並んでいるときに、どちらを編集したのかは
         名前だけでは決まらないため。省略すると先頭の 1 件を編集する。
+        同じ名前のグループが並んでいるときは、その接続先の機器を持つグループを
+        編集する（_group_of_device。old_device には編集前の機器データを渡す）。
+        グループ名を変えない編集は、そのグループに置いたままにする（名前で
+        引き直すと、先に並んでいる同名のグループへ移る）。
         """
-        source = self.get_group(group_name)
-        target = self.get_group(new_group_name)
+        source = self._group_of_device(group_name, old_name, old_endpoint,
+                                       old_device)
+        target = (source if new_group_name == group_name
+                  else self.get_group(new_group_name))
         if not source or not target:
             return False
         new_name = device_info.get("name", "")
@@ -1793,7 +1875,7 @@ class ConfigManager:
         return self.save_config()
     
     def move_device(self, source_group_name: str, target_group_name: str,
-                    device_name: str, endpoint=None) -> bool:
+                    device_name: str, endpoint=None, device=None) -> bool:
         """
         デバイスをグループ間で移動
 
@@ -1804,18 +1886,23 @@ class ConfigManager:
             endpoint: 掴んだ機器の接続先（device_endpoint() の戻り値）。
                 同じグループに同名が並んでいるとき、どの 1 台を動かすかを
                 これで決める。省略時は今までどおり先頭の 1 件
+            device: 掴んだ機器のデータ（同じ名前のグループの選び分けに使う）
 
         Returns:
             移動成功時True、失敗時False
         """
-        # 移動元グループを取得
-        source_group = self.get_group(source_group_name)
+        # 移動元グループを取得。同じ名前のグループが並んでいるときは、掴んだ
+        # 機器を持つ方（_group_of_device。決まらなければ断る）
+        source_group = self._group_of_device(source_group_name, device_name,
+                                             endpoint, device)
         if not source_group:
-            print(f"エラー: 移動元グループ '{source_group_name}' が見つかりません")
+            print(f"エラー: 移動元グループ '{source_group_name}' が見つからないか、"
+                  "同じ名前のグループのどれの機器か決められません")
             return False
         
-        # 移動先グループを取得
-        target_group = self.get_group(target_group_name)
+        # 移動先グループを取得（同じ名前なら移動元のまま＝今までどおり断る）
+        target_group = (source_group if target_group_name == source_group_name
+                        else self.get_group(target_group_name))
         if not target_group:
             print(f"エラー: 移動先グループ '{target_group_name}' が見つかりません")
             return False

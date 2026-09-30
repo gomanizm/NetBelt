@@ -8,9 +8,11 @@ from itertools import groupby
 from operator import itemgetter
 from typing import Dict, Optional
 
+from core.log_writer import LogWriter
 from core.terminal import parser as vt
 from core.terminal.attrs import DEFAULT
 from core.terminal.screen import Screen, BLANK
+from core.unsendable import unsendable_index, unsendable_notice
 
 # SGR の基本 16 色 (xterm の既定値)。0-7 が基本、8-15 が明色
 def _u16(text: str) -> int:
@@ -118,10 +120,59 @@ class InteractiveTerminal(QTextEdit):
     font_size_change_requested = pyqtSignal(int)
     # ウィジェットの大きさが変わった（行数・桁数の再計算が要る）
     resized = pyqtSignal()
+    # アプリ自身の案内を画面へ出したい（TerminalWidget.show_notice へ繋ぐ）
+    notice_requested = pyqtSignal(str)
 
     def resizeEvent(self, event):
-        super().resizeEvent(event)
+        self._keep_top_row(super().resizeEvent, event)
         self.resized.emit()
+
+    def changeEvent(self, event):
+        if event.type() == QEvent.Type.FontChange:
+            self._keep_top_row(super().changeEvent, event)
+        else:
+            super().changeEvent(event)
+
+    def _row_of(self, cursor):
+        """カーソルの載る表示行の (上端, 高さ)。そこまでの組版を先に済ませる。"""
+        block = cursor.block()
+        top = self.document().documentLayout().blockBoundingRect(block).top()
+        line = block.layout().lineForTextPosition(cursor.positionInBlock())
+        if not line.isValid():
+            return int(top), 0
+        return int(top + line.y()), int(line.height())
+
+    def _keep_top_row(self, relayout, event):
+        """組み直し（幅・文字の大きさの変更）の前後で、上端に見えていた行を保つ。
+
+        Qt は組み直しの前後でスクロールバーの値（ピクセル）をそのまま保つ。
+        上へスクロールして過去の出力を読んでいるときに長い行が折り返し
+        直されると、上端に別の行が来る（実測: 幅を半分にすると line 000149
+        が line 000049 に）。そこで、上端の表示行の先頭の文字と行内のずれを
+        控え、組み直しの後でその文字が載る表示行へ戻す。最下部を見ている
+        ときは、格子の更新が最下部へ寄せるので何もしない。
+        """
+        if getattr(self, "_follow_output", True):
+            relayout(event)
+            return
+        from PyQt6.QtCore import QPoint
+        bar = self.verticalScrollBar()
+        # 0 ピクセル目は、行の境目にあると一つ上の行の末尾に当たる
+        top = self.cursorForPosition(QPoint(0, 1))
+        within = bar.value() - self._row_of(top)[0]
+        relayout(event)
+        row_top, height = self._row_of(top)
+        # 一番上では上端が文書の上の余白にあり、within は負になる。負のまま
+        # 足して余白ごと見せる（0 で切ると値 0 が 4 になっていた）
+        target = row_top + min(within, max(height - 1, 0))
+        if target > bar.maximum():
+            # 組版が遅れて進むあいだ、スクロールバーの最大値は組み終えた分の
+            # 高さのまま残り、値がそこで切られて最下部（追従）扱いになる
+            # （実測: 3000 行で文字を大きくすると最下部へ飛んだ）。Qt が少し
+            # 後で出す大きさの知らせを先に出して、範囲を合わせてから戻す
+            layout = self.document().documentLayout()
+            layout.documentSizeChanged.emit(layout.documentSize())
+        bar.setValue(target)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -200,8 +251,11 @@ class InteractiveTerminal(QTextEdit):
         ドラッグ＆ドロップを始める。端末では Tera Term と同じく、どこから
         ドラッグしても範囲選択にする。押す前に選択を外しておけば、Qt は
         ドラッグではなく選択として扱う。
+        修飾キーが Shift だけのときは外さない。Qt はそのとき選択の起点から
+        広げ（ドラッグは始めない）、外すと Shift+クリックの拡張が空になる。
         """
         if (event.button() == Qt.MouseButton.LeftButton
+                and event.modifiers() != Qt.KeyboardModifier.ShiftModifier
                 and self.textCursor().hasSelection()):
             bar = self.verticalScrollBar()
             value = bar.value()
@@ -358,9 +412,19 @@ class InteractiveTerminal(QTextEdit):
         見えてしまう。
 
         Returns:
-            bool: 送ったなら True（送れる状態でない・空文字なら False）
+            bool: 送ったなら True（送れる状態でない・空文字・送れない文字を
+            含むなら False）
         """
         if not text or not self.can_send_input():
+            return False
+        # 送れない文字（孤立したサロゲート）を含むなら、区切りに分ける前に
+        # 丸ごと断って知らせる。接続の encode で断られると、それより前の
+        # 区切りは送ったあとで、SSH・Telnet は切断、シリアルは区切り 1 つを
+        # 黙って落として前後の行が繋がったまま実行されていた
+        index = unsendable_index(text)
+        if index is not None:
+            self.notice_requested.emit(
+                "\n" + unsendable_notice(text, index) + "\n")
             return False
         # 改行は端末と同じく CR で送る
         payload = text.replace('\r\n', '\r').replace('\n', '\r')
@@ -501,7 +565,9 @@ class InteractiveTerminal(QTextEdit):
 
         self.key_pressed.emit(chunk)
 
-        # 受け取ったその場で送る接続（SSH・Telnet）なら、もう送り出している
+        # 接続が書き終えていれば、もう送り出している（Telnet はその場で書く。
+        # SSH は書き手のスレッドが書き終えていれば。終えていなければ、
+        # send_drained で再開した _drain_send_queue の先頭で知らせる）
         if not self._connection_busy():
             self._notify_sent()
         if self._send_queue or self._sent_callback is not None:
@@ -648,7 +714,17 @@ class InteractiveTerminal(QTextEdit):
         慣習どおり最下部へ戻す。戻さないと、打った文字のエコーもプロンプトも
         見えないまま入力することになる。マクロやキープアライブ、機器の
         問い合わせへの応答はここを通さない（読んでいる位置を勝手に動かさない）。
+
+        送れない文字（孤立したサロゲート）を含む打鍵・IME の確定は、貼り付け
+        （send_text）と同じく区切りに分ける前に丸ごと断って知らせる。接続の
+        保険は区切り 1 つだけを断るので、区切りより長い確定では前の区切りが
+        機器へ届いてしまう。
         """
+        index = unsendable_index(payload)
+        if index is not None:
+            self.notice_requested.emit(
+                "\n" + unsendable_notice(payload, index) + "\n")
+            return
         bar = self.verticalScrollBar()
         bar.setValue(bar.maximum())
         self._note_typed(payload)
@@ -766,9 +842,14 @@ class TerminalWidget(QWidget):
     # 色付きでも 4 秒ぶんの描き待ちを飲み込めるので、通常の操作では
     # ここまで届かない。届くのは 127.0.0.1 級の速さで流し続けたとき
     # （実測: 上限が無いと 27.5 秒で 21.3 MB まで単調に増えた）。
+    # 記録先が詰まったときの、記録の書き込み待ちの上限にも使う（同じく待たせる。
+    # 関所の無い接続は待たせられないので、描き進めて知らせる）
     PENDING_HIGH_WATER = 8 * 1024 * 1024
     # ここまで減らしてから再開する。上限の直下で開け閉めを繰り返さない
     PENDING_LOW_WATER = 2 * 1024 * 1024
+
+    # アプリを閉じるとき、記録先が詰まった記録の書き終わりを待つ上限（秒）
+    LOG_FINISH_WAIT = 5.0
 
     # タブが閉じられたときのシグナル（機器名を送信）
     tab_closed = pyqtSignal(str)
@@ -794,9 +875,14 @@ class TerminalWidget(QWidget):
         # 記録（機器名 -> [[ハンドル, パス, 残りの文字数], ...]、停止した順）。
         # 各項目の文字数は、描き待ちの先頭から前の項目のぶんに続く区間
         self._closing_logs: Dict[str, list] = {}
-        # 記録中のファイルへ、始めてから書いたファイル上のバイト数
-        # （機器名 -> バイト数）。記録中ダイアログの表示に使う
-        self._log_bytes: Dict[str, int] = {}
+        # 記録先が詰まっていて、閉じ終わりを待っている記録
+        # （[(機器名, ハンドル, パス, 閉じる失敗の知らせ先), ...]）
+        self._closing_writers: list = []
+        # 記録の書き込み待ちが溜まって、描くのと受信を止めている機器
+        self._log_throttled = set()
+        # 書き込み待ちが上限を超えて、まだ PENDING_LOW_WATER まで減っていない、
+        # 関所の無い接続（シリアル）の機器（記録中ダイアログに遅れを出す）
+        self._log_lagging = set()
         self._log_dialogs: Dict[str, object] = {}  # 機器名 -> ログ記録ダイアログ
         # ターミナルの外観設定。_create_terminal が参照するので _create_ui より先に持つ
         self._terminal_settings = dict(self.DEFAULT_TERMINAL_SETTINGS)
@@ -823,6 +909,20 @@ class TerminalWidget(QWidget):
         self._output_timer.setSingleShot(True)
         self._output_timer.setInterval(0)
         self._output_timer.timeout.connect(self._flush_pending_output)
+        # 記録先が詰まっている間だけ、書き込みスレッドを見回る（_check_log_writers）。
+        # 本体は刻み（_log_watch）から単発のタイマー（_log_check）へ渡して動かす。
+        # 本体は警告をモーダルで出し、Qt はスロットが入れ子のループにいる間、
+        # 同じタイマーを配り直さない。刻みのスロットで出すと、開いている間は
+        # 見回りが一度も動かず、記録先が戻っても止めた機器は OK を押すまで
+        # 再開しなかった（実測: 5.5 秒開いたままで呼び出しは 0 回）。単発の
+        # タイマーは刻みのたびに掛け直すので、開いている間も次の刻みで動く
+        self._log_watch = QTimer(self)
+        self._log_watch.setInterval(100)
+        self._log_check = QTimer(self)
+        self._log_check.setSingleShot(True)
+        self._log_check.setInterval(0)
+        self._log_check.timeout.connect(self._check_log_writers)
+        self._log_watch.timeout.connect(self._log_check.start)
         self._create_ui()
     
     def _create_ui(self):
@@ -1002,7 +1102,16 @@ class TerminalWidget(QWidget):
                 if self.tab_widget.tabText(i) == device_name:
                     self.tab_widget.setCurrentIndex(i)
                     # 前の接続から届いて描いていない出力は、前の画面へ描き切る
-                    self._draw_pending_now(device_name)
+                    try:
+                        self._draw_pending_now(device_name)
+                    finally:
+                        # 記録先の詰まりで止めた受信（_log_throttled）を次の
+                        # 接続へ引き継がない。関所は機器名で持ち回されるので、
+                        # 引き継ぐと、書き込み待ちが上限を下回っていても再接続
+                        # した先が読めないままになる。記録がまだ詰まっていれば、
+                        # 次の接続の受信で _flush_pending_output が改めて判定する
+                        self._log_throttled.discard(device_name)
+                        self._update_output_gate(device_name)
                     # 再接続は新しいセッション。前の画面はそのまま記録と
                     # して文書に残し、端末状態 (パーサ・画面) は作り直す
                     self._attach_screen(self._terminals[device_name])
@@ -1036,6 +1145,10 @@ class TerminalWidget(QWidget):
         terminal.macro_settings_requested.connect(
             lambda: self.macro_settings_requested.emit(device_name)
         )
+
+        # 端末自身の案内（送らなかった理由など）をこのタブへ出す
+        terminal.notice_requested.connect(
+            lambda text: self.show_notice(device_name, text))
 
         # ウィンドウの大きさに画面の格子を追従させる
         terminal.resized.connect(
@@ -1295,6 +1408,12 @@ class TerminalWidget(QWidget):
         pending = []                        # (属性, [文字列, ...]) の並び
         column = region.positionInBlock()   # 溜めた分を書いた後の行内位置
         probe_text = None
+        if screen.take_history_break() and column:
+            # 書き済みの履歴の最後の行は折り返しで画面の 0 行目へ続いていた
+            # (改行なしで書いた) が、0 行目は別の行に入れ替わった。境目で
+            # 行を閉じる。MAX_BLOCK_CHARS で既に切ってあれば (行頭) 足さない
+            region.insertText("\n", QTextCharFormat())
+            column = 0
         if screen.take_history_dropped():
             # 押し出された行が多すぎて、画面側が古い方を捨てた（ESC[nS の
             # 連打）。文書の先頭を切り捨てたのと同じことなので、「全ログ
@@ -1587,10 +1706,6 @@ class TerminalWidget(QWidget):
             try:
                 handle.write(logged)
                 handle.flush()
-                if target is None:
-                    self._log_bytes[device_name] = (
-                        self._log_bytes.get(device_name, 0)
-                        + self._file_byte_count(logged))
             except Exception as e:
                 if target is None:
                     self._abort_log_recording(device_name, e)
@@ -1611,39 +1726,151 @@ class TerminalWidget(QWidget):
         for handle, path, error in failed:
             self._close_stopped_log(device_name, handle, path, error)
 
-    @staticmethod
-    def _file_byte_count(text: str) -> int:
-        """text を記録へ書いたときに、ファイルの上で増えるバイト数
-
-        記録は open(path, 'w', encoding='utf-8') のテキストモードなので、
-        LF は os.linesep（Windows では CRLF）へ直されてから UTF-8 で
-        符号化される。記録中ダイアログは os.path.getsize を GUI スレッドで
-        呼ばない（共有フォルダだと 1 回で数秒止まる）ので、書いた側で
-        数えたこの値を見せる。
-        """
-        import os
-        return len(text.replace("\n", os.linesep).encode("utf-8"))
-
     def recorded_bytes(self, device_name: str) -> int:
-        """その機器の記録中のファイルへ、始めてから書いたバイト数"""
-        return self._log_bytes.get(device_name, 0)
+        """その機器の記録中のファイルへ、始めてから書けたバイト数
+
+        数えるのは書き込みスレッド（LogWriter.written_bytes）。記録先が
+        詰まっている間は、まだ書けていない分を数えない。
+        """
+        handle = self._log_files.get(device_name)
+        return handle.written_bytes if isinstance(handle, LogWriter) else 0
 
     def _close_stopped_log(self, device_name: str, handle, path,
                            error=None) -> None:
         """停止した記録のファイルを閉じ、使用中の登録を外す。"""
         from PyQt6.QtWidgets import QMessageBox
-        from core import log_recording
-        log_recording.stop(device_name, path)
-        try:
-            handle.close()
-        except Exception as e:
-            error = error or e
-        if error is not None:
+
+        def report(error):
             QMessageBox.warning(
                 self, "ログ記録",
                 "%s の停止したログ記録の、停止より前に受信した分を書き終えられ"
                 "ませんでした:\n%s\n\n記録は失敗する前の行までです。"
                 % (device_name, error))
+        self._close_log_file(device_name, handle, path, report, error)
+
+    def _close_log_file(self, device_name: str, handle, path,
+                        report=None, error=None) -> None:
+        """記録ファイルを閉じ、閉じ終えてから使用中の登録を外す。
+
+        記録先が詰まっていて閉じ終わらないときは、閉じ終わりを見回り
+        （_check_log_writers）に任せる。先に登録を外すと、同じファイルへ
+        始めた次の記録が、前の記録の書き込みと混ざる。
+        report(error) は閉じられなかった（書き終えられなかった）ときに呼ぶ。
+        """
+        from core import log_recording
+        try:
+            if handle is not None:
+                handle.close()
+        except Exception as e:
+            error = error or e
+        if isinstance(handle, LogWriter) and handle.busy:
+            # 失敗を知らせるのは 1 回だけ（ここで知らせたら、閉じ終わりでは知らせない）
+            self._closing_writers.append(
+                (device_name, handle, path, None if error else report))
+            self._start_log_watch()
+        else:
+            if isinstance(handle, LogWriter):
+                # 手が空いたのを見てから失敗を読み直す。close() は詰まっていると
+                # 待たずに戻るので、その直後に詰まりが解けて失敗し、閉じ終えた
+                # 記録の失敗は close() からは見えない（知らせないと黙って欠ける）
+                error = error or handle.failure
+            log_recording.stop(device_name, path)
+        if error is not None and report is not None:
+            report(error)
+
+    def _start_log_watch(self) -> None:
+        """見回り（_check_log_writers）を、動いていなければ動かす。
+
+        動いている見回りは掛け直さない。QTimer.start() は動いているタイマーを
+        最初から数え直すので、ほかのタブの受信で _flush_pending_output が
+        見回りの間隔より短く回り続けると、見回りが一度も動かず、止めた機器が
+        再開せず、記録の失敗も知らせなかった（実測: 30ms ごとの受信で 3 秒以上）。
+        """
+        if not self._log_watch.isActive():
+            self._log_watch.start()
+
+    def _check_log_writers(self) -> None:
+        """記録先が詰まっている間、書き込みスレッドを見回る。
+
+        スレッドで起きた書き込みの失敗を、次の受信を待たずに知らせる
+        （知らせないと、利用者は記録できていると思って作業を続ける）。
+        閉じ終えた記録の使用中の登録を外す。止めた機器を再開させ、関所の無い
+        接続の書き込み待ちの遅れと、関所のある接続の受信を止めていることを
+        記録中ダイアログの状態の行に出す（_show_log_status）。
+        見回るものが無くなったら止まる。
+        失敗の警告はモーダルで、出ている間も次の刻みでここへ入り直す
+        （_log_check）。そのため、モーダルを出す前に状態を書き換え終え、
+        出したあとは状態を読み直す。
+        """
+        from core import log_recording
+        for name in list(self._log_files):
+            handle = self._log_files.get(name)
+            if isinstance(handle, LogWriter) and handle.failure is not None:
+                self._abort_log_recording(name, handle.failure)
+        for item in list(self._closing_writers):
+            name, handle, path, report = item
+            if handle.busy or item not in self._closing_writers:
+                continue
+            self._closing_writers.remove(item)
+            log_recording.stop(name, path)
+            if handle.failure is not None and report is not None:
+                report(handle.failure)
+        # 書き込み待ちが減った機器（記録を停止した機器を含む）は、描くのと受信を再開する
+        for name in list(self._log_throttled):
+            if self._held_log_backlog(name) <= self.PENDING_LOW_WATER:
+                self._log_throttled.discard(name)
+                self._update_output_gate(name)
+                if self._pending_output.get(name):
+                    self._output_timer.start()
+        # 関所の無い接続（シリアル）は止めずに書き込み待ちを積み続ける（記録は
+        # 欠かさない）。上限を超えたら遅れているとし、PENDING_LOW_WATER まで
+        # 減ったら外す
+        for name in list(self._log_lagging):
+            if self._log_backlog(name) <= self.PENDING_LOW_WATER:
+                self._log_lagging.discard(name)
+        for name in set(self._log_files) | set(self._closing_logs):
+            if (name not in self._output_gates
+                    and self._log_backlog(name) >= self.PENDING_HIGH_WATER):
+                self._log_lagging.add(name)
+        self._show_log_status()
+        handles = list(self._log_files.values()) + [
+            entry[0] for entries in self._closing_logs.values()
+            for entry in entries]
+        # 止める前に、手が空いたのを見てから記録中の失敗を読み直す。先頭で
+        # 読んだあとに失敗して手を空けた記録を、知らせないまま止めない
+        # （スレッドは失敗を残してから手を空けるので、ここなら見える。
+        # 見えたら止めずに、次の回で知らせる）
+        if not self._closing_writers and not self._log_throttled and not any(
+                isinstance(h, LogWriter) and h.busy for h in handles) and not any(
+                isinstance(h, LogWriter) and h.failure is not None
+                for h in self._log_files.values()):
+            self._log_watch.stop()
+
+    def _show_log_status(self) -> None:
+        """記録先の詰まりを、記録中ダイアログの状態の行に出す（解けたら消す）。
+
+        受信を止めたことを知らせないと、止まった理由がどこにも出ず、エコーの
+        見えないまま打ち直すと機器へ二重に送る。
+        知らせのために新しい窓（QMessageBox）は出さない。窓は出た瞬間に
+        活性化してフォーカスを OK ボタンへ移すので、打っている最中に出ると
+        残りの文字が捨てられ、Enter は窓を閉じるだけになっていた（実測:
+        'switchport trunk allowed vlan 10' のあとの ',20<Enter>' が窓に吸われ、
+        機器には欠けたコマンドが残った）。キーを奪わない窓にすると、今度は
+        窓を閉じるつもりの Enter が機器へ送られる。記録中ダイアログは記録中
+        ずっと出ているので、そこへ書く（前に出さず、活性化もしない）。
+        止めては再開するのを繰り返しても、行が出て消えるだけ。停止した記録の
+        詰まりはダイアログが無いので出さない（受け取るのは停止前の分だけ）。
+        端末の中には書かない（show_notice は描き待ちを先に描き切るので、
+        止めている意味が無くなる）。
+        """
+        for name, dialog in list(self._log_dialogs.items()):
+            if name in self._log_throttled:
+                text = dialog.STATUS_HELD
+            elif name in self._log_lagging:
+                text = dialog.STATUS_LAGGING
+            else:
+                text = ""
+            dialog.set_status(text)
 
     def has_open_log_recordings(self) -> bool:
         """まだ閉じていない記録があるか（記録中と、停止して書き終えていない分）
@@ -1670,6 +1897,25 @@ class TerminalWidget(QWidget):
             self._log_pending_on_close(device_name)
             if device_name in self._log_files:
                 self._stop_log_recording_for(device_name)
+        # 記録先が詰まっていて閉じ終わらない記録は、合わせて LOG_FINISH_WAIT
+        # 秒まで待つ。書き切れなければ、途中までかもしれないと知らせて閉じる
+        # （利用者の決定。書き切るまで待つと、閉じられない時間が続きうる）
+        if not self._closing_writers:
+            return
+        import time
+        from PyQt6.QtWidgets import QMessageBox
+        deadline = time.monotonic() + self.LOG_FINISH_WAIT
+        for _, handle, _, _ in list(self._closing_writers):
+            handle.wait(max(0.0, deadline - time.monotonic()))
+        self._check_log_writers()
+        left, self._closing_writers = self._closing_writers, []
+        if left:
+            QMessageBox.warning(
+                self, "ログ記録",
+                "記録先が応答しないため、次のログ記録を書き終えられないまま"
+                "閉じます:\n%s\n\n記録が途中までの可能性があります。"
+                % "\n".join("%s: %s" % (name, path)
+                            for name, _, path, _ in left))
 
     def queue_output(self, device_name: str, text: str) -> None:
         """受信した出力を溜め、イベントループへ戻ってから描く
@@ -1710,10 +1956,30 @@ class TerminalWidget(QWidget):
         if gate is None:
             return
         waiting = len(self._pending_output.get(device_name, ()))
-        if waiting >= self.PENDING_HIGH_WATER:
+        if (waiting >= self.PENDING_HIGH_WATER
+                or device_name in self._log_throttled):
             gate.clear()
         elif waiting <= self.PENDING_LOW_WATER:
             gate.set()
+
+    def _log_backlog(self, device_name: str) -> int:
+        """その機器の記録（記録中と、停止して書き終えていない分）の書き込み待ちの文字数"""
+        handles = [self._log_files.get(device_name)] + [
+            entry[0] for entry in self._closing_logs.get(device_name, ())]
+        return sum(h.backlog for h in handles if isinstance(h, LogWriter))
+
+    def _held_log_backlog(self, device_name: str) -> int:
+        """描画と受信を止めるかどうかの判定に使う、記録中のファイルの書き込み待ちの文字数
+
+        停止した記録（_closing_logs）は数えない。停止した記録が受け取るのは
+        停止より前に受信した分だけで量に上限があるので、描いてその書き込み
+        スレッドへ積めばよい。数えると、記録先が詰まったままでは停止した記録の
+        書き込み待ちが減らず、「記録停止」を押しても、健全なファイルへ記録を
+        始め直しても、止めたままになっていた（実測: 詰まりが解けるまで画面が
+        進まなかった）。
+        """
+        handle = self._log_files.get(device_name)
+        return handle.backlog if isinstance(handle, LogWriter) else 0
 
     def _flush_pending_output(self) -> None:
         """溜めた出力を機器ごとに OUTPUT_SLICE 文字まで描き、残りは次の回へ回す"""
@@ -1728,6 +1994,22 @@ class TerminalWidget(QWidget):
                 if not pending or device_name not in self._terminals:
                     self._pending_output.pop(device_name, None)
                     continue
+                # 記録先が詰まって記録中のファイルの書き込み待ちが上限を超えたら、
+                # この機器だけ描くのを止めて受信の関所を閉じる。機器側が待つので
+                # 記録も画面も欠けず、書き込み待ちがメモリに積み上がり続けない
+                # （利用者の決定）。減ったら _check_log_writers が再開させる。
+                # 停止した記録は数えない（_held_log_backlog）。止めている
+                # ことは、見回りが記録中ダイアログの状態の行に出す。
+                # 関所の無い接続（シリアル）は止めない。受信は止まらないので、
+                # 止めると描き待ちが上限なく増えるだけになる（遅れは見回りが出す）
+                if device_name in self._output_gates and (
+                        device_name in self._log_throttled
+                        or self._held_log_backlog(device_name)
+                        >= self.PENDING_HIGH_WATER):
+                    self._log_throttled.add(device_name)
+                    self._update_output_gate(device_name)
+                    self._start_log_watch()
+                    continue
                 text = pending.take(self.OUTPUT_SLICE)
                 if not pending:
                     # 描き残しがあれば残しておく。描いている最中（警告の
@@ -1741,7 +2023,9 @@ class TerminalWidget(QWidget):
                     self._flushing_device = None
                     self._update_output_gate(device_name)
         finally:
-            if self._pending_output:
+            # 止めている機器の分だけが残っているなら掛け直さない（0ms で空回りする）
+            if any(name not in self._log_throttled
+                   for name in self._pending_output):
                 self._output_timer.start()
 
     def _draw_pending_now(self, device_name: str) -> None:
@@ -1821,17 +2105,16 @@ class TerminalWidget(QWidget):
         ハンドルを先に外すので、警告は失敗のたびではなく一度だけ出る。
         """
         from PyQt6.QtWidgets import QMessageBox
-
         from core import log_recording
+
         handle = self._log_files.pop(device_name, None)
-        self._log_bytes.pop(device_name, None)
-        # 停止して書き終えていない前の記録の登録は残す
-        log_recording.stop(device_name, getattr(handle, "name", None))
         if handle is not None:
-            try:
-                handle.close()
-            except Exception:
-                pass   # 壊れたハンドルは閉じるのも失敗しうる
+            # 閉じ終わるまで使用中のまま。停止した記録として案内させる
+            log_recording.mark_stopped(device_name, getattr(handle, "name", None))
+        # 停止して書き終えていない前の記録の登録は残す。壊れたハンドルは
+        # 閉じるのも失敗しうるが、知らせるのは下の 1 回だけ
+        self._close_log_file(device_name, handle,
+                             getattr(handle, "name", None))
         terminal = self._terminals.get(device_name)
         if isinstance(terminal, InteractiveTerminal):
             terminal._is_recording = False
@@ -1929,6 +2212,8 @@ class TerminalWidget(QWidget):
         if tab_name in self._terminals:
             del self._terminals[tab_name]
         self._pending_output.pop(tab_name, None)
+        self._log_throttled.discard(tab_name)
+        self._log_lagging.discard(tab_name)
         # 受信を止めたまま閉じない。開けてから外さないと、まだ動いている
         # 受信スレッドが待ち続ける（切断の検知もその先にある）
         gate = self._output_gates.pop(tab_name, None)
@@ -2027,28 +2312,23 @@ class TerminalWidget(QWidget):
             return os.path.expanduser("~")
         return logs_dir
 
-    def _recording_device_using(self, file_path: str):
-        """file_path を記録先にしている機器名を返す（無ければ None）
+    def _refuse_log_file_in_use(self, title: str, file_path: str) -> bool:
+        """file_path が記録先なら知らせて断る（断ったら True）
 
         記録中のファイルを別の記録や全ログ保存の保存先に選ぶと、open('w')
         で記録済みの内容が消え、以降は両者の書き込みが混在する。保存先を
         決めた直後にここで見て拒否する。
 
-        判定そのものは core.log_recording に置いてある。端末以外の画面
+        判定と案内文は core.log_recording に置いてある。端末以外の画面
         （SNMP のエクスポートなど）も同じ判定を使う必要があるため。
         """
-        from core import log_recording
-        return log_recording.device_using(file_path)
-
-    def _warn_log_file_in_use(self, title: str, file_path: str, device_name: str):
-        """記録中のファイルが選ばれたことを知らせる"""
         from PyQt6.QtWidgets import QMessageBox
-        QMessageBox.warning(
-            self,
-            title,
-            f"このファイルは {device_name} のログ記録に使用中です:\n{file_path}\n"
-            "別のファイルを選ぶか、先にそのログ記録を停止してください。"
-        )
+        from core import log_recording
+        message = log_recording.in_use_message(file_path)
+        if message is None:
+            return False
+        QMessageBox.warning(self, title, message)
+        return True
 
     def save_current_log(self):
         """現在アクティブなターミナルのログを保存"""
@@ -2132,9 +2412,7 @@ class TerminalWidget(QWidget):
                 self, "ログ保存", file_path, selected_filter, default_filename)
 
             if file_path:
-                in_use_by = self._recording_device_using(file_path)
-                if in_use_by is not None:
-                    self._warn_log_file_in_use("ログ保存", file_path, in_use_by)
+                if self._refuse_log_file_in_use("ログ保存", file_path):
                     return
 
                 # プログレスダイアログを表示してログを保存
@@ -2208,14 +2486,15 @@ class TerminalWidget(QWidget):
             self, "ログ記録", file_path, selected_filter, default_filename)
 
         if file_path:
-            in_use_by = self._recording_device_using(file_path)
-            if in_use_by is not None:
-                self._warn_log_file_in_use("ログ記録", file_path, in_use_by)
+            if self._refuse_log_file_in_use("ログ記録", file_path):
                 return
 
             try:
-                # ファイルを開く
-                log_file = open(file_path, 'w', encoding='utf-8', buffering=1)  # 行バッファリング
+                # ファイルを開く。書き込みは記録ごとのスレッドで行う（記録先が
+                # 応答しない間に GUI を止めない。core/log_writer.py）
+                log_file = LogWriter(
+                    open(file_path, 'w', encoding='utf-8', buffering=1),  # 行バッファリング
+                    on_stall=self._start_log_watch)
                 # 記録していなかった間に受信して、まだ描いていない分を
                 # 取り置く。停止側と同じ式で「どの停止した記録の区間にも
                 # 割り当てられていない文字数」を出し、ハンドルを持たない
@@ -2229,7 +2508,6 @@ class TerminalWidget(QWidget):
                     self._closing_logs.setdefault(tab_name, []).append(
                         [None, None, skipped])
                 self._log_files[tab_name] = log_file
-                self._log_bytes[tab_name] = 0   # 'w' で切り詰めたので 0 から
                 from core import log_recording
                 log_recording.start(tab_name, file_path)
                 # 開けたところまで来たら覚える（開けなければ except へ抜ける）
@@ -2245,8 +2523,17 @@ class TerminalWidget(QWidget):
                     tab_name, file_path, self,
                     size_provider=lambda name=tab_name: self.recorded_bytes(name))
                 dialog.stop_requested.connect(self.stop_log_recording)
+                # ほかの機器の記録中ダイアログに重ねない（重ねると、その状態の
+                # 行が隠れる）
+                dialog.place_apart(self._log_dialogs.values())
                 dialog.show()
                 self._log_dialogs[tab_name] = dialog
+                # show() はダイアログを活性化し、フォーカスが「記録停止」へ
+                # 移る。端末へ打つつもりの Enter・Space で記録が止まり、Esc
+                # も端末へ届かないので、キーの行き先を端末へ戻す
+                self.window().activateWindow()
+                if isinstance(current_widget, InteractiveTerminal):
+                    current_widget.setFocus()
                 
                 # 開始の知らせは出さない。記録中ダイアログが出れば分かり、
                 # 複数の機器を記録するときに毎回 OK を押させることになる
@@ -2296,8 +2583,10 @@ class TerminalWidget(QWidget):
             # ハンドルと「記録中」ダイアログが残り、記録を始め直そうとしても
             # 「既にログ記録中です。」で断られる（止める手段が無くなる）。
             handle = self._log_files.pop(tab_name)
-            self._log_bytes.pop(tab_name, None)
+            # 書き終えて閉じるまでは使用中のまま。その間に選ばれても「停止
+            # してください」と案内しないよう、停止したことを覚えさせる
             from core import log_recording
+            log_recording.mark_stopped(tab_name, getattr(handle, "name", None))
             # 停止より前に受信して、まだ描いていない分がある（受信が描画を
             # 上回って溜まっている最中の停止）。受信した分は記録に入れるので、
             # 描き進んでそこへ届くまで閉じずに預ける（_write_logs が書いて
@@ -2307,8 +2596,6 @@ class TerminalWidget(QWidget):
             if waiting > 0:
                 self._closing_logs.setdefault(tab_name, []).append(
                     [handle, getattr(handle, "name", None), waiting])
-            else:
-                log_recording.stop(tab_name, getattr(handle, "name", None))
 
             # ターミナルの記録フラグをクリア
             if isinstance(current_widget, InteractiveTerminal):
@@ -2322,15 +2609,14 @@ class TerminalWidget(QWidget):
 
             if waiting > 0:
                 return
-            try:
-                handle.close()
-            except Exception as e:
-                QMessageBox.warning(
+            # 使用中の登録を外すのは閉じ終えてから（_close_log_file）
+            self._close_log_file(
+                tab_name, handle, getattr(handle, "name", None),
+                lambda e: QMessageBox.warning(
                     self,
                     "エラー",
                     f"ログファイルを閉じる際にエラーが発生しました:\n{str(e)}"
-                )
-                return
+                ))
     
     def _on_current_tab_changed(self, index: int) -> None:
         """表示中のタブが変わったことを知らせる"""

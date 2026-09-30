@@ -30,6 +30,7 @@ from ui import theme
 from typing import Dict, Union, Optional
 from datetime import datetime
 import os
+import time
 
 class DetachableTabBar(QTabBar):
     """タブを下方向へ十分ドラッグすると、そのタブを別ウィンドウへ切り離すタブバー。"""
@@ -390,6 +391,9 @@ class MainWindow(QMainWindow):
         splitter.setCollapsible(0, True)
         splitter.setCollapsible(1, False)
         splitter.setCollapsible(2, True)
+        # 接続先リストを隠している間に仕切りが引かれたか（_toggle_device_list で使う）
+        self._list_moved_while_hidden = False
+        splitter.splitterMoved.connect(self._note_splitter_moved)
         
         layout.addWidget(splitter)
         
@@ -399,6 +403,8 @@ class MainWindow(QMainWindow):
             config_manager=self.config_manager)
         self.tftp_server_panel = TFTPServerPanel(config_manager=self.config_manager)
         self.ftp_server_panel = FTPServerPanel(config_manager=self.config_manager)
+        for _label, _panel, _server in self._file_servers():
+            _server.started.connect(self._warn_shared_server_root)
         self.syslog_panel = SyslogPanel(config_manager=self.config_manager)
         self.syslog_receiver.message_received.connect(self.syslog_panel.add_message)
         self.syslog_panel.set_syslog_receiver(self.syslog_receiver)
@@ -528,10 +534,43 @@ class MainWindow(QMainWindow):
         finally:
             dialog.deleteLater()
 
+    def _device_dialog_groups(self) -> list:
+        """機器ダイアログのグループ欄に並べる名前を返す（同じ名前は 1 つだけ）。
+
+        手編集の config.json で同じ名前のグループが並ぶと、欄にも同じ名前が
+        並び、後ろの方を選んでも名前で探すので先に並んでいる方へ入っていた
+        （実測）。選び分けられるように見せない（入る先は読み込み時の案内
+        どおり先に並んでいる方）。
+        """
+        return list(dict.fromkeys(
+            g["name"] for g in self.config_manager.get_groups()))
+
+    def _same_name_group_hint(self, group_name: str, device_name: str,
+                              device_data: dict = None) -> str:
+        """同じ名前のグループのどれの機器か決められずに断ったとき、訳と直し方を返す。
+
+        同じ名前のグループの複数に名前も接続先も同じ機器があり、中身でも絞れ
+        ないと、どれの機器か決められないので ConfigManager は断る
+        （_group_of_device / device_group_is_ambiguous）。失敗とだけ
+        出すと、訳も直し方も分からなかった（実測）。ほかの理由（移動先に同じ
+        名前の機器がいる・保存の失敗など）で断ったときは、改名しても直らない
+        ので付けない（グループ名が並んでいるだけで付けていた。実測）。
+        付けないときは空文字。断った操作はメモリを元に戻しているので、
+        断った後に聞いても、操作の前と同じ答えになる。
+        """
+        if not self.config_manager.device_group_is_ambiguous(
+                group_name, device_name, self._endpoint_of(device_data),
+                device_data):
+            return ""
+        return (f"\n\n同じ名前のグループ '{group_name}' の複数に、名前も接続先も"
+                "同じ機器があり、どのグループの機器か決められないため、別の機器を"
+                "書き換えないよう変更していません。接続先リストで先に並んでいる方を"
+                "右クリックし「グループを編集」で別の名前にすると分かれます。")
+
     def _on_add_device(self):  # 追加
         """機器追加ダイアログを表示"""
         # グループ名リストを取得
-        group_names = [g["name"] for g in self.config_manager.get_groups()]
+        group_names = self._device_dialog_groups()
         
         if not group_names:
             QMessageBox.warning(
@@ -583,7 +622,7 @@ class MainWindow(QMainWindow):
             device_data: 機器データ
         """
         # グループ名リストを取得
-        group_names = [g["name"] for g in self.config_manager.get_groups()]
+        group_names = self._device_dialog_groups()
         
         # 編集ダイアログを表示
         dialog = DeviceDialog(self, groups=group_names, device_data=device_data)
@@ -611,8 +650,11 @@ class MainWindow(QMainWindow):
             # マクロの実行状態は古い名前のまま残り、接続先リストの「ツール」は
             # 新しい名前で引くので、そのセッションのマクロやキープアライブを
             # 止められなくなる。名前以外の変更はそのまま通す
-            session_open = (self.terminal_widget.has_terminal(old_device_name)
-                            or old_device_name in self.connections)
+            # （接続先が違えば同名の別の機器＝手編集の config のセッションなので通す）
+            session_open = ((self.terminal_widget.has_terminal(old_device_name)
+                             or old_device_name in self.connections)
+                            and not self._session_target_conflict(
+                                old_device_name, device_data))
             if new_name != old_device_name and session_open:
                 QMessageBox.warning(
                     self, "機器の編集",
@@ -639,7 +681,8 @@ class MainWindow(QMainWindow):
             # だけでは開いた項目を指せず、別の 1 台が書き換わってしまう
             if self.config_manager.update_device(group_name, old_device_name,
                                                  new_group_name, new_device_data,
-                                                 old_endpoint=self._endpoint_of(device_data)):
+                                                 old_endpoint=self._endpoint_of(device_data),
+                                                 old_device=device_data):
                 # 開いているタブの再接続は device_info の写しを見る。
                 # ここを更新しないと編集内容が届かず、古い接続情報のまま
                 # 繋がり続ける（存在しない鍵を指定しても、以前の鍵で
@@ -655,7 +698,9 @@ class MainWindow(QMainWindow):
                 self._load_devices()
                 self.status_bar.showMessage(f"機器 '{new_device_data['name']}' を更新しました")
             else:
-                QMessageBox.warning(self, "エラー", "機器の更新に失敗しました。設定は変更されていません。")
+                QMessageBox.warning(self, "エラー", "機器の更新に失敗しました。設定は変更されていません。"
+                                    + self._same_name_group_hint(
+                                        group_name, old_device_name, device_data))
     
     def _on_device_delete(self, group_name: str, device_name: str,
                           device_data: dict = None):
@@ -670,8 +715,11 @@ class MainWindow(QMainWindow):
         # タブを開いている（接続が残っている）機器の削除は、改名と同じく断る。
         # 消すと接続先リストから項目が無くなり、実行中のマクロを「ツール」
         # から止められなくなる（接続もマクロも残る）
-        if (self.terminal_widget.has_terminal(device_name)
-                or device_name in self.connections):
+        # （接続先が違えば同名の別の機器＝手編集の config のセッションなので通す）
+        if ((self.terminal_widget.has_terminal(device_name)
+                or device_name in self.connections)
+                and not (device_data is not None and
+                         self._session_target_conflict(device_name, device_data))):
             QMessageBox.warning(
                 self, "機器の削除",
                 f"'{device_name}' のタブを開いている間は、削除できません。\n"
@@ -689,18 +737,36 @@ class MainWindow(QMainWindow):
         
         if reply == QMessageBox.StandardButton.Yes:
             # 削除に失敗したとき、設定に元から無かったのか（ツリーにだけ
-            # 残っていた）、保存だけ失敗したのかを見分けるために控えておく
-            group = self.config_manager.get_group(group_name) or {}
-            existed = any(d.get("name") == device_name
-                          for d in group.get("devices", []))
+            # 残っていた）、保存だけ失敗したのかを見分けるために控えておく。
+            # 同じ名前のグループが並ぶときは、先頭だけでなく、この機器（名前と
+            # 接続先）を実際に持つ同名グループがあるかで見る（remove_device が
+            # グループを選ぶのと同じ読み方）。先頭だけを見ていたので、後ろの
+            # グループにしか居ない機器の保存の失敗でツリーを作り直して畳んだ
+            # グループが開き直り、先頭に同名の別の機器が居ると、ツリーにだけ
+            # 残った行を何度削除しても消せなかった（実測）
+            endpoint = self._endpoint_of(device_data)
+            groups = [g for g in self.config_manager.get_groups()
+                      if g.get("name") == group_name]
+            if len(groups) > 1 and endpoint is not None:
+                existed = any(d.get("name") == device_name
+                              and self._endpoint_of(d) == endpoint
+                              for g in groups for d in g.get("devices", []))
+            else:
+                group = self.config_manager.get_group(group_name) or {}
+                existed = any(d.get("name") == device_name
+                              for d in group.get("devices", []))
             # 同じグループに同名が並んでいるときは、右クリックした項目の
             # 接続先で 1 台に絞る（名前だけだと別の 1 台が消える）
             if self.config_manager.remove_device(
                     group_name, device_name,
-                    endpoint=self._endpoint_of(device_data)):
+                    endpoint=self._endpoint_of(device_data), device=device_data):
                 # 消した機器の接続情報を残さない（残すと、開いたままの
                 # タブで Enter を押したときに消したはずの機器へ繋がる）
-                self.device_info.pop(device_name, None)
+                # （接続先が違う写しは、同名の別の機器のセッションのものなので残す）
+                session = self.device_info.get(device_name)
+                if (device_data is None or session is None
+                        or self._endpoint_of(session) == self._endpoint_of(device_data)):
+                    self.device_info.pop(device_name, None)
                 # ツリーを再読み込み
                 self._load_devices()
                 self.status_bar.showMessage(f"機器 '{device_name}' を削除しました")
@@ -711,7 +777,9 @@ class MainWindow(QMainWindow):
                     # 保存に失敗しただけなら remove_device がメモリを戻して
                     # いるので、ツリーは設定と一致したまま＝作り直さない
                     self._load_devices()
-                QMessageBox.warning(self, "エラー", "機器の削除に失敗しました。")
+                QMessageBox.warning(self, "エラー", "機器の削除に失敗しました。"
+                                    + self._same_name_group_hint(
+                                        group_name, device_name, device_data))
     
     def _on_device_duplicate(self, group_name: str, device_data: dict):
         """
@@ -722,7 +790,7 @@ class MainWindow(QMainWindow):
             device_data: 機器データ
         """
         # グループ名リストを取得
-        group_names = [g["name"] for g in self.config_manager.get_groups()]
+        group_names = self._device_dialog_groups()
         
         # 複製データを作成（名前に「のコピー」を追加）
         duplicate_data = device_data.copy()
@@ -770,14 +838,16 @@ class MainWindow(QMainWindow):
         # 掴んだ項目の接続先で 1 台に絞る（名前だけだと別の 1 台が動く）
         if self.config_manager.move_device(
                 source_group_name, target_group_name, device_name,
-                endpoint=self._endpoint_of(device_data)):
+                endpoint=self._endpoint_of(device_data), device=device_data):
             # ツリーを再読み込み
             self._load_devices()
             self.status_bar.showMessage(
                 f"機器 '{device_name}' を '{source_group_name}' から '{target_group_name}' に移動しました"
             )
         else:
-            QMessageBox.warning(self, "エラー", "機器の移動に失敗しました。")
+            QMessageBox.warning(self, "エラー", "機器の移動に失敗しました。"
+                                + self._same_name_group_hint(
+                                    source_group_name, device_name, device_data))
     
     def _on_connect_requested(self, device_data: dict):
         """
@@ -1126,7 +1196,8 @@ class MainWindow(QMainWindow):
     def _attach_send_backpressure(terminal, conn) -> None:
         """接続が待たずに書けるときだけ、端末が次の区切りを渡すようにする
 
-        SSH / Telnet は渡された区切りをその場で書く。読むのが遅い機器へ
+        Telnet は渡された区切りをその場で書き、SSH は書き手のスレッドへ渡して
+        書き終わりを短く待つ（書き終わるまでは書けない扱い）。読むのが遅い機器へ
         大きく貼り付けると、受信ウィンドウや送信バッファが空かないまま
         時間切れになり、送信エラーとして切断していた（実機の IOSv で 16KB が
         途中で切れた）。接続の has_pending_sends を端末へ渡し、書けるように
@@ -1156,7 +1227,14 @@ class MainWindow(QMainWindow):
         self.terminal_widget.queue_output(device_name, text)
 
     def _drop_sftp_manager(self, device_name: str) -> None:
-        """機器の SFTP マネージャを切断して外し、表示中ならパネルも空にする"""
+        """機器の SFTP マネージャを切断して外し、表示中ならパネルも空にする
+
+        後始末では SSH の接続を先に閉じてから呼ぶ。SFTPClient.close は SFTP の
+        チャネルへ CHANNEL_CLOSE を書くので、相手が TCP まで受け取りを止めて
+        いる間は書けるまで GUI スレッドが止まる（実測: タブを閉じるのに 4.9 秒）。
+        先に Transport が閉じていれば、チャネルも閉じ済みで何も書かない。
+        SSH を閉じる前には _let_sftp_finish で進行中の操作を待っておく。
+        """
         if device_name not in self.sftp_managers:
             return
         sftp_mgr = self.sftp_managers.pop(device_name)
@@ -1167,6 +1245,30 @@ class MainWindow(QMainWindow):
         self._release_object(sftp_mgr)
         if self.sftp_panel.current_device == device_name:
             self.sftp_panel.clear()
+
+    def _let_sftp_finish(self, device_name: str,
+                         deadline: Optional[float] = None) -> None:
+        """SSH を閉じる前に、その機器の SFTP の進行中の操作を上限つきで待つ
+
+        後始末は SSH を SFTP より先に閉じる（_drop_sftp_manager 参照）。
+        待たずに閉じると、置き換えの途中のアップロードが Transport ごと
+        断ち切られ、機器に旧版の設定ファイルと一時名が残る。posix_rename の
+        無い機器では最終名を消した直後に切れ、最終名が無くなる（実測。
+        進捗が 100% に見えた直後に閉じても起きる）。知らせは画面に出ない。
+        新しい操作を止め、いま走っている操作が手を離すのを待つ。待つだけで
+        何も書かないので、相手が TCP まで詰まっていても止まるのは
+        SFTPManager._DISCONNECT_WAIT_SECONDS まで。1 回の後始末で呼ばれる
+        2 回目以降（タブの × から _on_connection_closed へ入る）と、あとの
+        disconnect は、最初の期限の残りだけ待つ（SFTPManager.quiesce 参照）。
+        deadline は、複数台で同じ期限を使うとき（closeEvent）に渡す。
+        """
+        sftp_mgr = self.sftp_managers.get(device_name)
+        if sftp_mgr is None:
+            return
+        try:
+            sftp_mgr.quiesce(deadline)
+        except Exception as e:
+            print(f"[SFTP] {device_name} の転送の終わりを待てませんでした: {e}")
 
     def _on_connection_success(self, device_name: str, terminal, conn=None):
         """接続成功時の処理（SSH/Telnet/シリアル共通）"""
@@ -1569,11 +1671,14 @@ class MainWindow(QMainWindow):
             return
         self.status_bar.showMessage(f"{device_name} から切断されました")
         
+        # 接続を閉じてから削除（閉じないとポートを掴んだまま残る）。
+        # SFTP より先に閉じる（_drop_sftp_manager 参照）。機器がシェルだけを
+        # 閉じたときは SFTP が生きているので、進行中の転送を先に待つ
+        self._let_sftp_finish(device_name)
+        self._dispose_connection(device_name)
+        
         # SFTP接続を切断
         self._drop_sftp_manager(device_name)
-        
-        # 接続を閉じてから削除（閉じないとポートを掴んだまま残る）
-        self._dispose_connection(device_name)
 
         # 切断メッセージと再接続方法を表示
         self.terminal_widget.show_notice(
@@ -1601,9 +1706,10 @@ class MainWindow(QMainWindow):
         else:
             # その他のエラー
             self.terminal_widget.show_notice(device_name, f"\nエラー: {error}\n")
-            # 閉じた client を抱えた SFTP マネージャを残さない
-            self._drop_sftp_manager(device_name)
+            self._let_sftp_finish(device_name)
             self._dispose_connection(device_name)
+            # 閉じた client を抱えた SFTP マネージャを残さない（SSH の後に閉じる）
+            self._drop_sftp_manager(device_name)
             # 切断時（_on_connection_closed）と同じく再接続待ちへ戻す。
             # ここを抜かすと、Enter で始めた再接続が失敗したあと誰も待ちを
             # 張り直さず、画面に残る案内どおりに Enter を押しても何も
@@ -1695,10 +1801,9 @@ class MainWindow(QMainWindow):
         # マクロマネージャーのクリーンアップ
         self.macro_manager.cleanup_device(device_name)
         
-        # SFTP接続を切断
-        self._drop_sftp_manager(device_name)
-        
-        # SSH接続を切断（接続が存在する場合のみ）
+        # SSH接続を切断（接続が存在する場合のみ）。SFTP より先に閉じる
+        # （_drop_sftp_manager 参照）。その前に進行中の転送を待つ
+        self._let_sftp_finish(device_name)
         if device_name in self.connections:
             try:
                 self.connections[device_name].disconnect()
@@ -1710,6 +1815,9 @@ class MainWindow(QMainWindow):
                 del self.connections[device_name]
             
             self.status_bar.showMessage(f"{device_name} の接続を切断しました")
+        
+        # SFTP接続を切断
+        self._drop_sftp_manager(device_name)
     
     def _on_add_group(self):
         """グループ追加ダイアログを表示"""
@@ -2096,7 +2204,13 @@ class MainWindow(QMainWindow):
         
         # マクロを実行
         self.macro_manager.start_command_list(device_name, commands, 1000)
-        self.status_bar.showMessage(f"マクロ '{macro_name}' を実行中...")
+        # 「ツール」を開いている間に切れていると、送り先が無く最初の行で
+        # 止まる（macro_error は誰も聞いていない）。始まったときだけ実行中と出す
+        if self.macro_manager.is_command_list_active(device_name):
+            self.status_bar.showMessage(f"マクロ '{macro_name}' を実行中...")
+        else:
+            self.status_bar.showMessage(
+                f"{device_name}: 接続が切れているためマクロを実行できません")
     
     def _on_macro_settings_from_context(self, device_name: str):
         """
@@ -2333,16 +2447,38 @@ class MainWindow(QMainWindow):
         そのまま終了すると「表示メニューを押しても何も起きない」
         （実際には一度隠してから出し直している）ように見える。
         幅が無いものは隠れていると見なす。
+
+        表示中の窓では、隠れている間の sizes() がこのリストに 0 を返す。
+        そのまま判断すると、隠していただけのリストも既定幅で戻し、Qt が
+        覚えている幅（利用者が決めた幅）を上書きする。出した直後に
+        並べ直させ、覚えている幅を見てから決める。
+
+        ただし隠している間に端末とツールエリアの仕切りが引かれていたら、
+        Qt が覚えていたリストの幅は 0 になっている。並べ直させるとリストの
+        最小幅を端末とツールエリアから比例で取り、利用者がいま決めた
+        ツールエリアの幅を削るので、並べ直させずに既定幅を端末から取る。
+        ツールエリアも隠れているときは並べ直させる（sizes() がツールエリアに
+        返す 0 を渡すと、ツールエリアが幅 0 のまま戻る）。
         """
         sizes = self.main_splitter.sizes()
         hidden = self.device_tree.isHidden() or (sizes and sizes[0] < 40)
+        moved = self._list_moved_while_hidden
+        self._list_moved_while_hidden = False
         self.device_tree.setVisible(hidden)
+        if hidden and not (moved and not self.tool_tabs.isHidden()):
+            self.main_splitter.refresh()
+            sizes = self.main_splitter.sizes()
         if hidden and sizes and sizes[0] < 40:
             spare = max(sizes[1] - self.DEVICE_LIST_WIDTH, 100)
             self.main_splitter.setSizes(
                 [self.DEVICE_LIST_WIDTH, spare] + sizes[2:])
         if hasattr(self, "toggle_device_list_action"):
             self.toggle_device_list_action.setChecked(hidden)
+
+    def _note_splitter_moved(self, _pos, _index):
+        """接続先リストを隠している間に仕切りが引かれたことを控える。"""
+        if self.device_tree.isHidden():
+            self._list_moved_while_hidden = True
 
     def _toggle_sftp_panel(self):
         """SFTPクライアントパネルの表示/非表示を切り替え"""
@@ -2385,7 +2521,52 @@ class MainWindow(QMainWindow):
     def _on_ftp_server_dock_visibility_changed(self, visible: bool):
         """FTPサーバードックの表示状態が変更されたときの処理"""
         self.ftp_server_panel_action.setChecked(visible)
-    
+
+    def _file_servers(self):
+        """内蔵ファイルサーバーの (表示名, パネル, マネージャ) の組"""
+        return (("FTP", self.ftp_server_panel, self.ftp_server_panel.ftp_server),
+                ("SFTP", self.sftp_server_panel, self.sftp_server_panel.sftp_server),
+                ("TFTP", self.tftp_server_panel, self.tftp_server_panel.tftp_server))
+
+    def _warn_shared_server_root(self):
+        """起動したサーバーのルートが、動いている別のサーバーと同じか入れ子なら警告する。
+
+        書き込み中の保存先の予約は FTP / SFTP / TFTP がそれぞれ別に持つので、
+        プロトコルをまたいだ同じ名前への同時アップロードは断れず、どれも成功と
+        報告されたまま中身が混ざる（実測）。共通の予約にするのは大きいので、
+        起動は断らずに、起動したパネルのログへ知らせるだけにする。
+        比べるのはルートの文字列だけ（abspath → normcase）。realpath は
+        ルートを開いて最終パスを問い合わせるので、動いている別サーバーの
+        ルートが応答しない共有だと GUI スレッドが固まり、切れた共有では
+        OSError（WinError 64 など）がスロットの外へ出て「予期しないエラー」に
+        なっていた（実測）。警告だけなので、ディスクに問い合わせないと
+        分からない同じフォルダの別の綴り（ジャンクション・シンボリックリンク・
+        8.3 短縮名・ネットワークドライブの文字と UNC パス・subst のドライブ）
+        までは追わない
+        """
+        def key(panel):
+            # abspath は文字列とカレントディレクトリだけで決め、ディスクに触れない
+            return os.path.normcase(os.path.abspath(panel.root_dir_edit.text().strip()))
+        servers = self._file_servers()
+        started = [s for s in servers if s[2] is self.sender()]
+        if not started:
+            return
+        _label, panel, server = started[0]
+        mine = key(panel)
+        for label, other_panel, other in servers:
+            if other is server or not other.is_running:
+                continue
+            theirs = key(other_panel)
+            try:
+                common = os.path.commonpath([mine, theirs])
+            except ValueError:
+                continue    # ドライブが違う
+            if common in (mine, theirs):
+                panel._add_log(
+                    "注意: ルートが %s サーバーのルート（%s）と同じか入れ子です。"
+                    "両方から同じファイルへ同時に書き込むと、断られずに中身が"
+                    "混ざることがあります" % (label, other_panel.root_dir_edit.text().strip()))
+
     def _toggle_syslog_panel(self):
         """Syslog タブを別ウィンドウにデタッチ/タブに戻す（単一インスタンスを付け替え）。"""
         if getattr(self, "_detached", {}).get("syslog"):
@@ -2925,26 +3106,32 @@ for details.
         for device_name in list(self.connections.keys()):
             self.macro_manager.cleanup_device(device_name)
         
+        # すべての接続を切断（SSH/シリアル）。記録を閉じるより先に切るのは、
+        # 受信スレッドを止めてからでないと記録し切れないため（下の
+        # _drain_output_before_log_finish）。conn.disconnect() ではなく
+        # _dispose_connection() を使う。disconnect() は disconnected を出し、
+        # その先の _on_connection_closed が切断バナーを端末へ書くので、
+        # まだ開いている記録へ終了時の案内が混ざる。
+        # SFTP より先に閉じる（_drop_sftp_manager 参照）。その前に進行中の
+        # 転送を待つ（_let_sftp_finish 参照）。全台で同じ期限を使い、待ちを
+        # 台数ぶん積み重ねない（どの機器の転送も同じ時刻から上限まで待てる）
+        deadline = time.monotonic() + SFTPManager._DISCONNECT_WAIT_SECONDS
+        for device_name in list(self.sftp_managers.keys()):
+            self._let_sftp_finish(device_name, deadline)
+        closed = list(self.connections.values())
+        for device_name in list(self.connections.keys()):
+            self._dispose_connection(device_name)
+
+        self.connections.clear()
+
         # すべてのSFTP接続を切断。知らせを外すのは、配送待ちを配り切った後
-        closed = list(self.sftp_managers.values())
+        closed.extend(self.sftp_managers.values())
         for device_name, sftp_mgr in list(self.sftp_managers.items()):
             try:
                 sftp_mgr.disconnect()
             except Exception:
                 pass
         self.sftp_managers.clear()
-        
-        # すべての接続を切断（SSH/シリアル）。記録を閉じるより先に切るのは、
-        # 受信スレッドを止めてからでないと記録し切れないため（下の
-        # _drain_output_before_log_finish）。conn.disconnect() ではなく
-        # _dispose_connection() を使う。disconnect() は disconnected を出し、
-        # その先の _on_connection_closed が切断バナーを端末へ書くので、
-        # まだ開いている記録へ終了時の案内が混ざる
-        closed.extend(self.connections.values())
-        for device_name in list(self.connections.keys()):
-            self._dispose_connection(device_name)
-
-        self.connections.clear()
 
         # 受信済みでまだ描いていない出力を記録し切ってから、記録を止めて
         # ファイルを閉じる。記録へ書くのは描くときなので、ここで済ませないと

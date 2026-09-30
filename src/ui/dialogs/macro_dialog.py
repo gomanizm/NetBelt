@@ -249,13 +249,19 @@ class MacroDialog(QDialog):
         if not macro:
             QMessageBox.warning(self, "エラー", f"プリセット '{preset_name}' が見つかりません。")
             return
-        
+
+        # 手編集の config.json では説明が数値などのことがある。そのまま渡すと
+        # setPlainText が TypeError になり編集が開かない。ツールメニューの
+        # 表示（空なら出さない、それ以外は文字列にする）と同じ見え方にそろえる
+        description = macro.get("description", "")
+        if not isinstance(description, str):
+            description = str(description) if description else ""
         dialog = PresetEditDialog(
             self,
             config_manager=self.config_manager,
             preset_name=preset_name,
             commands=macro.get("commands", []),
-            description=macro.get("description", "")
+            description=description
         )
 
         if self._exec_preset_dialog(dialog) == QDialog.DialogCode.Accepted:

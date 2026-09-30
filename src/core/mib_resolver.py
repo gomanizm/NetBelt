@@ -11,7 +11,7 @@ from typing import Dict, Optional
 # MIB 解析器の版。抽出・解決の規則を変えたら上げる。mib_cache.json は
 # この値も鍵にするので、古い解析器が作ったキャッシュがアプリの更新後に
 # そのまま使われることがなくなる。
-MIB_PARSER_VERSION = '2026-09-23.2'
+MIB_PARSER_VERSION = '2026-09-26.1'
 
 
 def app_dir() -> str:
@@ -97,6 +97,9 @@ class MIBResolver:
         # モジュール名→そのモジュールが宣言している名前。抽出のあいだに
         # 貯めて解決で使う。詳しくは _MIB_LOCAL_NAME を見ること
         self._module_local_names: Dict[str, set] = {}
+        # 1.3.1 では読めなかった形で抜き出した定義。詳しくは
+        # _extract_mib_definitions を見ること
+        self._newly_read_definitions: set = set()
         self._load_default_mibs()
         self._load_custom_mibs()
     
@@ -323,12 +326,21 @@ class MIBResolver:
             # 読めない MIB ファイルと同じように理由を 1 行残し、前回の
             # 解析結果（読めていれば）で続ける。解析し直していないので
             # キャッシュはそのまま、上書きもしない。
+            # ただし解析器の版や custom_mibs.json が変わって無効になった
+            # キャッシュは使わない（利用者の決定 2026-09-20）。使うと、
+            # 古い解析器の誤対応や、直す前の custom_mibs.json の親で決めた
+            # 名前が戻る（実測）
+            usable = not cache_needs_update
+            stale = bool(cached_mibs) and not usable
             print(f"[MIBResolver] mibs フォルダの一覧を取得できません"
                   f"（{e}）。今回は MIB ファイルを読み込まず、"
-                  f"キャッシュがあればその内容を使います（フォルダを"
-                  f"入れ替え中か、アクセス権が無い可能性があります）")
-            self._mib_cache_used = True
-            return cached_mibs
+                  + ("キャッシュも古い（アプリの更新か custom_mibs.json の"
+                     "変更の後）ので使いません" if stale else
+                     "キャッシュがあればその内容を使います")
+                  + "（フォルダを入れ替え中か、アクセス権が無い可能性が"
+                  "あります）")
+            self._mib_cache_used = usable
+            return cached_mibs if usable else {}
         for filename in filenames:
             # 拡張子は大小を無視して判定する。Windows はファイル名の大小を
             # 保持するので、CASE.MIB のように大文字で配布された MIB が
@@ -401,6 +413,7 @@ class MIBResolver:
             unread = set()
             # 解析し直すたびに取り直す（前回の mibs/ の名前を残さない）
             self._module_local_names = {}
+            self._newly_read_definitions = set()
             for filename in current_files.keys():
                 filepath = os.path.join(mibs_dir, filename)
                 try:
@@ -468,7 +481,8 @@ class MIBResolver:
     # 止まれずに次の定義の ::= まで伸びて、隣の OID を黙って奪ったうえ
     # 隣の定義を消す。IMPORTS の直後に並ぶ MODULE-IDENTITY も
     # 「名前 MODULE-IDENTITY」に見えるので、同じ理由で根を飲み込む。
-    # 右辺が { 名前 数字 } ちょうどでない定義は、その定義だけ落とす。
+    # 右辺を読めない定義（_parse_oid_value を見ること）は、その定義だけ
+    # 落とす。
     #
     # ただし「別の定義が始まる行」に節キーワードの行を混ぜてはいけない。
     # `SYNTAX OBJECT IDENTIFIER` は「名前 OBJECT IDENTIFIER」の形なので、
@@ -495,7 +509,60 @@ class MIBResolver:
         + r')[\w-]+' + _MIB_NAME_GAP
         + _MIB_DEFINITION_KEYWORDS + r'\b).)*?'
     )
-    _MIB_ASSIGNMENT = r'::=\s*\{\s*([\w-]+)\s+(\d+)\s*\}'
+    # 右辺 `{ … }` の中身。`{ 親 添字 }` だけでなく、複数添字
+    # （`{ aRoot 0 1 }`）とラベル付きフルパス（`{ iso(1) org(3) …
+    # 65001 }`）も読む（_parse_oid_value）。`{ 親 添字 }` しか読まずに
+    # いたので、実 MIB にあるこれらの宣言は OID が決まらず、その子が
+    # 内蔵表・custom_mibs.json・よそのモジュールの同名を親にして、標準や
+    # 他社の OID に自社の名前が付いた（実測: 自社の木に置いた system の
+    # 子が標準 sysName の 1.3.6.1.2.1.1.5 に付いた）
+    _MIB_ASSIGNMENT = r'::=\s*\{([^{}]*)\}'
+    # 右辺の添字 1 つぶん: ラベル付きの `iso(1)`・裸の数字・裸の名前
+    _MIB_OID_COMPONENT = (r'\s*(?:([A-Za-z][\w-]*)\s*\(\s*(\d+)\s*\)'
+                          r'|(\d+)|([A-Za-z][\w-]*))')
+    # 先頭にラベル付きで来たときだけ、OID の根からの数字とみなすラベル
+    _MIB_ROOT_LABELS = ('iso', 'ccitt', 'itu-t', 'joint-iso-ccitt',
+                        'joint-iso-itu-t')
+
+    @classmethod
+    def _parse_oid_value(cls, text: str):
+        """右辺 `{ … }` の中身を (親の名前, 添字, ラベル付きか) にする。
+        読めなければ None。
+
+        { aRoot 0 1 } → ('aRoot', '0.1', False)、{ mib-2 x(26) 4 } →
+        ('mib-2', '26.4', True)、{ iso(1) org(3) 6 } → ('', '1.3.6', True)。
+        親 '' は「根から数字だけで書いた OID」。2 つ目以降に裸の名前が来る
+        形（{ a b 1 }）は OID にならないので読まない（これまでどおり、その
+        定義だけ落とす）。ラベル付きか＝`x(26)` の形の添字が 1 つでも
+        あったか。1.3.1 は { 親 番号 } しか読めなかったので、{ system sn(5) }
+        のような 1 段も 1.3.1 には無かった宣言として扱う（_resolve_definitions）
+        """
+        import re
+
+        component = re.compile(cls._MIB_OID_COMPONENT)
+        parent, numbers, pos = '', [], 0
+        has_label = False
+        text = text.rstrip()
+        while pos < len(text):
+            match = component.match(text, pos)
+            if match is None:
+                return None
+            label, labeled, number, bare = match.groups()
+            has_label = has_label or labeled is not None
+            if labeled is not None and not (
+                    pos == 0 and label not in cls._MIB_ROOT_LABELS):
+                numbers.append(labeled)
+            elif number is not None:
+                numbers.append(number)
+            elif pos == 0:
+                parent = label or bare
+            else:
+                return None
+            pos = match.end()
+        if not numbers:
+            return None
+        return parent, '.'.join(numbers), has_label
+
     # 定義の名前。全部大文字の語は名前として認めない。ASN.1 の値参照は
     # 小文字で始まるので、IMPORTS / EXPORTS のような節のキーワードが
     # 定義の名前になること自体が誤り。起点を `([\w-]+)` のまま何でも
@@ -537,17 +604,38 @@ class MIBResolver:
         _MIB_NAME + r'\s+OBJECT-IDENTITY\b' + _MIB_DEFINITION_BODY
         + _MIB_ASSIGNMENT,
     )
-    # そのモジュールが宣言している名前。上の抽出は `::= { 親 添字 }` の形
-    # しか拾わないので、実 MIB にある複数添字の右辺（`::= { aRoot 0 1 }`）
-    # で宣言された名前は定義の一覧から落ちる。落ちた名前を「このモジュール
-    # には無い」とみなすと、全モジュール共通の表にある別モジュールの同名が
-    # 親になり、その子がよその名前空間へ入る（実測: A-MIB の aAlarm が
-    # B-MIB の 1.3.6.1.4.1.2222.1 に登録され、B ベンダーの OID で来た Trap に
-    # 他社の名前が出た）。OID を決められなくても「名前 + 型キーワード」の
-    # 並びは残るので、そちらから宣言の有無だけを拾う。
+    # SMIv1 の Trap（RFC 1215）。`ENTERPRISE 親 … ::= 番号` の Trap は
+    # 親の下の 0.番号 として届く（RFC 3584 の v1→v2 変換。pysnmp も同じ
+    # OID を snmpTrapOID に置く）。拾わないと、SMIv1 のベンダー Trap が
+    # 'acme.0.7' のように番号のまま出る（実測）
+    _MIB_TRAP_TYPE = (_MIB_NAME + r'\s+TRAP-TYPE\s+ENTERPRISE\s+([\w-]+)'
+                      + _MIB_DEFINITION_BODY + r'::=\s*(\d+)')
+    # そのモジュールが宣言している名前。上の抽出は右辺を読めない宣言
+    # （`::= { a b 1 }` のように 2 つ目以降に裸の名前がある形。1.3.1 までは
+    # 複数添字の `::= { aRoot 0 1 }` もここに入った）を定義の一覧から
+    # 落とす。落ちた名前を「このモジュールには無い」とみなすと、全
+    # モジュール共通の表にある別モジュールの同名が親になり、その子が
+    # よその名前空間へ入る（実測: A-MIB の aAlarm が B-MIB の
+    # 1.3.6.1.4.1.2222.1 に登録され、B ベンダーの OID で来た Trap に他社の
+    # 名前が出た）。OID を決められなくても「名前 + 型キーワード」の並びは
+    # 残るので、そちらから宣言の有無だけを拾う。
     _MIB_LOCAL_NAME = (_MIB_NAME + r'\s+(?:OBJECT\s+IDENTIFIER|OBJECT-TYPE'
                        r'|NOTIFICATION-TYPE|MODULE-IDENTITY'
                        r'|OBJECT-IDENTITY)\b')
+    # 前の定義を閉じる `}` と同じ行から始まる定義（実 MIB の DS3-MIB.my:
+    # `ds3Conformance 1 } ds3Compliances OBJECT`）。名前は行頭に錨で
+    # 留めてあるので、そのままでは拾えない（1.3.1 で v1.3.0 から後退した。
+    # 実測: ds3Compliances と、同じ書き方の MIB ではその配下が名前なし）。
+    # 錨を外すと語の途中や `FROM SNMPv2-TC` からの始め直しが戻り、正規
+    # 表現も重くなるので、この `}` の後ろにだけ改行を差し込んでから抽出
+    # する。起点は `}` だけで、全部大文字の語は _MIB_NAME と同じく弾く。
+    # こうして拾った定義は 1.3.1 には無かったので、解決では複数添字などと
+    # 同じく 1.3.1 では読めなかった形として扱う（_resolve_definitions の
+    # preset の説明を見ること）
+    _MIB_DEFINITION_AFTER_BRACE = (
+        r'\}(?=[ \t]*(?![A-Z][A-Z0-9-]*(?![\w-]))[\w-]+\s+'
+        r'(?:OBJECT\s+IDENTIFIER|OBJECT-TYPE|NOTIFICATION-TYPE'
+        r'|MODULE-IDENTITY|OBJECT-IDENTITY|TRAP-TYPE)\b)')
 
     @staticmethod
     def _blank_comments_and_strings(text: str) -> str:
@@ -758,7 +846,22 @@ class MIBResolver:
             if local_names is None:
                 # __init__ を通さずに作った（検証用の __new__）ときの保険
                 local_names = self._module_local_names = {}
+            # 1.3.1 では読めなかった形で抜き出した定義（ラベル付きの添字と、
+            # `}` の直後から始まる定義）。解決で 1.3.1 の 1 段と区別する
+            # （_resolve_definitions の preset の説明を見ること）
+            newly_read = getattr(self, '_newly_read_definitions', None)
+            if newly_read is None:
+                newly_read = self._newly_read_definitions = set()
             for module, text in sections:
+                # `}` の直後から始まる定義を行頭へ。詳しくは
+                # _MIB_DEFINITION_AFTER_BRACE を見ること。差し込んだ改行の
+                # 次（その定義の行頭）の位置を覚えて印を付ける
+                breaks = [m.end() for m in re.finditer(
+                    self._MIB_DEFINITION_AFTER_BRACE, text)]
+                after_brace = {end + i + 1 for i, end in enumerate(breaks)}
+                if breaks:
+                    text = '\n'.join(text[a:b] for a, b in zip(
+                        [0] + breaks, breaks + [len(text)]))
                 local_names.setdefault(module, set()).update(
                     re.findall(self._MIB_LOCAL_NAME, text,
                                re.MULTILINE))
@@ -767,9 +870,17 @@ class MIBResolver:
                     # 拾わないと型キーワードから ::= まで届かない
                     for match in re.finditer(pattern, text,
                                              re.MULTILINE | re.DOTALL):
-                        definitions.append(
-                            (match.group(1), match.group(2), match.group(3),
-                             module))
+                        value = self._parse_oid_value(match.group(2))
+                        if value is not None:
+                            definition = (match.group(1), value[0], value[1],
+                                          module)
+                            definitions.append(definition)
+                            if value[2] or match.start() in after_brace:
+                                newly_read.add(definition)
+                for match in re.finditer(self._MIB_TRAP_TYPE, text,
+                                         re.MULTILINE | re.DOTALL):
+                    definitions.append((match.group(1), match.group(2),
+                                        '0.' + match.group(3), module))
         except OSError:
             # 読めなかった（排他ロック・ACL など）ことは空の結果にせず、
             # 呼び出し側へ返す。空で返すと解析済みとして mtime ごと
@@ -819,7 +930,7 @@ class MIBResolver:
 
         「同じモジュールにあるか」は、抽出できた定義だけでなく
         _MIB_LOCAL_NAME で集めた宣言も見る。そのモジュールの宣言が抽出から
-        落ちていると（複数添字の右辺など）、よその同名が親になって子が別
+        落ちていると（右辺を読めない宣言）、よその同名が親になって子が別
         ベンダーの名前空間へ入るため（実測）。宣言はあるが OID が決まらない
         親の子は、最後まで解決しないまま残る。利用者の決定（2026-09-20）に
         より、どのモジュールの親か確定できないときは名前を付けず OID の
@@ -836,7 +947,9 @@ class MIBResolver:
         custom_mibs.json にベンダー根を置いた一式ではベンダーの木が
         丸ごと消えて、Trap の名前が 'alarmRaised' から 'acme.2.4.2' に
         なった）。曖昧でなければ標準表 / custom_mibs.json / IMPORTS の
-        値をこれまでどおり使う。
+        値をこれまでどおり使う。1.3.2 からはこれらの右辺も読む
+        （_parse_oid_value）ので、その宣言の OID は自分の右辺で決まり、
+        よその同名を借りる場面そのものが無い。
 
         残る制限: 2 つのモジュールが同じ名前を定義し、第三のモジュールが
         その一方を IMPORTS しているとき、IMPORTS を見ていないのでどちらを
@@ -846,10 +959,14 @@ class MIBResolver:
         結果は mib_cache.json に残るので、一度ずれるとキャッシュを
         作り直すまでそのまま使われる。IMPORTS 節（`IMPORTS ... FROM
         <MODULE>;`）を解析して名前ごとに参照先モジュールを持たない限り、
-        ここは直らない。曖昧になったこと自体も知らせていない。
+        ここは直らない。曖昧になったこと自体も知らせていない。1.3.1 では
+        読めなかった宣言（1 段でない右辺・ラベル付きの添字・`}` の直後から
+        始まる定義）とその子孫は、この候補を増やさないように扱う（preset の
+        説明を見ること）。
 
         Args:
-            definitions: (名前, 親の名前, 添字, モジュール名) のリスト
+            definitions: (名前, 親の名前, 添字, モジュール名) のリスト。
+                親の名前が '' のものは、添字が根からの OID
 
         Returns:
             解決できた OID→名前 の辞書（同名でも別 OID なら両方残る）
@@ -877,6 +994,42 @@ class MIBResolver:
             for _declared_name in _module_names:
                 declaring[_declared_name] = (
                     declaring.get(_declared_name, 0) + 1)
+        # 1.3.1 では OID が決まらなかった宣言（fresh）は、同じ名前の候補が
+        # ほかにある（内蔵表か custom_mibs.json にある、または別のモジュール
+        # も宣言している）とき、よそのモジュールから名前で引く known へ
+        # 入れない。fresh は、右辺が 1.3.1 の 1 段（{ 親 番号 }）でない宣言
+        # （複数添字・ラベル付きの添字・SMIv1 の Trap。1.3.1 までは抽出
+        # できなかった形）と、親が fresh な宣言（子孫まで）。IMPORTS を見ない
+        # ので、候補が 2 つ以上あると取り込んだ側の子は後に決まった方に
+        # 付く（この関数の説明の「残る制限」）。1.3.1 で決まらなかった宣言が
+        # その候補に加わると、1.3.1 で正しく付いていた名前がよその木へ移る
+        # （実測: 他社の foo ::= { xRoot 5 1 } があると、Y-MIB の foo を
+        # 取り込んだ zLeaf が他社の 1.3.6.1.4.1.1111.5.1.7 に付いた。他社の
+        # linkDown TRAP-TYPE があると、内蔵の linkDown の子が他社の Trap の
+        # 下に付いた。右辺の形だけを見ていたときは、ラベル付きの根の下に
+        # 1 段で置いた system ::= { acmeRoot 9 } が known に入り、SNMPv2-MIB
+        # の system を取り込んだ zAlarm が 1.3.6.1.4.1.777.9.99 に付いた）。
+        # 自分のモジュールの子の親（in_module）には、これまでどおり使う。
+        # { 親 x(26) } も 1.3.1 では読めなかったので、1 段でも fresh に数える
+        # （実測: { acmeRoot sys(9) } で置いた system が known に入り、上と
+        # 同じく zAlarm が自社の木に付いた）。`}` の直後から始まる定義も
+        # 1.3.1 は抜き出さなかったので同じ（実測: `… { enterprises 888 }
+        # interfaces … ::= { bxRoot 2 }` の行があると、IF-MIB の interfaces を
+        # 取り込んだ bzLeaf が 1.3.6.1.4.1.888.2.50 に付いた）
+        preset = set(known)
+        newly_read = getattr(self, '_newly_read_definitions', None) or ()
+        # fresh な宣言の (モジュール, 名前) と、known の値が fresh な宣言
+        # から来た名前。子が fresh かを親から引く
+        fresh_in_module = set()
+        fresh_known = set()
+        # 借用で決まった宣言（子孫まで）の (モジュール, 名前) と、known の値が
+        # そうした宣言から来た名前。その下の 1.3.1 では読めなかった形の子は
+        # 解決しない（借用の説明を見ること）。後者が無いと、よそのモジュール
+        # が取り込んだ親では借用の印が消える（実測: M-MIB の借用で決まった
+        # acmeX ::= { system 4 } を取り込んだ N-MIB の { acmeX 6 1 } が、
+        # 標準の 1.3.6.1.2.1.1.4.6.1 に付いた）
+        borrowed = set()
+        borrowed_known = set()
         in_module = {}
         resolved = {}
         pending = list(definitions)
@@ -900,24 +1053,71 @@ class MIBResolver:
                 for _pending_name, _, _, _pending_module in pending:
                     awaiting.add((_pending_module, _pending_name))
             for name, parent, index, module in pending:
+                # 自分の右辺が 1.3.1 では読めなかった形か（preset の説明）
+                new_form = not parent or '.' in index or (
+                    bool(newly_read)
+                    and (name, parent, index, module) in newly_read)
+                parent_fresh = False
+                parent_borrowed = False
                 if parent == 'enterprises':
                     parent_oid = '1.3.6.1.4.1'
+                elif parent == '':
+                    # 根から数字だけで書いた右辺（ラベル付きフルパスなど）
+                    parent_oid = ''
                 elif parent in declared[module]:
                     parent_oid = in_module.get(module, {}).get(parent)
+                    parent_fresh = (module, parent) in fresh_in_module
+                    parent_borrowed = (module, parent) in borrowed
                     if (parent_oid is None and borrow
+                            and not new_form
                             and (module, parent) not in awaiting
                             and declaring.get(parent, 0) < 2):
                         # よそのモジュールに同名が無い＝曖昧ではない。
                         # 標準表 / custom_mibs.json / IMPORTS の値を
-                        # これまでどおり使う
+                        # これまでどおり使う。ただし 1.3.1 と同じ 1 段の
+                        # 子だけ。ここへ来る親は宣言があるのに OID が
+                        # 決まらない節（右辺を読めない { a b 1 } など）で、
+                        # 1.3.2 から抜き出す複数添字・ラベル付きの子と
+                        # TRAP-TYPE（添字 0.N）にまで借用を広げない（実測:
+                        # 自社が読めない右辺で宣言した system の
+                        # { system 5 1 } が標準の 1.3.6.1.2.1.1.5.1 に、
+                        # { system sn(5) } が 1.3.6.1.2.1.1.5 に付いた）。
+                        # 借りて決まった子の下（子孫まで）の新しい形の子も
+                        # 解決しない。解決すると借用を広げたのと同じになる
+                        # （実測: { system 4 } の下の { acmeSingle 6 1 } が
+                        # 標準の 1.3.6.1.2.1.1.4.6.1 に付いた）
                         parent_oid = known.get(parent)
+                        parent_fresh = parent in fresh_known
+                        parent_borrowed = True
                 else:
                     parent_oid = known.get(parent)
-                if parent_oid is None:
+                    parent_fresh = parent in fresh_known
+                    parent_borrowed = parent in borrowed_known
+                if parent_oid is None or (new_form and parent_borrowed):
                     still_pending.append((name, parent, index, module))
                     continue
-                oid = f"{parent_oid}.{index}"
-                known[name] = oid
+                oid = f"{parent_oid}.{index}" if parent_oid else index
+                # 1.3.1 では決まらなかった宣言か（preset の説明を見ること）
+                fresh = new_form or parent_fresh
+                if not fresh or (name not in preset
+                                 and declaring.get(name, 0) < 2):
+                    known[name] = oid
+                    if fresh:
+                        fresh_known.add(name)
+                    else:
+                        fresh_known.discard(name)
+                    if parent_borrowed:
+                        borrowed_known.add(name)
+                    else:
+                        borrowed_known.discard(name)
+                if fresh:
+                    fresh_in_module.add((module, name))
+                else:
+                    fresh_in_module.discard((module, name))
+                if parent_borrowed:
+                    borrowed.add((module, name))
+                else:
+                    borrowed.discard((module, name))
                 in_module.setdefault(module, {})[name] = oid
                 resolved[oid] = name
                 progressed = True
@@ -938,10 +1138,15 @@ class MIBResolver:
         # 残ったもののうち、よそのモジュールの同名を親にすれば解決できた
         # ものの数。利用者の決定（2026-09-20）により、どのモジュールの親か
         # 確定できないときは名前を付けずに OID のまま出すので、ここは
-        # 「黙って捨てた件数」になる。判断に使った条件と件数を 1 行残す
+        # 「黙って捨てた件数」になる。判断に使った条件と件数を 1 行残す。
+        # よその同名は known だけでなく解決済みの名前からも探す。1 段で
+        # ない右辺の宣言は known に入れないことがある（preset の説明）ので、
+        # known だけを見ると、よその同名が複数添字で決まっているときに
+        # 知らせが消える
+        named = set(resolved.values()) if pending else set()
         gave_up = sum(1 for _, parent, _, module in pending
                       if parent != 'enterprises' and parent in declared[module]
-                      and parent in known
+                      and (parent in known or parent in named)
                       and declaring.get(parent, 0) > 1)
         if gave_up:
             print(f"[MIBResolver] 親の名前を自分のモジュールで解決できない"

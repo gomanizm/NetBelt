@@ -39,10 +39,12 @@ class _GatedListener:
 
     def __init__(self, real):
         self._real = real
+        self.entered = threading.Event()
         self.accepted = threading.Event()
         self.release = threading.Event()
 
     def accept(self):
+        self.entered.set()
         result = self._real.accept()
         self.accepted.set()
         self.release.wait(10)
@@ -79,6 +81,12 @@ class SftpStopAcceptRaceTest(unittest.TestCase):
         m.server_socket = gate
         disconnects = []
         m.client_disconnected.connect(disconnects.append)
+        # 待受ループが差し替えより前に本物のソケットで accept に入っていると、
+        # 接続はそちらが受け取り、gate を通らない（pytest を通さずに流すと
+        # 10 回中 10 回、pytest -s でも 3 回中 3 回そうなった）。本物の accept は
+        # 1 秒で時間切れになり、次の周で gate を読むので、それを待ってから繋ぐ
+        self.assertTrue(gate.entered.wait(3),
+                        "前提: 待受が差し替えたソケットで待っていない")
 
         client = socket.socket()
         self.addCleanup(client.close)
