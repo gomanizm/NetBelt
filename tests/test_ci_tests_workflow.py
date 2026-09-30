@@ -255,7 +255,7 @@ class CiTestsWorkflowTest(unittest.TestCase):
         self.assertTrue(os.path.exists(TESTS),
                         "PR と push でテストを走らせるワークフロー %s が無い"
                         "（テストがランナーで走るのはタグと手動実行のときだけ）"
-                        % os.path.relpath(TESTS, REPO_ROOT))
+                        % TESTS)
         self.release = _read(RELEASE)
         self.tests = _read(TESTS)
 
