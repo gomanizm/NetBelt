@@ -16,8 +16,9 @@ before timeout のため中断。全部ではありません）」、閉じた�
 直し方: 断られたら（False が返ったら）status_label に触れずに戻る。
 「…実行中」は受理したときだけ出す。
 
-ここでは実際の SNMPManager を使い、nextCmd / getCmd だけを差し替える。
-差し替えた nextCmd は 1 行返したところで止まり、合図を受けてから残りを
+ここでは実際の SNMPManager を使い、_snmp_walk / _snmp_get（pysnmp 5.1.0 の
+ころは nextCmd / getCmd）だけを差し替える。
+差し替えた _snmp_walk は 1 行返したところで止まり、合図を受けてから残りを
 返す（途中で切れる場合は errorIndication）。警告の代わりに、合図を出して
 WALK の完了までイベントループを回す関数を差し込む。
 """
@@ -42,7 +43,7 @@ def _row(index):
 
 
 class _GatedCmd:
-    """1 行返したところで止まり、release の合図で続きを返す nextCmd / getCmd。"""
+    """1 行返したところで止まり、release の合図で続きを返す _snmp_walk / _snmp_get。"""
 
     def __init__(self, rows=8, error=None):
         self.rows = rows
@@ -77,15 +78,17 @@ class SnmpRefusedRequestKeepsStatusTest(unittest.TestCase):
         self.panel.set_snmp_manager(self.manager)
         self.panel.host_edit.setText(HOST)
         self.panel.oid_edit.setText(BASE)
-        # nextCmd / getCmd はテストの終わり（ワーカーを手放した後）まで
+        # _snmp_walk / _snmp_get はテストの終わり（ワーカーを手放した後）まで
         # 差し替えたままにする。ワーカーが呼ぶ前に戻すと本物が走る
         self.gate = _GatedCmd()
         self.errors = []
         for patch in (
-                mock.patch("core.snmp_manager.nextCmd",
+                mock.patch("core.snmp_manager._snmp_walk",
                            side_effect=lambda *a, **k: self.gate(*a, **k)),
-                mock.patch("core.snmp_manager.getCmd",
-                           side_effect=lambda *a, **k: self.gate(*a, **k)),
+                # _snmp_get は 4 つ組を 1 つ返す（5.1.0 の getCmd は反復子を
+                # 返し、ワーカーが next() で 1 つ取っていた）
+                mock.patch("core.snmp_manager._snmp_get",
+                           side_effect=lambda *a, **k: next(self.gate(*a, **k))),
                 # 失敗の通知（モーダル）で止まらないよう、記録だけする
                 mock.patch("ui.snmp_panel.QMessageBox.critical",
                            side_effect=lambda parent, title, text, *a, **k:
@@ -95,7 +98,7 @@ class SnmpRefusedRequestKeepsStatusTest(unittest.TestCase):
         self.addCleanup(self._drain)
 
     def _drain(self):
-        """止めた nextCmd を流し切り、ワーカーを手放してから片付ける。"""
+        """止めた _snmp_walk を流し切り、ワーカーを手放してから片付ける。"""
         self.gate.release.set()
         self._pump_until(lambda: self.manager.worker is None, 10)
         self.panel.deleteLater()

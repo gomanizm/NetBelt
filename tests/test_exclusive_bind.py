@@ -142,6 +142,11 @@ class ExclusiveBindOverridesReuseAddrTest(unittest.TestCase):
     （pysnmp/carrier/asyncore/base.py）。Windows ではその状態で
     SO_EXCLUSIVEADDRUSE を立てようとすると WinError 10022 になるため、
     先に SO_REUSEADDR を戻す必要がある。
+
+    （pysnmp 7.1.28 には asyncore のトランスポートが無く、Trap の待ち受け
+    ソケットは NetBelt が自分で作って asyncio へ渡すので、pysnmp が
+    SO_REUSEADDR を立てることは無くなった。既に立っているソケットでも
+    排他にできることは set_exclusive_bind の約束なので、このまま確かめる。）
     """
 
     def test_can_be_applied_after_so_reuseaddr(self):

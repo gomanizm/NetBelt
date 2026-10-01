@@ -22,14 +22,18 @@ class ResolveV3ProtocolsTest(unittest.TestCase):
 
     def test_sha256_maps_to_the_hmac192_constant(self):
         """SHA-256 は usmHMAC192SHA256AuthProtocol。名前の数字が紛らわしい。"""
-        from pysnmp.hlapi import usmHMAC192SHA256AuthProtocol
+        # pysnmp 7 の名前を 5.1.0 の名前で受ける（7 系の usm... は非推奨の別名）
+        from pysnmp.hlapi.v3arch.asyncio import (
+            USM_AUTH_HMAC192_SHA256 as usmHMAC192SHA256AuthProtocol)
         from core.snmp_manager import resolve_v3_protocols
         auth, _priv = resolve_v3_protocols("SHA-256", "none")
         self.assertEqual(auth, usmHMAC192SHA256AuthProtocol)
 
     def test_aes256_maps_to_the_reeder_variant(self):
         """ベンダー実装と相互接続するのは Reeder 版（名前が短い方）。"""
-        from pysnmp.hlapi import usmAesCfb256Protocol, usmAesBlumenthalCfb256Protocol
+        from pysnmp.hlapi.v3arch.asyncio import (
+            USM_PRIV_CFB256_AES as usmAesCfb256Protocol,
+            USM_PRIV_CFB256_AES_BLUMENTHAL as usmAesBlumenthalCfb256Protocol)
         from core.snmp_manager import resolve_v3_protocols
         _auth, priv = resolve_v3_protocols("SHA", "AES-256")
         self.assertEqual(priv, usmAesCfb256Protocol)
@@ -95,8 +99,9 @@ class ResolveV3ProtocolsTest(unittest.TestCase):
 
     def test_aes_is_not_the_blumenthal_variant(self):
         """取り違えると相互接続できない組み合わせを明示的に弾く。"""
-        from pysnmp.hlapi import (usmAesBlumenthalCfb192Protocol,
-                                  usmAesBlumenthalCfb256Protocol)
+        from pysnmp.hlapi.v3arch.asyncio import (
+            USM_PRIV_CFB192_AES_BLUMENTHAL as usmAesBlumenthalCfb192Protocol,
+            USM_PRIV_CFB256_AES_BLUMENTHAL as usmAesBlumenthalCfb256Protocol)
         from core.snmp_manager import resolve_v3_protocols
         for name, blumenthal in (("AES-192", usmAesBlumenthalCfb192Protocol),
                                  ("AES-256", usmAesBlumenthalCfb256Protocol)):
@@ -170,23 +175,26 @@ class PrepareAuthDataTest(unittest.TestCase):
         w = self._worker({"username": "netbelt"})
         data = w._prepare_auth_data("v3")
         self.assertEqual(str(data.userName), "netbelt")
-        self.assertEqual(data.securityLevel, "noAuthNoPriv")
+        self.assertEqual(data.security_level, "noAuthNoPriv")
 
     def test_v3_auth_no_priv(self):
         w = self._worker({"username": "netbelt", "auth_protocol": "SHA-256",
                           "auth_password": "authpass12345"})
         data = w._prepare_auth_data("v3")
-        self.assertEqual(data.securityLevel, "authNoPriv")
+        self.assertEqual(data.security_level, "authNoPriv")
 
     def test_v3_auth_priv(self):
-        from pysnmp.hlapi import usmHMAC192SHA256AuthProtocol, usmAesCfb128Protocol
+        from pysnmp.hlapi.v3arch.asyncio import (
+            USM_AUTH_HMAC192_SHA256 as usmHMAC192SHA256AuthProtocol,
+            USM_PRIV_CFB128_AES as usmAesCfb128Protocol)
         w = self._worker({"username": "netbelt", "auth_protocol": "SHA-256",
                           "auth_password": "authpass12345",
                           "priv_protocol": "AES-128", "priv_password": "privpass12345"})
         data = w._prepare_auth_data("v3")
-        self.assertEqual(data.securityLevel, "authPriv")
-        self.assertEqual(data.authProtocol, usmHMAC192SHA256AuthProtocol)
-        self.assertEqual(data.privProtocol, usmAesCfb128Protocol)
+        # pysnmp 7 の属性名（5.1.0 は securityLevel / authProtocol / privProtocol）
+        self.assertEqual(data.security_level, "authPriv")
+        self.assertEqual(data.authentication_protocol, usmHMAC192SHA256AuthProtocol)
+        self.assertEqual(data.privacy_protocol, usmAesCfb128Protocol)
 
     def test_v3_priv_without_auth_raises(self):
         w = self._worker({"username": "netbelt", "auth_protocol": "none",
@@ -196,8 +204,9 @@ class PrepareAuthDataTest(unittest.TestCase):
 
     def test_v1_and_v2c_are_unchanged(self):
         w = self._worker({"community": "netbelt"})
-        self.assertEqual(w._prepare_auth_data("v1").mpModel, 0)
-        self.assertEqual(w._prepare_auth_data("v2c").mpModel, 1)
+        # pysnmp 7 の属性名（5.1.0 は mpModel）
+        self.assertEqual(w._prepare_auth_data("v1").message_processing_model, 0)
+        self.assertEqual(w._prepare_auth_data("v2c").message_processing_model, 1)
 
 
 
@@ -535,19 +544,22 @@ class V3TrapReceiveTest(unittest.TestCase):
         return m, port, got
 
     def _send_v3_trap(self, port, auth_password):
-        from pysnmp.hlapi import (SnmpEngine, UsmUserData, UdpTransportTarget,
-                                  ContextData, NotificationType, ObjectIdentity,
-                                  sendNotification, usmHMAC192SHA256AuthProtocol,
-                                  usmAesCfb128Protocol)
+        # pysnmp 7 の送信は asyncio だけなので、conftest.send_trap で送る
+        # （5.1.0 は next(sendNotification(...)) で同期に送れた）
+        from conftest import send_trap
+        from pysnmp.hlapi.v3arch.asyncio import (
+            SnmpEngine, UsmUserData, NotificationType, ObjectIdentity,
+            USM_AUTH_HMAC192_SHA256 as usmHMAC192SHA256AuthProtocol,
+            USM_PRIV_CFB128_AES as usmAesCfb128Protocol)
         from pysnmp.proto.rfc1902 import OctetString
         sender = SnmpEngine(OctetString(hexValue=self.SENDER_ENGINE_ID))
-        next(sendNotification(
+        send_trap(
             sender,
             UsmUserData(self.USER, auth_password, self.PRIVKEY,
                         authProtocol=usmHMAC192SHA256AuthProtocol,
                         privProtocol=usmAesCfb128Protocol),
-            UdpTransportTarget(("127.0.0.1", port)), ContextData(), "trap",
-            NotificationType(ObjectIdentity("1.3.6.1.6.3.1.1.5.1"))))
+            port,
+            NotificationType(ObjectIdentity("1.3.6.1.6.3.1.1.5.1")))
 
     def _wait(self, got, expect_more, before, timeout=4):
         import time

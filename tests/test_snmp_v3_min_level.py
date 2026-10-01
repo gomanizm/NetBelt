@@ -79,19 +79,22 @@ class SnmpV3MinLevelTest(unittest.TestCase):
 
     @staticmethod
     def _send(user_data, port, label):
-        from pysnmp.hlapi import (SnmpEngine, UdpTransportTarget, ContextData,
-                                  NotificationType, ObjectIdentity, sendNotification)
+        # pysnmp 7 の送信は asyncio だけなので、conftest.send_trap で送る
+        # （5.1.0 は next(sendNotification(...)) で同期に送れた。
+        # addVarBinds は 7 で add_varbinds になった）
+        from conftest import send_trap
+        from pysnmp.hlapi.v3arch.asyncio import (SnmpEngine, NotificationType,
+                                                 ObjectIdentity)
         from pysnmp.proto.rfc1902 import OctetString
         engine = SnmpEngine(snmpEngineID=OctetString(hexValue=ENGINE_HEX))
-        next(sendNotification(
-            engine, user_data,
-            UdpTransportTarget(("127.0.0.1", port), timeout=1, retries=0),
-            ContextData(), "trap",
-            NotificationType(ObjectIdentity("1.3.6.1.6.3.1.1.5.1")).addVarBinds(
-                ("1.3.6.1.2.1.1.5.0", OctetString(label)))))
+        send_trap(
+            engine, user_data, port,
+            NotificationType(ObjectIdentity("1.3.6.1.6.3.1.1.5.1")).add_varbinds(
+                ("1.3.6.1.2.1.1.5.0", OctetString(label))),
+            timeout=1, retries=0)
 
     def test_a_noauth_trap_for_an_authpriv_user_is_dropped(self):
-        from pysnmp.hlapi import UsmUserData
+        from pysnmp.hlapi.v3arch.asyncio import UsmUserData
         m, port, got = self._receiver()
 
         self._send(UsmUserData(USER), port, "forged")
@@ -100,8 +103,10 @@ class SnmpV3MinLevelTest(unittest.TestCase):
         self.assertEqual(got, [], "鍵なしの通知を受け入れている: %s" % got)
 
     def test_a_correct_authpriv_trap_is_still_received(self):
-        from pysnmp.hlapi import (UsmUserData, usmHMACSHAAuthProtocol,
-                                  usmAesCfb128Protocol)
+        # pysnmp 7 の名前を 5.1.0 の名前で受ける（7 系の usm... は非推奨の別名）
+        from pysnmp.hlapi.v3arch.asyncio import (
+            UsmUserData, USM_AUTH_HMAC96_SHA as usmHMACSHAAuthProtocol,
+            USM_PRIV_CFB128_AES as usmAesCfb128Protocol)
         m, port, got = self._receiver()
 
         self._send(UsmUserData(USER, AUTH, PRIV,
@@ -114,8 +119,9 @@ class SnmpV3MinLevelTest(unittest.TestCase):
 
     def test_an_authnopriv_trap_for_an_authpriv_user_is_dropped(self):
         """認証はあっても暗号が無い通知は、authPriv 登録には足りない。"""
-        from pysnmp.hlapi import (UsmUserData, usmHMACSHAAuthProtocol,
-                                  usmNoPrivProtocol)
+        from pysnmp.hlapi.v3arch.asyncio import (
+            UsmUserData, USM_AUTH_HMAC96_SHA as usmHMACSHAAuthProtocol,
+            USM_PRIV_NONE as usmNoPrivProtocol)
         m, port, got = self._receiver()
 
         self._send(UsmUserData(USER, AUTH, authProtocol=usmHMACSHAAuthProtocol,
@@ -126,7 +132,7 @@ class SnmpV3MinLevelTest(unittest.TestCase):
 
     def test_the_warning_is_raised_once_per_user_name(self):
         """偽の通知で画面が埋まらないよう、ユーザ名ごとに一度だけ知らせること。"""
-        from pysnmp.hlapi import UsmUserData
+        from pysnmp.hlapi.v3arch.asyncio import UsmUserData
         m, port, got = self._receiver()
         errors = []
         m.error_occurred.connect(errors.append)
@@ -151,7 +157,7 @@ class SnmpV3MinLevelTest(unittest.TestCase):
 
     def test_a_noauth_user_still_receives_noauth_traps(self):
         """noAuthNoPriv で登録したユーザには、これまでどおり鍵なしで届くこと（対照）。"""
-        from pysnmp.hlapi import UsmUserData
+        from pysnmp.hlapi.v3arch.asyncio import UsmUserData
         m, port, got = self._receiver(auth_protocol="none", priv_protocol="none")
 
         self._send(UsmUserData(USER), port, "plain")

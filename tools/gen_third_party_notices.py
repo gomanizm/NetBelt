@@ -23,6 +23,9 @@ VERIFIED = {
     "paramiko": "LGPL-2.1-or-later",
     # METADATA にライセンス欄が無いが、LICENSE 本文と各ソースヘッダが MIT。
     "pyftpdlib": "MIT",
+    # 7.1.28 の METADATA にライセンス欄が無いが、同梱の LICENSE.rst は
+    # 2 条項の BSD（BSD-2-Clause）。5.1.0 の METADATA も BSD-2-Clause だった。
+    "pysnmp": "BSD-2-Clause",
 }
 
 # 実行時には同梱されない、開発・ビルド時のみ使うもの

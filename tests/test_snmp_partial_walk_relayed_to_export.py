@@ -13,7 +13,8 @@ JSON の書き出しは complete=True・partial_reason=None になった（正�
 「途中まで: 4件（…）」、complete=False）。途中までの結果が完走として
 保存される回帰を、どのテストも検出できなかった。
 
-ここでは実際の SNMPManager をパネルに set_snmp_manager し、nextCmd だけを
+ここでは実際の SNMPManager をパネルに set_snmp_manager し、_snmp_walk
+（pysnmp 5.1.0 のころは nextCmd）だけを
 「数行返してから errorIndication を返す」ものに差し替えて WALK ボタンを
 押す。完了を待ってから、保存ダイアログを差し替えた _on_export_clicked で
 JSON に書き出し、complete=false と partial_reason を確かめる。
@@ -35,7 +36,7 @@ REASON = "No SNMP response received before timeout"
 
 
 def _rows_then(error, rows=4):
-    """rows 行返したあと error（None なら何も）を返す nextCmd の代わり。"""
+    """rows 行返したあと error（None なら何も）を返す _snmp_walk の代わり。"""
     from pysnmp.proto.rfc1902 import ObjectName, OctetString
 
     def fake(*args, **kwargs):
@@ -92,7 +93,7 @@ class PartialWalkRelayedToExportTest(unittest.TestCase):
     def _walk(self, fake_next_cmd):
         """WALK ボタンを押し、結果がパネルに届くまで待つ。"""
         # ワーカーを手放すまで差し替えたままにする（戻すと本物が走る）
-        with mock.patch("core.snmp_manager.nextCmd", fake_next_cmd):
+        with mock.patch("core.snmp_manager._snmp_walk", fake_next_cmd):
             self.panel.walk_button.click()
             self.assertIsNotNone(self.manager.worker, "WALK が受理されていない")
             self.assertTrue(
