@@ -3,13 +3,16 @@
 このファイルの形式は [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) に、
 バージョン番号は [Semantic Versioning](https://semver.org/lang/ja/) に従います。
 
-## [Unreleased]
+## [1.3.3] - 2026-10-02
 
 pyasn1 の脆弱性（GHSA-8ppf-4f7h-5ppj / CVE-2026-59885）に対応しました。
 
+### セキュリティ
+
+- SNMP の処理に使う pyasn1 を 0.5.1 から 0.6.4 へ更新しました。細工したデータで処理が極端に重くなる脆弱性（GHSA-8ppf-4f7h-5ppj / CVE-2026-59885 ほか）を直したものです。あわせて pysnmp を 5.1.0 から 7.1.28 へ更新しました。GET / WALK / Trap 受信の使い方と、SNMPv3 の認証・暗号の選択肢は変わりません
+
 ### 変更
 
-- SNMP に使うライブラリを更新しました（pyasn1 0.5.1 → 0.6.4、pysnmp 5.1.0 → 7.1.28）。GET / WALK / Trap 受信の使い方と、SNMPv3 の認証・暗号の選択肢は変わりません
 - 標準 MIB の値を MIB と違う型で返す機器への GET / WALK は、値を受け取ったまま表示します（型の欄は MIB の型名です。以前は値を MIB の型へ変換して表示し、変換できない値では GET 全体が失敗することがありました）
 - SNMPv1 の機器への WALK が機器の MIB の最後まで進んだとき、最後の行を 2 回表示しなくなりました。最後の OID より後ろから始めた WALK は 0 行になります（以前は要求した OID の Null の 1 行）
 
