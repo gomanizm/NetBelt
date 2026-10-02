@@ -5,16 +5,36 @@ GET/WALK/Trap受信をサポートし、SNMPv1/v2c/v3に対応
 """
 from PyQt6.QtCore import QObject, pyqtSignal, QThread
 from typing import List, Dict, Optional, Tuple
+import asyncio
+import contextlib
+import os
+import socket
 import threading
+import traceback
 from datetime import datetime
 from .sockets import set_exclusive_bind
 
-# pysnmp 5.x用のインポート (pyasn1バージョンによっては使用不可)
+# pysnmp 7.x 用のインポート。7.x の API は asyncio だけで、同期の getCmd /
+# nextCmd や asyncore のトランスポートは無い。pyasn1 との組み合わせによっては
+# 読み込めない（5.1.0 は pyasn1 0.6.4 に無い pyasn1.compat.octets を使う）ので、
+# 失敗しても本体は起動し、SNMP 機能だけが使えない状態にする。
 try:
-    from pysnmp.hlapi import *
-    from pysnmp.entity import engine, config
-    from pysnmp.carrier.asyncore.dgram import udp
+    from pysnmp.carrier.asyncio.dgram import udp
+    from pysnmp.carrier.asyncio.dispatch import AsyncioDispatcher
+    from pysnmp.entity import config
+    from pysnmp.entity.engine import SnmpEngine
     from pysnmp.entity.rfc3413 import ntfrcv
+    from pysnmp.hlapi.varbinds import CommandGeneratorVarBinds
+    from pysnmp.proto import errind, rfc1902, rfc1905
+    from pyasn1.type import univ
+    from pysnmp.hlapi.v3arch.asyncio import (
+        CommunityData, ContextData, ObjectIdentity, ObjectType,
+        UdpTransportTarget, UsmUserData, get_cmd, walk_cmd,
+        USM_AUTH_NONE, USM_AUTH_HMAC96_MD5, USM_AUTH_HMAC96_SHA,
+        USM_AUTH_HMAC128_SHA224, USM_AUTH_HMAC192_SHA256,
+        USM_AUTH_HMAC256_SHA384, USM_AUTH_HMAC384_SHA512,
+        USM_PRIV_NONE, USM_PRIV_CBC56_DES, USM_PRIV_CBC168_3DES,
+        USM_PRIV_CFB128_AES, USM_PRIV_CFB192_AES, USM_PRIV_CFB256_AES)
     _PYSNMP_AVAILABLE = True
 except Exception:
     _PYSNMP_AVAILABLE = False
@@ -57,7 +77,8 @@ def _clean_communities(communities):
 # pysnmp は v1 Trap を v1ToV2 変換に通すとき snmpTrapCommunity を合成し、
 # コミュニティ文字列そのものを varbind として足す。v1/v2c ではこれが
 # 唯一の認証情報で、CSV/JSON/TXT のエクスポートはチケットや報告書へ回る
-# ため、値は表示にもファイルにも載せない。
+# ため、値は表示にもファイルにも載せない。7.1.28 でも同じ OID で合成する
+# （pysnmp/proto/proxy/rfc2576.py の v1_to_v2、135 行目）。
 SNMP_TRAP_COMMUNITY_OID = '1.3.6.1.6.3.18.1.4.0'
 
 
@@ -82,27 +103,30 @@ def resolve_v3_protocols(auth_name: str, priv_name: str):
     if not _PYSNMP_AVAILABLE:
         raise RuntimeError("SNMPライブラリ(pysnmp)を利用できません")
 
-    # SHA-2 系の定数名は「HMAC<出力ビット長>SHA<ダイジェスト長>」の順であり、
-    # SHA-256 は usmHMAC192SHA256AuthProtocol になる（usmHMACSHA256... ではない）。
+    # SHA-2 系の定数名は「HMAC<出力ビット長>_SHA<ダイジェスト長>」の順であり、
+    # SHA-256 は USM_AUTH_HMAC192_SHA256 になる（HMAC256 ではない）。
+    # pysnmp 5.1.0 での名前は usmHMAC192SHA256AuthProtocol で、並びは同じ。
     auth_table = {
-        "none": usmNoAuthProtocol,
-        "MD5": usmHMACMD5AuthProtocol,
-        "SHA": usmHMACSHAAuthProtocol,
-        "SHA-224": usmHMAC128SHA224AuthProtocol,
-        "SHA-256": usmHMAC192SHA256AuthProtocol,
-        "SHA-384": usmHMAC256SHA384AuthProtocol,
-        "SHA-512": usmHMAC384SHA512AuthProtocol,
+        "none": USM_AUTH_NONE,
+        "MD5": USM_AUTH_HMAC96_MD5,
+        "SHA": USM_AUTH_HMAC96_SHA,
+        "SHA-224": USM_AUTH_HMAC128_SHA224,
+        "SHA-256": USM_AUTH_HMAC192_SHA256,
+        "SHA-384": USM_AUTH_HMAC256_SHA384,
+        "SHA-512": USM_AUTH_HMAC384_SHA512,
     }
-    # AES-192/256 は Reeder 版（名前が短い方）を使う。pysnmp のソースが
-    # 「non-standard but used by many vendors」と書いている方で、Cisco 等の
-    # 実装と相互接続するのはこちら。Blumenthal 版は名前に Blumenthal が入る。
+    # AES-192/256 は Reeder 版（名前に BLUMENTHAL が付かない方）を使う。
+    # pysnmp のソースが「non-standard but used by many vendors」と書いている方で
+    # （7.1.28 の pysnmp/entity/config.py 102〜103 行目）、Cisco 等の実装と
+    # 相互接続するのはこちら。
+    # 5.1.0 での名前は usmAesCfb192Protocol / usmAesCfb256Protocol。
     priv_table = {
-        "none": usmNoPrivProtocol,
-        "DES": usmDESPrivProtocol,
-        "3DES": usm3DESEDEPrivProtocol,
-        "AES-128": usmAesCfb128Protocol,
-        "AES-192": usmAesCfb192Protocol,
-        "AES-256": usmAesCfb256Protocol,
+        "none": USM_PRIV_NONE,
+        "DES": USM_PRIV_CBC56_DES,
+        "3DES": USM_PRIV_CBC168_3DES,
+        "AES-128": USM_PRIV_CFB128_AES,
+        "AES-192": USM_PRIV_CFB192_AES,
+        "AES-256": USM_PRIV_CFB256_AES,
     }
 
     if auth_name not in auth_table:
@@ -163,6 +187,317 @@ def short_failure_reason(error: BaseException) -> str:
     if len(first_line) > PARTIAL_REASON_MAX_LENGTH:
         first_line = first_line[:PARTIAL_REASON_MAX_LENGTH] + "…"
     return f"{name}: {first_line}"
+
+
+def _new_event_loop():
+    """pysnmp の処理 1 回ぶん（GET 1 回・WALK 1 回・Trap 受信 1 回）の専用ループを作る
+
+    Windows の既定の ProactorEventLoop ではなく SelectorEventLoop を使う。
+    Proactor のデータグラム受信は、ポート到達不能以外の OSError を受けると
+    error_received を呼んだあと次の受信を出し直さず、以後は黙って何も
+    受け取らなくなる（Python 3.11 の asyncio/proactor_events.py の
+    _ProactorDatagramTransport._loop_reading）。Selector は error_received の
+    あとも読み続ける。5.1.0 の asyncore と同じ select() による待ち方でもある。
+    例外ハンドラは _quiet_loop_exception に替える。
+    """
+    loop = asyncio.SelectorEventLoop()
+    loop.set_exception_handler(_quiet_loop_exception)
+    return loop
+
+
+def _quiet_loop_exception(loop, context):
+    """ループが拾った例外を、受信したデータを載せずに 1 行で出す
+
+    asyncio の既定の例外ハンドラは、例外が出たコールバックの引数を表示する。
+    pysnmp の受信コールバックの引数は、受信したパケットのバイト列と送信元
+    （BER として読めないパケットで pysnmp の復号が例外を出し、先頭の
+    バイト列がそのまま出た。実測）。v1/v2c のパケットにはコミュニティが
+    平文で入っており、凍結ビルドでは stdout と stderr をログファイルへ
+    恒久保存する（main.py の _setup_logging）。例外の文にも受信した値が
+    入りうるので、型名と、例外が出た場所（ファイル名と行番号。値は含まない）
+    だけを出す。受信は続く（ループは止まらない）。
+    ここで例外を漏らすと、asyncio は既定のハンドラで元の context を
+    まるごと出す（stdout が日本語を書けないときの print の失敗など）ので、
+    すべて握る。
+    """
+    try:
+        error = context.get("exception")
+        name = type(error).__name__ if error is not None else "不明"
+        where = ""
+        frames = (traceback.extract_tb(error.__traceback__)
+                  if error is not None else [])
+        if frames:
+            where = f"（{os.path.basename(frames[-1].filename)}:{frames[-1].lineno}）"
+        print(f"[SNMP] イベントループの処理で例外を捨てました: {name}{where}")
+    except Exception:
+        pass
+
+
+def _close_event_loop(loop):
+    """止まっているイベントループの残りを片付けてから閉じる
+
+    asyncio.run() の後始末と同じ手順。取り消したタスク（ディスパッチャの
+    タイマ）を終わらせ、transport.close() が積んだ後始末（ソケットを閉じる）と、
+    名前解決に使ったスレッド（既定の executor）の終了をここで回してから閉じる。
+    回さずに閉じると、ソケットとスレッドが GC まで残る。
+    """
+    try:
+        tasks = [task for task in asyncio.all_tasks(loop) if not task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            loop.run_until_complete(
+                asyncio.gather(*tasks, return_exceptions=True))
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.run_until_complete(loop.shutdown_default_executor())
+    except Exception as e:
+        # 後始末の失敗で、呼び出し側の結果や本来の例外を上書きしない
+        print(f"[SNMP] イベントループの後始末に失敗しました: {e}")
+    finally:
+        loop.close()
+
+
+class _LoopFailure:
+    """GET/WALK のループで拾った例外を、待っている操作の失敗にする
+
+    pysnmp 7.1.28 の受信は、応答を要求と突き合わせて待ちの一覧から外した
+    あとで、v1 の値を v2 の型へ変換する（pysnmp/proto/proxy/rfc2576.py
+    152 行目）。範囲を超える INTEGER（2147483648 など）でこの変換が例外を
+    出すと、例外はイベントループのコールバックの中で止まり、待っている
+    get_cmd / walk_cmd に届かない。待ちの一覧から外れているので再送も
+    タイムアウトも働かず、取り消しも効かずに終わらなくなる（実測）。
+    5.1.0 は同じ応答ですぐエラーになっていた（実測）。ループの例外ハンドラで
+    拾った例外を、待っている操作の失敗に変える。文言は型名だけにする
+    （例外の文には受信した値が入る）。
+    """
+
+    def __init__(self, loop):
+        self._loop = loop
+        self._failed = loop.create_future()
+        loop.set_exception_handler(self._handle)
+
+    def _handle(self, loop, context):
+        _quiet_loop_exception(loop, context)
+        if not self._failed.done():
+            error = context.get("exception")
+            name = type(error).__name__ if error is not None else "不明"
+            self._failed.set_exception(
+                RuntimeError(f"SNMP の応答を処理できません（{name}）"))
+
+    def run(self, coroutine):
+        """coroutine を回して結果を返す。先にループで例外を拾ったら、その失敗を投げる"""
+        task = self._loop.create_task(coroutine)
+        self._loop.run_until_complete(asyncio.wait(
+            {task, self._failed}, return_when=asyncio.FIRST_COMPLETED))
+        if task.done():
+            return task.result()
+        task.cancel()
+        self._loop.run_until_complete(
+            asyncio.gather(task, return_exceptions=True))
+        return self._failed.result()
+
+    def close(self):
+        """誰も受け取らなかった失敗を片付ける（ループを閉じる前に呼ぶ）"""
+        if not self._failed.done():
+            self._failed.cancel()
+        elif not self._failed.cancelled():
+            self._failed.exception()
+
+
+def _close_dispatcher(engine):
+    """エンジンのディスパッチャを閉じる（トランスポートを閉じ、タイマを止める）
+
+    ディスパッチャが無ければ何もしない。閉じたトランスポートのソケットは、
+    このあと _close_event_loop がループを回したところで実際に閉じる。
+    """
+    try:
+        engine.close_dispatcher()
+    except Exception as e:
+        print(f"[SNMP] ディスパッチャを閉じられませんでした: {e}")
+
+
+def _value_text(value):
+    """GET/WALK で受け取った値を、表示する文字列にする
+
+    pysnmp 7 は、既定で読む MIB に定義のあるオブジェクト（system グループ
+    など）の値を、受信したタグと中身のまま MIB の型のクラスへ押し込む
+    （7.1.28 の pysnmp/smi/rfc1902.py の ObjectType.resolve_with_mib、
+    1063〜1071 行目）。機器が MIB と違う型で返すと（sysContact.0 を Gauge32 で
+    返すなど）、MIB の型の prettyPrint が中身を読めずに SmiError を投げ、
+    GET 全体が失敗し、WALK はその行で途切れる。5.1.0 は MIB の型へ値を
+    変換して表示していた（Gauge32(5) の sysContact.0 は "5"。実測）。
+    クラスと受信したタグが食い違う値だけ、受信したタグの基本型で表示する
+    （実測した組み合わせでは 5.1.0 と同じ文字列になる）。中身は _value から
+    取る（pysnmp が受信した値をそのまま入れた属性で、同じ関数の 1065・1071
+    行目で pysnmp 自身もこの属性を読み書きする）。型名は呼び出し側が MIB の
+    型のクラス名のまま出す。5.1.0 も変換できたときは MIB の型の名前だったが、
+    変換できなかったとき（sysServices.0 に OctetString など）は受信した型の
+    名前だったので、そこだけ型名が違う。
+    クラスにタグが無い値はそのまま prettyPrint する。OID の値は pysnmp が
+    ObjectIdentity（pyasn1 の型ではない）に置き換えて渡し（同じ関数の
+    1089〜1094 行目）、_snmp_get / _snmp_walk を差し替えたテストは
+    prettyPrint だけを持つ値を渡す。
+    """
+    tag_set = getattr(value, "tagSet", None)
+    class_tag_set = getattr(type(value), "tagSet", None)
+    received_type = _RECEIVED_TYPES.get(tag_set)
+    if (received_type is None or class_tag_set is None
+            or class_tag_set == tag_set):
+        return value.prettyPrint()
+    return received_type(value._value).prettyPrint()
+
+
+# 受信したタグ → SNMP の基本型（_value_text が使う）。Unsigned32 は Gauge32 と、
+# Bits は OctetString と同じタグ
+_RECEIVED_TYPES = ({cls.tagSet: cls for cls in (
+    rfc1902.Integer32, rfc1902.OctetString, rfc1902.IpAddress,
+    rfc1902.Counter32, rfc1902.Gauge32, rfc1902.TimeTicks, rfc1902.Opaque,
+    rfc1902.Counter64, rfc1902.ObjectIdentifier)}
+    if _PYSNMP_AVAILABLE else {})
+
+
+def _snmp_get(auth_data, host, port, oids):
+    """SNMP GET を 1 回行い、(errorIndication, errorStatus, errorIndex, varBinds) を返す
+
+    pysnmp 7 には同期の getCmd が無い。呼ぶたびに専用のイベントループと
+    SnmpEngine を作り、返す前にどちらも閉じる。run_until_complete は、
+    走っている間だけそのスレッドの「実行中のループ」になるだけなので、
+    GUI スレッドや他のスレッドの既定ループを作らず、奪わない。
+    待ち時間は UdpTransportTarget の既定（timeout 1 秒 × retries 5。7.1.28 の
+    pysnmp/hlapi/transport.py 28〜29 行目）のまま。
+
+    SNMPWorker はこの関数を通してだけ pysnmp の GET を呼ぶ。テストは
+    これを差し替えて、機器なしでワーカーの判定を確かめる。
+    """
+    loop = _new_event_loop()
+    failure = None
+    engine = None
+    try:
+        # ループを作ったあとで作る（作るところで落ちても、ループを閉じる）
+        failure = _LoopFailure(loop)
+        engine = SnmpEngine()
+
+        async def query():
+            target = await UdpTransportTarget.create((host, port))
+            return await get_cmd(
+                engine, auth_data, target, ContextData(),
+                *[ObjectType(ObjectIdentity(oid)) for oid in oids])
+
+        return failure.run(query())
+    finally:
+        if engine is not None:
+            _close_dispatcher(engine)
+        if failure is not None:
+            failure.close()
+        _close_event_loop(loop)
+
+
+def _snmp_walk(auth_data, host, port, oid):
+    """SNMP WALK を行い、応答 1 つごとに 4 つ組を返すジェネレータ
+
+    返す形は _snmp_get と同じ (errorIndication, errorStatus, errorIndex, varBinds)。
+    部分木の外へ出たところで終わる（5.1.0 の nextCmd の lexicographicMode=False
+    と同じ）。この判定は walk_cmd に任せず、下の「OID が増えない」の比較の
+    あとで自分で行う（walk_cmd は lexicographicMode=True で回す）。
+
+    5.1.0 との違い: v1 の機器は MIB の終わりを noSuchName のエラーで返す。
+    7.1.28 の walk_cmd はこれを何も返さずに終わる（pysnmp/hlapi/v3arch/
+    asyncio/cmdgen.py 758〜763 行目）。5.1.0 の nextCmd はエラーを消した
+    うえで直前の要求の行をもう一度返していたので、最後の行が 2 回載り、
+    何も無いところからの WALK では要求した OID が Null の 1 行になっていた
+    （実測）。7.1.28 では、それぞれ 1 回・0 行になる。
+    ループと SnmpEngine は最初の next() で作り、最後まで回ったとき・例外で
+    抜けたとき・途中で close() されたとき（取り消し）に閉じる。途中で
+    やめるときは、pysnmp の非同期ジェネレータを aclose してから閉じる。
+    途中で抜ける呼び出し側は close() すること（SNMPWorker は
+    contextlib.closing で閉じる）。
+
+    OID が増えない応答（同じ OID を返す・前へ戻る機器）: 5.1.0 の nextCmd は、
+    応答の OID が問い合わせた OID 以下なら errorIndication を「OID not
+    increasing」にして WALK を終えていた（5.1.0 の pysnmp/entity/rfc3413/
+    cmdgen.py の getNextVarBinds）。7.1.28 の NextCommandGenerator は
+    この比較をしない（pysnmp/entity/rfc3413/cmdgen.py 432 行目からの
+    process_response_varbinds。walk_cmd にあるのは、この errorIndication を
+    無視するオプションだけで、検出はしない）。そのままでは同じ行を際限なく
+    集め続ける（実測で 1 秒に約 1000 行）ので、ここで 5.1.0 と同じ比べ方を
+    して errind.oidNotIncreasing を返して終える。ワーカーはこれを、ほかの
+    errorIndication と同じく「行が無ければエラー、あれば途中まで」にする。
+    比べる相手は直前に問い合わせた OID（最初は開始 OID）で、開始 OID は
+    walk_cmd と同じ手順（エンジンの MIB で解決）で数字にしておく。
+    値による終わりの判定は 5.1.0 と同じ順で行う。noSuchObject・
+    noSuchInstance は比べずにそこで黙って終える（GETNEXT の応答にこの 2 つを
+    入れるのは規格外（RFC 3416）だが、返す機器はある）。素の NULL は比べた
+    うえで、増えていればそこで黙って終える。5.1.0 は比較から外すのが
+    noSuchObject・noSuchInstance・endOfMibView の 3 つだけで（5.1.0 の
+    entity/rfc3413/cmdgen.py）、pyasn1 の Null の仲間はすべて WALK の終わり
+    にしていた（5.1.0 の hlapi の nextCmd）。7.1.28 の walk_cmd が自分で
+    終えるのは pysnmp の rfc1902.Null と endOfMibView の値だけで
+    （cmdgen.py 772 行目）、受信した NULL（pyasn1 の univ.Null）と
+    noSuchObject・noSuchInstance は行として渡してくる。
+    部分木の外の、前へ戻った応答も「OID not increasing」の途中までにする
+    （5.1.0 と同じ）。walk_cmd に lexicographicMode=False で部分木の判定を
+    任せると、この応答は OID を見せずにその場で終わり、そこまでの行の
+    成功になる。部分木の残りを取りこぼしたことが利用者に伝わらない。
+
+    SNMPWorker はこの関数を通してだけ pysnmp の WALK を呼ぶ。テストは
+    これを差し替えて、機器なしでワーカーの判定を確かめる。
+    """
+    loop = _new_event_loop()
+    failure = None
+    engine = None
+    responses = None
+    try:
+        # ループを作ったあとで作る（作るところで落ちても、ループを閉じる）
+        failure = _LoopFailure(loop)
+        engine = SnmpEngine()
+        target = failure.run(UdpTransportTarget.create((host, port)))
+        request = ObjectType(ObjectIdentity(oid))
+        # walk_cmd の中と同じ呼び出しで解決する（解決済みの ObjectType は
+        # walk_cmd がそのまま使う）。解決できない OID の例外もここで出る
+        previous = CommandGeneratorVarBinds().make_varbinds(
+            engine.cache, (request,))[0][0].get_oid().asTuple()
+        subtree = previous
+        responses = walk_cmd(engine, auth_data, target, ContextData(),
+                             request, lexicographicMode=True)
+
+        async def next_response():
+            try:
+                return await responses.__anext__()
+            except StopAsyncIteration:
+                return None
+
+        while True:
+            response = failure.run(next_response())
+            if response is None:
+                return
+            errorIndication, errorStatus, _errorIndex, varBinds = response
+            # エラーの応答では比べない。walk_cmd はエラーに、直前に問い合わせた
+            # varBind をそのまま付けて返す（7.1.28 の cmdgen.py 755・764 行目）
+            # ので、比べるとタイムアウトも genErr も「OID not increasing」に化ける
+            if not errorIndication and not errorStatus and varBinds:
+                value = varBinds[0][1]
+                if isinstance(value, (rfc1905.NoSuchObject,
+                                      rfc1905.NoSuchInstance)):
+                    return
+                found = varBinds[0][0].get_oid().asTuple()
+                if found <= previous:
+                    yield (errind.oidNotIncreasing, 0, 0, varBinds)
+                    return
+                if found[:len(subtree)] != subtree or isinstance(value, univ.Null):
+                    return
+                previous = found
+            yield response
+    finally:
+        if responses is not None:
+            try:
+                loop.run_until_complete(responses.aclose())
+            except Exception:
+                pass
+        if engine is not None:
+            _close_dispatcher(engine)
+        if failure is not None:
+            failure.close()
+        _close_event_loop(loop)
 
 
 class SNMPWorker(QThread):
@@ -246,19 +581,9 @@ class SNMPWorker(QThread):
         # 認証情報の準備
         auth_data = self._prepare_auth_data(version)
         
-        # ObjectIdentityのリストを作成
-        object_identities = [ObjectType(ObjectIdentity(oid)) for oid in oids]
-        
-        # SNMP GET実行
-        iterator = getCmd(
-            SnmpEngine(),
-            auth_data,
-            UdpTransportTarget((host, port)),
-            ContextData(),
-            *object_identities
-        )
-        
-        errorIndication, errorStatus, errorIndex, varBinds = next(iterator)
+        # SNMP GET実行（OID から ObjectType を組むのも _snmp_get の中）
+        errorIndication, errorStatus, errorIndex, varBinds = _snmp_get(
+            auth_data, host, port, oids)
         
         if errorIndication:
             raise Exception(f"SNMP Error: {errorIndication}")
@@ -269,7 +594,7 @@ class SNMPWorker(QThread):
         results = []
         for varBind in varBinds:
             oid = varBind[0].prettyPrint()
-            value = varBind[1].prettyPrint()
+            value = _value_text(varBind[1])
             value_type = varBind[1].__class__.__name__
             results.append((oid, value_type, value))
         
@@ -290,41 +615,37 @@ class SNMPWorker(QThread):
         results = self._collected
         count = 0
         
-        for (errorIndication, errorStatus, errorIndex, varBinds) in nextCmd(
-            SnmpEngine(),
-            auth_data,
-            UdpTransportTarget((host, port)),
-            ContextData(),
-            ObjectType(ObjectIdentity(oid)),
-            lexicographicMode=False
-        ):
-            if self._cancelled:
-                break
+        # 途中で抜けても（取り消し・途中のエラー・例外）、WALK が使っている
+        # イベントループとソケットをその場で閉じるよう、必ず close() する
+        with contextlib.closing(_snmp_walk(auth_data, host, port, oid)) as responses:
+            for (errorIndication, errorStatus, errorIndex, varBinds) in responses:
+                if self._cancelled:
+                    break
             
-            if errorIndication or errorStatus:
-                reason = (str(errorIndication) if errorIndication
-                          else errorStatus.prettyPrint())
-                if not results:
-                    # 1件も取れていない。見せるものが無いのでエラーのまま
-                    raise Exception(f"SNMP Error: {reason}")
-                # 取れた分は捨てない。WALK は OID のステップごとに1往復で、
-                # 1リクエストあたり最大6秒（timeout 1 秒 x retries 5）待つ。
-                # ステップ数の多いウォークほど途中で1回落ちる確率が上がる
-                # ので、そこまでの成果を捨てると成果がゼロになりやすい。
-                # 不完全であることは呼び出し側が伝える。
-                self._partial_reason = reason
-                break
+                if errorIndication or errorStatus:
+                    reason = (str(errorIndication) if errorIndication
+                              else errorStatus.prettyPrint())
+                    if not results:
+                        # 1件も取れていない。見せるものが無いのでエラーのまま
+                        raise Exception(f"SNMP Error: {reason}")
+                    # 取れた分は捨てない。WALK は OID のステップごとに1往復で、
+                    # 1リクエストあたり最大6秒（timeout 1 秒 x retries 5）待つ。
+                    # ステップ数の多いウォークほど途中で1回落ちる確率が上がる
+                    # ので、そこまでの成果を捨てると成果がゼロになりやすい。
+                    # 不完全であることは呼び出し側が伝える。
+                    self._partial_reason = reason
+                    break
             
-            for varBind in varBinds:
-                oid_str = varBind[0].prettyPrint()
-                value = varBind[1].prettyPrint()
-                value_type = varBind[1].__class__.__name__
-                results.append((oid_str, value_type, value))
-                count += 1
+                for varBind in varBinds:
+                    oid_str = varBind[0].prettyPrint()
+                    value = _value_text(varBind[1])
+                    value_type = varBind[1].__class__.__name__
+                    results.append((oid_str, value_type, value))
+                    count += 1
             
-            # 進捗更新（100件ごと）
-            if count % 100 == 0:
-                self.progress_update.emit(f"{count}件取得中...")
+                # 進捗更新（100件ごと）
+                if count % 100 == 0:
+                    self.progress_update.emit(f"{count}件取得中...")
         
         return results
     
@@ -353,7 +674,9 @@ class SNMPWorker(QThread):
                 raise ValueError(password_error)
 
             # authProtocol / privProtocol は必ず明示的に渡す。pysnmp は
-            # authKey だけ渡すと既定で MD5、privKey だけなら既定で DES を選ぶため。
+            # authKey だけ渡すと既定で MD5、privKey だけなら既定で DES を選ぶため
+            # （7.1.28 でも同じ。pysnmp/hlapi/v3arch/asyncio/auth.py の
+            # UsmUserData.__init__、417・429 行目）。
             if auth_protocol == 'none':
                 return UsmUserData(username)
             if priv_protocol == 'none':
@@ -374,9 +697,21 @@ class SNMPTrapReceiver(QThread):
     """
     SNMP Trap受信スレッド
 
-    pysnmp のエンジン（SnmpEngine + ntfrcv + AsyncoreDispatcher）で受信する。
+    pysnmp のエンジン（SnmpEngine + ntfrcv + AsyncioDispatcher）で受信する。
     v3 は scopedPDU が暗号化され得るため、生ソケットで BER デコードする方式では
     中身を取り出せない。USM の復号経路を持つエンジンに載せる必要がある。
+
+    pysnmp 7 は asyncio だけで動く。スレッドとイベントループの持ち方:
+    - bind()（呼び出し元スレッド）: 待ち受けソケットを自分で作って同期で
+      バインドし、エンジン・認証情報・observer・NotificationReceiver を
+      用意する。どれもイベントループを使わないので、呼び出し元スレッドには
+      ループを作らない。
+    - run()（受信スレッド）: このスレッド専用のループを作ってスレッドの
+      ループにし、ディスパッチャとトランスポートを載せてソケットを渡し、
+      run_dispatcher() で回す。
+    - stop()（どのスレッドからでも）: 回っているループへ
+      call_soon_threadsafe で loop.stop を積む。
+    - run() の finally: ディスパッチャ・トランスポート・ソケット・ループを閉じる。
     """
 
     # シグナル定義
@@ -384,9 +719,6 @@ class SNMPTrapReceiver(QThread):
     error_occurred = pyqtSignal(str)  # エラーメッセージ
     started = pyqtSignal()  # 開始通知
     stopped = pyqtSignal()  # 停止通知
-
-    # ディスパッチャを止めるときのジョブID（pysnmp の慣例で 1 を使う）
-    _JOB_ID = 1
 
     def __init__(self, port: int = 162, communities: List[str] = None,
                  v3_users: List[dict] = None):
@@ -414,11 +746,19 @@ class SNMPTrapReceiver(QThread):
         self._running = False
         self._engine = None
         self._transport = None
-        # jobStarted と停止要求は別スレッドから触るのでロックで守る。
-        # 先に jobFinished を呼ぶと pysnmp 内部で KeyError になり、
-        # ジョブカウンタが不整合のまま runDispatcher() が戻らなくなる。
+        # bind() で作った待ち受けソケット。run() が asyncio へ渡す
+        self._socket = None
+        # run() が作ったイベントループ。閉じたあとも参照は残す（次の run() で
+        # 置き換わる）
+        self._loop = None
+        # _dispatching と停止要求は別スレッドから触るのでロックで守る。
+        # _dispatching は run_dispatcher() に入る直前から抜けるまで True で、
+        # その間だけ stop() はループへ停止を積む。それより前に来た停止要求は
+        # _stop_requested に残り、run() がループを回し始める前に見る。
+        # （pysnmp 5.1.0 ではジョブ ID で止めていて、jobStarted より先に
+        # jobFinished を呼ぶと runDispatcher() が永久に戻らなくなった。）
         self._state_lock = threading.Lock()
-        self._job_started = False
+        self._dispatching = False
         self._stop_requested = False
         # observer で拾った直近のセキュリティ情報（表示用の参考値）
         self._last_security = {}
@@ -429,6 +769,19 @@ class SNMPTrapReceiver(QThread):
         呼び出し元スレッドで実行し、失敗を戻り値で返す。スレッドの中で
         バインドすると成否を呼び出し側へ返せず、ポートが使用中でも UI は
         「受信中」の表示のまま何も待ち受けない状態になる。
+
+        pysnmp 7 のトランスポートは、バインドを asyncio の中で非同期に行う
+        （open_server_mode は create_datagram_endpoint を ensure_future に
+        積むだけ。7.1.28 の pysnmp/carrier/asyncio/dgram/base.py 160〜183 行目）
+        ので、そのままではここで成否を返せない。ソケットは自分で作って同期で
+        バインドし、run() で asyncio へ渡す。
+
+        ここで作るエンジン・認証情報・observer・NotificationReceiver は
+        イベントループを使わない（7.1.28 の SnmpEngine.__init__・
+        config.add_v1_system / add_v3_user・ntfrcv に asyncio の呼び出しは
+        無い。ループを使うのはディスパッチャとトランスポートを作るときで、
+        それは run() が受信スレッドで行う）。呼び出し元スレッドには
+        ループを作らない。
         """
         if not _PYSNMP_AVAILABLE:
             self.error_occurred.emit("SNMPライブラリ(pysnmp)を利用できません")
@@ -444,17 +797,24 @@ class SNMPTrapReceiver(QThread):
                 self.error_occurred.emit(f"v3 ユーザの設定に問題があります: {password_error}")
                 return False
 
+        # 前に bind() したまま start() していない待ち受けがあれば閉じてから作る。
+        # 参照を上書きすると、そのソケットが GC されるまでポートを掴んだまま残る。
+        # 受信スレッドの中（再 start 時の run()）では前回の finally で閉じ済み。
+        if not self.isRunning():
+            self._close_engine()
+
         try:
-            self._engine = engine.SnmpEngine()
-            self._transport = udp.UdpTransport()
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._socket = sock
+            # Windows の REUSEADDR 系は待ち受け中のポートへの二重バインドを
+            # 許すので、他プロセスの待ち受けポートを奪わないよう排他バインドに
+            # する（5.1.0 は pysnmp が自前のソケットへ REUSEADDR 系を無条件に
+            # 立てていたので、それを戻す意味もあった）。
+            set_exclusive_bind(sock)
+            sock.bind(('0.0.0.0', self.port))
+            sock.setblocking(False)
 
-            # pysnmp は自前のソケットへ無条件に REUSEADDR 系のオプションを立てる。
-            # Windows ではそれだけだと他プロセスの待ち受けポートを奪えてしまうので、
-            # 排他バインドへ差し替える（set_exclusive_bind が REUSEADDR を戻す）。
-            set_exclusive_bind(self._transport.socket)
-            self._transport.openServerMode(('0.0.0.0', self.port))
-            config.addTransport(self._engine, udp.domainName, self._transport)
-
+            self._engine = SnmpEngine()
             self._register_credentials()
             self._register_observer()
             ntfrcv.NotificationReceiver(self._engine, self._on_notification)
@@ -469,7 +829,7 @@ class SNMPTrapReceiver(QThread):
         # v1/v2c: コミュニティごとに securityName を分けて登録する。
         # 未登録のコミュニティは pysnmp 側で弾かれる（大文字小文字は区別される）。
         for index, community in enumerate(self.communities):
-            config.addV1System(self._engine, f"netbelt-v2c-{index}", community)
+            config.add_v1_system(self._engine, f"netbelt-v2c-{index}", community)
         # v3: USM ユーザ行のキーは (securityEngineId, securityName) の組なので、
         # engineID ごとに登録が要る。Trap では送信側の機器が authoritative engine
         # になるため、受信側は送信元の engineID を事前に知っている必要がある。
@@ -506,7 +866,7 @@ class SNMPTrapReceiver(QThread):
                     OctetString(hexValue=engine_id.strip()))
 
             for security_engine_id in security_engine_ids:
-                config.addV3User(
+                config.add_v3_user(
                     self._engine, username,
                     auth_proto, auth_key,
                     priv_proto, priv_key,
@@ -519,11 +879,19 @@ class SNMPTrapReceiver(QThread):
         ため、observer で別途拾う。pysnmp は observer を processPdu の
         直前に発火して直後に消すので、同一スレッド・同一コールスタックの
         あいだだけ有効な値になる（Trap が近接しても取り違えない）。
+        7.1.28 でも同じ（pysnmp/proto/rfc3412.py の receive_message が
+        'rfc3412.receiveMessage:request' で store_execution_context し
+        （536 行目）、process_pdu のあとで clear_execution_context する
+        （575 行目））。
 
-        observer は pysnmp のディスパッチ経路の中で呼ばれ、ここで例外が
-        出ると runDispatcher() を抜けて受信が完全に止まる。旧実装は
-        受信ループの中で握っていたので1パケットで止まることは無かった。
-        _on_notification と同じ扱いに揃える。
+        observer は pysnmp のディスパッチ経路の中で呼ばれ、pysnmp 5.1.0 では
+        ここで例外が出ると runDispatcher() を抜けて受信が完全に止まった。
+        旧実装は受信ループの中で握っていたので1パケットで止まることは
+        無かった。_on_notification と同じ扱いに揃える。7.1.28 では受信の
+        処理は loop.call_soon のコールバックとして走る
+        （pysnmp/carrier/asyncio/dgram/base.py 108 行目）ので、例外は
+        asyncio の例外ハンドラに記録されるだけで受信は続くが、前の Trap の
+        値を残さないため、ここで握る扱いは変えない。
         """
         def _observe(snmp_engine, execpoint, variables, cb_ctx):
             # 先に空にする。失敗したときに前の Trap の値が残ると、
@@ -534,7 +902,7 @@ class SNMPTrapReceiver(QThread):
             except Exception as e:
                 print(f"[SNMPTrapReceiver] セキュリティ情報を拾えません: {e}")
 
-        self._engine.observer.registerObserver(
+        self._engine.observer.register_observer(
             _observe, 'rfc3412.receiveMessage:request')
 
     def _capture_security(self, variables):
@@ -554,9 +922,12 @@ class SNMPTrapReceiver(QThread):
                          context_engine_id, context_name, var_binds, cb_ctx):
         """ntfrcv から呼ばれる通知コールバック
 
-        ntfrcv はコールバックのアリティを例外ベースで判定し、TypeError が出ると
-        「引数の数が違う」とみなして呼び直す。本体で TypeError を漏らすと
-        同じ通知が二度処理されるため、ここで握りつぶす。
+        pysnmp 5.1.0 の ntfrcv はコールバックのアリティを例外ベースで判定し、
+        TypeError が出ると「引数の数が違う」とみなして呼び直した。本体で
+        TypeError を漏らすと同じ通知が二度処理されるため、ここで握りつぶす。
+        7.1.28 の ntfrcv は 6 引数で 1 回呼ぶだけで呼び直さない
+        （pysnmp/entity/rfc3413/ntfrcv.py の process_pdu、139 行目）が、
+        例外をディスパッチ経路へ漏らさない扱いとして残す。
 
         制限: 1件ごとにそのまま emit する（間引きは GUI 側の
         SNMPPanel._trim_traps だけ）。GUI が止まっている間は Qt の
@@ -651,6 +1022,7 @@ class SNMPTrapReceiver(QThread):
 
     def run(self):
         """Trap受信スレッドのメイン処理"""
+        loop = None
         try:
             print(f"[SNMPTrapReceiver] 開始: ポート{self.port}")
             if self._engine is None and not self.bind():
@@ -662,18 +1034,39 @@ class SNMPTrapReceiver(QThread):
             print(f"[SNMPTrapReceiver] v3ユーザ: {len(self.v3_users)}件")
             print(f"[SNMPTrapReceiver] Trap受信待機中...")
 
+            # このスレッド専用のループ。スレッドのループにもするのは、pysnmp が
+            # 中で asyncio.get_event_loop() を呼んだときにこのループを返すため。
+            # ディスパッチャとトランスポートにはループを明示して渡す
+            # （渡さないと作った時点で asyncio.get_event_loop() を呼ぶ。7.1.28 の
+            # pysnmp/carrier/asyncio/dispatch.py 65 行目・dgram/base.py 100 行目）。
+            loop = _new_event_loop()
+            self._loop = loop
+            asyncio.set_event_loop(loop)
+            dispatcher = AsyncioDispatcher(loop=loop)
+            self._engine.register_transport_dispatcher(dispatcher)
+            transport = udp.UdpAsyncioTransport(loop=loop)
+            self._transport = transport
+            config.add_transport(self._engine, udp.DOMAIN_NAME, transport)
+
             self._running = True
-            with self._state_lock:
-                self._engine.transportDispatcher.jobStarted(self._JOB_ID)
-                self._job_started = True
-                # ここより前に来ていた停止要求は jobFinished を呼べていない
-                stop_before_start = self._stop_requested
             self.started.emit()
 
-            if stop_before_start:
-                self._engine.transportDispatcher.jobFinished(self._JOB_ID)
-
-            self._engine.transportDispatcher.runDispatcher()
+            with self._state_lock:
+                stop_before_start = self._stop_requested
+            if not stop_before_start:
+                # bind() で用意したソケットを asyncio へ渡す。open_server_mode
+                # (sock=...) も中で同じ create_datagram_endpoint を呼ぶが、
+                # ensure_future に積むだけで結果を見ないため（7.1.28 の
+                # pysnmp/carrier/asyncio/dgram/base.py 172・178 行目）、失敗しても
+                # 黙って何も受け取らない受信機になる。ここで完了まで待って失敗を拾う
+                loop.run_until_complete(loop.create_datagram_endpoint(
+                    lambda: transport, sock=self._socket))
+                with self._state_lock:
+                    # ここより前に来た停止要求は、まだループへ積めていない
+                    stop_before_start = self._stop_requested
+                    self._dispatching = not stop_before_start
+            if not stop_before_start:
+                dispatcher.run_dispatcher()
 
             print(f"[SNMPTrapReceiver] 正常終了")
 
@@ -684,51 +1077,81 @@ class SNMPTrapReceiver(QThread):
             self.error_occurred.emit(f"Trap受信エラー: {str(e)}")
 
         finally:
+            with self._state_lock:
+                self._dispatching = False
             self._running = False
             self._close_engine()
+            if loop is not None:
+                asyncio.set_event_loop(None)
             # 同じ受信機をもう一度 start() したとき、前回の停止要求が
-            # 残っていると jobStarted の直後に jobFinished して即終了する。
+            # 残っていると、ループを回す前に即終了する。
             with self._state_lock:
-                self._job_started = False
                 self._stop_requested = False
             # 例外で抜けたときも必ず知らせる。ここを成功経路だけに
             # 置くと、受信が死んでも画面は「受信中」のまま残る。
             self.stopped.emit()
 
     def _close_engine(self):
-        """エンジンとトランスポートを片付ける"""
-        if self._engine is not None:
-            try:
-                self._engine.transportDispatcher.closeDispatcher()
-            except Exception:
-                pass
-        self._engine = None
+        """エンジン・トランスポート・待ち受けソケット・イベントループを片付ける
+
+        bind() の失敗時、run() の終わり、bind() だけして start() しなかった
+        受信機の stop() から呼ぶ。何度呼んでもよい。回っているループには
+        触らない（回っている間は run() が持ち主）。
+        """
+        engine, self._engine = self._engine, None
+        sock, self._socket = self._socket, None
         self._transport = None
+        if engine is not None:
+            # トランスポートを閉じ（ソケットの close はループを回したときに
+            # 実行される）、ディスパッチャのタイマを取り消す
+            _close_dispatcher(engine)
+        loop = self._loop
+        if loop is not None and not loop.is_closed() and not loop.is_running():
+            _close_event_loop(loop)
+        if sock is not None:
+            # asyncio へ渡していなければ、ここで閉じるまで残る
+            try:
+                sock.close()
+            except OSError:
+                pass
 
     def stop(self):
         """Trap受信を停止
 
-        jobFinished でディスパッチャのジョブを終わらせると runDispatcher() が
-        戻る。検知はディスパッチャのタイマ分解能（0.5秒）の周期。
+        回っている受信ループへ call_soon_threadsafe で loop.stop を積む。
+        ループは待っている select() からすぐ起きて run_dispatcher() が戻る
+        （7.1.28 の run_dispatcher は loop.run_forever() を呼ぶだけ。
+        pysnmp/carrier/asyncio/dispatch.py 77〜84 行目）。
 
-        スレッドが jobStarted に到達する前に呼ばれた場合は、ここでは何もせず
-        run() 側に終わらせてもらう。先回りして jobFinished を呼ぶと
-        pysnmp 内部で KeyError になり、ジョブカウンタが合わなくなって
-        runDispatcher() が永久に戻らなくなる。
+        スレッドがループを回し始める前（run() の準備中）に呼ばれた場合は、
+        停止要求を立てるだけにして run() に終わらせてもらう。準備中の
+        run_until_complete へ loop.stop が届くと、準備の途中で止まって
+        しまう。bind() だけして start() していない受信機なら、ここで
+        待ち受けソケットとエンジンを閉じる。
         """
         print(f"[SNMPTrapReceiver] 停止要求")
         self._running = False
 
         with self._state_lock:
+            already_requested = self._stop_requested
             self._stop_requested = True
-            if not self._job_started:
+            if self._dispatching:
+                # loop.stop を積むのは 1 度だけ。2 つ目が、ループが止まってから
+                # run() の finally に入るまでの間に積まれると、後始末
+                # （_close_event_loop の run_until_complete）がそれで途中で
+                # 止まり、残りの片付けが飛ぶ（実測）。run() は停止要求が
+                # 無いときだけ _dispatching を立てるので、立っている間の
+                # 最初の stop() だけが積む
+                if not already_requested:
+                    try:
+                        self._loop.call_soon_threadsafe(self._loop.stop)
+                    except RuntimeError:
+                        pass    # 閉じたループ。run() は既に終わりかけている
                 return
+            unstarted = not self.isRunning()
 
-        if self._engine is not None:
-            try:
-                self._engine.transportDispatcher.jobFinished(self._JOB_ID)
-            except Exception:
-                pass
+        if unstarted:
+            self._close_engine()
 
 
 class SNMPManager(QObject):
@@ -954,7 +1377,7 @@ class SNMPManager(QObject):
             return
 
         receiver.stop()
-        finished = receiver.wait(5000)  # 受信ループは最大1秒で停止を検知する
+        finished = receiver.wait(5000)  # 停止要求は受信ループをすぐ起こす
         if not finished:
             # terminate() は任意の位置でスレッドを殺すためソケットや内部状態が
             # 壊れる。ここでは強制終了せず、参照を保持して破棄だけ防ぐ

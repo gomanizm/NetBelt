@@ -50,7 +50,7 @@ class _Pretty:
 
 
 def _rows_then(error, rows=OK_ROWS):
-    """rows を返したあと error を出す nextCmd の代わり。"""
+    """rows を返したあと error を出す _snmp_walk（5.1.0 では nextCmd）の代わり。"""
     def fake(*args, **kwargs):
         for oid, type_name, value in rows:
             vb = _VarBind(oid, value, type_name)
@@ -80,7 +80,7 @@ class SnmpPartialWalkTest(unittest.TestCase):
         if hasattr(worker, "partial_result"):
             worker.partial_result.connect(warnings.append)
 
-        with mock.patch("core.snmp_manager.nextCmd", fake_next_cmd):
+        with mock.patch("core.snmp_manager._snmp_walk", fake_next_cmd):
             worker.run()
 
         self.assertTrue(seen, "結果が1度も出ていない")

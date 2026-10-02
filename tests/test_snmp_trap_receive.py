@@ -76,6 +76,8 @@ class SnmpTrapReceiveTest(unittest.TestCase):
         PySnmpError として runDispatcher() から再送出される。旧実装は
         受信ループの中で握っていたので1パケットで止まることは無かったが、
         エンジンへ載せ替えた際にその保護が外れていた。
+        （pysnmp 7.1.28 では、例外は asyncio のコールバックの中で記録されて
+        受信は続く。握る扱いは変えていないので、同じことを確かめる。）
         """
         m, port = self._start()
         receiver = m.trap_receiver
@@ -107,8 +109,15 @@ class SnmpTrapReceiveTest(unittest.TestCase):
 
         seen = []
         receiver.stopped.connect(lambda: seen.append(True))
-        receiver._engine.transportDispatcher.runDispatcher = (
-            unittest.mock.Mock(side_effect=RuntimeError("boom")))
+        # pysnmp 7 ではディスパッチャを run() が作るので、クラスの
+        # run_dispatcher を差し替える（5.1.0 では bind() が作ったエンジンの
+        # transportDispatcher.runDispatcher を差し替えていた）
+        from core import snmp_manager
+        patch = unittest.mock.patch.object(
+            snmp_manager.AsyncioDispatcher, "run_dispatcher",
+            side_effect=RuntimeError("boom"))
+        patch.start()
+        self.addCleanup(patch.stop)
         receiver.start()
 
         deadline = time.time() + 5
@@ -205,6 +214,12 @@ class SnmpTrapReceiveTest(unittest.TestCase):
 
         SNMPManager.stop_trap_receiver() はタイムアウト時に参照を捨てるので、
         そちら経由では気づけない。レシーバを直接止めて確かめる。
+
+        pysnmp 7.1.28 ではジョブが無くなり、停止は受信ループへ
+        call_soon_threadsafe で loop.stop を積む。ループが回り始める前の
+        停止要求は積まずにフラグで run() へ渡す（準備中の
+        run_until_complete を途中で止めてしまうため）。順序を誤ると
+        固まるという同じ危険を、ここで確かめる。
         """
         m, _port = self._start()
         receiver = m.trap_receiver
@@ -366,7 +381,9 @@ class SnmpTrapReceiveTest(unittest.TestCase):
 
         self.assertFalse(r._stop_requested,
                          "停止要求が残っていて次回の起動が即終了する")
-        self.assertFalse(r._job_started, "ジョブ状態が残っている")
+        # 5.1.0 ではジョブの開始状態（_job_started）を見ていた。7.1.28 では
+        # 「ループへ停止を積める状態」がそれにあたる
+        self.assertFalse(r._dispatching, "ループの実行状態が残っている")
 
 
 if __name__ == "__main__":

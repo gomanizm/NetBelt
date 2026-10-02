@@ -14,8 +14,9 @@ set_snmp_manager が progress_update をつないでおらず、src/ 全体に�
 出ていて押せるとき（実行中で、停止を押す前）だけ。停止を押した後の
 「停止中…」や、結果が届いた後の「完了: N件」は上書きしない。
 
-ここでは実際の SNMPManager を使い、nextCmd だけを差し替える。差し替えた
-nextCmd は before 行返したところで止まり、合図を受けてから続きを返す。
+ここでは実際の SNMPManager を使い、_snmp_walk（pysnmp 5.1.0 のころは
+nextCmd）だけを差し替える。差し替えた _snmp_walk は before 行返した
+ところで止まり、合図を受けてから続きを返す。
 """
 import os
 import sys
@@ -37,7 +38,7 @@ def _row(index):
 
 
 class _GatedWalk:
-    """before 行返したところで止まり、release の合図で続きを返す nextCmd。"""
+    """before 行返したところで止まり、release の合図で続きを返す _snmp_walk。"""
 
     def __init__(self, before, rows):
         self.before = before
@@ -75,7 +76,7 @@ class SnmpWalkProgressShownTest(unittest.TestCase):
         self.panel.oid_edit.setText(BASE)
         self.gate = _GatedWalk(before=100, rows=120)
         for patch in (
-                mock.patch("core.snmp_manager.nextCmd",
+                mock.patch("core.snmp_manager._snmp_walk",
                            side_effect=lambda *a, **k: self.gate(*a, **k)),
                 # モーダルで止まらないよう塞ぐ
                 mock.patch("ui.snmp_panel.QMessageBox")):
@@ -84,7 +85,7 @@ class SnmpWalkProgressShownTest(unittest.TestCase):
         self.addCleanup(self._drain)
 
     def _drain(self):
-        """止めた nextCmd を流し切り、ワーカーを手放してから片付ける。"""
+        """止めた _snmp_walk を流し切り、ワーカーを手放してから片付ける。"""
         self.gate.release.set()
         self._pump_until(lambda: self.manager.worker is None, 10)
         self.panel.deleteLater()

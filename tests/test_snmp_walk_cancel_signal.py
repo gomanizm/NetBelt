@@ -45,7 +45,7 @@ def _row(index):
 
 
 def _walk_then_cancel(worker_ref, rows_before=3, rows_after=5):
-    """rows_before 行返したあと、次の応答を待つ間に取り消される nextCmd。"""
+    """rows_before 行返したあと、次の応答を待つ間に取り消される _snmp_walk。"""
     def fake(*args, **kwargs):
         for index in range(1, rows_before + 1):
             yield (None, None, None, [_row(index)])
@@ -57,7 +57,7 @@ def _walk_then_cancel(worker_ref, rows_before=3, rows_after=5):
 
 
 class _GatedWalk:
-    """3 行返したところで止まり、release の合図で続きを返す nextCmd。"""
+    """3 行返したところで止まり、release の合図で続きを返す _snmp_walk。"""
 
     def __init__(self, rows=8):
         self.rows = rows
@@ -103,7 +103,7 @@ class WorkerCancelSignalTest(unittest.TestCase):
         results, partials, cancels = self._run(
             "walk", {"host": "192.0.2.1", "oid": BASE, "version": "v2c",
                      "community": "public"},
-            "nextCmd", _walk_then_cancel)
+            "_snmp_walk", _walk_then_cancel)
 
         self.assertEqual(len(cancels), 1,
                          "取り消しが知らされていない（届いた結果: %r）" % results)
@@ -117,17 +117,17 @@ class WorkerCancelSignalTest(unittest.TestCase):
     def test_a_get_cancelled_before_a_timeout_is_not_an_error(self):
         """止めた GET の応答待ちがタイムアウトしても、エラーにしないこと。"""
         def fake_factory(ref):
+            # _snmp_get は 4 つ組を 1 つ返す（5.1.0 の getCmd は反復子を
+            # 返し、ワーカーが next() で 1 つ取っていた）
             def fake(*args, **kwargs):
-                def generate():
-                    ref[0].cancel()   # 応答待ちの間に停止を押した
-                    yield (TIMEOUT, None, None, [])
-                return generate()
+                ref[0].cancel()   # 応答待ちの間に停止を押した
+                return (TIMEOUT, None, None, [])
             return fake
 
         results, _, cancels = self._run(
             "get", {"host": "192.0.2.1", "oids": [BASE + ".1"],
                     "version": "v2c", "community": "public"},
-            "getCmd", fake_factory)
+            "_snmp_get", fake_factory)
 
         self.assertEqual(results, [],
                          "止めた GET のタイムアウトがエラーとして届いた")
@@ -154,7 +154,7 @@ class ManagerCancelRelayTest(unittest.TestCase):
         if hasattr(self.manager, "operation_cancelled"):
             self.manager.operation_cancelled.connect(self.cancelled.append)
         # ワーカーを手放すまで差し替えたままにする（戻すと本物が走る）
-        patch = mock.patch("core.snmp_manager.nextCmd",
+        patch = mock.patch("core.snmp_manager._snmp_walk",
                            side_effect=lambda *a, **k: self.gate(*a, **k))
         patch.start()
         self.addCleanup(patch.stop)

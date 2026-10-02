@@ -318,26 +318,77 @@ def free_udp_port():
 
 
 def _trap_bytes(proto_version, community):
+    # pysnmp 7 の名前（5.1.0 の protoModules / setDefaults / setCommunity /
+    # setPDU は 7.1.28 には無い）
     from pyasn1.codec.ber import encoder
     from pysnmp.proto import api
 
-    pMod = api.protoModules[proto_version]
+    pMod = api.PROTOCOL_MODULES[proto_version]
     pdu = pMod.TrapPDU()
-    pMod.apiTrapPDU.setDefaults(pdu)
+    pMod.apiTrapPDU.set_defaults(pdu)
     msg = pMod.Message()
-    pMod.apiMessage.setDefaults(msg)
-    pMod.apiMessage.setCommunity(msg, community)
-    pMod.apiMessage.setPDU(msg, pdu)
+    pMod.apiMessage.set_defaults(msg)
+    pMod.apiMessage.set_community(msg, community)
+    pMod.apiMessage.set_pdu(msg, pdu)
     return encoder.encode(msg)
 
 
 def trap_bytes(community="public"):
     """指定したコミュニティを持つ SNMPv2c Trap のバイト列。"""
     from pysnmp.proto import api
-    return _trap_bytes(api.protoVersion2c, community)
+    return _trap_bytes(api.SNMP_VERSION_2C, community)
 
 
 def v1_trap_bytes(community="public"):
     """指定したコミュニティを持つ SNMPv1 Trap のバイト列。"""
     from pysnmp.proto import api
-    return _trap_bytes(api.protoVersion1, community)
+    return _trap_bytes(api.SNMP_VERSION_1, community)
+
+
+def send_trap(engine, auth_data, port, notification, **target_options):
+    """pysnmp の送信側で Trap を 1 通、127.0.0.1:port へ送り、送り終えてから戻る。
+
+    pysnmp 5.1.0 では next(sendNotification(...)) で同期に送れた。7.1.28 の
+    send_notification は asyncio だけなので、呼ぶたびに専用のイベントループを
+    作って回し、終わったらディスパッチャとループを閉じる（テストのスレッドの
+    既定ループは作らない）。
+
+    Trap は応答を待たないので、send_notification は送信を待たずに戻る
+    （送る分はソケットの用意ができるまで積まれる）。積んだ分を送ったこと
+    （pysnmp のトランスポートがソケットを得て積み荷を送り出したこと）を
+    見てから戻る。target_options は UdpTransportTarget.create へ渡す。
+    engine は 1 通ごとに新しく作って渡す（送り終えたらディスパッチャを閉じる）。
+    """
+    import asyncio
+    from pysnmp.hlapi.v3arch.asyncio import (ContextData, UdpTransportTarget,
+                                             send_notification)
+
+    async def send():
+        target = await UdpTransportTarget.create(("127.0.0.1", port),
+                                                 **target_options)
+        result = await send_notification(engine, auth_data, target,
+                                         ContextData(), "trap", notification)
+        # 接続の用意ができたとき（connection_made）に積み荷を送り出す
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 5
+        while target.transport.transport is None and loop.time() < deadline:
+            await asyncio.sleep(0.01)
+        if target.transport.transport is None:
+            # 送れていないのに戻ると、「届かないこと」を確かめるテストが
+            # 何も送らずに通ってしまう
+            raise AssertionError("Trap を送るソケットが 5 秒で用意できない")
+        return result
+
+    loop = asyncio.SelectorEventLoop()
+    try:
+        return loop.run_until_complete(send())
+    finally:
+        engine.close_dispatcher()
+        pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            loop.run_until_complete(
+                asyncio.gather(*pending, return_exceptions=True))
+        loop.run_until_complete(loop.shutdown_default_executor())
+        loop.close()

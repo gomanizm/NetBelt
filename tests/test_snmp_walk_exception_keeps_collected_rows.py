@@ -69,7 +69,7 @@ class _VarBind:
 
 
 def _rows_then_raise(error, rows=3, on_last=None):
-    """rows 行 yield したあと error を投げる nextCmd の代わり。
+    """rows 行 yield したあと error を投げる _snmp_walk（5.1.0 では nextCmd）の代わり。
 
     on_last を渡すと、最後の行を返した直後に呼ぶ（取り消しの再現用）。
     """
@@ -105,7 +105,7 @@ class SnmpWalkExceptionKeepsCollectedRowsTest(unittest.TestCase):
         worker.result_ready.connect(lambda ok, r: results.append((ok, r)))
         worker.partial_result.connect(partials.append)
         worker.cancelled.connect(cancels.append)
-        with mock.patch("core.snmp_manager.nextCmd", fake_next_cmd):
+        with mock.patch("core.snmp_manager._snmp_walk", fake_next_cmd):
             worker.run()
         return results, partials, cancels
 
@@ -176,7 +176,7 @@ class SnmpWalkExceptionKeepsCollectedRowsTest(unittest.TestCase):
         worker.result_ready.connect(lambda ok, r: results.append((ok, r)))
         worker.partial_result.connect(partials.append)
         worker.cancelled.connect(cancels.append)
-        with mock.patch("core.snmp_manager.nextCmd", fake):
+        with mock.patch("core.snmp_manager._snmp_walk", fake):
             worker.run()
 
         self.assertEqual(results, [], "取り消しなのに result_ready が出た")
@@ -231,7 +231,7 @@ class InterruptedWalkReachesTheUserTest(unittest.TestCase):
     def _walk(self, fake_next_cmd):
         """WALK ボタンを押し、結果がパネルに届くまで待つ。"""
         # ワーカーを手放すまで差し替えたままにする（戻すと本物が走る）
-        with mock.patch("core.snmp_manager.nextCmd", fake_next_cmd):
+        with mock.patch("core.snmp_manager._snmp_walk", fake_next_cmd):
             self.panel.walk_button.click()
             self.assertIsNotNone(self.manager.worker, "WALK が受理されていない")
             self.assertTrue(
