@@ -109,10 +109,25 @@ Windows SmartScreen の警告が出る場合は「詳細情報」→「実行」
 
 受信サーバ（FTP / TFTP / Syslog / SFTP / SNMP Trap）は、起動しても Windows Defender
 ファイアウォールの受信許可ルールを追加しません。起動しただけで管理者権限（UAC）を求めないためです。
+NetBelt を管理者として実行する必要はありません。
 
 そのポートで受信できないときは、各パネルの**「ファイアウォールで許可（管理者）」**を一度押してください。
-押したときだけ UAC が表示され、`NetBelt - <サービス> (<プロトコル>/<ポート>)` という名前で
-受信許可ルールを追加します。
+押したときだけ UAC が表示され、次の 3 つを行います。
+
+1. `NetBelt - <サービス> (<プロトコル>/<ポート>)` という名前で、そのポートの受信許可ルールを
+   追加します（プログラムを限定せず、すべてのプロファイルで有効）。
+2. NetBelt.exe を対象にした既存の受信ルールを、手動で作ったものやブロックのルールも含めて
+   すべて削除します。Windows の初回の確認画面をキャンセルしたときに作られるブロックのルールを
+   消すためです。ただし、グループ ポリシーで配られたルールは消せず、そのブロックのルールが
+   あると 3 の許可を足しても受信できません。消えたかどうかは確かめないので、1〜3 がすべて
+   済んだときも、パネルには「既存のブロック規則の除去は確認していません」と添えて表示されます。
+3. NetBelt.exe のすべてのポートの受信を、すべてのプロファイルで許可するルール
+   `NetBelt - app inbound (self)` を追加します。
+
+UAC は、1 のルールのうち無いものや有効な許可になっていないもの 1 つにつき 1 回（FTP のパッシブの
+ポート範囲は 1 つのルールです）と、2・3 で 1 回表示されます。初めて押したときは最大 3 回（FTP と、
+UDP・TCP の両方で受信中の Syslog。ほかは 2 回）、1 のルールがそろった後は 1 回です。
+途中の UAC を拒否しても、残りの UAC は表示されます。
 
 v1.3.0 より前の版が自動で作ったルールは、そのまま残っています。同じポートを使い続けるなら
 追加の操作は要りません。
@@ -275,6 +290,27 @@ run on other platforms. The portable build does not require Python.
 See [Releases](https://github.com/gomanizm/NetBelt/releases). Windows SmartScreen
 will warn about the executable because it is not code-signed; choose
 **More info** then **Run anyway**.
+
+### Firewall
+
+Starting a server does not add Windows Defender Firewall rules, so NetBelt never
+asks for administrator rights (UAC) just by starting, and it does not need to be
+run as administrator. If a server receives nothing, press
+「ファイアウォールで許可（管理者）」 ("Allow through firewall (admin)") in its panel. It:
+
+1. adds an inbound allow rule for that port, `NetBelt - <service> (<protocol>/<port>)`
+   (any program, all profiles);
+2. deletes every existing inbound rule for NetBelt.exe, including rules you created
+   yourself and block rules (this is how it removes the block rule Windows creates
+   when its first-run prompt is cancelled). Rules pushed by Group Policy are not
+   deleted, and a block rule among them still stops traffic after step 3. The
+   deletion is not checked, so the panel says so even when every step succeeds;
+3. allows all inbound traffic to NetBelt.exe on all profiles
+   (`NetBelt - app inbound (self)`).
+
+UAC appears once for each step 1 rule that is missing or not an enabled allow rule
+(the FTP passive port range is a single rule), plus once for steps 2 and 3: up to
+3 times on the first press, and once per press after the step 1 rules exist.
 
 ### A note on the built-in servers
 
