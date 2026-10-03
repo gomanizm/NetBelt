@@ -896,16 +896,15 @@ class SNMPPanel(QWidget):
         データを同じ数だけ削り、エクスポートの中身と画面が食い違わない
         ようにする。
 
-        制限: 上限が効くのは、GUI が Trap を1件受け取って表示へ入れた
-        後だけ。受信スレッドは1件ごとに完成した dict を queued シグナル
-        で送るので、GUI が止まっている間そのキューは上限と無関係に
-        伸びる（実測: 1件あたり約 2.3 KB、5万件で RSS +116 MB。GUI が
-        処理し終えると解放される）。定常状態では問題にならない。受信側の
-        復号が約 1,670 件/秒、GUI 側の処理が約 2,550 件/秒で、GUI の方が
-        速いため未処理は常に3件以下だった（毎秒 3,000 件を外から送った
-        実測でも同じ）。効くのは終了時の wait などで GUI が数十秒
-        止まっている間だけなので、まとめ配送（deque + QTimer）は
-        入れていない。
+        ここが効くのは、GUI が Trap を受け取って表示へ入れた後だけ。その
+        手前の配送待ち（受信スレッドから queued シグナルで届く前の Trap）は
+        SNMPManager が max(1000, max_traps) 件で止め、超えた分は新しく
+        届いた方を捨てて数える（SNMPManager.trap_dropped。上限が無かった
+        ころの実測は core.snmp_manager._TrapBacklog）。GUI が止まって上限を
+        超えた場合、一覧に入るのは先に届いた側（嵐の始まり）で、あふれて
+        いる間に届いた新しい Trap は入らない（件数はパネルの表示とログ）。
+        上限は max_traps より小さくしないので、あふれていなければ、ここで
+        残るのは届いた順の最新 N 件のまま。
         """
         while len(self.trap_data_list) > self.max_traps:
             self.trap_data_list.pop()
@@ -1053,8 +1052,10 @@ class SNMPPanel(QWidget):
         communities = [] if version == "v3" else [self.trap_community_edit.text()]
         v3_users = [] if version == "v1/v2c" else self._collect_trap_v3_users()
 
-        # 起動できなければ表示を変えない（エラーは error_occurred で通知済み）
-        if not self.snmp_manager.start_trap_receiver(port, communities, v3_users):
+        # 起動できなければ表示を変えない（エラーは error_occurred で通知済み）。
+        # 配送待ちの上限は保持件数より小さくしない（SNMPManager が決める）
+        if not self.snmp_manager.start_trap_receiver(
+                port, communities, v3_users, keep_traps=self.max_traps):
             return
         self.trap_start_button.setVisible(False)
         self.trap_stop_button.setVisible(True)
