@@ -5,6 +5,7 @@ import os
 import socket
 import threading
 import time
+import weakref
 import paramiko
 from paramiko import ServerInterface, SFTPServerInterface, SFTPServer, SFTPAttributes, SFTPHandle, SFTP_OK, SFTP_FAILURE
 from PyQt6.QtCore import QObject, pyqtSignal
@@ -608,12 +609,29 @@ class SFTPServerHandler(SFTPServerInterface):
 
 
 class SSHServerInterface(ServerInterface):
-    """SSH サーバーインターフェース"""
+    """SSH サーバーインターフェース（1 本の接続につき 1 つ）"""
     
-    def __init__(self, username, password):
+    def __init__(self, username, password, max_channels=None, peer="",
+                 notify=None):
         super().__init__()
         self.username = username
         self.password = password
+        # 同時に開いておけるチャネルの上限（None は上限なし）。断ったことは
+        # 相手の IP（peer）を添えて診断の行へ、notify（1 行の文字列を
+        # 受け取る）でパネルのログへ出す
+        self._max_channels = max_channels
+        self._peer = peer
+        self._notify = notify
+        # 開くのを許してまだ accept() されていない数と、accept() 済みで持って
+        # いるチャネル。paramiko のチャネル表は弱参照なので、受け取った
+        # チャネルは閉じるまでここで持つ（捨てると GC で閉じられる）
+        self._channel_lock = threading.Lock()
+        self._unaccepted = 0
+        self._channels = []
+        # subsystem の起動に成功したチャネル（1 本につき 1 回まで）。弱参照
+        # なので、捨てられたチャネルは消える（paramiko のチャネル表も弱参照で、
+        # 捨てられたチャネルへの要求は paramiko が読み捨てる）
+        self._subsystem_started = weakref.WeakSet()
     
     def check_auth_password(self, username, password):
         """パスワード認証"""
@@ -622,10 +640,69 @@ class SSHServerInterface(ServerInterface):
         return paramiko.AUTH_FAILED
     
     def check_channel_request(self, kind, chanid):
-        """チャネルリクエストの許可"""
-        if kind == 'session':
-            return paramiko.OPEN_SUCCEEDED
-        return paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
+        """チャネルリクエストの許可。
+
+        同時に開いておける session チャネルは max_channels 本まで。上限なら
+        OPEN_FAILED_RESOURCE_SHORTAGE で断る（相手には Resource shortage と
+        理由が見える）。ハンドラが accept() で受け取ったチャネルは、閉じたら
+        ここで枠を戻す。閉じる知らせは同じ接続の次の要求より先に届くので、
+        閉じてすぐ開き直しても断らない。まだ accept() されていないチャネルは、
+        閉じていても accept() されるまで枠を使う（ハンドラは届いたチャネルを
+        待ち受けの accept() ですぐ取り出す）
+        """
+        if kind != 'session':
+            return paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
+        with self._channel_lock:
+            self._channels[:] = [c for c in self._channels if not c.closed]
+            if self._max_channels is None or \
+                    self._unaccepted + len(self._channels) < self._max_channels:
+                self._unaccepted += 1
+                return paramiko.OPEN_SUCCEEDED
+        # 知らせに失敗しても例外は外へ出さない（paramiko は接続ごと切る）
+        try:
+            _log_limited("channel refused",
+                         f"[SFTP Server] Channel refused from {self._peer}: "
+                         f"limit {self._max_channels} per connection")
+            if self._notify is not None:
+                self._notify("1 つの接続で同時に開けるセッションの上限"
+                             "（%d 本）に達したため断りました" % self._max_channels)
+        except Exception:
+            pass
+        return paramiko.OPEN_FAILED_RESOURCE_SHORTAGE
+
+    def keep_channel(self, channel):
+        """accept() で受け取ったチャネルを閉じるまで持つ。
+
+        閉じた分はここでも手放す（channel が None なら手放すだけ）
+        """
+        with self._channel_lock:
+            if channel is not None:
+                self._unaccepted = max(0, self._unaccepted - 1)
+                self._channels.append(channel)
+            self._channels[:] = [c for c in self._channels if not c.closed]
+
+    def check_channel_subsystem_request(self, channel, name):
+        """subsystem の起動は 1 本のチャネルにつき 1 回だけ（RFC 4254 6.5）。
+
+        paramiko の既定の実装は要求のたびにハンドラのスレッドを起こすので、
+        同じチャネルへ繰り返し要求されると、チャネル数の上限を素通りして
+        スレッドが積み上がる（実測: 20 回で 20 本）。起動に成功したチャネル
+        への要求は、ハンドラを作る前に断る。セッションが終わった後も、同じ
+        チャネルでは起動し直させない。記録するのは起動に成功したときだけで、
+        断った要求（未知の名前など）の後は、同じチャネルで送り直せば起動
+        できる。ハンドラの作成や起動の例外も記録しない（例外はこれまでどおり
+        paramiko へ返し、paramiko は接続を切る）。1 本の接続の要求は
+        paramiko の 1 本のスレッドが順に呼ぶので、確かめてから記録するまでの
+        間に同じチャネルの要求が割り込むことはない
+        """
+        with self._channel_lock:
+            if channel in self._subsystem_started:
+                return False
+        if not super().check_channel_subsystem_request(channel, name):
+            return False
+        with self._channel_lock:
+            self._subsystem_started.add(channel)
+        return True
     
     def get_allowed_auths(self, username):
         """許可する認証方法"""
@@ -644,6 +721,14 @@ class SFTPServerManager(QObject):
     file_uploaded = pyqtSignal(str, str)  # クライアントIP, ファイル名
     file_downloaded = pyqtSignal(str, str)  # クライアントIP, ファイル名
     error_occurred = pyqtSignal(str)
+
+    # 1 本の接続で同時に開けるチャネル（SFTP のセッション）の上限。
+    # max_client_connections が数えるのは TCP の接続だけで、認証を通った
+    # 相手は 1 本の接続の中でセッションを何本でも開け、その本数だけ
+    # スレッドが立った（実測: 200 本）。OpenSSH の MaxSessions の既定値と
+    # 揃える（多重化する OpenSSH の ControlMaster は 1 接続に複数開く）。
+    # 接続の上限 32 本と合わせて、SFTP のスレッドは最大 320 本
+    MAX_CHANNELS_PER_CONNECTION = 10
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1148,8 +1233,13 @@ class SFTPServerManager(QObject):
                     self._emit_activity(ip, message),
                 stop_event=stop_event)
             
-            # SSHサーバーインターフェースを作成
-            server = SSHServerInterface(self.username, self.password)
+            # SSHサーバーインターフェースを作成（チャネル数の上限は接続ごと）
+            server = SSHServerInterface(
+                self.username, self.password,
+                max_channels=self.MAX_CHANNELS_PER_CONNECTION,
+                peer=client_addr[0],
+                notify=lambda message, ip=client_addr[0]:
+                    self._emit_activity(ip, message))
             
             # SSHネゴシエーション開始
             transport.start_server(server=server)
@@ -1160,13 +1250,19 @@ class SFTPServerManager(QObject):
                 _log_limited("no channel",
                              f"[SFTP Server] No channel from {client_addr[0]}")
                 return
+            server.keep_channel(channel)
             
             # SFTPServer の生成と起動は set_subsystem_handler 経由で paramiko が行う。
             # ここで手動生成しても start() されないため、転送は始まらない。
             
-            # チャネルが閉じるまで待つ
+            # 接続が切れるか停止するまで待つ。その間に開かれた 2 本目以降の
+            # チャネルも accept() で取り出し、閉じるまで持つ（keep_channel）。
+            # 取り出さないと、閉じた後も server_accepts に参照が溜まる。
+            # server_accepts から外すのは accept() だけにする（subsystem の
+            # 要求の中で外すと、1 本目を上の accept より先に外して取り逃がし、
+            # 20 秒後に動いているセッションごと切ることがある）
             while transport.is_active() and not stop_event.is_set():
-                threading.Event().wait(0.5)
+                server.keep_channel(transport.accept(timeout=0.5))
             
         except Exception as e:
             _log_limited("client handler error",
