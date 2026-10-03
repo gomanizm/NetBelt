@@ -17,12 +17,25 @@ importlib.metadata（packages_distributions と RECORD）で distribution を
 入っていれば、その節に載っているかを確かめる。Python パッケージ
 でない DLL（python311.dll・OpenSSL・VC ランタイムなど）と PyInstaller の
 起動部品は照合の対象外で、参考として表示するだけ。
+
+使い方（exe をビルドした環境で、リポジトリの直下から）:
+    python tools/check_bundled_notices.py [--exe dist/NetBelt.exe]
+        [--notices THIRD-PARTY-NOTICES.txt] [--src src]
+
+終了コード: 0 = 一致、1 = 通知に無いものがある、
+    2 = 照合できない（入力を読めない、照合の途中で失敗した）
 """
+import argparse
+import importlib.metadata as md
+import os
 import re
+import sys
 
 SEP = "=" * 78
 VENDOR_DIRS = {"_vendor", "vendor", "vendored"}
 LICENSE_PREFIXES = ("LICENSE", "COPYING", "NOTICE")
+# 表示のファイル名。tools/gen_third_party_notices.py の NOTICE_NAME と同じ
+NOTICE_NAME = re.compile(r"NOTICES?(\.(txt|md|rst))?", re.IGNORECASE)
 # PyInstaller のブートストラップ・ランタイムフックとその補助モジュール
 PYINSTALLER_PREFIXES = ("pyimod", "pyiboot", "pyi_rth_", "_pyi_rth_")
 STDLIB_ARCHIVES = {"base_library.zip"}  # PyInstaller が標準ライブラリを入れる ZIP
@@ -189,3 +202,91 @@ def check(bundle, listed, sections, own, stdlib, top_dists, file_owner, licences
                 uncovered.append((scope or dist, "%s の本文が %s の節にありません" % (path, dist)))
     natives = sorted(d for d in bundle.loose_dlls if not file_owner.get(d.lower()))
     return missing, unknown, uncovered, natives
+
+
+def read_exe(path):
+    """exe の CArchive の項目 [(型, 名前)] と、PYZ のモジュール名の並びを返す"""
+    from PyInstaller.archive.readers import CArchiveReader
+    pkg = CArchiveReader(path)
+    entries, modules = [], []
+    for name, entry in pkg.toc.items():
+        if entry[-1] == "z":
+            modules.extend(pkg.open_embedded_archive(name).toc)
+        else:
+            entries.append((entry[-1], name))
+    return entries, modules
+
+
+def own_names(src):
+    """NetBelt 自身の最上位の名前（src の直下の .py とディレクトリ）"""
+    return {os.path.splitext(n)[0] for n in os.listdir(src) if n != "__pycache__"
+            and (n.endswith(".py") or os.path.isdir(os.path.join(src, n)))}
+
+
+def installed_licences(dist_name, comp):
+    """ビルド環境の dist_name が持つ、部品 comp のライセンス本文 [(パス, 本文)]"""
+    out = []
+    for f in md.distribution(dist_name).files or []:
+        if f.name.upper().startswith(LICENSE_PREFIXES) and component_owns(comp, f.as_posix()):
+            with open(f.locate(), encoding="utf-8", errors="replace") as fh:
+                out.append((f.as_posix(), fh.read()))
+    return out
+
+
+def installed_notices(dist_name):
+    """ビルド環境の dist_name の RECORD にある表示（NOTICE 系）[(パス, 本文)]"""
+    out = []
+    for f in md.distribution(dist_name).files or []:
+        if NOTICE_NAME.fullmatch(f.name):
+            with open(f.locate(), encoding="utf-8", errors="replace") as fh:
+                out.append((f.as_posix(), fh.read()))
+    return out
+
+
+def main(argv=None):
+    # ランナーは英語ロケール（cp1252）。--help の説明も日本語なので、引数の解析より前に
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    parser = argparse.ArgumentParser(description="exe の同梱物と通知の一覧を突き合わせる")
+    parser.add_argument("--exe", default=os.path.join(root, "dist", "NetBelt.exe"))
+    parser.add_argument("--notices", default=os.path.join(root, "THIRD-PARTY-NOTICES.txt"))
+    parser.add_argument("--src", default=os.path.join(root, "src"))
+    args = parser.parse_args(argv)
+    try:
+        with open(args.notices, encoding="utf-8") as f:
+            listed, sections = parse_notices(f.read())
+        own = own_names(args.src)
+        bundle = Bundle(*read_exe(args.exe))
+        file_owner = {}
+        for dist in md.distributions():
+            for f in dist.files or []:
+                file_owner.setdefault(f.as_posix().lower(), dist.metadata.get("Name"))
+        missing, unknown, uncovered, natives = check(
+            bundle, listed, sections, own, set(sys.stdlib_module_names),
+            md.packages_distributions(), file_owner, installed_licences, installed_notices)
+    except Exception as e:  # 1（通知に無いものがある）と混ざらないよう、途中の失敗も 2
+        print("照合できません: %s: %s" % (type(e).__name__, e))
+        return 2
+
+    print("exe: %s" % args.exe)
+    print("通知: %s（一覧 %d 件）" % (args.notices, len(listed)))
+    for name, why in sorted(missing.items()):
+        print("NG 通知の一覧に無い: %s（%s）" % (name, ", ".join(sorted(why)[:3])))
+    for name in sorted(unknown):
+        print("NG distribution を割り出せない: %s" % name)
+    for comp, reason in uncovered:
+        print("NG 部品の本文が無い: %s: %s" % (comp, reason))
+    print("参考（照合の対象外）Python パッケージでない DLL %d 件: %s"
+          % (len(natives), ", ".join(natives)))
+    print("参考（照合の対象外）PyInstaller の起動部品 %d 件: %s"
+          % (len(bundle.pyinstaller), ", ".join(sorted(bundle.pyinstaller))))
+    if missing or unknown or uncovered:
+        print("結果: NG。tools/gen_third_party_notices.py と NetBelt.spec を見直してください")
+        return 1
+    print("結果: OK。exe に入っている distribution はすべて通知に載っています")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

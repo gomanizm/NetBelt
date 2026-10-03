@@ -36,7 +36,8 @@ VERIFIED = {
     "packaging": "Apache-2.0 OR BSD-2-Clause",
 }
 
-# テストとビルドにだけ使い、exe には入らないもの
+# テストとビルドにだけ使い、exe には入らないもの。
+# exe に入るものをここへ入れると、CI の tools/check_bundled_notices.py が止める
 BUILD_ONLY = {
     "pytest", "pluggy", "iniconfig", "colorama", "pygments",
     "pyinstaller", "pyinstaller-hooks-contrib", "altgraph", "pefile",
