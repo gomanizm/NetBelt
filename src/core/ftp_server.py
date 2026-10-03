@@ -48,32 +48,18 @@ def _enable_keepalive(sock):
         pass
 
 
-# 受信中のデータ接続の recv が返したとき、相手が消えたとみなすエラー。
-# keepalive の確かめが尽きたときに返るのはこのどれか（OS による。localhost
-# では作れないので、どれが返るかは確かめていない）
+# 受信中のデータ接続の recv が返したとき、相手が消えた（転送は未完了）と
+# みなすエラー。keepalive の確かめが尽きたときに返るのは ETIMEDOUT などの
+# どれか（OS による。localhost では作れないので、どれが返るかは確かめていない）。
+# RST（ECONNRESET）も、届いた時刻によらず含める。Windows は読み終えていない
+# 受信データを RST の到着で捨てるので、データの直後の RST でも、0 バイトや
+# 途中までのファイルになりうる（実測）。vsftpd も受信中の読み取りエラーは 426。
+# 中身が揃っていても RST で終われば未完了になるが、ストリームモードの終わりは
+# データ接続の閉じ方でしか示されず、ほかに揃ったかを確かめる手段が無い
 _DATA_LOST_ERRNOS = frozenset(
     getattr(errno, name) for name in
-    ("ETIMEDOUT", "ENOTCONN", "ECONNABORTED", "ENETRESET") if hasattr(errno, name))
-
-# 黙っていた時間を比べるときの余裕（秒）。測るのは最後のデータを読んだ時刻から
-# RST を読んだ時刻までで、時計の粒度（Python 3.12 の Windows の time.monotonic は
-# 約 16 ミリ秒刻み）や読む時刻の遅れの分だけ、確かめへの RST でも
-# DATA_KEEPALIVE_SECONDS をわずかに下回って測れることがある
-_SILENCE_MARGIN_SECONDS = 1.0
-
-
-def _data_connection_lost(code, silent_seconds):
-    """受信中の recv のエラー code が、相手が消えたことを示すか。
-
-    RST（ECONNRESET）は、相手が SO_LINGER 0 で閉じたときなどにも届き、
-    これまで完了として扱ってきたので変えない。ただし keepalive の確かめは
-    DATA_KEEPALIVE_SECONDS 黙った後にしか送らないので、それほど黙った
-    後の RST は、再起動した相手が確かめに返したものとみなす
-    """
-    if code in _DATA_LOST_ERRNOS:
-        return True
-    return (code == errno.ECONNRESET and silent_seconds
-            >= DATA_KEEPALIVE_SECONDS - _SILENCE_MARGIN_SECONDS)
+    ("ETIMEDOUT", "ENOTCONN", "ECONNABORTED", "ENETRESET", "ECONNRESET")
+    if hasattr(errno, name))
 
 
 class FTPServerManager(QObject):
@@ -384,22 +370,22 @@ class FTPServerManager(QObject):
                 # 送れば確かめが尽きたところで recv がエラーになり、下の recv が
                 # 未完了として閉じて予約を外す。生きている相手は応答するだけ
                 # なので、黙っている転送は切らない
-                self._last_recv_at = time.monotonic()
                 _enable_keepalive(sock)
                 super().__init__(sock, cmd_channel)
             def recv(self, buffer_size):
-                # pyftpdlib（ioloop.AsyncChat.recv）は ETIMEDOUT・ENOTCONN など
-                # 接続断のエラーを EOF と同じく扱い、受信中なら完了（226）にする。
-                # keepalive で切れた書き手の途中までのファイルが完了と記録される
-                # （実測: エラーを差し込むと 226 と完了）ので、相手が消えたときは
-                # 未完了（426）で閉じる。それ以外は pyftpdlib と同じ扱い
+                # pyftpdlib（ioloop.AsyncChat.recv）は ETIMEDOUT・ENOTCONN・
+                # ECONNRESET など接続断のエラーを EOF と同じく扱い、受信中なら
+                # 完了（226）にする。keepalive や RST で切れた書き手の途中までの
+                # ファイルが完了と記録される（実測: エラーを差し込むと 226 と
+                # 完了。送り切った直後の RST では 0 バイトのファイルが完了）ので、
+                # 相手が消えたときは未完了（426）で閉じる。それ以外は pyftpdlib
+                # と同じ扱い
                 if not self.receive:
                     return super().recv(buffer_size)
                 try:
                     data = self.socket.recv(buffer_size)
                 except OSError as err:
-                    if _data_connection_lost(
-                            err.errno, time.monotonic() - self._last_recv_at):
+                    if err.errno in _DATA_LOST_ERRNOS:
                         self._resp = ("426 Connection lost; transfer aborted.",
                                       _ftp_logger.info)
                         self.close()   # on_incomplete_file_received が予約を外す
@@ -413,7 +399,6 @@ class FTPServerManager(QObject):
                 if not data:
                     self.handle_close()   # 通常の EOF（完了）
                     return b""
-                self._last_recv_at = time.monotonic()
                 return data
             def send(self, data):
                 result = super().send(data)
