@@ -13,7 +13,12 @@ NetBelt.exe は PyInstaller で 1 ファイルに固めるため、依存パッ�
 同梱の LICENSE ファイルから実際に読み取る。
 """
 import importlib.metadata as md
+import re
 import sys
+
+# 表示（NOTICE 系）のファイル名。dist-info の外ではコードと同じ場所に置かれるので、
+# 名前の形で絞る（notice.py のようなモジュールは読まない）
+NOTICE_NAME = re.compile(r"NOTICES?(\.(txt|md|rst))?", re.IGNORECASE)
 
 # メタデータの記載が実物と食い違うもの。いずれも配布物の本文を読んで確認した。
 VERIFIED = {
@@ -26,13 +31,21 @@ VERIFIED = {
     # 7.1.28 の METADATA にライセンス欄が無いが、同梱の LICENSE.rst は
     # 2 条項の BSD（BSD-2-Clause）。5.1.0 の METADATA も BSD-2-Clause だった。
     "pysnmp": "BSD-2-Clause",
+    # classifier は Apache と BSD の 2 つで、最初の 1 つだけでは片方が落ちる。
+    # LICENSE 本文は LICENSE.APACHE と LICENSE.BSD（2 条項）の二者択一（*either*）
+    "packaging": "Apache-2.0 OR BSD-2-Clause",
 }
 
-# 実行時には同梱されない、開発・ビルド時のみ使うもの
+# テストとビルドにだけ使い、exe には入らないもの
 BUILD_ONLY = {
     "pytest", "pluggy", "iniconfig", "colorama", "pygments",
     "pyinstaller", "pyinstaller-hooks-contrib", "altgraph", "pefile",
-    "setuptools", "invoke", "packaging",
+}
+
+# 実行時の依存だが、NetBelt.spec の excludes で exe から外したもの。
+# spec と揃っていることは tests/test_third_party_notices_bundle.py が確かめる
+EXCLUDED_FROM_EXE = {
+    "invoke",  # paramiko.config が try で import するだけで、NetBelt は使わない
 }
 
 
@@ -97,6 +110,56 @@ def license_text(dist):
     return texts
 
 
+def vendored_license_text(dist):
+    """パッケージが内部に取り込んだ部品（vendored）の LICENSE 系ファイルの本文を返す。
+
+    setuptools は取り込んだパッケージの dist-info を setuptools/_vendor/ の下に
+    そのまま持っており、exe にはその部品のコードが入る。RECORD に載った、
+    自分のものではない dist-info の中のファイルを読む。
+    """
+    texts = []
+    for f in dist.files or []:
+        parts = f.parts
+        if not parts or parts[0].endswith(".dist-info"):
+            continue  # 自分の dist-info は license_text() が読む
+        if not any(p.endswith(".dist-info") for p in parts[1:-1]):
+            continue
+        if not f.name.upper().startswith(("LICENSE", "COPYING", "NOTICE")):
+            continue
+        try:
+            with open(f.locate(), encoding="utf-8", errors="replace") as fh:
+                body = fh.read()
+        except Exception:
+            continue
+        if body:
+            texts.append((f.as_posix(), body))
+    return sorted(texts)
+
+
+def notice_text(dist):
+    """dist-info の外に置かれた表示（NOTICE 系のファイル）の本文を返す。
+
+    取り込んだコードの出どころとライセンスを、そのディレクトリの NOTICE に書く
+    パッケージがある（setuptools/config/_validate_pyproject は fastjsonschema と
+    validate-pyproject に由来する）。RECORD に載ったものを実物から読む。
+    dist-info の中のものは license_text() と vendored_license_text() が読む。
+    """
+    texts = []
+    for f in dist.files or []:
+        if any(p.endswith(".dist-info") for p in f.parts[:-1]):
+            continue
+        if not NOTICE_NAME.fullmatch(f.name):
+            continue
+        try:
+            with open(f.locate(), encoding="utf-8", errors="replace") as fh:
+                body = fh.read()
+        except Exception:
+            continue
+        if body:
+            texts.append((f.as_posix(), body))
+    return sorted(texts)
+
+
 def main():
     # 出力先のエンコーディングはロケール依存で、英語ロケールの Windows では
     # cp1252 になり日本語を書けない（GitHub Actions の windows-latest が該当）。
@@ -119,7 +182,7 @@ def main():
     dists = []
     for d in md.distributions():
         name = (d.metadata.get("Name") or "").strip()
-        if not name or name.lower() in BUILD_ONLY:
+        if not name or name.lower() in BUILD_ONLY | EXCLUDED_FROM_EXE:
             continue
         dists.append((name.lower(), name, d))
     dists.sort()
@@ -153,6 +216,22 @@ def main():
             out.append("")
             out.append("（このパッケージは配布物にライセンス本文を同梱していません。")
             out.append("  上記の配布元を参照してください）")
+        notices = notice_text(d)
+        if notices:
+            out.append("")
+            out.append("（以下は、このパッケージの中のディレクトリに置かれた表示（NOTICE）です）")
+            for path, body in notices:
+                out.append("")
+                out.append("--- %s ---" % path)
+                out.append(body.rstrip())
+        vendored = vendored_license_text(d)
+        if vendored:
+            out.append("")
+            out.append("（以下は、このパッケージが内部に取り込んでいる部品のライセンスです）")
+            for path, body in vendored:
+                out.append("")
+                out.append("--- %s ---" % path)
+                out.append(body.rstrip())
         out.append("")
 
     sys.stdout.write("\n".join(out) + "\n")
