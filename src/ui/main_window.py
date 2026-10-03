@@ -2648,9 +2648,14 @@ class MainWindow(QMainWindow):
         
         # 決め打ちの色は暗い配色で沈む。地に追従させる。
         dim_colour = theme.dim(theme.surface(self)).name()
+        # 起動の仕方で読む config.json が変わるので、どれかを確かめられる
+        # ようにする。RichText なので & や < を含むパスは逃がす
+        from html import escape
+        config_file = escape(self.config_manager.config_file_path())
         info_text = f"""<h2>{app_name}</h2>
 <p><b>バージョン:</b> {version}</p>
 <p><b>リポジトリ:</b> <a href="https://github.com/{repo}">github.com/{repo}</a></p>
+<p><b>設定ファイル:</b> {config_file}</p>
 <br>
 <p style="font-size: 10pt; color: {dim_colour};">
 Copyright (C) 2026 NetBelt Contributors<br>
