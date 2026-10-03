@@ -74,7 +74,7 @@ v3 の認証情報は保存されません。アプリを起動するたびに�
 「取りこぼし: N 件（配送待ちの上限 1000 件。最後 HH:MM:SS）」と出て、
 受信開始とクリアで 0 に戻ります。一覧とエクスポートには入りません。
 あふれ始めたときと、捌けたあとの件数・時間帯はログ（exe 版は
-`%LOCALAPPDATA%\NetBelt\logs\`）にも残ります。
+`%LOCALAPPDATA%\NetBelt\logs\`。`Trap backlog` を含む行）にも残ります。
 
 NetBelt が数えられるのは、自分の表示待ちで捨てた分だけです。それより
 手前で Windows の受信バッファがあふれて落ちた分（毎秒数千件の嵐で
@@ -309,7 +309,8 @@ newly arriving traps are dropped and counted, and the earlier ones are
 kept. The count appears under the receiver status as
 「取りこぼし: N 件…」 ("N dropped"), is reset when reception starts or the
 list is cleared, and never goes into the list or the exports. The log
-(`%LOCALAPPDATA%\NetBelt\logs\` for the exe) records when an overflow
+(`%LOCALAPPDATA%\NetBelt\logs\` for the exe; lines containing
+`Trap backlog`) records when an overflow
 started and, once it drained, how many traps were dropped and when.
 
 NetBelt can only count what it drops itself. Datagrams that Windows
