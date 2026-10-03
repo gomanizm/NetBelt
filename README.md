@@ -65,6 +65,27 @@ v3 の認証情報は保存されません。アプリを起動するたびに�
 `v3 authPriv / netbelt`）。この列はエクスポートにも含まれます。
 パスワードと、v1/v2c のコミュニティ文字列は出ません。
 
+#### SNMP Trap の取りこぼしについて
+
+画面の処理が追いつかない間に届いた Trap は、表示を待つ列に溜まります。
+この列の上限は 1000 件（`settings.snmp.max_traps` をそれより大きくして
+いればその値）で、あふれている間に届いた Trap は捨てて数えます（先に
+届いていた方が残ります）。捨てた件数は「受信状態」の下に
+「取りこぼし: N 件（配送待ちの上限 1000 件。最後 HH:MM:SS）」と出て、
+受信開始とクリアで 0 に戻ります。一覧とエクスポートには入りません。
+あふれ始めたときと、捌けたあとの件数・時間帯はログ（exe 版は
+`%LOCALAPPDATA%\NetBelt\logs\`）にも残ります。
+
+NetBelt が数えられるのは、自分の表示待ちで捨てた分だけです。それより
+手前で Windows の受信バッファがあふれて落ちた分（毎秒数千件の嵐で
+起こります）は NetBelt に届かないので数えられません。取りこぼしが
+無かったかは、送信側機器の Trap の送信数（Cisco IOS なら `show snmp` の
+Trap PDUs）と一覧の件数を比べて確かめてください。なお
+`netstat -s -p udp` の「IPv4 の UDP 統計」の「受信エラー」（英語版の
+Windows では「UDP Statistics for IPv4」の「Receive Errors」）は、
+Windows 11 で 127.0.0.1 宛てに試した範囲では、受信バッファで落ちた分を
+数えませんでした。
+
 ### その他
 - **ポートチェッカー** — この PC のポートが空いているかを調べます（ツール → ポートチェッカー）。指定ポートへ実際にバインドを試し、使用中なら `netstat` と `tasklist` で占有しているプロセスを特定します。Syslog・TFTP・SNMP Trap などの受信サーバが起動できないときの切り分け用です。リモート機器へのポートスキャンではありません
 - **設定** — ターミナルの配色とフォント、SFTP クライアントの動作、起動時の更新確認を変更できます（ツール → 設定）
@@ -279,6 +300,24 @@ The trap list has a security column showing which version and protection
 level each trap arrived with, including the v3 username (e.g.
 `v3 authPriv / netbelt`). It is carried into the exports too. Passwords
 and v1/v2c community strings are not shown anywhere.
+
+#### Dropped traps
+
+Traps that arrive while the GUI cannot keep up wait in a queue capped at
+1000 (or `settings.snmp.max_traps`, if that is larger). While it is full,
+newly arriving traps are dropped and counted, and the earlier ones are
+kept. The count appears under the receiver status as
+「取りこぼし: N 件…」 ("N dropped"), is reset when reception starts or the
+list is cleared, and never goes into the list or the exports. The log
+(`%LOCALAPPDATA%\NetBelt\logs\` for the exe) records when an overflow
+started and, once it drained, how many traps were dropped and when.
+
+NetBelt can only count what it drops itself. Datagrams that Windows
+discards because the receive buffer overflowed (storms of thousands per
+second) never reach it. To check for those, compare the sending device's
+trap counter (Trap PDUs in Cisco IOS `show snmp`) with the list. In a test
+against 127.0.0.1 on Windows 11, the "Receive Errors" line of
+`netstat -s -p udp` did not count receive-buffer overflows.
 
 ### Requirements
 

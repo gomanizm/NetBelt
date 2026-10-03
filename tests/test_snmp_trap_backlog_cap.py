@@ -22,10 +22,13 @@ import contextlib
 import io
 import os
 import re
+import shutil
 import socket
 import sys
+import tempfile
 import threading
 import time
+import types
 import unittest
 from datetime import datetime
 from unittest import mock
@@ -266,6 +269,117 @@ class TrapBacklogCapTest(_Case):
         drained = re.findall(r"backlog drained: dropped (\d+) trap",
                              out.getvalue())
         self.assertEqual(sorted(drained), ["100", "500"])
+
+
+class TrapBacklogPanelTest(_Case):
+
+    def _panel(self, max_traps=None):
+        from ui.snmp_panel import SNMPPanel
+        config = None
+        if max_traps is not None:
+            config = types.SimpleNamespace(
+                config={"settings": {"snmp": {"max_traps": max_traps}}})
+        with mock.patch.object(SNMPPanel, "_start_background_mib_loading"):
+            panel = SNMPPanel(config_manager=config)
+        self._keep.append(panel)
+        panel.mib_loading = False
+        panel.mib_loaded = True
+        manager = self._manager()
+        panel.set_snmp_manager(manager)
+        panel.trap_port_spinbox.setValue(free_udp_port())
+        return panel, manager
+
+    def _start_from_panel(self, panel):
+        with mock.patch("ui.snmp_panel.QMessageBox.warning") as warn:
+            panel._on_trap_start_clicked()
+        warn.assert_not_called()
+        self.assertIn("受信中", panel.trap_status_label.text())
+        return panel.snmp_manager.trap_receiver
+
+    def test_the_drops_are_shown_outside_the_list_and_the_exports(self):
+        panel, manager = self._panel()
+        receiver = self._start_from_panel(panel)
+        label = panel.trap_drop_label
+        self.assertTrue(label.isHidden(), "取りこぼしが無いのに出ている")
+
+        _inject(receiver, 0, CAP + 200)
+        self._drain()
+        self.assertFalse(label.isHidden(), "取りこぼしが表示されない")
+        self.assertIn("取りこぼし: 200 件", label.text())
+        self.assertIn("上限 %d 件" % CAP, label.text())
+        self.assertRegex(label.text(), r"最後 \d\d:\d\d:\d\d")
+
+        # 一覧と書き出しには機器からの Trap だけ
+        self.assertEqual(len(panel.trap_data_list), CAP)
+        model = panel.trap_tree_model
+        texts = [model.item(r, c).text()
+                 for r in range(model.rowCount()) for c in range(5)]
+        self.assertEqual([t for t in texts if "取りこぼ" in t], [])
+        d = tempfile.mkdtemp(prefix="netbelt-trap-cap-")
+        self.addCleanup(shutil.rmtree, d, True)
+        traps = list(panel.trap_data_list)
+        for name, write in (("t.csv", panel._export_to_csv),
+                            ("t.json", panel._export_to_json),
+                            ("t.txt", panel._export_to_txt)):
+            path = os.path.join(d, name)
+            write(path, traps)
+            with open(path, encoding="utf-8-sig") as f:
+                content = f.read()
+            self.assertNotIn("取りこぼ", content, name)
+            self.assertNotIn("NetBelt", content, name)
+
+        # クリアで 0 に戻り、次のあふれはそこから数える
+        panel._on_trap_clear_clicked()
+        self.assertTrue(label.isHidden(), "クリアしても取りこぼしの表示が残る")
+        _inject(receiver, 5000, CAP + 30)
+        self._drain()
+        self.assertIn("取りこぼし: 30 件", label.text())
+
+    def test_the_count_adds_up_until_cleared(self):
+        """クリアも受信開始も挟まなければ、あふれた回の分を足し合わせて見せる。
+
+        最後の知らせの件数だけを出すと、上限付近を行き来する嵐（配送のたびに
+        少しずつ知らせが来る）で、取りこぼしを少なく見せてしまう。
+        """
+        panel, manager = self._panel()
+        receiver = self._start_from_panel(panel)
+        _inject(receiver, 0, CAP + 200)
+        self._drain()
+        self.assertIn("取りこぼし: 200 件", panel.trap_drop_label.text())
+        _inject(receiver, 5000, CAP + 30)
+        self._drain()
+        self.assertIn("取りこぼし: 230 件", panel.trap_drop_label.text())
+
+    def test_starting_again_resets_the_display(self):
+        panel, manager = self._panel()
+        receiver = self._start_from_panel(panel)
+        _inject(receiver, 0, CAP + 10)
+        self._drain()
+        self.assertFalse(panel.trap_drop_label.isHidden())
+
+        stopped = []
+        manager.trap_receiver_stopped.connect(lambda: stopped.append(True))
+        panel._on_trap_stop_clicked()
+        deadline = time.monotonic() + 5
+        while not stopped and time.monotonic() < deadline:
+            self.app.processEvents()
+            time.sleep(0.01)
+        self.assertTrue(stopped)
+        # 止めただけでは消さない（止めた後も確かめられる）
+        self.assertFalse(panel.trap_drop_label.isHidden())
+        panel.trap_port_spinbox.setValue(free_udp_port())
+        self._start_from_panel(panel)
+        self.assertTrue(panel.trap_drop_label.isHidden(),
+                        "受信開始で取りこぼしの表示が 0 に戻らない")
+
+    def test_the_cap_follows_the_configured_max_traps(self):
+        panel, manager = self._panel(max_traps=1500)
+        receiver = self._start_from_panel(panel)
+        _inject(receiver, 0, 1500 + 40)
+        self._drain()
+        self.assertIn("取りこぼし: 40 件", panel.trap_drop_label.text())
+        self.assertIn("上限 1500 件", panel.trap_drop_label.text())
+        self.assertEqual(len(panel.trap_data_list), 1500)
 
 
 class TrapBacklogUdpTest(_Case):

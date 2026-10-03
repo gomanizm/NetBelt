@@ -189,6 +189,8 @@ class SNMPPanel(QWidget):
         self.trap_tree_model = QStandardItemModel(self)
         self.trap_data_list = []  # 完全なTrapデータ（エクスポート用）
         self.max_traps = self._configured_max_traps()
+        # 配送待ちの上限で捨てた Trap の件数（受信開始とクリアで 0 に戻す）
+        self._trap_dropped = 0
         # WALK が途中で途切れたときの理由。結果より先に届き、結果を
         # 表示するときに使って忘れる
         self._partial_reason = None
@@ -478,6 +480,13 @@ class SNMPPanel(QWidget):
         self.trap_status_label.setWordWrap(True)
         self.trap_status_label.setStyleSheet("color: #f44336; font-weight: bold; font-size: 14px;")
         trap_status_layout.addWidget(self.trap_status_label)
+        # 配送待ちの上限で捨てた Trap の件数（取りこぼしがあるときだけ出す）。
+        # 状態表示はファイアウォール許可の結果などで上書きされるので別に置く
+        self.trap_drop_label = QLabel()
+        self.trap_drop_label.setWordWrap(True)
+        self.trap_drop_label.setStyleSheet("color: #ff9800; font-weight: bold;")
+        self.trap_drop_label.setVisible(False)
+        trap_status_layout.addWidget(self.trap_drop_label)
         trap_status_group.setLayout(trap_status_layout)
         layout.addWidget(trap_status_group)
 
@@ -1057,6 +1066,7 @@ class SNMPPanel(QWidget):
         if not self.snmp_manager.start_trap_receiver(
                 port, communities, v3_users, keep_traps=self.max_traps):
             return
+        self._reset_trap_dropped()
         self.trap_start_button.setVisible(False)
         self.trap_stop_button.setVisible(True)
         self.trap_status_label.setText(f"🔵 受信中 (ポート {port})")
@@ -1185,7 +1195,25 @@ class SNMPPanel(QWidget):
         self.trap_tree_model.setHorizontalHeaderLabels(
             ["時刻", "送信元IP", "セキュリティ", "Trap OID / VarBind", "値"])
         self.trap_data_list.clear()
+        self._reset_trap_dropped()
     
+    def _on_trap_dropped(self, count: int, limit: int, last):
+        """配送待ちの上限で捨てた Trap の件数を、一覧の外の表示へ足す
+
+        一覧の 1 行にすると、書き出し（CSV / JSON / TXT）に機器からではない
+        行が混ざる。受信状態の下の別の表示に出し、消えないようにする。
+        """
+        self._trap_dropped += count
+        self.trap_drop_label.setText(
+            "取りこぼし: %d 件（配送待ちの上限 %d 件。最後 %s）"
+            % (self._trap_dropped, limit, last.strftime("%H:%M:%S")))
+        self.trap_drop_label.setVisible(True)
+
+    def _reset_trap_dropped(self):
+        """取りこぼしの件数を 0 に戻して表示を隠す（受信開始・クリア）"""
+        self._trap_dropped = 0
+        self.trap_drop_label.setVisible(False)
+
     def _on_trap_expand_all_clicked(self):
         """すべてのTrapを展開"""
         self.trap_tree.expandAll()
@@ -1351,6 +1379,7 @@ class SNMPPanel(QWidget):
             self.snmp_manager.operation_cancelled.connect(self._on_operation_cancelled)
             self.snmp_manager.progress_update.connect(self._on_operation_progress)
             self.snmp_manager.trap_received.connect(self._on_trap_received)
+            self.snmp_manager.trap_dropped.connect(self._on_trap_dropped)
             self.snmp_manager.trap_receiver_started.connect(self._on_trap_receiver_started)
             self.snmp_manager.trap_receiver_stopped.connect(self._on_trap_receiver_stopped)
             self.snmp_manager.error_occurred.connect(self._on_error_occurred)
