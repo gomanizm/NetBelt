@@ -15,14 +15,15 @@ A に 226 Transfer complete、transfer_complete が出て、中身は途中の b
 これも完了として扱われる。
 
 どう直したか: _ProgressDTP.recv で、受信中に相手が消えたことを示すエラー
-（ETIMEDOUT / ENOTCONN / ECONNABORTED / ENETRESET）を受けたら、426 で未完了
-として閉じる（予約は on_incomplete_file_received が外し、行は中断で閉じる）。
-ECONNRESET は、これまでどおり完了として扱う（相手が SO_LINGER 0 で閉じた
-ときなど、既存の挙動）。ただし keepalive の確かめを送り始める
-DATA_KEEPALIVE_SECONDS ほど黙った後の RST は、確かめへの応答とみなして
-未完了にする。黙っていた時間の測り方には誤差がある（Python 3.12 の Windows の
-time.monotonic は約 16 ミリ秒刻み）ので、ちょうどの秒数ではなく 1 秒の余裕を
-見て比べる。b'' の通常の EOF は、これまでどおり完了。
+（ETIMEDOUT / ENOTCONN / ECONNABORTED / ENETRESET / ECONNRESET）を受けたら、
+426 で未完了として閉じる（予約は on_incomplete_file_received が外し、行は
+中断で閉じる）。RST（ECONNRESET）は、当初は既存の挙動として完了のまま残し、
+keepalive の確かめを送り始める DATA_KEEPALIVE_SECONDS ほど黙った後のものだけを
+未完了にしていた。1.3.4（R03）で、黙っていた時間によらず未完了にした。
+Windows は読み終えていない受信データを RST の到着で捨てるので、データの直後の
+RST でも 0 バイトや途中までのファイルになりうる（実測）。vsftpd も受信中の
+読み取りエラーは 426 にしている。b'' の通常の EOF（FIN）は、これまでどおり
+完了。実際のソケットでの RST は test_ftp_data_connection_reset_is_interrupted.py。
 """
 import errno
 import ftplib
@@ -128,42 +129,49 @@ class FtpDataConnectionLostTest(_FtpServerCase):
                 reply = self._upload_then_fail_recv(name, getattr(errno, label))
                 self._assert_interrupted(name, reply)
 
-    def test_a_reset_right_after_data_is_still_complete(self):
-        """データの直後の RST（ECONNRESET）は、これまでどおり完了として扱う"""
+    def test_a_reset_right_after_data_is_interrupted(self):
+        """データの直後の RST（ECONNRESET）も、未完了として扱う"""
         reply = self._upload_then_fail_recv("reset.cfg", errno.ECONNRESET)
-        self.assertTrue(reply.startswith("226"), reply)
-        self._pump()
-        self.assertIn(("complete", "reset.cfg"), self.events)
+        self._assert_interrupted("reset.cfg", reply)
 
     def test_a_reset_after_keepalive_silence_is_interrupted(self):
-        """keepalive の確かめを送り始めるほど黙った後の RST は、未完了として扱う"""
+        """keepalive の確かめを送り始める時間を過ぎた接続での RST も、未完了として扱う。
+
+        RST は、黙っていた時間によらず未完了にする。keepalive は、RST を
+        返さずに黙って消えた相手を見つける別の経路で、再起動した相手が
+        確かめに RST を返したときも、ほかの RST と同じく未完了になる。
+        DATA_KEEPALIVE_SECONDS の差し替え（0 秒）は時間で見分けていたころの
+        名残で、変わるのはデータ接続に掛ける keepalive の設定だけ。RST の
+        判定には効かない
+        """
         with mock.patch("core.ftp_server.DATA_KEEPALIVE_SECONDS", 0):
             reply = self._upload_then_fail_recv("probe-reset.cfg", errno.ECONNRESET)
         self._assert_interrupted("probe-reset.cfg", reply)
 
     def test_a_reset_slightly_short_of_the_keepalive_time_is_interrupted(self):
-        """確かめを送り始める秒数にわずかに届かずに測れた RST も、未完了として扱う。
+        """確かめを送り始める秒数にわずかに届かないうちの RST も、未完了として扱う。
 
-        黙っていた時間は、最後のデータを読んだ時刻から RST を読んだ時刻までで
-        測る。時計の粒度（Python 3.12 の Windows の time.monotonic は約 16 ミリ秒
-        刻み）や読む時刻の遅れで、確かめへの RST でも DATA_KEEPALIVE_SECONDS を
-        わずかに下回って測れることがある
+        DATA_KEEPALIVE_SECONDS を 2 秒にし、最後のデータから 1.6 秒黙った後
+        （keepalive の確かめを送り始める前）に RST を受ける。RST は黙っていた
+        時間によらず未完了にするので、黙っていた時間も、確かめへの返事か
+        どうかも見分けない（keepalive は、黙って消えた相手を見つける別の経路）。
+        名前と秒数は、時間で見分けていたころ（1.3.3 まで）に、時計の粒度で
+        黙っていた時間をわずかに短く測る場合を試していた名残
         """
         with mock.patch("core.ftp_server.DATA_KEEPALIVE_SECONDS", 2):
             reply = self._upload_then_fail_recv("short.cfg", errno.ECONNRESET,
                                                 silent=1.6)
         self._assert_interrupted("short.cfg", reply)
 
-    def test_silence_is_counted_from_the_latest_data(self):
-        """黙っていた時間は最後に受け取ったデータから数える（途中で黙っても関係ない）"""
-        # 途中で 2.5 秒黙る（余裕の 1 秒を引いた 2 秒を超える）が、RST は再開した
-        # データの直後
+    def test_a_reset_after_resumed_data_is_interrupted(self):
+        """途中で黙ってから再開したデータの直後の RST も、未完了として扱う
+        （黙っていた時間では見分けない）"""
+        # 途中で 2.5 秒黙り、RST は再開したデータの直後。以前は最後のデータから
+        # の時間で見分けていたので、これは完了になっていた
         with mock.patch("core.ftp_server.DATA_KEEPALIVE_SECONDS", 3):
             reply = self._upload_then_fail_recv("resumed.cfg", errno.ECONNRESET,
                                                 pause=2.5)
-        self.assertTrue(reply.startswith("226"), reply)
-        self._pump()
-        self.assertIn(("complete", "resumed.cfg"), self.events)
+        self._assert_interrupted("resumed.cfg", reply)
 
     def test_a_normal_end_of_data_is_still_complete(self):
         a = self.client()

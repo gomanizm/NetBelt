@@ -390,8 +390,66 @@ class ConfigManager:
         # られなかった（同名・対象なし）」のか。戻り値の False だけでは
         # 区別できず、呼び出し側が案内を書き分けられない
         self.last_save_failed = False
+        # 他アプリの JSON だったので読み込まず、書き込みも断っているときの
+        # その絶対パス（_is_foreign_config）。None なら NetBelt の設定
+        self.foreign_config_path = None
         self.config = self._load_config()
     
+    def config_file_path(self) -> str:
+        """設定ファイルの絶対パス（画面に出す用）
+
+        既定の config_path は作業ディレクトリからの相対なので、起動の
+        仕方によって読む config.json が変わる。どれを読み書きしているかを
+        利用者が確かめられるよう、絶対パスで返す。
+        """
+        return os.path.abspath(self.config_path)
+
+    # NetBelt が config.json の最上位に書くキー（_load_default_config と
+    # 保存の経路が作るもの）。これ以外のキーを含み groups の無い dict は
+    # 他アプリの JSON とみなす
+    _NETBELT_TOP_LEVEL_KEYS = frozenset((
+        "config_version", "groups", "global_macros", "settings",
+        "update_settings"))
+
+    @classmethod
+    def _is_foreign_config(cls, config) -> bool:
+        """読めた JSON が NetBelt の設定ではない（他アプリのもの）か
+
+        既定の保存先は作業ディレクトリの config.json なので、exe と違う
+        フォルダから起動すると、そこにある他アプリの config.json を読む。
+        自己修復（Default の補い・バックアップと作り直し）はファイルが
+        NetBelt のものである前提なので、他アプリのものなら書き換えも
+        バックアップの整理（同じ名前の形のファイルを消す）もしない。
+        判定は保守的にする。{} や NetBelt のキーだけの手書きの設定、
+        groups の形が崩れた設定は NetBelt のものとして今までどおり直す。
+        """
+        if not isinstance(config, dict):
+            return True
+        return ("groups" not in config
+                and any(key not in cls._NETBELT_TOP_LEVEL_KEYS
+                        for key in config))
+
+    def _refuse_foreign_config(self) -> Dict:
+        """他アプリの JSON を読まず、この回は既定の設定で動かす"""
+        self.foreign_config_path = self.config_file_path()
+        message = (
+            "起動したフォルダにある次の config.json は NetBelt の設定ファイル"
+            "ではないため、読み込まず、書き換えもしません:\n"
+            f"  {self.foreign_config_path}\n\n"
+            "NetBelt の設定を使うには、NetBelt.exe と同じフォルダから起動するか、"
+            "このファイルを別の場所へ移してから起動し直してください。\n"
+            "今回は既定の設定で起動しています。変更した設定は保存されません。")
+        # 知らせはログより先に控え、ログのパスは ASCII に逃がす（!a）。
+        # 出力先の符号化（ファイルへ向けた cp932 など）でパスを表せないと
+        # print が例外になり、_load_config の except で破損扱い（load_error と
+        # このファイルのバックアップ）へ落ちる（_append_load_warning は
+        # 全文を print してから控えるので使わない）
+        self.load_warning = (f"{self.load_warning}\n\n{message}"
+                             if self.load_warning else message)
+        print(f"[Config] Not a NetBelt config file, leaving it untouched: "
+              f"{self.foreign_config_path!a}")
+        return self._load_default_config()
+
     def _load_config(self) -> Dict:
         """
         設定ファイルを読み込む
@@ -418,6 +476,9 @@ class ConfigManager:
             # 読み直して保存すれば BOM は落ちる
             with open(self.config_path, 'r', encoding='utf-8-sig') as f:
                 config = json.load(f)
+                # 他アプリの JSON には書かない・バックアップも取らない
+                if self._is_foreign_config(config):
+                    return self._refuse_foreign_config()
                 # name/host の無い機器とグループは先に整える（UI が KeyError で
                 # 落ちる）。復号も機器が dict であることを前提にしているので、
                 # 隔離はその前に済ませる
@@ -1138,7 +1199,8 @@ class ConfigManager:
             # バックアップを作成
             import shutil
             shutil.copy2(self.config_path, backup_path)
-            self.backup_path = str(backup_path)  # バックアップパスを保存
+            # 画面に出すので絶対パスで控える（相対だとどのフォルダか分からない）
+            self.backup_path = os.path.abspath(backup_path)
             print(f"[INFO] 破損した設定ファイルをバックアップしました: {backup_path}")
             
             # 古いバックアップファイルを整理（最新5つを保持）
@@ -1204,6 +1266,9 @@ class ConfigManager:
         Returns:
             保存成功時True、失敗時False
         """
+        # 他アプリの JSON は既定の設定で上書きしない（一時ファイルも作らない）
+        if self.foreign_config_path:
+            return False
         try:
             # 保存用に設定をコピー（パスワードを暗号化）
             save_config = json.loads(json.dumps(self.config))

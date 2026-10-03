@@ -693,6 +693,94 @@ class SNMPWorker(QThread):
             raise Exception(f"サポートされていないSNMPバージョン: {version}")
 
 
+class _TrapBacklog:
+    """受信 1 回ぶんの、GUI へ渡したまま届いていない Trap の数え役
+
+    保持件数の上限（パネルの max_traps）が効くのは GUI が一覧へ入れた後だけで、
+    受信スレッドから GUI へ渡す Qt のキューには上限が無い。上限が無かった
+    ころの実測（pysnmp 7.1.28、127.0.0.1 への UDP）: GUI が止まっている間は
+    配送 0 のまま溜まり、1 件あたり約 2.8 KB（普通の Trap）、細工した 60 KB の
+    値では 67〜128 KB で、毎秒 5〜7 MB（最大約 50 MB）ずつ増えた。描画ありの
+    定常状態でも、毎秒 5,000 件を送ると未処理が約 600〜900 件（最大 1,435 件）
+    まで伸びた。捌いた後に OS へ戻ったのは増えた分の約 43〜83%。
+    Syslog の max_pending_messages と同じく、上限に達している間に届いた Trap は
+    捨てて数える（嵐の始まりの方が残る）。
+
+    SNMPManager が受信の開始ごとに作って受信機へ渡す。受信機は開始のたびに
+    作り直す QThread なので、受信機に数えさせて自分へつなぐ形は取らない。
+    配送待ちの Trap はこの参照を一緒に運ぶので、止めて開き直したあとに前の回の
+    配送が届いても、新しい回の数には混ざらない。take は受信スレッド、delivered
+    は GUI スレッドで呼ぶので、数は _lock で守る。
+    """
+
+    def __init__(self, limit):
+        self.limit = limit
+        self._lock = threading.Lock()
+        self.pending = 0
+        self.dropped = 0          # この回で捨てた件数の合計
+        self._reported = 0        # そのうちパネルへ知らせた件数
+        # まだ要約していない件数と、その最初・最後に捨てた時刻
+        self._burst = 0
+        self._burst_first = None
+        self._burst_last = None
+
+    def take(self):
+        """1 件ぶんの枠を取る（受信スレッド）。上限に達していれば数えて False"""
+        with self._lock:
+            if self.pending < self.limit:
+                self.pending += 1
+                return True
+            now = datetime.now()
+            self.dropped += 1
+            self._burst += 1
+            if self._burst == 1:
+                self._burst_first = now
+            self._burst_last = now
+            started = self._burst == 1
+        if started:
+            print("[SNMPManager] Trap backlog reached its limit (%d); dropping "
+                  "newly received traps until the GUI catches up" % self.limit)
+        return False
+
+    def delivered(self):
+        """GUI が 1 件受け取ったので配送待ちを戻す（GUI スレッド）
+
+        Returns:
+            (まだ知らせていない捨てた件数, 最後に捨てた時刻,
+             捌け切ったときの要約 (件数, 最初, 最後) か None)
+        """
+        with self._lock:
+            if self.pending > 0:
+                self.pending -= 1
+            new, self._reported = self.dropped - self._reported, self.dropped
+            summary = None
+            # 要約の区切りは、件数を取り出すのと同じ錠の中で付ける（Syslog・
+            # FTP・SFTP と同じ。錠の外だと、その隙に捨てた分が要約から漏れる）
+            if self.pending == 0 and self._burst:
+                summary = (self._burst, self._burst_first, self._burst_last)
+                self._burst = 0
+            return new, self._burst_last, summary
+
+    def summarise(self):
+        """まだ要約していない分を、捌け切るのを待たずに区切る（GUI スレッド）
+
+        受信を止める・開き直すときに呼ぶ。捌け切るのを待つと、配送待ちが
+        配られないまま終わったときに件数がログに残らない（実測: 更新の
+        適用は閉じたあと QApplication.quit() で終わり、配送待ち 1000 件が
+        配られず、捨てた 500 件の要約が出なかった）。パネルへ知らせる件数
+        （_reported）はそのまま配送で知らせる。
+
+        Returns:
+            (件数, 最初, 最後) か None
+        """
+        with self._lock:
+            if not self._burst:
+                return None
+            summary = (self._burst, self._burst_first, self._burst_last)
+            self._burst = 0
+            return summary
+
+
 class SNMPTrapReceiver(QThread):
     """
     SNMP Trap受信スレッド
@@ -715,13 +803,16 @@ class SNMPTrapReceiver(QThread):
     """
 
     # シグナル定義
-    trap_received = pyqtSignal(dict)  # Trap情報
+    trap_received = pyqtSignal(dict)  # Trap情報（数え役なしで作ったとき）
+    # 数え役（_TrapBacklog）つきで作ったときの配送。(数え役, Trap情報)。
+    # 数え役を一緒に運ぶので、届いた側はどの回の配送待ちを戻すか取り違えない
+    trap_queued = pyqtSignal(object, dict)
     error_occurred = pyqtSignal(str)  # エラーメッセージ
     started = pyqtSignal()  # 開始通知
     stopped = pyqtSignal()  # 停止通知
 
     def __init__(self, port: int = 162, communities: List[str] = None,
-                 v3_users: List[dict] = None):
+                 v3_users: List[dict] = None, backlog=None):
         """
         Args:
             port: 受信ポート
@@ -729,9 +820,12 @@ class SNMPTrapReceiver(QThread):
             v3_users: v3 ユーザの定義リスト。各要素は
                 {"username", "auth_protocol", "auth_password",
                  "priv_protocol", "priv_password", "engine_ids"}
+            backlog: 配送待ちの数え役（_TrapBacklog）。渡すと trap_queued で
+                上限つきで渡し、渡さなければ trap_received で全件を渡す
         """
         super().__init__()
         self.port = port
+        self._backlog = backlog
         # None（未指定）と []（v1/v2c を受けない）は別物。or で書くと
         # [] が既定値へ落ちるため、Trap のバージョンに v3 を選んで
         # パネルが [] を渡しても public の v1/v2c Trap が通ってしまう。
@@ -929,18 +1023,30 @@ class SNMPTrapReceiver(QThread):
         （pysnmp/entity/rfc3413/ntfrcv.py の process_pdu、139 行目）が、
         例外をディスパッチ経路へ漏らさない扱いとして残す。
 
-        制限: 1件ごとにそのまま emit する（間引きは GUI 側の
-        SNMPPanel._trim_traps だけ）。GUI が止まっている間は Qt の
-        キューが上限なしに伸びる。理由と実測値は _trim_traps に書いた。
+        GUI へは _emit_trap で渡す。SNMPManager が作った受信機では、配送待ちが
+        上限（max(1000, max_traps)）に達している間に届いた Trap を捨てて数える
+        （理由と上限が無かったころの実測は _TrapBacklog）。
+        制限: 数えられるのは自分の配送待ちで捨てた分だけ。それより手前の
+        OS の受信バッファで落ちた分は見えない（実測: 毎秒 2,000 件前後から
+        落ち始め、毎秒 5,000 件を 10 秒送ると 49,998 件中 23,781 件しか
+        届かなかった）。
         """
         try:
             if self._is_weaker_than_registered():
                 return
-            self.trap_received.emit(self._build_trap_data(var_binds))
+            self._emit_trap(self._build_trap_data(var_binds))
         except TypeError as e:
             print(f"[SNMPTrapReceiver] 通知処理エラー: {e}")
         except Exception as e:
             print(f"[SNMPTrapReceiver] 通知処理エラー: {e}")
+
+    def _emit_trap(self, trap_data):
+        """GUI へ 1 件渡す。数え役があれば、配送待ちが上限の間は捨てて数える"""
+        backlog = self._backlog
+        if backlog is None:
+            self.trap_received.emit(trap_data)
+        elif backlog.take():
+            self.trap_queued.emit(backlog, trap_data)
 
     def _is_weaker_than_registered(self) -> bool:
         """v3 の通知が、登録時に求めたレベルより弱ければ True。
@@ -981,7 +1087,7 @@ class SNMPTrapReceiver(QThread):
             var_binds: (ObjectName, ObjectSyntax) のシーケンス
 
         Returns:
-            trap_received で emit する dict
+            _emit_trap で GUI へ渡す dict（trap_received か trap_queued で送る）
         """
         security = dict(self._last_security)
         trap_data = {
@@ -1169,9 +1275,17 @@ class SNMPManager(QObject):
     operation_cancelled = pyqtSignal(object)
     error_occurred = pyqtSignal(str)  # エラーメッセージ
     trap_received = pyqtSignal(dict)  # Trap受信
+    # 配送待ちの上限で捨てた Trap。(新しく捨てた件数, 上限, 最後に捨てた時刻)。
+    # 今の回（最後に開始した受信）のぶんだけ出す
+    trap_dropped = pyqtSignal(int, int, object)
     trap_receiver_started = pyqtSignal()  # Trap受信開始
     trap_receiver_stopped = pyqtSignal()  # Trap受信停止
     
+    # GUI へ渡したまま届いていない Trap の上限（_TrapBacklog）。パネルの
+    # max_traps の方が大きければそちらに合わせる。小さくすると、max_traps を
+    # 大きくしている利用者に新しく取りこぼしが出る
+    DEFAULT_MAX_PENDING_TRAPS = 1000
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.worker = None
@@ -1179,6 +1293,9 @@ class SNMPManager(QObject):
         # 停止しきらなかったスレッドを保持する。参照を落とすと実行中の QThread が
         # 破棄されてプロセスごと落ちるため、終わるまで手放さない。
         self._retired_receivers = []
+        # 今の回の数え役。止めても次の開始までは残す（止めたあとに届く配送の
+        # 取りこぼしもパネルへ知らせる）
+        self._trap_backlog = None
     
     def snmp_get(self, host: str, oids: List[str], **kwargs):
         """
@@ -1328,7 +1445,7 @@ class SNMPManager(QObject):
             return False, str(e)
 
     def start_trap_receiver(self, port: int = 162, communities: List[str] = None,
-                            v3_users: List[dict] = None):
+                            v3_users: List[dict] = None, keep_traps: int = 0):
         """
         SNMP Trap受信を開始
         
@@ -1336,24 +1453,32 @@ class SNMPManager(QObject):
             port: 受信ポート (デフォルト: 162)
             communities: 許可するコミュニティ名のリスト
             v3_users: v3 ユーザの定義リスト（SNMPTrapReceiver の docstring 参照）
+            keep_traps: パネルが保持する Trap の件数（max_traps）。配送待ちの
+                上限は max(DEFAULT_MAX_PENDING_TRAPS, keep_traps)
         """
         if self.trap_receiver and self.trap_receiver.isRunning():
             self.error_occurred.emit("既にTrap受信が実行中です")
             return False
+        # 前の回を置き換える前に書く（停止を通らずに受信スレッドが終わった回）
+        self._summarise_trap_backlog()
         
         # ファイアウォールは自動設定しない（3CDaemon 方式）。管理者昇格(UAC)を避けるため、
         # 受信許可は Windows 標準の初回プロンプト／既存の許可ルールに委ねる。
         # 自動で足すと、ポートを変えて使うたびポート名入りのルールが恒久登録され、
         # 停止しても消えずに残骸が増える。通らない環境は fix_firewall() で直す。
         print("[SNMP] ファイアウォール: 自動設定なし（Windowsの許可に委ねます）")
-        self.trap_receiver = SNMPTrapReceiver(port, communities, v3_users)
+        backlog = _TrapBacklog(max(self.DEFAULT_MAX_PENDING_TRAPS, keep_traps or 0))
+        self.trap_receiver = SNMPTrapReceiver(port, communities, v3_users,
+                                              backlog=backlog)
         # 中継は必ずシグナル同士でつなぐ（.emit を渡さない）。
         # self.<シグナル> は参照のたびに作られるその場限りの
         # pyqtBoundSignal で、その .emit を渡すと PyQt は受け手が
         # この QObject だと認識できない。別スレッドから積まれた呼び出しが
         # キューに残ったままこのオブジェクトが解放されると、次に誰かが
         # processEvents() した時点で解放済みの C++ を叩いて落ちる（実測）。
-        self.trap_receiver.trap_received.connect(self.trap_received)
+        # Trap は配送待ちを戻してから流すので、自分のメソッドで受ける
+        # （QObject のメソッドなら、この QObject が消えたときに接続ごと外れる）。
+        self.trap_receiver.trap_queued.connect(self._on_trap_queued)
         self.trap_receiver.error_occurred.connect(self.error_occurred)
         self.trap_receiver.started.connect(self.trap_receiver_started)
         self.trap_receiver.stopped.connect(self.trap_receiver_stopped)
@@ -1361,11 +1486,53 @@ class SNMPManager(QObject):
         if not self.trap_receiver.bind():
             self.trap_receiver = None
             return False
+        self._trap_backlog = backlog
         self.trap_receiver.start()
         
         self.operation_started.emit(f"SNMP Trap受信開始: ポート{port}")
         return True
     
+    def _on_trap_queued(self, backlog, trap_data):
+        """受信機からの Trap を流す（GUI スレッドで動く）。届いたぶん配送待ちを戻す"""
+        new, last, summary = backlog.delivered()
+        self.trap_received.emit(trap_data)
+        if summary:
+            self._log_dropped_traps("Trap backlog drained", summary,
+                                    backlog.limit)
+        # 前の回のぶんは、開始で 0 に戻したパネルの表示へ足さない（ログには残る）
+        if new and backlog is self._trap_backlog:
+            self.trap_dropped.emit(new, backlog.limit, last)
+
+    @staticmethod
+    def _log_dropped_traps(head, summary, limit):
+        """捨てた件数の要約を 1 行書く
+
+        README は「Trap backlog」を含む行を見るよう案内している。
+        """
+        count, first, last = summary
+        print("[SNMPManager] %s: dropped %d trap(s) between %s and %s "
+              "(limit %d)" % (head, count, first.strftime("%H:%M:%S"),
+                              last.strftime("%H:%M:%S"), limit))
+
+    def _summarise_trap_backlog(self):
+        """今の回の、まだ要約していない取りこぼしをすぐログへ書く
+
+        停止と開始（受信スレッドが自分で終わった後の開き直し）で呼ぶ。
+        受信スレッドが終わっていれば、この回でこれ以上は捨てない。
+        配送待ちはこのあとも届き、パネルの件数はそこで足す
+        （_TrapBacklog.summarise）。
+
+        制限: 受信スレッドが 5 秒で止まらずに残った場合（stop_trap_receiver の
+        警告）、その後に捨てた分は新しいあふれとして数え、捌け切ったときか
+        次の開始で書く。それより先にアプリが終わると、その分は残らない。
+        """
+        backlog = self._trap_backlog
+        summary = backlog.summarise() if backlog is not None else None
+        if summary:
+            self._log_dropped_traps(
+                "Reception stopped before the Trap backlog drained", summary,
+                backlog.limit)
+
     def stop_trap_receiver(self):
         """SNMP Trap受信を停止
 
@@ -1386,6 +1553,9 @@ class SNMPManager(QObject):
                   "強制終了はせず、終了するまで参照を保持します")
             self._retire(receiver)
 
+        # 配送待ちが捌け切るのを待たずに書く。アプリの終了で配られずに
+        # 終わっても、捨てた件数はログに残る
+        self._summarise_trap_backlog()
         self.trap_receiver = None
         self.operation_started.emit("SNMP Trap受信停止")
 
