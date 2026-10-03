@@ -1493,34 +1493,33 @@ class SNMPPanel(QWidget):
         
         # 親アイテム作成（Trap情報）
         timestamp_item = QStandardItem(timestamp)
-        source_ip_item = QStandardItem(source_ip)
-        security_item = QStandardItem(security)
-        trap_oid_item = QStandardItem(trap_name)
         varbinds_count = f"{len(filtered_vbs)} VarBinds" if filtered_vbs else "VarBindsなし"
-        value_item = QStandardItem(varbinds_count)
-        
-        # 親行をツリーのルートに挿入（最新を先頭に）
-        self.trap_tree_model.insertRow(0, [timestamp_item, source_ip_item,
-                                          security_item, trap_oid_item, value_item])
-        
-        # 各VarBindを子アイテムとして追加
-        for vb in filtered_vbs:
-            oid = vb['oid']
-            value = vb['value']
-            
+
+        # 項目は 1 つずつ置く。insertRow / appendRow に Python のリストを渡すと、
+        # PyQt6 はその変換で new した QList を解放しない（/Transfer/ の引数を
+        # 所有権ごと渡した扱いにする）。1 回で 2 ブロック残り、max_traps に
+        # 達して古い行を捨てていても、Trap 1 件ごとにメモリが増え続けた
+        # （実測: 子 4 行で約 0.6 KB/件、子 28 行で約 3.3 KB/件）。
+
+        # 各VarBindを子アイテムとして、第0列の項目の下へ 1 行ずつ足す
+        # （親を一覧へ入れる前に組むので、行ごとの変更通知も出ない）
+        for row, vb in enumerate(filtered_vbs):
             # OIDを名前に変換
-            oid_name = resolver.resolve_oid(oid)
-            
-            # 子アイテム作成（1行につき1つのVarBind）
-            child_timestamp = QStandardItem("")  # 空
-            child_source = QStandardItem("")  # 空
-            child_security = QStandardItem("")  # 空
-            child_oid = QStandardItem(oid_name)
-            child_value = QStandardItem(value)
-            
-            # 親の最初の列に子行を追加
-            timestamp_item.appendRow([child_timestamp, child_source,
-                                      child_security, child_oid, child_value])
+            oid_name = resolver.resolve_oid(vb['oid'])
+            # 子アイテム（1行につき1つのVarBind。時刻・送信元・セキュリティは空）
+            children = (QStandardItem(""), QStandardItem(""), QStandardItem(""),
+                        QStandardItem(oid_name), QStandardItem(vb['value']))
+            for column, child in enumerate(children):
+                timestamp_item.setChild(row, column, child)
+
+        # 親行をツリーのルートに挿入（最新を先頭に）。残りの 4 列は setData で
+        # 置き、項目はモデルに作らせる。setItem だと 1 つごとに layoutChanged が
+        # 出て、見出しが伸ばしている最終列（値）を伸ばす前の幅（100 px）へ戻す。
+        # 列を広げて横スクロールが出ていると、Trap が届くたびに値の列が縮んだ
+        self.trap_tree_model.insertRow(0, timestamp_item)
+        for column, text in enumerate((source_ip, security, trap_name,
+                                       varbinds_count), 1):
+            self.trap_tree_model.setData(self.trap_tree_model.index(0, column), text)
 
         # 上限を超えたぶんの古い Trap を捨てる
         self._trim_traps()
