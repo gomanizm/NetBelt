@@ -235,15 +235,78 @@ class _OpenWriters:
             return list(self._entries.values())
 
 
-class _WriteHandle(SFTPHandle):
+class _OpenFiles:
+    """SFTP で開いているファイルの数（セッションごと・サーバー全体）。
+
+    開いたファイルは 1 個ずつ C ランタイム（UCRT）の低水準ファイル記述子を使う。
+    その上限はプロセスで 8192 個（CRT のファイル入出力の上限で、Windows の
+    ハンドル全体の上限ではない）。Python の open()（設定の保存・ログ・FTP/TFTP
+    のファイル）と名前解決（getaddrinfo）も同じ表を使い、使い切ると EMFILE で
+    失敗する（実測。QFile と確立済みのソケットは影響を受けない）。上限が無いと、
+    認証済みの相手は SFTP のセッション 1 本で開き続けるだけで表を使い切れた
+    （実測: 4.3 秒で 8189 個）。接続をまたいで数えるので錠で守る。ディレクトリの
+    ハンドルは一覧をメモリに持つだけで記述子を使わないので数えない
+    """
+
+    def __init__(self, per_session, total):
+        self._lock = threading.Lock()
+        self.per_session = per_session
+        self.total = total
+        self._held = {}     # セッション（SFTPServerHandler）-> 開いている数
+        self._in_use = 0    # サーバー全体で開いている数
+
+    def take(self, session):
+        """1 個ぶん数える。上限なら数えずに、当たった側（'session' / 'total'）を返す"""
+        with self._lock:
+            held = self._held.get(session, 0)
+            if held >= self.per_session:
+                return "session"
+            if self._in_use >= self.total:
+                return "total"
+            self._held[session] = held + 1
+            self._in_use += 1
+            return None
+
+    def give_back(self, session):
+        """閉じた 1 個ぶんを戻す（end の後に閉じた分は数えない）"""
+        with self._lock:
+            held = self._held.pop(session, 0)
+            if held > 1:
+                self._held[session] = held - 1
+            self._in_use -= min(held, 1)
+
+    def end(self, session):
+        """セッションの終わり。開いたまま残った分をまとめて戻す"""
+        with self._lock:
+            self._in_use -= self._held.pop(session, 0)
+
+
+class _CountedHandle(SFTPHandle):
+    """閉じたら give_back を 1 回だけ呼ぶハンドル（開いているファイルの数を戻す）"""
+
+    def __init__(self, flags, give_back=None):
+        super().__init__(flags)
+        self._give_back = give_back
+
+    def close(self):
+        try:
+            super().close()
+        finally:
+            # 2 回目の close（finish_subsystem の後始末など）では戻さない
+            give_back, self._give_back = self._give_back, None
+            if give_back is not None:
+                give_back()
+
+
+class _WriteHandle(_CountedHandle):
     """書き込み用のハンドル。閉じ終えたら _OpenWriters から外れる。
 
     close() の中で止まっている間（共有フォルダへの書き出しなど）は
     一覧に残るので、まだ保存先を握っていると分かる
     """
 
-    def __init__(self, flags, open_writers):
-        super().__init__(flags)
+    def __init__(self, flags, open_writers, give_back=None):
+        super().__init__(flags, give_back)
         self._open_writers = open_writers
 
     def close(self):
@@ -257,7 +320,7 @@ class SFTPServerHandler(SFTPServerInterface):
     """SFTP サーバーハンドラー"""
     
     def __init__(self, server, root_dir, *args, open_writers=None,
-                 notify=None, stop_event=None, **kwargs):
+                 notify=None, stop_event=None, open_files=None, **kwargs):
         super().__init__(server, *args, **kwargs)
         self.root_dir = os.path.abspath(root_dir)
         # 書き込み用に開いたハンドルを登録する先（SFTPServerManager の一覧）
@@ -266,6 +329,51 @@ class SFTPServerHandler(SFTPServerInterface):
         self._notify = notify
         # この接続を受けた起動の停止フラグ（立った後の変更の要求を断る）
         self._stop_event = stop_event
+        # 開いているファイルを数える先（SFTPServerManager の _OpenFiles。
+        # None なら数えない）
+        self._open_files = open_files
+
+    def session_ended(self):
+        """SFTP のセッションの終わり。開いたまま残ったファイルの数をまとめて戻す。
+
+        paramiko の finish_subsystem は、ここを呼んでから残ったハンドルを
+        閉じる。閉じる途中の例外で残りが閉じられなくても全体の数は戻る
+        （この後の close は数を変えない）。例外は外へ出さない（paramiko が
+        握りつぶし、その後のハンドルの後始末が飛ぶ）
+        """
+        try:
+            if self._open_files is not None:
+                self._open_files.end(self)
+        except Exception as e:
+            _log_limited("session end error",
+                         f"[SFTP Server] session end error: {e}")
+
+    def _take_open_file(self, path):
+        """開いているファイルの上限（_OpenFiles）を見て 1 個ぶん数える。
+
+        上限なら、断ったことを診断の行とパネルのログへ出して False を返す
+        """
+        if self._open_files is None:
+            return True
+        hit = self._open_files.take(self)
+        if hit is None:
+            return True
+        if hit == "session":
+            limit, where = self._open_files.per_session, "1 セッションあたり"
+        else:
+            limit, where = self._open_files.total, "サーバー全体"
+        _log_limited("open limit",
+                     f"[SFTP Server] open refused, {limit} files already open "
+                     f"({hit}): {path}")
+        if self._notify is not None:
+            self._notify("開いているファイルが%sの上限（%d 個）に達したため"
+                         "断りました: %s" % (where, limit, path))
+        return False
+
+    def _give_back_open_file(self):
+        """閉じた・開けなかった 1 個ぶんを戻す"""
+        if self._open_files is not None:
+            self._open_files.give_back(self)
 
     def _busy(self, real_path):
         """保存先を触る間、停止に見えるよう一覧へ載せる（_OpenWriters.busy）。
@@ -431,13 +539,20 @@ class SFTPServerHandler(SFTPServerInterface):
         # （実測: 停止の後に積まれた分が再起動の後に作っていた）。予約は
         # 掛けない（既存のファイルは変えないので、書き込み中でも妨げない）
         guarded = tracked or bool(flags & (os.O_CREAT | os.O_EXCL))
+        # 開いているファイルの上限（_OpenFiles）。数えた分は、開けたら
+        # ハンドルの close で、開けなかったらここで戻す
+        if not self._take_open_file(path):
+            return SFTP_FAILURE
         try:
             with (self._busy(path) if guarded else contextlib.nullcontext()):
-                return self._open(path, flags, writing, tracked)
+                result = self._open(path, flags, writing, tracked)
         except Exception as e:
             # _open は自分で失敗を返すので、ここへ来るのは停止の後の要求だけ
             _log_limited("open error", f"[SFTP Server] open error: {e}")
-            return SFTP_FAILURE
+            result = SFTP_FAILURE
+        if not isinstance(result, SFTPHandle):
+            self._give_back_open_file()
+        return result
 
     def _open(self, path, flags, writing, tracked):
         """open の本体（writing と tracked は open がフラグから決めたもの）"""
@@ -471,8 +586,9 @@ class SFTPServerHandler(SFTPServerInterface):
                 mode = 'rb'
             f = os.fdopen(fd, mode)
 
-            fobj = (_WriteHandle(flags, self._open_writers) if tracked
-                    else SFTPHandle(flags))
+            give_back = self._give_back_open_file
+            fobj = (_WriteHandle(flags, self._open_writers, give_back) if tracked
+                    else _CountedHandle(flags, give_back))
             # モードに応じて片方だけ設定する。両方入れると、読み取り専用の
             # ハンドルが書き込み可能として応答してしまう。
             if flags & os.O_RDWR:
@@ -729,6 +845,18 @@ class SFTPServerManager(QObject):
     # 揃える（多重化する OpenSSH の ControlMaster は 1 接続に複数開く）。
     # 接続の上限 32 本と合わせて、SFTP のスレッドは最大 320 本
     MAX_CHANNELS_PER_CONNECTION = 10
+    # 開いておけるファイルの数の上限。1 本の SFTP セッションあたりと、
+    # サーバー全体（_OpenFiles を参照）。チャネル数の上限とは別に持つ。
+    # 確かめた範囲では、OpenSSH の sftp/scp は 1 セッションで同時に 1 個しか
+    # 開かない（実測）。WinSCP は並べて転送するとき、ファイルごとに別の接続を
+    # 使う（公式の文書）。FileZilla と機器の copy は未確認。セッションあたりは
+    # Windows 版 OpenSSH の sftp-server が 1 セッションで持てる記述子の数
+    # （MAX_FDS = 256）に揃える。全体は CRT の記述子の上限（8192 個）の 1/4 に
+    # して、残りを設定の保存・ログ・FTP/TFTP のファイル・名前解決に残す
+    # （NetBelt 自身が普段使うのは数個。実測: 画面と SFTP サーバーを起動した
+    # ままで 3 個）
+    MAX_OPEN_FILES_PER_SESSION = 256
+    MAX_OPEN_FILES_TOTAL = 2048
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -745,6 +873,10 @@ class SFTPServerManager(QObject):
         # 停止のあとも書き込みを抱えたまま生き残ったスレッド
         self._open_writers = _OpenWriters()
         self._unfinished = []
+        # SFTP で開いているファイルの数（接続・起動をまたいで数える。停止の
+        # 後も生き残ったスレッドが閉じた分は、ここへ戻る）
+        self._open_files = _OpenFiles(self.MAX_OPEN_FILES_PER_SESSION,
+                                      self.MAX_OPEN_FILES_TOTAL)
 
         # 同時に受け付けるクライアント接続の上限。認証前の接続でも
         # スレッドと Transport を 1 つずつ消費するので、上限が無いと
@@ -1231,7 +1363,7 @@ class SFTPServerManager(QObject):
                 open_writers=self._open_writers,
                 notify=lambda message, ip=client_addr[0]:
                     self._emit_activity(ip, message),
-                stop_event=stop_event)
+                stop_event=stop_event, open_files=self._open_files)
             
             # SSHサーバーインターフェースを作成（チャネル数の上限は接続ごと）
             server = SSHServerInterface(
