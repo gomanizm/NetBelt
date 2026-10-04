@@ -15,6 +15,7 @@ from pyftpdlib.ioloop import _ERRNOS_DISCONNECTED, _ERRNOS_RETRY
 from pyftpdlib.log import logger as _ftp_logger
 
 from .crypto import PasswordCrypto
+from .sockets import set_exclusive_bind
 
 # 復号できずに暗号文のまま残ったパスワードを渡されたときの通知文。
 # 暗号文そのものは含めない（画面・ログに出さない）。
@@ -89,6 +90,27 @@ class _RangePassiveDTP(FTPHandler.passive_dtp):
             self.close()    # ioloop への登録も外す
             raise _NoPassivePort()
         super().listen(num)
+
+
+class _ExclusiveFTPServer(_PyFTPServer):
+    """制御の待ち受けを排他（SO_EXCLUSIVEADDRUSE）にした pyftpdlib の FTPServer。
+
+    pyftpdlib の待ち受けは排他でなく、Windows では同じ PC の同じユーザーの
+    ほかのソケットが特定アドレス（127.0.0.1 や LAN の IP）の同じ番号へ bind でき
+    （別のユーザーの bind は今の形でも OS が断る）、その宛先への
+    制御接続はそちらへ届く。PASV の待ち受けもその一つで、制御ポートが
+    パッシブの範囲に入ると、後から来た制御接続をデータ接続として受け付けた
+    （実測。今は start() が範囲から制御ポートを除くので、PASV はこの形にならない）。
+    ほかの受信機能（SFTP / TFTP / Syslog / SNMP Trap）と同じく排他にすると、
+    その bind は断られる。
+    排他の設定は bind の前でないと効かない。
+    pyftpdlib は bind の直前に set_reuse_addr() を呼ぶ（Windows では何も
+    しない形に上書きされている）ので、そこで掛ける
+    """
+
+    def set_reuse_addr(self):
+        super().set_reuse_addr()   # Windows 以外の SO_REUSEADDR はそのまま
+        set_exclusive_bind(self.socket)
 
 
 class FTPServerManager(QObject):
@@ -789,20 +811,22 @@ class FTPServerManager(QObject):
             # （実測で、動いている側へログインできなくなった）。
             # 2 本の待受スレッドが同じ fd の一覧を同時に読み書きする
             # 状態も、pyftpdlib が想定していない
-            self._server = _PyFTPServer(("0.0.0.0", port), _Handler,
-                                        ioloop=_PyIOLoop.factory())
+            self._server = _ExclusiveFTPServer(("0.0.0.0", port), _Handler,
+                                               ioloop=_PyIOLoop.factory())
             self.port = self._server.address[1]
         except Exception as e:
             self.error_occurred.emit("FTP起動失敗: %s" % e)
             self._server = None
             return False
         # 制御ポートはパッシブの範囲から外す。PASV の待ち受けは制御接続の自分側の
-        # アドレス（127.0.0.1 や LAN の IP）へ bind し、Windows では 0.0.0.0 で
-        # 待ち受け中の制御ポートと同じ番号でも通る。そうなると、その宛先へ来た
-        # 別の制御接続がデータ接続として受け付けられる（127.0.0.1 で実測）。
+        # アドレス（127.0.0.1 や LAN の IP）へ bind し、制御の待ち受けが排他でな
+        # かったころは、Windows では 0.0.0.0 で待ち受け中の制御ポートと同じ番号でも
+        # 通った。そうなると、その宛先へ来た別の制御接続がデータ接続として受け付け
+        # られた（127.0.0.1 で実測）。排他にした今（_ExclusiveFTPServer）はその
+        # bind は断られるが、範囲に残すと使えない番号が候補に混ざる。
         # 外した結果、番号が残らない範囲（制御ポートだけ・下限が上限より大きい）
-        # では起動しない。起動すると、PASV が別の制御接続を取り違えるか、PASV の
-        # たびに制御接続ごと切れる（実測）
+        # では起動しない。起動すると、PASV のたびに 425 で断ることになる
+        # （排他と 425 の前は、別の制御接続の取り違えか、制御接続ごと切れた。実測）
         passive = [p for p in _Handler.passive_ports if p != self.port]
         if not passive:
             self._server.close_all()
