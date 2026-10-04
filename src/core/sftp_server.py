@@ -245,7 +245,13 @@ class _OpenFiles:
     失敗する（実測。QFile と確立済みのソケットは影響を受けない）。上限が無いと、
     認証済みの相手は SFTP のセッション 1 本で開き続けるだけで表を使い切れた
     （実測: 4.3 秒で 8189 個）。接続をまたいで数えるので錠で守る。ディレクトリの
-    ハンドルは一覧をメモリに持つだけで記述子を使わないので数えない
+    ハンドルは一覧をメモリに持つだけで記述子を使わないので数えない。
+
+    サーバーは 1 個ぶんを take_slot で取り、返す権利（_Slot）を記述子のハンドル
+    に持たせて、閉じたときに 1 回だけ返す。セッションの終わりや停止では
+    まとめて戻さない。戻すと、旧セッションの記述子が閉じ終わる前に新しい
+    open が通り、合わせて上限を超えて開ける（実測: 開いたまま停止した直後に、
+    数 0 で記述子が 254 個開いていた）
     """
 
     def __init__(self, per_session, total):
@@ -267,22 +273,65 @@ class _OpenFiles:
             self._in_use += 1
             return None
 
+    def take_slot(self, session):
+        """1 個ぶん数えて (_Slot, None) を返す。上限なら (None, 当たった側)"""
+        hit = self.take(session)
+        if hit is not None:
+            return None, hit
+        return _Slot(self, session), None
+
     def give_back(self, session):
         """閉じた 1 個ぶんを戻す（end の後に閉じた分は数えない）"""
         with self._lock:
-            held = self._held.pop(session, 0)
-            if held > 1:
-                self._held[session] = held - 1
-            self._in_use -= min(held, 1)
+            self._give_back_locked(session)
+
+    def _give_back_locked(self, session):
+        held = self._held.pop(session, 0)
+        if held > 1:
+            self._held[session] = held - 1
+        self._in_use -= min(held, 1)
+
+    def release(self, slot):
+        """take_slot で取った枠を返す。同じ枠は 2 回目から何もしない"""
+        with self._lock:
+            if slot.released:
+                return
+            slot.released = True
+            self._give_back_locked(slot.session)
 
     def end(self, session):
-        """セッションの終わり。開いたまま残った分をまとめて戻す"""
+        """セッションの残りをまとめて戻す。
+
+        サーバーは使わない（記述子を閉じる前に戻すことになる）。セッションの
+        終わりには、開いたまま残ったハンドルを閉じ、閉じた分だけ _Slot で戻す
+        """
         with self._lock:
             self._in_use -= self._held.pop(session, 0)
 
 
+class _Slot:
+    """_OpenFiles の 1 個ぶんの枠を返す権利（take_slot が返す）。
+
+    呼ぶと、取った _OpenFiles の、取ったセッションの数へ 1 回だけ返す。
+    2 回目からは何もしないので、再起動の後に届いた旧セッションの close が、
+    ほかのセッションの数を減らしたり、二重に返したりしない
+    """
+
+    def __init__(self, open_files, session):
+        self.open_files = open_files
+        self.session = session
+        self.released = False
+
+    def __call__(self):
+        self.open_files.release(self)
+
+
 class _CountedHandle(SFTPHandle):
-    """閉じたら give_back を 1 回だけ呼ぶハンドル（開いているファイルの数を戻す）"""
+    """閉じたら give_back を 1 回だけ呼ぶハンドル（開いているファイルの数を戻す）。
+
+    呼ぶのは記述子を閉じる処理を試みた後。close の中で止まっている間
+    （共有フォルダなど）は数に残る
+    """
 
     def __init__(self, flags, give_back=None):
         super().__init__(flags)
@@ -291,6 +340,15 @@ class _CountedHandle(SFTPHandle):
     def close(self):
         try:
             super().close()
+        except Exception:
+            # 途中で例外が出ても、記述子を閉じる処理は試みてから数を戻す
+            # （閉じ終えたファイルの close は何もしない）
+            for f in (getattr(self, "readfile", None),
+                      getattr(self, "writefile", None)):
+                with contextlib.suppress(Exception):
+                    if f is not None:
+                        f.close()
+            raise
         finally:
             # 2 回目の close（finish_subsystem の後始末など）では戻さない
             give_back, self._give_back = self._give_back, None
@@ -332,32 +390,41 @@ class SFTPServerHandler(SFTPServerInterface):
         # 開いているファイルを数える先（SFTPServerManager の _OpenFiles。
         # None なら数えない）
         self._open_files = open_files
+        # このセッションで開いたファイルのハンドル（session_ended で閉じる）。
+        # 閉じて paramiko の表から外れたものは消える（弱参照）
+        self._handles = weakref.WeakSet()
 
     def session_ended(self):
-        """SFTP のセッションの終わり。開いたまま残ったファイルの数をまとめて戻す。
+        """SFTP のセッションの終わり。開いたまま残ったファイルを 1 個ずつ閉じる。
 
-        paramiko の finish_subsystem は、ここを呼んでから残ったハンドルを
-        閉じる。閉じる途中の例外で残りが閉じられなくても全体の数は戻る
-        （この後の close は数を変えない）。例外は外へ出さない（paramiko が
-        握りつぶし、その後のハンドルの後始末が飛ぶ）
+        数（_OpenFiles）は、記述子を閉じたハンドルが 1 個ずつ戻す
+        （_CountedHandle）。ここでまとめて戻すと、閉じ終える前に新しい open が
+        通り、旧セッションの残りと合わせて上限を超えて開ける。paramiko の
+        finish_subsystem もこの後で残ったハンドルを閉じるが、1 つが例外を
+        出すと残りを閉じないので、ここで 1 個ずつ閉じる（2 回目の close は
+        数を変えない）。close の中で止まったハンドル（共有フォルダなど）の
+        分は、戻るまで数に残り、その間は新しい open を断ることがある。
+        例外は外へ出さない（paramiko が握りつぶし、その後のハンドルの
+        後始末が飛ぶ）
         """
-        try:
-            if self._open_files is not None:
-                self._open_files.end(self)
-        except Exception as e:
-            _log_limited("session end error",
-                         f"[SFTP Server] session end error: {e}")
+        for handle in list(self._handles):
+            try:
+                handle.close()
+            except Exception as e:
+                _log_limited("session end error",
+                             f"[SFTP Server] session end error: {e}")
 
     def _take_open_file(self, path):
         """開いているファイルの上限（_OpenFiles）を見て 1 個ぶん数える。
 
-        上限なら、断ったことを診断の行とパネルのログへ出して False を返す
+        数えたら返す権利（_Slot）を、数えない（open_files が None）なら None を
+        返す。上限なら、断ったことを診断の行とパネルのログへ出して False を返す
         """
         if self._open_files is None:
-            return True
-        hit = self._open_files.take(self)
-        if hit is None:
-            return True
+            return None
+        slot, hit = self._open_files.take_slot(self)
+        if slot is not None:
+            return slot
         if hit == "session":
             limit, where = self._open_files.per_session, "1 セッションあたり"
         else:
@@ -369,11 +436,6 @@ class SFTPServerHandler(SFTPServerInterface):
             self._notify("開いているファイルが%sの上限（%d 個）に達したため"
                          "断りました: %s" % (where, limit, path))
         return False
-
-    def _give_back_open_file(self):
-        """閉じた・開けなかった 1 個ぶんを戻す"""
-        if self._open_files is not None:
-            self._open_files.give_back(self)
 
     def _busy(self, real_path):
         """保存先を触る間、停止に見えるよう一覧へ載せる（_OpenWriters.busy）。
@@ -539,23 +601,28 @@ class SFTPServerHandler(SFTPServerInterface):
         # （実測: 停止の後に積まれた分が再起動の後に作っていた）。予約は
         # 掛けない（既存のファイルは変えないので、書き込み中でも妨げない）
         guarded = tracked or bool(flags & (os.O_CREAT | os.O_EXCL))
-        # 開いているファイルの上限（_OpenFiles）。数えた分は、開けたら
-        # ハンドルの close で、開けなかったらここで戻す
-        if not self._take_open_file(path):
+        # 開いているファイルの上限（_OpenFiles）。数えた枠は、開けたら
+        # ハンドルが記述子を閉じたときに、開けなかったらここで返す
+        slot = self._take_open_file(path)
+        if slot is False:
             return SFTP_FAILURE
         try:
             with (self._busy(path) if guarded else contextlib.nullcontext()):
-                result = self._open(path, flags, writing, tracked)
+                result = self._open(path, flags, writing, tracked, slot)
         except Exception as e:
             # _open は自分で失敗を返すので、ここへ来るのは停止の後の要求だけ
             _log_limited("open error", f"[SFTP Server] open error: {e}")
             result = SFTP_FAILURE
-        if not isinstance(result, SFTPHandle):
-            self._give_back_open_file()
+        if not isinstance(result, SFTPHandle) and slot is not None:
+            slot()
         return result
 
-    def _open(self, path, flags, writing, tracked):
-        """open の本体（writing と tracked は open がフラグから決めたもの）"""
+    def _open(self, path, flags, writing, tracked, slot=None):
+        """open の本体。
+
+        writing と tracked は open がフラグから決めたもの。slot はハンドルが
+        記述子を閉じたときに返す枠（数えないなら None）
+        """
         reserved = False
         try:
             real_path = self._get_real_path(path)
@@ -586,9 +653,9 @@ class SFTPServerHandler(SFTPServerInterface):
                 mode = 'rb'
             f = os.fdopen(fd, mode)
 
-            give_back = self._give_back_open_file
-            fobj = (_WriteHandle(flags, self._open_writers, give_back) if tracked
-                    else _CountedHandle(flags, give_back))
+            fobj = (_WriteHandle(flags, self._open_writers, slot) if tracked
+                    else _CountedHandle(flags, slot))
+            self._handles.add(fobj)
             # モードに応じて片方だけ設定する。両方入れると、読み取り専用の
             # ハンドルが書き込み可能として応答してしまう。
             if flags & os.O_RDWR:
@@ -873,8 +940,9 @@ class SFTPServerManager(QObject):
         # 停止のあとも書き込みを抱えたまま生き残ったスレッド
         self._open_writers = _OpenWriters()
         self._unfinished = []
-        # SFTP で開いているファイルの数（接続・起動をまたいで数える。停止の
-        # 後も生き残ったスレッドが閉じた分は、ここへ戻る）
+        # SFTP で開いているファイルの数（接続・起動をまたいで 1 つを使い回す。
+        # 停止しても 0 に戻さない。旧セッションのファイルは、記述子を閉じた
+        # ときにここへ戻る）
         self._open_files = _OpenFiles(self.MAX_OPEN_FILES_PER_SESSION,
                                       self.MAX_OPEN_FILES_TOTAL)
 
@@ -1079,6 +1147,14 @@ class SFTPServerManager(QObject):
                 f"ポート {self.port} で待ち受けできません: {e}")
             return False
         self.server_socket = sock
+        # 前の起動のセッションのファイルが閉じ終わっていなければ（共有フォルダの
+        # close が止まっているなど）、その分は数に残り、閉じ終えるまで新しい
+        # open に使えない。待たずに（画面を固めない）診断の行へ残す
+        still_open = self._open_files._in_use
+        if still_open:
+            print(f"[SFTP Server] {still_open} file(s) from earlier sessions "
+                  f"still open, counted toward the limit "
+                  f"({self._open_files.total}) until closed")
 
         # サーバースレッドを起動。停止フラグは起動ごとに作り直して渡す。
         # 使い回して clear() すると、前回の stop() で抜けきらなかった
