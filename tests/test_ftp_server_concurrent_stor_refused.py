@@ -25,6 +25,7 @@ pyftpdlib が開く前に保存先（実パスを realpath → normcase した�
 """
 import ftplib
 import os
+import socket
 import sys
 import tempfile
 import time
@@ -40,6 +41,28 @@ PASSWORD = "example-pass"
 class _FtpServerCase(unittest.TestCase):
     """FTP サーバーを 127.0.0.1 で起動して、ftplib で操作する土台（テストは持たない）"""
     anonymous = False
+    # パッシブの範囲。FTPServerManager.start() の既定値と同じ
+    passive_ports = (50100, 50150)
+
+    def _control_port(self):
+        """制御ポートを、パッシブの範囲の外から選ぶ。
+
+        port=0 で起動すると、制御ポートは OS の動的ポートの範囲（Windows の
+        既定は 49152〜65535）から選ばれ、既定のパッシブの範囲もその中にある。制御
+        ポートが範囲に入ると、PASV が 127.0.0.1 の同じ番号へ bind できてしまい
+        （Windows）、そのあいだに張った別の制御接続が、データ接続として受け
+        付けられる（全件テストでまれに落ちていた）。OS に番号を出させ、範囲の
+        外のものを使う。出させた番号はすぐ閉じるが、OS は番号を順に渡すので
+        （実測）、起動までにほかへ渡ることはまず無い
+        """
+        lo, hi = self.passive_ports
+        for _ in range(1000):
+            with socket.socket() as probe:
+                probe.bind(("0.0.0.0", 0))
+                port = probe.getsockname()[1]
+            if not lo <= port <= hi:
+                return port
+        self.fail("パッシブの範囲の外の制御ポートを選べなかった")
 
     def setUp(self):
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -58,12 +81,15 @@ class _FtpServerCase(unittest.TestCase):
             lambda ip, message: self.activity.append((ip, message)))
         # テストのあとに届く知らせが、GC で空にされた lambda を呼ばないよう外す
         self.addCleanup(self.m.client_activity.disconnect)
+        port = self._control_port()
         if self.anonymous:
-            started = self.m.start(port=0, root_dir=self.root,
-                                   anonymous=True, anonymous_write=True)
+            started = self.m.start(port=port, root_dir=self.root,
+                                   anonymous=True, anonymous_write=True,
+                                   passive_ports=self.passive_ports)
         else:
-            started = self.m.start(port=0, root_dir=self.root,
-                                   username=USER, password=PASSWORD)
+            started = self.m.start(port=port, root_dir=self.root,
+                                   username=USER, password=PASSWORD,
+                                   passive_ports=self.passive_ports)
         self.assertTrue(started)
         self.addCleanup(self.m.stop)
 
