@@ -750,6 +750,27 @@ class FTPServerManager(QObject):
             self.error_occurred.emit("FTP起動失敗: %s" % e)
             self._server = None
             return False
+        # 制御ポートはパッシブの範囲から外す。PASV の待ち受けは制御接続の自分側の
+        # アドレス（127.0.0.1 や LAN の IP）へ bind し、Windows では 0.0.0.0 で
+        # 待ち受け中の制御ポートと同じ番号でも通る。そうなると、その宛先へ来た
+        # 別の制御接続がデータ接続として受け付けられる（127.0.0.1 で実測）。
+        # 外した結果、番号が残らない範囲（制御ポートだけ・下限が上限より大きい）
+        # では起動しない。起動すると、PASV が別の制御接続を取り違えるか、PASV の
+        # たびに制御接続ごと切れる（実測）
+        passive = [p for p in _Handler.passive_ports if p != self.port]
+        if not passive:
+            self._server.close_all()
+            self._server = None
+            lo, hi = passive_ports[0], passive_ports[1]
+            if lo > hi:
+                reason = "下限が上限より大きく、使える番号がありません"
+            else:
+                reason = "制御ポート %d を除くと、使える番号がありません" % self.port
+            self.error_occurred.emit(
+                "passiveポート範囲 %d-%d は%s。下限を上限以下にし、"
+                "制御ポートと重ならない範囲にしてください" % (lo, hi, reason))
+            return False
+        _Handler.passive_ports = passive
         self._stop_event = threading.Event()
         # 前回の待受スレッドは終わっている（_await_previous_thread）ので、
         # 閉じ損ねた接続の予約が残っていても持ち越さない
