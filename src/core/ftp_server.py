@@ -62,6 +62,35 @@ _DATA_LOST_ERRNOS = frozenset(
     if hasattr(errno, name))
 
 
+class _NoPassivePort(Exception):
+    """パッシブの範囲に待ち受けられる番号が無い（_RangePassiveDTP が投げる）"""
+
+
+class _RangePassiveDTP(FTPHandler.passive_dtp):
+    """PASV / EPSV の待ち受け。パッシブの範囲の番号でしか待ち受けない。
+
+    pyftpdlib 2.2.0 の PassiveDTP は、範囲の番号を無作為な順に bind する。最後に
+    試した番号が使用中（EADDRINUSE）だと、黙って OS に任せた番号（範囲の外。
+    ファイアウォールで許可した範囲からも外れる）で待ち受ける。最後に試した番号が
+    断られた（WSAEACCES。ほかのアプリの排他の待ち受けなど）ときは、bind しない
+    まま listen へ進んで例外になり、制御接続ごと切れる（どちらも実測）。
+    待ち受ける直前に番号を確かめ、範囲の外（bind していないときを含む）なら
+    閉じて _NoPassivePort を投げる（_Handler._make_epasv が 425 で断る）。
+    範囲を指定しない（None）ときは pyftpdlib のまま（start() は必ず範囲を渡す）
+    """
+
+    def listen(self, num):
+        ports = self.cmd_channel.passive_ports
+        try:
+            port = self.socket.getsockname()[1]
+        except OSError:     # bind していない（Windows は WSAEINVAL）
+            port = None
+        if ports is not None and port not in ports:
+            self.close()    # ioloop への登録も外す
+            raise _NoPassivePort()
+        super().listen(num)
+
+
 class FTPServerManager(QObject):
     started = pyqtSignal()
     stopped = pyqtSignal()
@@ -416,6 +445,7 @@ class FTPServerManager(QObject):
 
         class _Handler(FTPHandler):
             dtp_handler = _ProgressDTP
+            passive_dtp = _RangePassiveDTP
             # データ接続を使う転送コマンド
             _TRANSFER_COMMANDS = ("STOR", "APPE", "STOU", "RETR",
                                   "LIST", "NLST", "MLSD")
@@ -458,6 +488,22 @@ class FTPServerManager(QObject):
                          % (cmd, arg)).rstrip())
                     return
                 super().process_command(cmd, *args, **kwargs)
+
+            def _make_epasv(self, extmode=False):
+                # 範囲に待ち受けられる番号が無いときは、範囲の外の番号を使わずに
+                # 425 で断る（_RangePassiveDTP）。制御接続はそのまま続き、番号が
+                # 空けば次の PASV / EPSV から使える
+                try:
+                    super()._make_epasv(extmode)
+                except _NoPassivePort:
+                    self.respond("425 Can't open data connection: "
+                                 "no free port in the passive range.")
+                    mgr._emit_activity(
+                        self.remote_ip,
+                        "passiveポート範囲 %d-%d に待ち受けられる番号が無いため"
+                        " %s を断りました（ほかの接続の PASV や、ほかのアプリが"
+                        "使用中）" % (passive_ports[0], passive_ports[1],
+                                    "EPSV" if extmode else "PASV"))
 
             def ftp_RETR(self, file):
                 result = super().ftp_RETR(file)  # 成功時はftpパスを返す
