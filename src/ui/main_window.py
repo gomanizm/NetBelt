@@ -3138,6 +3138,17 @@ for details.
                 pass
         self.sftp_managers.clear()
 
+        # 配られていない Trap は一覧へ入れずに捨て、件数だけをログへ書く。
+        # 配り切るのは待たない。下の記録の書き切り（_drain_output_before_log_finish
+        # と finish_log_recordings）は配送待ちをその場で配るので、その前に
+        # 数え終える。後に置くと、記録中は閉じかけの窓の一覧へ全部配ってから
+        # 数えるので 0 件になる（SNMPManager.discard_undelivered_traps）
+        if hasattr(self, 'snmp_panel') and hasattr(self.snmp_panel, 'snmp_manager'):
+            try:
+                self.snmp_panel.snmp_manager.discard_undelivered_traps()
+            except Exception as e:
+                print(f"[Main] SNMP の後始末エラー: {e}")
+
         # 受信済みでまだ描いていない出力を記録し切ってから、記録を止めて
         # ファイルを閉じる。記録へ書くのは描くときなので、ここで済ませないと
         # 画面が流れている最中に閉じた分が記録から欠ける

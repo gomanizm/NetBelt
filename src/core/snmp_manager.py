@@ -723,6 +723,8 @@ class _TrapBacklog:
         self._burst = 0
         self._burst_first = None
         self._burst_last = None
+        # 終了で配送待ちを数え終えたか（discard_pending。GUI スレッドだけが触る）
+        self.closed = False
 
     def take(self):
         """1 件ぶんの枠を取る（受信スレッド）。上限に達していれば数えて False"""
@@ -779,6 +781,21 @@ class _TrapBacklog:
             summary = (self._burst, self._burst_first, self._burst_last)
             self._burst = 0
             return summary
+
+    def discard_pending(self):
+        """配送待ちを、配らずに捨てる分として数え終える（終了処理。GUI スレッド）
+
+        以後に届いた配送は一覧へ入れない（SNMPManager._on_trap_queued が
+        closed を見る）。捨てた分として数えた Trap を、表示した分にも数えない。
+        上限で捨てた件数（dropped と要約）には触らない。
+
+        Returns:
+            受信スレッドが GUI へ渡したが、まだ配られていない件数
+        """
+        with self._lock:
+            count, self.pending = self.pending, 0
+            self.closed = True
+            return count
 
 
 class SNMPTrapReceiver(QThread):
@@ -1296,6 +1313,9 @@ class SNMPManager(QObject):
         # 今の回の数え役。止めても次の開始までは残す（止めたあとに届く配送の
         # 取りこぼしもパネルへ知らせる）
         self._trap_backlog = None
+        # 前の回の数え役のうち、開き直した時点で配送待ちが残っていたもの。
+        # 終了で捨てる件数に入れる（discard_undelivered_traps）
+        self._earlier_backlogs = []
     
     def snmp_get(self, host: str, oids: List[str], **kwargs):
         """
@@ -1486,6 +1506,9 @@ class SNMPManager(QObject):
         if not self.trap_receiver.bind():
             self.trap_receiver = None
             return False
+        self._earlier_backlogs = [
+            old for old in self._earlier_backlogs + [self._trap_backlog]
+            if old is not None and old.pending]
         self._trap_backlog = backlog
         self.trap_receiver.start()
         
@@ -1494,6 +1517,8 @@ class SNMPManager(QObject):
     
     def _on_trap_queued(self, backlog, trap_data):
         """受信機からの Trap を流す（GUI スレッドで動く）。届いたぶん配送待ちを戻す"""
+        if backlog.closed:
+            return   # 終了で捨てた分として数え終えた（discard_undelivered_traps）
         new, last, summary = backlog.delivered()
         self.trap_received.emit(trap_data)
         if summary:
@@ -1532,6 +1557,33 @@ class SNMPManager(QObject):
             self._log_dropped_traps(
                 "Reception stopped before the Trap backlog drained", summary,
                 backlog.limit)
+
+    def discard_undelivered_traps(self):
+        """終了で配られずに消える Trap の件数を、配送を待たずにログへ書く
+
+        MainWindow.closeEvent で受信を止めた後、記録の書き切りより前に呼ぶ
+        （書き切りは配送待ちをその場で配る）。受信スレッドが GUI へ渡したが
+        まだ配られていない Trap は、更新の適用（閉じたあと QApplication.quit()）
+        では配られずに消え、×で閉じたときは閉じた窓の一覧へ入るだけで、
+        どちらも誰にも見えない（実測: 配送待ち 1000 件で、更新の適用は 1 件も
+        配らずに終わり、×は閉じた後に 1000 件を一覧へ入れてから終わった。
+        配っている途中に更新を適用すると、quit() の後も残りを配った。端末の
+        記録中は、どちらの終わり方でも書き切りの中で一覧へ全部配った）。
+        件数だけを書いて、以後に届いた配送は一覧へ入れない（同じ Trap を
+        表示と破棄の両方に数えない）。
+
+        上限で捨てた件数（「Trap backlog」の行）とは別の行にする。0 件のときは
+        書かない（ほとんどの終了は配送待ちが無いので、ログを今までと変えない。
+        上限の行も捨てたときだけ書く）。
+
+        制限: 受信スレッドが 5 秒で止まらずに残った場合（stop_trap_receiver の
+        警告）、ここより後に受け取った分は表示も数えもしない。
+        """
+        backlogs = self._earlier_backlogs + [self._trap_backlog]
+        count = sum(b.discard_pending() for b in backlogs if b is not None)
+        if count:
+            print("[SNMPManager] Discarded %d undelivered trap(s) at exit "
+                  "(not shown in the list)" % count)
 
     def stop_trap_receiver(self):
         """SNMP Trap受信を停止
