@@ -15,6 +15,7 @@ from pyftpdlib.ioloop import _ERRNOS_DISCONNECTED, _ERRNOS_RETRY
 from pyftpdlib.log import logger as _ftp_logger
 
 from .crypto import PasswordCrypto
+from .sockets import set_exclusive_bind
 
 # 復号できずに暗号文のまま残ったパスワードを渡されたときの通知文。
 # 暗号文そのものは含めない（画面・ログに出さない）。
@@ -60,6 +61,25 @@ _DATA_LOST_ERRNOS = frozenset(
     getattr(errno, name) for name in
     ("ETIMEDOUT", "ENOTCONN", "ECONNABORTED", "ENETRESET", "ECONNRESET")
     if hasattr(errno, name))
+
+
+class _ExclusiveFTPServer(_PyFTPServer):
+    """制御の待ち受けを排他（SO_EXCLUSIVEADDRUSE）にした pyftpdlib の FTPServer。
+
+    pyftpdlib の待ち受けは排他でなく、Windows では同じ PC の同じユーザーの
+    ほかのソケットが特定アドレス（127.0.0.1 や LAN の IP）の同じ番号へ bind でき
+    （別のユーザーの bind は今の形でも OS が断る）、その宛先への
+    制御接続はそちらへ届く。PASV の待ち受けもその一つで、制御ポートが
+    パッシブの範囲に入ると、後から来た制御接続をデータ接続として受け付けた
+    （実測）。ほかの 3 サーバーと同じく排他にすると、その bind は断られる
+    （PASV は範囲のほかの番号を使う）。排他の設定は bind の前でないと効かない。
+    pyftpdlib は bind の直前に set_reuse_addr() を呼ぶ（Windows では何も
+    しない形に上書きされている）ので、そこで掛ける
+    """
+
+    def set_reuse_addr(self):
+        super().set_reuse_addr()   # Windows 以外の SO_REUSEADDR はそのまま
+        set_exclusive_bind(self.socket)
 
 
 class FTPServerManager(QObject):
@@ -743,8 +763,8 @@ class FTPServerManager(QObject):
             # （実測で、動いている側へログインできなくなった）。
             # 2 本の待受スレッドが同じ fd の一覧を同時に読み書きする
             # 状態も、pyftpdlib が想定していない
-            self._server = _PyFTPServer(("0.0.0.0", port), _Handler,
-                                        ioloop=_PyIOLoop.factory())
+            self._server = _ExclusiveFTPServer(("0.0.0.0", port), _Handler,
+                                               ioloop=_PyIOLoop.factory())
             self.port = self._server.address[1]
         except Exception as e:
             self.error_occurred.emit("FTP起動失敗: %s" % e)
