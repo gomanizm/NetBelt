@@ -47,7 +47,8 @@ EXIT = re.compile(r"\[SNMPManager\] Discarded (\d+) undelivered trap\(s\) at exi
 # 上限で捨てた件数の要約（捌け切ったとき・止めたときのどちらの行にも当たる）
 SUMMARY = re.compile(r"Trap backlog drained: dropped (\d+) trap")
 # 終了が待たされないことの目安。手元では閉じ始めてから app.exec() が戻るまで
-# 0.01〜0.03 秒。遅い CI と GC の停止（約 0.26 秒）を見込んで大きく取る
+# 0.003〜0.015 秒（配送待ち 20000 件でも）。遅い CI と GC の停止（約 0.26 秒）を
+# 見込んで大きく取る
 EXIT_SECONDS = 3.0
 
 
