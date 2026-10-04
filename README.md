@@ -75,6 +75,10 @@ v3 の認証情報は保存されません。アプリを起動するたびに�
 受信開始とクリアで 0 に戻ります。一覧とエクスポートには入りません。
 あふれ始めたときと、捌けたあとの件数・時間帯はログ（exe 版は
 `%LOCALAPPDATA%\NetBelt\logs\`。`Trap backlog` を含む行）にも残ります。
+NetBelt を閉じたときと更新を当てたときに、まだ一覧に出ていなかった
+Trap は、出し終わるのを待たずに捨て、その件数を別の行
+（`Discarded N undelivered trap(s) at exit`。0 件のときは書きません）に
+残します。
 
 NetBelt が数えられるのは、自分の表示待ちで捨てた分だけです。それより
 手前で Windows の受信バッファがあふれて落ちた分（毎秒数千件の嵐で
@@ -312,6 +316,10 @@ list is cleared, and never goes into the list or the exports. The log
 (`%LOCALAPPDATA%\NetBelt\logs\` for the exe; lines containing
 `Trap backlog`) records when an overflow
 started and, once it drained, how many traps were dropped and when.
+Traps not yet shown when NetBelt closes or quits to apply an update are
+discarded without waiting for them, and their count goes on a separate
+line, `Discarded N undelivered trap(s) at exit` (omitted when there are
+none).
 
 NetBelt can only count what it drops itself. Datagrams that Windows
 discards because the receive buffer overflowed (storms of thousands per
