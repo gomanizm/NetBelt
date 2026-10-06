@@ -16,14 +16,25 @@ cd "${CLAUDE_PROJECT_DIR:-$(dirname "$0")/../..}"
 VENV="${HOME}/.venvs/netbelt"
 
 # PyQt6 は offscreen でも libEGL.so.1 を要る（無いと import で落ちる）。
-# コンテナのイメージには入っていない。
-if ! ldconfig -p | grep -q 'libEGL\.so\.1'; then
+# コンテナのイメージには入っていない。フォントの 2 つは下で使う。
+# 入っているかは dpkg に訊く。ldconfig -p | grep -q だと、grep が先に
+# 終わったときの SIGPIPE を pipefail が拾い、入っていても「無い」になる。
+PACKAGES=(libegl1 fonts-inconsolata fonts-liberation)
+MISSING=()
+for pkg in "${PACKAGES[@]}"; do
+  status="$(dpkg-query -W -f='${Status}' "${pkg}" 2> /dev/null || true)"
+  if [ "${status}" != "install ok installed" ]; then
+    MISSING+=("${pkg}")
+  fi
+done
+if [ "${#MISSING[@]}" -gt 0 ]; then
   SUDO=""
   if [ "$(id -u)" -ne 0 ]; then
     SUDO="sudo"
   fi
   $SUDO apt-get update -q
-  DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y -q --no-install-recommends libegl1
+  DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y -q --no-install-recommends \
+    "${MISSING[@]}"
 fi
 
 # python があるかだけで判断しない。venv の作成や pip の更新が途中で止まると、
@@ -50,3 +61,40 @@ if [ -n "${CLAUDE_ENV_FILE:-}" ]; then
     echo "export QT_QPA_PLATFORM=offscreen"
   } >> "${CLAUDE_ENV_FILE}"
 fi
+
+# テストは Windows の既定のフォントを前提に、名前と幅を確かめる。
+# Linux には無く、代わりのフォントで次のように落ちる（実測）。
+# - Consolas（ターミナルの既定）が DejaVu Sans Mono になり、1 文字 8px
+#   （Consolas は 7px）。既定の幅で 80 桁が 79 桁になる
+#   （test_terminal_widget_render）
+# - Courier New が Liberation Mono と名乗る（test_settings_dialog）
+# - ヒンティングが無いと行の高さが小数になり、行数の計算（整数）とずれて
+#   1 行目が画面の外へ出る（test_terminal_selection_copy ほか）
+# 同じ幅の Inconsolata を Consolas、Courier New と同じ幅の Liberation Mono を
+# Courier New という名前で見せ、ヒンティングを Windows に近づける。
+# venv と PATH より後に置く（ここで落ちても、テストは走らせられる）。
+FONT_DIR="${HOME}/.local/share/fonts/netbelt-tests"
+FONT_CONF_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/fontconfig/conf.d"
+mkdir -p "${FONT_DIR}/consolas" "${FONT_DIR}/courier-new" "${FONT_CONF_DIR}"
+cp -f "$(dpkg -L fonts-inconsolata | grep -m 1 '/Inconsolata\.otf$')" "${FONT_DIR}/consolas/"
+cp -f $(dpkg -L fonts-liberation | grep '/LiberationMono-[A-Za-z]*\.ttf$') "${FONT_DIR}/courier-new/"
+cat > "${FONT_CONF_DIR}/60-netbelt-tests.conf" << 'EOF'
+<?xml version="1.0"?>
+<!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
+<!-- .claude/hooks/session-start.sh が書く。手で直しても次の起動で戻る -->
+<fontconfig>
+  <match target="scan">
+    <test name="file" compare="contains"><string>/netbelt-tests/consolas/</string></test>
+    <edit name="family" mode="assign" binding="same"><string>Consolas</string></edit>
+  </match>
+  <match target="scan">
+    <test name="file" compare="contains"><string>/netbelt-tests/courier-new/</string></test>
+    <edit name="family" mode="assign" binding="same"><string>Courier New</string></edit>
+  </match>
+  <match target="font">
+    <edit name="hinting" mode="assign"><bool>true</bool></edit>
+    <edit name="hintstyle" mode="assign"><const>hintfull</const></edit>
+  </match>
+</fontconfig>
+EOF
+fc-cache -f "${FONT_DIR}" > /dev/null
