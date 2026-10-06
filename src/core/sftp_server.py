@@ -17,6 +17,13 @@ from .ftp_server import UNDECRYPTABLE_PASSWORD_MESSAGE
 # 生き残りは保存先のファイルを握ったままなので、TFTP と同じ扱いにする
 from .tftp_server import PREVIOUS_STOP_INCOMPLETE_MESSAGE
 
+# 起動したとき、前の起動のセッションのファイルがまだ閉じ終わっていなければ
+# パネルのログへ出す 1 行（件数, サーバー全体の上限）。閉じ終えるまでは
+# その分の枠が埋まったままで、新しい open を断ることがある
+EARLIER_SESSION_FILES_MESSAGE = (
+    "前の接続の終了処理中のファイルが %d 個あり、その分の枠を使用中です"
+    "（開いておけるファイルはサーバー全体で %d 個まで。閉じ終われば空きます）")
+
 
 class _LogLimiter:
     """診断の行（print）を種類ごとに間引く。
@@ -1149,7 +1156,8 @@ class SFTPServerManager(QObject):
         self.server_socket = sock
         # 前の起動のセッションのファイルが閉じ終わっていなければ（共有フォルダの
         # close が止まっているなど）、その分は数に残り、閉じ終えるまで新しい
-        # open に使えない。待たずに（画面を固めない）診断の行へ残す
+        # open に使えない。待たずに（画面を固めない）診断の行へ残す。
+        # パネルのログへは、起動した後で同じ件数を 1 回だけ出す（_run_server）
         still_open = self._open_files._in_use
         if still_open:
             print(f"[SFTP Server] {still_open} file(s) from earlier sessions "
@@ -1162,7 +1170,8 @@ class SFTPServerManager(QObject):
         # 資格情報で接続を処理してしまう（FTP の _serve と同じ形）
         self._stop_event = threading.Event()
         self.server_thread = threading.Thread(
-            target=self._run_server, args=(sock, self._stop_event), daemon=True)
+            target=self._run_server, args=(sock, self._stop_event, still_open),
+            daemon=True)
         self.server_thread.start()
         
         return True
@@ -1283,12 +1292,13 @@ class SFTPServerManager(QObject):
         self._unfinished = [t for t in self._unfinished if t.is_alive()]
         return not self._unfinished
     
-    def _run_server(self, sock, stop_event):
+    def _run_server(self, sock, stop_event, held_open=0):
         """サーバーのメインループ
 
         sock と stop_event はこの起動のもの。停止待ちが期限切れになった後で
         起動し直されても、self の側（新しい起動）の停止フラグやソケットは
-        見ない。
+        見ない。held_open は start() が数えた、前の起動のセッションの
+        まだ閉じ終わっていないファイルの数（パネルのログへ出す件数）。
         """
         try:
             # ソケットは start() でバインド済み
@@ -1300,6 +1310,15 @@ class SFTPServerManager(QObject):
 
             self.is_running = True
             self.started.emit()
+            # 前の起動のセッションのファイルが残っていれば、パネルのログにも
+            # 起動のたびに 1 回だけ出す（件数は start() の診断の行と同じ）。
+            # started と同じスレッドから出すので「サーバー起動」の行の後に
+            # 届く。起動ごとに 1 行だけなので、配送待ちが上限でも省かない
+            # （省くと要約の件数に紛れて分からなくなる）
+            if held_open:
+                self._take_notice(force=True)
+                self.client_activity.emit("", EARLIER_SESSION_FILES_MESSAGE % (
+                    held_open, self._open_files.total))
             print(f"[SFTP Server] Server started on port {self.port}")
             print(f"[SFTP Server] Root directory: {self.root_dir}")
             print(f"[SFTP Server] Username: {self.username}")
