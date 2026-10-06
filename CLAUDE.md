@@ -23,7 +23,10 @@ Windows 専用の PyQt6 アプリ。テストの合否は Windows の CI
 - 次の 4 つは、モジュールの読み込みで `ctypes.windll` に触れ、収集で落ちる。
   `test_updater_apply_copy_cleanup.py`・`test_updater_exe_rename_blocked.py`・
   `test_updater_exe_swap_retry.py`・`test_updater_staged_exe_sweep.py`
-- ほかにも約 130 件が Linux でだけ落ちる。Windows にしか無いものに頼って
+- `test_server_status_ui.py` は、テストがすべて通ったあと、終わりの後片付け
+  （`tests/conftest.py` の `qapp`）で segfault する。
+  `test_ssh_resize_after_transport_recovers.py` は、タイミング次第で落ちる。
+- ほかにも約 120 件が Linux でだけ落ちる。Windows にしか無いものに頼って
   いるためで、直す対象ではない。主なもの:
   DPAPI（パスワードの暗号化）、`ctypes.windll`、`subprocess.CREATE_NEW_CONSOLE`、
   大文字と小文字を区別しないパスと 8.3 の短い名前、Windows のファイルの共有
