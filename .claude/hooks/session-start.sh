@@ -26,8 +26,14 @@ if ! ldconfig -p | grep -q 'libEGL\.so\.1'; then
   DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y -q --no-install-recommends libegl1
 fi
 
-if [ ! -x "${VENV}/bin/python" ]; then
-  python3.11 -m venv "${VENV}"
+# python があるかだけで判断しない。venv の作成や pip の更新が途中で止まると、
+# python はあって pip が無い venv が残り、以後の起動がすべて pip の行で落ちる。
+# pip の有無だけでも足りない。pyvenv.cfg を書く前に止まった venv の python は
+# システムの Python として動き、システムの pip を見つける（実測。そのまま
+# 進むと、システムの pip を入れ替えようとして落ちる）。
+if ! "${VENV}/bin/python" -c 'import sys, pip; sys.exit(sys.prefix == sys.base_prefix)' \
+    > /dev/null 2>&1; then
+  python3.11 -m venv --clear "${VENV}"
 fi
 
 # pytest の版は CI と同じものにする。CI 側で上げたら追従する。

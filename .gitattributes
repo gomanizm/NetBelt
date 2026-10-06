@@ -22,10 +22,12 @@ tests/fixtures/*.bin -text
 
 # シェルスクリプトは LF で格納し、LF で取り出す。
 #
-# .claude/hooks/session-start.sh は Claude Code が起動のたびに bash で
-# 実行する。core.autocrlf=true の Windows で取り出すと CRLF になり、bash は
-# 行末の CR をコマンドの一部として読む（実測: set -euo pipefail の行で
-# invalid option name になって止まる。シバンで直接起動すると、その前に
-# "bash\r" が見つからずに止まる）。
+# .claude/hooks/session-start.sh は Claude Code がセッションの開始・再開・
+# /clear・圧縮のたびに実行する（Windows では Git Bash で）。
+# core.autocrlf=true の Windows で取り出すと CRLF になり、bash は行末の CR を
+# コマンドの一部として読む（実測: set -euo pipefail の行で invalid option
+# name になって止まる）。Git Bash はシバン行の CR を読み飛ばす
+# （msys2-runtime の spawn.cc）ので、Windows でもこの行で止まる。Linux で
+# シバンから直接起動した場合は、その前に "bash\r" が見つからずに止まる。
 # クラウドでだけ働くスクリプトだが、手元の起動でもいったん実行される。
 *.sh text eol=lf
