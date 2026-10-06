@@ -13,9 +13,17 @@ SO_EXCLUSIVEADDRUSE を立てない（bind の直前に呼ぶ set_reuse_addr() �
      制御ポートを含むと、PASV が制御ポートの番号で待ち受けた（範囲 2 番号で 20 回中
      7〜12 回）。その間に張った別の制御接続は、データ接続として受け付けられる
 
-どう直したか: 制御の待ち受けを、ほかの 3 サーバーと同じく排他（core.sockets の
-set_exclusive_bind）にする。pyftpdlib が bind の直前に呼ぶ set_reuse_addr() で掛ける。
-特定アドレスの bind は WSAEACCES で断られ、PASV は範囲のほかの番号を使う。
+どう直したか: 制御の待ち受けを、ほかの受信機能（SFTP / TFTP / Syslog / SNMP Trap）と
+同じく排他（core.sockets の set_exclusive_bind）にする。pyftpdlib が bind の直前に
+呼ぶ set_reuse_addr() で掛ける。特定アドレスの bind は WSAEACCES で断られ、PASV は
+範囲のほかの番号を使う。
+
+2) は、start() がパッシブの範囲から制御ポートを除く修正
+（test_ftp_server_passive_range_excludes_control_port.py）でも起きない。そのため
+test_pasv_does_not_listen_on_the_control_port は、排他にしなくても通る（その修正と
+重なる。排他を外した変異で確かめた）。排他そのものを守るのは
+test_another_socket_cannot_take_the_control_port_on_a_specific_address と、
+test_ftp_server_exclusive_control_lan_restart.py の (a)。
 """
 import ftplib
 import os
@@ -69,9 +77,10 @@ class FtpExclusiveControlPortTest(unittest.TestCase):
         """制御ポート X を選ぶ。パッシブの範囲 (X, X+1) の X+1 は PASV が使える番号にする。
 
         X+1 がほかのソケットに 127.0.0.1 や排他のワイルドカードで使われていると、
-        PASV の bind はそこで断られ、範囲の最後に試すのが X（排他で WSAEACCES）の
-        回に、pyftpdlib は bind しないまま listen へ進んで制御接続ごと切る
-        （PassiveDTP.__init__）。製品の退行と見分けがつかないので、その X は使わない。
+        PASV の bind はそこで断られる。start() は範囲から X を除く（X+1 だけが残る）
+        ので、PASV は 425 で断られる（_RangePassiveDTP。除く修正と 425 の前は、
+        X を最後に試した回に制御接続ごと切れた）。製品の退行と見分けがつかないので、
+        その X は使わない。
         確かめは、PASV と同じ形（127.0.0.1、オプションなし）の bind だけで行う。
         同じユーザーの既定のワイルドカードの待ち受けは、この bind を断らない（PASV は
         その番号で待ち受けて通る）ので、0.0.0.0 では確かめない。別のユーザーの
@@ -96,17 +105,19 @@ class FtpExclusiveControlPortTest(unittest.TestCase):
         self.skipTest("X+1 を PASV が使える制御ポート X を選べなかった")
 
     def _pasv(self, ftp, port):
-        """PASV を張り、データの番号を返す。制御接続が切れたら、X+1 の様子を添えて落とす"""
+        """PASV を張り、データの番号を返す。
+
+        断られたか制御接続が切れたら、X+1 の様子を添えて落とす"""
         try:
             return ftp.makepasv()[1]
-        except (EOFError, OSError) as e:
+        except (EOFError, OSError, ftplib.error_temp) as e:
             try:
                 client = ftp.sock.getsockname()[1]
             except (AttributeError, OSError):
                 client = "不明"
             self.fail(
-                "PASV で制御接続が切れた（%r）。いま %d 番へ 127.0.0.1 で bind %s"
-                "（このクライアントの自分側の番号は %s）。できない場合は、起動の後に"
+                "PASV が断られたか、制御接続が切れた（%r）。いま %d 番へ 127.0.0.1 で"
+                " bind %s（このクライアントの自分側の番号は %s）。できない場合は、起動の後に"
                 "ほかのソケットが %d 番を使い、PASV の候補が尽きた可能性がある"
                 "（製品の退行とは限らない）"
                 % (e, port + 1,
@@ -134,6 +145,12 @@ class FtpExclusiveControlPortTest(unittest.TestCase):
         self.assertTrue(self._greeting(m.port).getwelcome().startswith("220"))
 
     def test_pasv_does_not_listen_on_the_control_port(self):
+        """PASV が制御ポートで待ち受けず、その間の新しい制御接続へ挨拶が返ること。
+
+        start() が範囲から制御ポートを除くので、排他にしなくても通る（排他の確かめは
+        上の試験。冒頭の docstring を参照）。範囲 2 番号で取り違えが起きた形を、
+        そのまま流す回帰の確かめとして残す
+        """
         port = self._control_port_with_free_next()
         m = self._start(port=port, passive_ports=(port, port + 1))
         ftp = self._greeting(m.port)

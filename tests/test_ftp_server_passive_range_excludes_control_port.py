@@ -90,12 +90,20 @@ class PassiveSkipsControlPortTest(_FtpServerCase):
 
     def test_pasv_and_epsv_never_listen_on_the_control_port(self):
         """PASV / EPSV を繰り返しても制御ポートで待ち受けず、範囲のほかの番号を使うこと。
-        PASV の待ち受けが開いている間も、新しい制御接続へ挨拶が返ること。"""
+        PASV の待ち受けが開いている間も、新しい制御接続へ挨拶が返ること。
+
+        制御の待ち受けを排他にした後（_ExclusiveFTPServer）は、範囲から除かなくても
+        PASV の X への bind は断られるので、PASV / EPSV の番号だけでは除いたかどうかを
+        見分けられない。そのため、起動後の PASV の候補に X が無いことを先に確かめる
+        （除くことだけを外した変異で、ここで落ちることを確かめた）。排他そのものは
+        test_ftp_server_exclusive_control_port.py が確かめる。"""
         self.assertEqual(self.m.port, self._x, "前提: 制御ポートが範囲の中にある")
+        self.assertNotIn(self._x, self.m._server.handler.passive_ports,
+                         "起動で制御ポートが PASV の候補から除かれていない")
         allowed = set(range(self._x + 1, self._x + SPARE_PORTS + 1))
         ftp = self.client()
         seen = set()
-        # 制御ポートを除かない形（43b2980 まで）は 1 回ごとに 5 分の 1 で X を
+        # 制御ポートを除かず排他でもない形（43b2980）は 1 回ごとに 5 分の 1 で X を
         # 選ぶので、40 回でまず見つかる（見逃すのは 0.8 の 40 乗、約 0.01%）
         for i in range(40):
             if i % 4 == 3:
