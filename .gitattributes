@@ -19,3 +19,15 @@ tests/fixtures/*.bin -text
 # core.autocrlf=false / input での clone — だけが壊れた updater.bat を
 # 受け取り、そこからビルドした NetBelt は自動更新が一切効かなかった。
 *.bat text eol=crlf
+
+# シェルスクリプトは LF で格納し、LF で取り出す。
+#
+# .claude/hooks/session-start.sh は Claude Code がセッションの開始・再開・
+# /clear・圧縮のたびに実行する（Windows では Git Bash で）。
+# core.autocrlf=true の Windows で取り出すと CRLF になり、bash は行末の CR を
+# コマンドの一部として読む（実測: set -euo pipefail の行で invalid option
+# name になって止まる）。Git Bash はシバン行の CR を読み飛ばす
+# （msys2-runtime の spawn.cc）ので、Windows でもこの行で止まる。Linux で
+# シバンから直接起動した場合は、その前に "bash\r" が見つからずに止まる。
+# クラウドでだけ働くスクリプトだが、手元の起動でもいったん実行される。
+*.sh text eol=lf
