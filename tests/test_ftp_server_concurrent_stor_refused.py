@@ -54,6 +54,16 @@ class _FtpServerCase(unittest.TestCase):
         付けられる（全件テストでまれに落ちていた）。OS に番号を出させ、範囲の
         外のものを使う。出させた番号はすぐ閉じるが、OS は番号を順に渡すので
         （実測）、起動までにほかへ渡ることはまず無い
+
+        上の取り違えは、1.3.4 の dcfd77c（B2）・98cd5f2（B1）より前の製品の
+        振る舞い（この選び方は、その前の 30d370d で足した）。今は start() が
+        制御ポートを PASV の候補から除き、制御の待ち受けが排他で 127.0.0.1 の同じ
+        番号への bind も断るので、起きない。範囲の外から選ぶのは変えていない。
+        こうすると start() が範囲から除く番号は無く、既定の範囲のまま試せる。
+        また、B2・B1 を戻した形でも、この選び方では重ならない。重なりは、
+        制御ポートを範囲の中に置く PassiveSkipsControlPortTest
+        （test_ftp_server_passive_range_excludes_control_port.py）と
+        test_ftp_server_exclusive_control_port.py が確かめる
         """
         lo, hi = self.passive_ports
         for _ in range(1000):
