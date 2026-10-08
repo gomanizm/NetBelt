@@ -363,6 +363,41 @@ def app_data_dir():
 _LAST_SAVE_DIR_SECTION = "paths"
 _LAST_SAVE_DIR_KEY = "last_save_dir"
 
+# 他アプリの config.json で起動した回（ConfigManager.foreign_config_path が
+# 立つ回）に、変更を断る理由として画面に出す文。起動時の知らせと、断った
+# ときの各画面で同じ文を出す。この回の save_config は必ず失敗するので、
+# 機器・グループ・プリセットの追加・変更・削除と設定画面の OK はメモリも
+# 元に戻して断る（そのほかの設定の変更はメモリにだけ効き、保存されない）
+FOREIGN_CONFIG_REFUSAL = (
+    "起動したフォルダの config.json は NetBelt の設定ファイルではないため、"
+    "今回は既定の設定で動いています。この回は、機器・グループ・プリセットの"
+    "追加・変更・削除と、設定画面（ツール → 設定）の変更は受け付けません。")
+
+# バージョン情報で、その回に使っていない他アプリの config.json のパスに添える文
+FOREIGN_CONFIG_PATH_NOTE = ("（NetBelt の設定ではないため、読み書きしていません。"
+                            "今回は既定の設定で動いています）")
+
+
+def foreign_config_refusal(config_manager) -> str:
+    """他アプリの config.json で動いている回なら、変更を断る理由の文を返す
+
+    そうでない回（読み取り専用などで保存だけ失敗した回を含む）は空文字。
+    foreign_config_path は None か絶対パスの文字列なので、文字列のときだけ
+    立っているとみなす。
+    """
+    path = getattr(config_manager, "foreign_config_path", None)
+    return FOREIGN_CONFIG_REFUSAL if isinstance(path, str) and path else ""
+
+
+def foreign_config_hint(config_manager) -> str:
+    """失敗を知らせる文の後ろに足す形（空行を挟む）で、断った理由を返す
+
+    失敗とだけ出すと、何度試しても失敗する訳が分からない。
+    他アプリの config.json で動いていない回は空文字（文は今までどおり）。
+    """
+    reason = foreign_config_refusal(config_manager)
+    return f"\n\n{reason}" if reason else ""
+
 
 class ConfigManager:
     """設定ファイルの読み書きを管理するクラス"""
@@ -433,12 +468,13 @@ class ConfigManager:
         """他アプリの JSON を読まず、この回は既定の設定で動かす"""
         self.foreign_config_path = self.config_file_path()
         message = (
-            "起動したフォルダにある次の config.json は NetBelt の設定ファイル"
-            "ではないため、読み込まず、書き換えもしません:\n"
+            "起動したフォルダにある次の config.json は、読み込まず、書き換えもしません:\n"
             f"  {self.foreign_config_path}\n\n"
             "NetBelt の設定を使うには、NetBelt.exe と同じフォルダから起動するか、"
-            "このファイルを別の場所へ移してから起動し直してください。\n"
-            "今回は既定の設定で起動しています。変更した設定は保存されません。")
+            "このファイルを別の場所へ移してから起動し直してください。\n\n"
+            f"{FOREIGN_CONFIG_REFUSAL}"
+            "表示メニューのフォントサイズ拡大・縮小（Ctrl+ホイール）など、"
+            "そのほかの設定の変更はこの回だけ効き、保存されません。")
         # 知らせはログより先に控え、ログのパスは ASCII に逃がす（!a）。
         # 出力先の符号化（ファイルへ向けた cp932 など）でパスを表せないと
         # print が例外になり、_load_config の except で破損扱い（load_error と

@@ -17,7 +17,9 @@ from .dialogs.group_dialog import GroupDialog
 from .dialogs.macro_dialog import MacroDialog
 from .dialogs.settings_dialog import SettingsDialog
 from core.config_manager import (ConfigManager, count_macros_named,
-                                 device_endpoint)
+                                 device_endpoint, foreign_config_hint,
+                                 foreign_config_refusal,
+                                 FOREIGN_CONFIG_PATH_NOTE)
 from core.ssh_connection import SSHConnection
 from core.serial_connection import SerialConnection
 from core.telnet_connection import TelnetConnection
@@ -600,7 +602,8 @@ class MainWindow(QMainWindow):
                 self._load_devices()
                 self.status_bar.showMessage(f"機器 '{device_data['name']}' を追加しました")
             else:
-                QMessageBox.warning(self, "エラー", "機器の追加に失敗しました。")
+                QMessageBox.warning(self, "エラー", "機器の追加に失敗しました。"
+                                    + foreign_config_hint(self.config_manager))
     
     def _on_device_connect(self, group_name: str, device_data: dict):
         """
@@ -700,7 +703,8 @@ class MainWindow(QMainWindow):
             else:
                 QMessageBox.warning(self, "エラー", "機器の更新に失敗しました。設定は変更されていません。"
                                     + self._same_name_group_hint(
-                                        group_name, old_device_name, device_data))
+                                        group_name, old_device_name, device_data)
+                                    + foreign_config_hint(self.config_manager))
     
     def _on_device_delete(self, group_name: str, device_name: str,
                           device_data: dict = None):
@@ -779,7 +783,8 @@ class MainWindow(QMainWindow):
                     self._load_devices()
                 QMessageBox.warning(self, "エラー", "機器の削除に失敗しました。"
                                     + self._same_name_group_hint(
-                                        group_name, device_name, device_data))
+                                        group_name, device_name, device_data)
+                                    + foreign_config_hint(self.config_manager))
     
     def _on_device_duplicate(self, group_name: str, device_data: dict):
         """
@@ -821,7 +826,8 @@ class MainWindow(QMainWindow):
                 self._load_devices()
                 self.status_bar.showMessage(f"機器 '{new_device_data['name']}' を追加しました")
             else:
-                QMessageBox.warning(self, "エラー", "機器の追加に失敗しました。")
+                QMessageBox.warning(self, "エラー", "機器の追加に失敗しました。"
+                                    + foreign_config_hint(self.config_manager))
     
     def _on_device_moved(self, source_group_name: str, target_group_name: str,
                          device_name: str, device_data: dict = None):
@@ -847,7 +853,8 @@ class MainWindow(QMainWindow):
         else:
             QMessageBox.warning(self, "エラー", "機器の移動に失敗しました。"
                                 + self._same_name_group_hint(
-                                    source_group_name, device_name, device_data))
+                                    source_group_name, device_name, device_data)
+                                + foreign_config_hint(self.config_manager))
     
     def _on_connect_requested(self, device_data: dict):
         """
@@ -1862,7 +1869,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self, "エラー",
                 f"{what}を設定ファイルへ保存できませんでした。\n"
-                "保存できなかったので、変更は反映していません。")
+                "保存できなかったので、変更は反映していません。"
+                + foreign_config_hint(self.config_manager))
         else:
             QMessageBox.warning(self, "エラー", f"{what}に失敗しました。")
 
@@ -2649,9 +2657,14 @@ class MainWindow(QMainWindow):
         # 決め打ちの色は暗い配色で沈む。地に追従させる。
         dim_colour = theme.dim(theme.surface(self)).name()
         # 起動の仕方で読む config.json が変わるので、どれかを確かめられる
-        # ようにする。RichText なので & や < を含むパスは逃がす
+        # ようにする。RichText なので & や < を含むパスは逃がし、連続した
+        # 空白が 1 つに縮まないよう pre-wrap で包む（&nbsp; と違い、コピー
+        # しても本物の空白のまま）。他アプリのファイルなら使っていないと添える
         from html import escape
-        config_file = escape(self.config_manager.config_file_path())
+        config_file = ('<span style="white-space: pre-wrap;">'
+                       f'{escape(self.config_manager.config_file_path())}</span>')
+        if foreign_config_refusal(self.config_manager):
+            config_file += escape(FOREIGN_CONFIG_PATH_NOTE)
         info_text = f"""<h2>{app_name}</h2>
 <p><b>バージョン:</b> {version}</p>
 <p><b>リポジトリ:</b> <a href="https://github.com/{repo}">github.com/{repo}</a></p>

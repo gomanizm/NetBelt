@@ -12,6 +12,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtGui import QColor, QFont
 
+from core.config_manager import foreign_config_refusal
 from ..terminal_widget import TerminalWidget
 from ..sftp_panel import SFTPPanel
 
@@ -328,7 +329,13 @@ class SettingsDialog(QDialog):
             self.accept()
             return
         # 黙って閉じないままだと、OK が効かない理由が利用者に伝わらない
-        if getattr(self, "_restore_failed", False):
+        reason = foreign_config_refusal(self.config_manager)
+        if reason:
+            # 他アプリの config.json で動いている回は保存が必ず失敗するので
+            # _restore も「戻せなかった」と答えるが、メモリは戻っており、
+            # ファイルも書き込めないのではなく書かないだけ。断った理由を出す
+            message = f"設定の変更は反映していません。\n\n{reason}"
+        elif getattr(self, "_restore_failed", False):
             message = ("設定を保存できず、元に戻すこともできませんでした。\n"
                        "設定ファイルに書き込めない可能性があります。")
         else:
