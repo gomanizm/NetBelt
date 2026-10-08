@@ -84,7 +84,14 @@ NetBelt が数えられるのは、自分の表示待ちで捨てた分だけで
 手前で Windows の受信バッファがあふれて落ちた分（毎秒数千件の嵐で
 起こります）は NetBelt に届かないので数えられません。取りこぼしが
 無かったかは、送信側機器の Trap の送信数（Cisco IOS なら `show snmp` の
-Trap PDUs）と一覧の件数を比べて確かめてください。なお
+Trap PDUs）と一覧の件数を比べて確かめてください。ただし一覧に残るのは
+`settings.snmp.max_traps` 件（既定 1000 件）までで、それを超えた分は
+落ちていなくても古い方から消えます。比べられるのは、送った数が
+その件数以下のときだけなので、確かめる前に一覧をクリアしてください。
+一覧に残す件数を増やすには、NetBelt を閉じてから `config.json` の
+`settings` の中に `"snmp": {"max_traps": 5000}` のように書き足して
+（既定の `config.json` にこの項目はありません。あればその値を大きく
+して）、起動し直してください。なお
 `netstat -s -p udp` の「IPv4 の UDP 統計」の「受信エラー」（英語版の
 Windows では「UDP Statistics for IPv4」の「Receive Errors」）は、
 Windows 11 で 127.0.0.1 宛てに試した範囲では、受信バッファで落ちた分を
@@ -324,7 +331,13 @@ none).
 NetBelt can only count what it drops itself. Datagrams that Windows
 discards because the receive buffer overflowed (storms of thousands per
 second) never reach it. To check for those, compare the sending device's
-trap counter (Trap PDUs in Cisco IOS `show snmp`) with the list. In a test
+trap counter (Trap PDUs in Cisco IOS `show snmp`) with the list. The list
+keeps at most `settings.snmp.max_traps` traps (1000 by default) and removes
+the oldest beyond that even when none were lost, so the comparison only
+works if no more traps were sent than that. Clear the list first. To
+keep more, close NetBelt, add `"snmp": {"max_traps": 5000}` (or another
+number) under `settings` in `config.json` (the default file does not have
+it; if yours does, raise the value) and start it again. In a test
 against 127.0.0.1 on Windows 11, the "Receive Errors" line of
 `netstat -s -p udp` did not count receive-buffer overflows.
 
