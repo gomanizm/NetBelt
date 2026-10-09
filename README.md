@@ -137,6 +137,11 @@ Windows 11 で 127.0.0.1 宛てに試した範囲では、受信バッファで�
 Windows SmartScreen の警告が出る場合は「詳細情報」→「実行」を選んでください
 （コード署名証明書を持たないため、署名なしの実行ファイルとして扱われます）。
 
+設定（機器・グループなど）は、起動したフォルダの `config.json` に保存されます（無ければ作ります）。
+NetBelt.exe と同じフォルダから起動してください。別のフォルダから起動すると、そのフォルダの
+`config.json` を使うので、設定が分かれます。使っているファイルの場所は、ヘルプ → バージョン情報の
+「設定ファイル」に出ます。
+
 ## ファイアウォールについて
 
 受信サーバ（FTP / TFTP / Syslog / SFTP / SNMP Trap）は、起動しても Windows Defender
@@ -351,6 +356,12 @@ run on other platforms. The portable build does not require Python.
 See [Releases](https://github.com/gomanizm/NetBelt/releases). Windows SmartScreen
 will warn about the executable because it is not code-signed; choose
 **More info** then **Run anyway**.
+
+Settings (devices, groups and so on) are kept in `config.json` in the folder
+NetBelt is started from, which is created if it is missing. Start NetBelt.exe
+from its own folder: started from another folder, it uses the `config.json`
+there, so your settings end up split. Help → バージョン情報 ("Version info")
+shows the full path of the file in use.
 
 ### Firewall
 
