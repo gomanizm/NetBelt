@@ -25,6 +25,18 @@ EARLIER_SESSION_FILES_MESSAGE = (
     "（開いておけるファイルはサーバー全体で %d 個まで。閉じ終われば空きます）")
 
 
+def _print_quietly(line):
+    """診断の行を 1 行出す。出力先へ書けないときの例外（容量不足など）は捨てる。
+
+    exe では標準出力がログファイルなので、保存先の容量不足などの間は print が
+    例外を出す。診断の行は、開けなかった open の枠の返却・セッションの終わりの
+    後始末・起動と停止の途中からも出すので、例外を出すとその処理が飛ぶ。標準出力が
+    無い（None）ときに print が黙って捨てるのと同じ扱いにする
+    """
+    with contextlib.suppress(Exception):
+        print(line)
+
+
 class _LogLimiter:
     """診断の行（print）を種類ごとに間引く。
 
@@ -66,7 +78,7 @@ class _LogLimiter:
             else:
                 window[2] += 1
         for line in lines:
-            print(line)
+            _print_quietly(line)
 
     def _clip(self, text):
         """MAX_LINE_CHARS を超えた行を切り、切った文字数を添える"""
@@ -82,7 +94,7 @@ class _LogLimiter:
                        for kind, window in self._windows.items() if window[2]]
             self._windows.clear()
         for kind, count in omitted:
-            print(self._summary(kind, count))
+            _print_quietly(self._summary(kind, count))
 
     def _summary(self, kind, count):
         return ("[SFTP Server] %s: %d more line(s) suppressed (limit %d per %ds)"
@@ -428,8 +440,10 @@ class SFTPServerHandler(SFTPServerInterface):
             try:
                 handle.close()
             except Exception as e:
-                _log_limited("session end error",
-                             f"[SFTP Server] session end error: {e}")
+                # 記録に失敗しても、残りのハンドルを閉じ続ける
+                with contextlib.suppress(Exception):
+                    _log_limited("session end error",
+                                 f"[SFTP Server] session end error: {e}")
 
     def _take_open_file(self, path):
         """開いているファイルの上限（_OpenFiles）を見て 1 個ぶん数える。
@@ -623,6 +637,7 @@ class SFTPServerHandler(SFTPServerInterface):
         slot = self._take_open_file(path)
         if slot is False:
             return SFTP_FAILURE
+        result = SFTP_FAILURE
         try:
             with (self._busy(path) if guarded else contextlib.nullcontext()):
                 result = self._open(path, flags, writing, tracked, slot)
@@ -630,8 +645,11 @@ class SFTPServerHandler(SFTPServerInterface):
             # _open は自分で失敗を返すので、ここへ来るのは停止の後の要求だけ
             _log_limited("open error", f"[SFTP Server] open error: {e}")
             result = SFTP_FAILURE
-        if not isinstance(result, SFTPHandle) and slot is not None:
-            slot()
+        finally:
+            # 開けなかった枠は、記録の成否に関係なく返す（同じ枠は 2 回目から
+            # 何もしない）
+            if not isinstance(result, SFTPHandle) and slot is not None:
+                slot()
         return result
 
     def _open(self, path, flags, writing, tracked, slot=None):
@@ -1175,12 +1193,14 @@ class SFTPServerManager(QObject):
         # 前の起動のセッションのファイルが閉じ終わっていなければ（共有フォルダの
         # close が止まっているなど）、その分は数に残り、閉じ終えるまで新しい
         # open に使えない。待たずに（画面を固めない）診断の行へ残す。
-        # パネルのログへは、起動した後で同じ件数を 1 回だけ出す（_run_server）
+        # パネルのログへは、起動した後で同じ件数を 1 回だけ出す（_run_server）。
+        # 待ち受けソケットを開いた後なので、書けなくても例外で抜けない（抜けると
+        # ソケットが開いたまま残り、同じポートで起動できなくなる）
         still_open = self._open_files._in_use
         if still_open:
-            print(f"[SFTP Server] {still_open} file(s) from earlier sessions "
-                  f"still open, counted toward the limit "
-                  f"({self._open_files.total}) until closed")
+            _print_quietly(f"[SFTP Server] {still_open} file(s) from earlier "
+                           f"sessions still open, counted toward the limit "
+                           f"({self._open_files.total}) until closed")
 
         # サーバースレッドを起動。停止フラグは起動ごとに作り直して渡す。
         # 使い回して clear() すると、前回の stop() で抜けきらなかった
@@ -1233,7 +1253,9 @@ class SFTPServerManager(QObject):
         if thread is None or not thread.is_alive():
             return self._previous_stop_finished()
 
-        print("[SFTP Server] Stopping server...")
+        # stop() の行は、ログへ書けなくても例外で抜けない（抜けると停止フラグを
+        # 立てる前に戻り、待ち受けが動き続ける）
+        _print_quietly("[SFTP Server] Stopping server...")
         # 停止フラグは接続一覧と同じロックの下で立てる。待受ループは
         # accept 復帰後に同じロックの下で「まだ停止していないか」を見て
         # から登録するので、どちらが先でも接続は必ずどちらかに閉じられる
@@ -1292,14 +1314,15 @@ class SFTPServerManager(QObject):
         for writer, _path in self._open_writers.alive():
             writer.join(timeout=max(0.0, deadline - time.monotonic()))
         for writer, path in self._open_writers.alive():
-            print(f"[SFTP Server] File operation still in progress after stop: {path}")
+            _print_quietly(f"[SFTP Server] File operation still in progress "
+                           f"after stop: {path}")
             if writer not in self._unfinished:
                 self._unfinished.append(writer)
         # 間引いたまま出していない件数を残す（同じ種類の行がもう来なくても
         # 失わない）
         _diag_log.flush()
         self.stopped.emit()
-        print("[SFTP Server] Server stopped")
+        _print_quietly("[SFTP Server] Server stopped")
         return self._previous_stop_finished()
 
     def _previous_stop_finished(self):

@@ -351,19 +351,38 @@ class SftpOpenFileCapTest(unittest.TestCase):
                         "断ったことがパネルのログへ届かない: %r" % self.notices)
 
     def test_session_ended_does_not_raise(self):
-        """数を戻す処理が失敗しても、session_ended は例外を外へ出さないこと。
+        """残ったファイルの close が例外を出しても、session_ended は例外を外へ
+        出さず、残りのファイルも閉じて数を戻すこと。
 
-        paramiko の finish_subsystem は session_ended を呼んでから残ったハンドルを
-        閉じ、例外は握りつぶす。例外が出ると、その後のハンドルの後始末が飛ぶ
+        paramiko の finish_subsystem は session_ended を呼んでからチャネルと
+        残ったハンドルを閉じ、例外は握りつぶす。例外が出ると、その後の後始末が
+        飛ぶ。以前のこの試験は、session_ended がもう呼ばない _OpenFiles.end の
+        失敗を模していて、開いたファイルも無かったので、何も確かめずに通っていた。
+        記録（print）が書けないときは test_sftp_server_log_write_failure.py で
+        確かめる
         """
-        from core.sftp_server import SFTPServerHandler
+        import paramiko
+        from core.sftp_server import SFTPServerHandler, _OpenFiles
+        open_files = _OpenFiles(3, 3)
+        handler = SFTPServerHandler(None, self.root, open_files=open_files)
+        handles = [handler.open("/a.txt", os.O_RDONLY, paramiko.SFTPAttributes())
+                   for _ in range(3)]
+        for handle in handles:
+            self.assertIsInstance(handle, paramiko.SFTPHandle)
+        self.assertEqual(open_files._in_use, 3)
+        real_close = paramiko.SFTPHandle.close
 
-        class _Broken:
-            def end(self, session):
-                raise RuntimeError("broken")
+        def close_then_raise(handle):
+            # 差し替えはプロセス全体に効くので、例外はこの試験のハンドルだけ
+            real_close(handle)
+            if any(handle is h for h in handles):
+                raise RuntimeError("close failed")
 
-        handler = SFTPServerHandler(None, self.root, open_files=_Broken())
-        handler.session_ended()
+        with mock.patch.object(paramiko.SFTPHandle, "close", close_then_raise):
+            handler.session_ended()
+        self.assertEqual([h.readfile.closed for h in handles], [True] * 3,
+                         "閉じ残した")
+        self.assertEqual((open_files._in_use, open_files._held), (0, {}))
 
 
 if __name__ == "__main__":
