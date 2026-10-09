@@ -114,6 +114,26 @@ class SNMPResultTableModel(QAbstractTableModel):
 
 
 
+# 走り始めた MIB 読み込みスレッドを、走り終えるまでここで持つ。
+#
+# スレッドは親を持たず、ほかの参照はパネルの mib_thread だけになる。
+# run() の実行中は、PyQt6 が run() を呼んでいる間の参照（束縛メソッドの
+# self）がスレッドを生かすが、start() から作業スレッドが run() に入るまで
+# の間（実測で普段は数 ms、CPU が混むと数百 ms）は誰も持たない。この間に
+# パネルが捨てられると、sip が実行中の QThread をその場で delete し、Qt が
+# qFatal（"QThread: Destroyed while thread '' is still running"）で
+# プロセスごと落とす（終了コード 0xC0000409。テストの実行では stderr にも
+# faulthandler にも何も残らなかった）。アプリではパネルは窓と同じだけ
+# 生きるが、テストはパネルを作って数 ms で捨てるので、CPU が混んだときに
+# これを踏んでいた。走り終えたスレッドは、次のスレッドを足すときに外す。
+_mib_loaders = []
+
+
+def _keep_until_finished(thread):
+    """thread を走り終えるまで持つ（走り終えたものは、ここで外す）"""
+    _mib_loaders[:] = [t for t in _mib_loaders if not t.isFinished()] + [thread]
+
+
 class MIBLoaderThread(QThread):
     """MIB読み込みスレッド"""
     progress = pyqtSignal(str)  # ステータスメッセージ
@@ -1083,6 +1103,8 @@ class SNMPPanel(QWidget):
         # MIB読み込みスレッド作成
         self.mib_thread = MIBLoaderThread()
         self.mib_thread.finished_signal.connect(self._on_background_mib_load_finished)
+        # run() に入るまでの間、パネルの参照だけにしない（_mib_loaders の注記）
+        _keep_until_finished(self.mib_thread)
         self.mib_thread.start()
     
     # MIB 読み込みスレッドの終了を待つ上限（ミリ秒）。mibs/ が空なら
@@ -1108,7 +1130,7 @@ class SNMPPanel(QWidget):
         再現しないので落とした。実測（いずれも offscreen）:
           - 待ちを空実装にして MainWindow を閉じ、del して gc しても、
             実行中の QThread は破棄されない。3 周とも終了コード 0・
-            stderr 空（PyQt6 が実行中の QThread への参照を保つ）。
+            stderr 空（スレッドが run() の中にいたため。下の注意を参照）。
           - main() と同じく app.exec() を回し、6 秒かかる読み込みを残した
             まま終了しても、待つ／待たないの両方で 3 回とも終了コード 0、
             "QThread: Destroyed while thread is still running" も無し。
@@ -1119,6 +1141,15 @@ class SNMPPanel(QWidget):
         テストスイートを落としていた間欠 segfault の本当の原因は、
         SNMPManager が connect(signal.emit) でシグナルを中継していたこと
         だった（47ecbde）。
+
+        注意: 取り消したうちの abort の件は、run() に入る前なら実際に
+        起きる。PyQt6 がスレッドへの参照を保つのは run() を呼んでいる
+        間だけで、start() から作業スレッドが run() に入るまでの間に
+        パネルが破棄されると Qt が abort する（テストがパネルを作って
+        数 ms で捨てたとき、CPU が混んでいると踏んでいた）。abort を
+        確かめた上の 2 つの実測は、どれもスレッドが run() に入った後に
+        破棄していたので、この間を見ていなかった。いまはこの間を
+        _mib_loaders が持つ。
 
         制限: 待ちは MIB_LOADER_WAIT_MS が上限で、戻り値は見ていない。
         上限を過ぎたら待つのをやめ、読み込み中のまま閉じる処理を続ける。
@@ -1136,8 +1167,9 @@ class SNMPPanel(QWidget):
         超えても落ちない。遅延を 5.22〜5.6 秒に伸ばした 13 回の実行は
         いずれも終了コード 0・stderr 空で、8 秒かかるスレッドを残した
         まま閉じても "QThread: Destroyed while thread is still running"
-        は出なかった（PyQt6 が実行中の QThread への参照を保持するため、
-        パネルが破棄されてもスレッド側は破棄されない）。解析の途中で
+        は出なかった（スレッドは run() の中にいて、run() の呼び出しが
+        参照を持つため、パネルが破棄されてもスレッド側は破棄されない。
+        run() に入る前の間は _mib_loaders が持つ）。解析の途中で
         終了してもキャッシュは書かれないだけで、次回また作り直される。
 
         利用者に見える影響は、閉じる操作が最大でこの上限ぶん固まること。
