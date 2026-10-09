@@ -740,8 +740,15 @@ class _TrapBacklog:
             self._burst_last = now
             started = self._burst == 1
         if started:
-            print("[SNMPManager] Trap backlog reached its limit (%d); dropping "
-                  "newly received traps until the GUI catches up" % self.limit)
+            # 受信スレッドの通知コールバックの中で書く。出力先へ書けなくても
+            # （容量不足など）例外を pysnmp へ出さない（出すと、その Trap の
+            # pysnmp の後始末（送信元の控えの削除）が飛び、あふれ始めのたびに
+            # 1 件ずつ残る。実測）
+            try:
+                print("[SNMPManager] Trap backlog reached its limit (%d); dropping "
+                      "newly received traps until the GUI catches up" % self.limit)
+            except Exception:
+                pass
         return False
 
     def delivered(self):
@@ -1191,7 +1198,14 @@ class SNMPTrapReceiver(QThread):
             if not stop_before_start:
                 dispatcher.run_dispatcher()
 
-            print(f"[SNMPTrapReceiver] 正常終了")
+            # 出力先へ書けなくても（容量不足など）例外を出さない。出すと下の
+            # except の行も書けず、例外が run() の外（excepthook）へ出る。
+            # main.py の excepthook はこのスレッドのままダイアログを開くので、
+            # stop_trap_receiver の wait が時間切れになり、停止が終わらない
+            try:
+                print(f"[SNMPTrapReceiver] 正常終了")
+            except Exception:
+                pass
 
         except Exception as e:
             print(f"[SNMPTrapReceiver] エラー: {str(e)}")
@@ -1252,7 +1266,12 @@ class SNMPTrapReceiver(QThread):
         しまう。bind() だけして start() していない受信機なら、ここで
         待ち受けソケットとエンジンを閉じる。
         """
-        print(f"[SNMPTrapReceiver] 停止要求")
+        # 出力先へ書けなくても（容量不足など）例外を出さない（出すと停止を
+        # 求める前に抜け、受信スレッドが動き続ける）
+        try:
+            print(f"[SNMPTrapReceiver] 停止要求")
+        except Exception:
+            pass
         self._running = False
 
         with self._state_lock:
@@ -1533,11 +1552,17 @@ class SNMPManager(QObject):
         """捨てた件数の要約を 1 行書く
 
         README は「Trap backlog」を含む行を見るよう案内している。
+        出力先へ書けなくても（容量不足など）例外は出さない。呼び出し元は
+        この後でパネルへ件数を知らせる・受信の停止を終える（_on_trap_queued・
+        stop_trap_receiver）ので、書けないのはこの行だけにする。
         """
         count, first, last = summary
-        print("[SNMPManager] %s: dropped %d trap(s) between %s and %s "
-              "(limit %d)" % (head, count, first.strftime("%H:%M:%S"),
-                              last.strftime("%H:%M:%S"), limit))
+        try:
+            print("[SNMPManager] %s: dropped %d trap(s) between %s and %s "
+                  "(limit %d)" % (head, count, first.strftime("%H:%M:%S"),
+                                  last.strftime("%H:%M:%S"), limit))
+        except Exception:
+            pass
 
     def _summarise_trap_backlog(self):
         """今の回の、まだ要約していない取りこぼしをすぐログへ書く
@@ -1601,8 +1626,13 @@ class SNMPManager(QObject):
             # terminate() は任意の位置でスレッドを殺すためソケットや内部状態が
             # 壊れる。ここでは強制終了せず、参照を保持して破棄だけ防ぐ
             # （実行中の QThread を破棄するとプロセスごと落ちる）。
-            print("[SNMPManager] 警告: Trap受信スレッドが5秒以内に終了しませんでした。"
-                  "強制終了はせず、終了するまで参照を保持します")
+            # 出力先へ書けなくても（容量不足など）例外を出さない（出すと
+            # 参照の保持・取りこぼしの要約・停止の知らせが飛ぶ）
+            try:
+                print("[SNMPManager] 警告: Trap受信スレッドが5秒以内に終了しませんでした。"
+                      "強制終了はせず、終了するまで参照を保持します")
+            except Exception:
+                pass
             self._retire(receiver)
 
         # 配送待ちが捌け切るのを待たずに書く。アプリの終了で配られずに

@@ -1592,7 +1592,12 @@ class SNMPPanel(QWidget):
     
     def _on_trap_receiver_stopped(self):
         """Trap受信停止時の処理"""
-        print("[SNMPPanel] Trap受信が停止しました")
+        # 出力先へ書けなくても（容量不足など）例外を出さない（出すと表示を
+        # 戻す処理が飛び、stopped は 1 回しか来ないので開始ボタンが戻らない）
+        try:
+            print("[SNMPPanel] Trap受信が停止しました")
+        except Exception:
+            pass
         self._show_trap_stopped()
     
     def _on_error_occurred(self, error: str):
