@@ -482,8 +482,14 @@ class ConfigManager:
         # 全文を print してから控えるので使わない）
         self.load_warning = (f"{self.load_warning}\n\n{message}"
                              if self.load_warning else message)
-        print(f"[Config] Not a NetBelt config file, leaving it untouched: "
-              f"{self.foreign_config_path!a}")
+        # 出力先へ書けないとき（容量不足など）の例外も出さない。1 回だけ
+        # 失敗して次の行から書けると、同じく破損扱いへ進み、バックアップの
+        # 整理がこのフォルダの config.json.backup_* を消していた
+        try:
+            print(f"[Config] Not a NetBelt config file, leaving it untouched: "
+                  f"{self.foreign_config_path!a}")
+        except Exception:
+            pass
         return self._load_default_config()
 
     def _load_config(self) -> Dict:
@@ -541,6 +547,11 @@ class ConfigManager:
                 self.save_config()
             return config
         except Exception as e:
+            # 他アプリの JSON と判定した後の例外（ログを書けないなど）も、
+            # 破損扱い（load_error・バックアップ・古いバックアップの整理）に
+            # しない。整理は同じ名前の形のファイルを消す
+            if self.foreign_config_path:
+                return self._load_default_config()
             print(f"[ERROR] 設定ファイルの読み込みエラー: {e}")
             # エラー情報を保存
             self.load_error = str(e)
