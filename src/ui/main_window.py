@@ -17,7 +17,9 @@ from .dialogs.group_dialog import GroupDialog
 from .dialogs.macro_dialog import MacroDialog
 from .dialogs.settings_dialog import SettingsDialog
 from core.config_manager import (ConfigManager, count_macros_named,
-                                 device_endpoint)
+                                 device_endpoint, foreign_config_hint,
+                                 foreign_config_refusal,
+                                 FOREIGN_CONFIG_PATH_NOTE)
 from core.ssh_connection import SSHConnection
 from core.serial_connection import SerialConnection
 from core.telnet_connection import TelnetConnection
@@ -31,6 +33,21 @@ from typing import Dict, Union, Optional
 from datetime import datetime
 import os
 import time
+
+
+def _print_quietly(line):
+    """終了処理の行を 1 行出す。出力先へ書けないときの例外（容量不足など）は捨てる。
+
+    exe では標準出力がログファイルなので、保存先の容量不足などの間は print が
+    例外を出す。closeEvent で例外を出すと、その後ろのサーバーや受信の停止・
+    端末の記録の書き切り・知らせの切り離し・別ウィンドウの片付けが飛ぶ
+    （core.sftp_server の _print_quietly と同じ扱い）
+    """
+    try:
+        print(line)
+    except Exception:
+        pass
+
 
 class DetachableTabBar(QTabBar):
     """タブを下方向へ十分ドラッグすると、そのタブを別ウィンドウへ切り離すタブバー。"""
@@ -600,7 +617,8 @@ class MainWindow(QMainWindow):
                 self._load_devices()
                 self.status_bar.showMessage(f"機器 '{device_data['name']}' を追加しました")
             else:
-                QMessageBox.warning(self, "エラー", "機器の追加に失敗しました。")
+                QMessageBox.warning(self, "エラー", "機器の追加に失敗しました。"
+                                    + foreign_config_hint(self.config_manager))
     
     def _on_device_connect(self, group_name: str, device_data: dict):
         """
@@ -700,7 +718,8 @@ class MainWindow(QMainWindow):
             else:
                 QMessageBox.warning(self, "エラー", "機器の更新に失敗しました。設定は変更されていません。"
                                     + self._same_name_group_hint(
-                                        group_name, old_device_name, device_data))
+                                        group_name, old_device_name, device_data)
+                                    + foreign_config_hint(self.config_manager))
     
     def _on_device_delete(self, group_name: str, device_name: str,
                           device_data: dict = None):
@@ -779,7 +798,8 @@ class MainWindow(QMainWindow):
                     self._load_devices()
                 QMessageBox.warning(self, "エラー", "機器の削除に失敗しました。"
                                     + self._same_name_group_hint(
-                                        group_name, device_name, device_data))
+                                        group_name, device_name, device_data)
+                                    + foreign_config_hint(self.config_manager))
     
     def _on_device_duplicate(self, group_name: str, device_data: dict):
         """
@@ -821,7 +841,8 @@ class MainWindow(QMainWindow):
                 self._load_devices()
                 self.status_bar.showMessage(f"機器 '{new_device_data['name']}' を追加しました")
             else:
-                QMessageBox.warning(self, "エラー", "機器の追加に失敗しました。")
+                QMessageBox.warning(self, "エラー", "機器の追加に失敗しました。"
+                                    + foreign_config_hint(self.config_manager))
     
     def _on_device_moved(self, source_group_name: str, target_group_name: str,
                          device_name: str, device_data: dict = None):
@@ -847,7 +868,8 @@ class MainWindow(QMainWindow):
         else:
             QMessageBox.warning(self, "エラー", "機器の移動に失敗しました。"
                                 + self._same_name_group_hint(
-                                    source_group_name, device_name, device_data))
+                                    source_group_name, device_name, device_data)
+                                + foreign_config_hint(self.config_manager))
     
     def _on_connect_requested(self, device_data: dict):
         """
@@ -1862,7 +1884,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self, "エラー",
                 f"{what}を設定ファイルへ保存できませんでした。\n"
-                "保存できなかったので、変更は反映していません。")
+                "保存できなかったので、変更は反映していません。"
+                + foreign_config_hint(self.config_manager))
         else:
             QMessageBox.warning(self, "エラー", f"{what}に失敗しました。")
 
@@ -2648,9 +2671,19 @@ class MainWindow(QMainWindow):
         
         # 決め打ちの色は暗い配色で沈む。地に追従させる。
         dim_colour = theme.dim(theme.surface(self)).name()
+        # 起動の仕方で読む config.json が変わるので、どれかを確かめられる
+        # ようにする。RichText なので & や < を含むパスは逃がし、連続した
+        # 空白が 1 つに縮まないよう pre-wrap で包む（&nbsp; と違い、コピー
+        # しても本物の空白のまま）。他アプリのファイルなら使っていないと添える
+        from html import escape
+        config_file = ('<span style="white-space: pre-wrap;">'
+                       f'{escape(self.config_manager.config_file_path())}</span>')
+        if foreign_config_refusal(self.config_manager):
+            config_file += escape(FOREIGN_CONFIG_PATH_NOTE)
         info_text = f"""<h2>{app_name}</h2>
 <p><b>バージョン:</b> {version}</p>
 <p><b>リポジトリ:</b> <a href="https://github.com/{repo}">github.com/{repo}</a></p>
+<p><b>設定ファイル:</b> {config_file}</p>
 <br>
 <p style="font-size: 10pt; color: {dim_colour};">
 Copyright (C) 2026 NetBelt Contributors<br>
@@ -3057,7 +3090,7 @@ for details.
         self._save_layout()
         # Syslogレシーバーを停止
         if hasattr(self, 'syslog_receiver') and self.syslog_receiver.is_running:
-            print("[Main] Stopping Syslog receiver...")
+            _print_quietly("[Main] Stopping Syslog receiver...")
             self.syslog_receiver.stop()
         
         # SFTPサーバーを停止。is_running では判定しない。あのフラグを
@@ -3068,17 +3101,17 @@ for details.
         if hasattr(self, 'sftp_server_panel'):
             sftp_thread = self.sftp_server_panel.sftp_server.server_thread
             if sftp_thread is not None and sftp_thread.is_alive():
-                print("[Main] Stopping SFTP server...")
+                _print_quietly("[Main] Stopping SFTP server...")
                 self.sftp_server_panel.sftp_server.stop()
         
         # TFTPサーバーを停止
         if hasattr(self, 'tftp_server_panel') and self.tftp_server_panel.tftp_server.is_running:
-            print("[Main] Stopping TFTP server...")
+            _print_quietly("[Main] Stopping TFTP server...")
             self.tftp_server_panel.tftp_server.stop()
         
         # FTPサーバーを停止
         if hasattr(self, 'ftp_server_panel') and self.ftp_server_panel.ftp_server.is_running:
-            print("[Main] Stopping FTP server...")
+            _print_quietly("[Main] Stopping FTP server...")
             self.ftp_server_panel.ftp_server.stop()
         
         # SNMP Trap 受信とワーカースレッドを停止。受信スレッドを
@@ -3087,11 +3120,11 @@ for details.
         # 領域へ届いてプロセスが落ちていた（中継は 47ecbde で直した）。
         if hasattr(self, 'snmp_panel') and hasattr(self.snmp_panel, 'snmp_manager'):
             try:
-                print("[Main] Stopping SNMP threads...")
+                _print_quietly("[Main] Stopping SNMP threads...")
                 self.snmp_panel.snmp_manager.cancel_operation()
                 self.snmp_panel.snmp_manager.stop_trap_receiver()
             except Exception as e:
-                print(f"[Main] SNMP 停止エラー: {e}")
+                _print_quietly(f"[Main] SNMP 停止エラー: {e}")
         # バックグラウンドの MIB 読み込み（QThread）も待つ。起動直後に
         # 閉じると読み込み中のことがあり、待たないと MIB キャッシュの
         # 書き出しがプロセス終了で切られる（落ちはしない。詳細は
@@ -3100,7 +3133,7 @@ for details.
             try:
                 self.snmp_panel.wait_for_background_work()
             except Exception as e:
-                print(f"[Main] MIB 読み込みの待機エラー: {e}")
+                _print_quietly(f"[Main] MIB 読み込みの待機エラー: {e}")
 
         # すべてのマクロをクリーンアップ
         for device_name in list(self.connections.keys()):
@@ -3132,6 +3165,17 @@ for details.
             except Exception:
                 pass
         self.sftp_managers.clear()
+
+        # 配られていない Trap は一覧へ入れずに捨て、件数だけをログへ書く。
+        # 配り切るのは待たない。下の記録の書き切り（_drain_output_before_log_finish
+        # と finish_log_recordings）は配送待ちをその場で配るので、その前に
+        # 数え終える。後に置くと、記録中は閉じかけの窓の一覧へ全部配ってから
+        # 数えるので 0 件になる（SNMPManager.discard_undelivered_traps）
+        if hasattr(self, 'snmp_panel') and hasattr(self.snmp_panel, 'snmp_manager'):
+            try:
+                self.snmp_panel.snmp_manager.discard_undelivered_traps()
+            except Exception as e:
+                _print_quietly(f"[Main] SNMP の後始末エラー: {e}")
 
         # 受信済みでまだ描いていない出力を記録し切ってから、記録を止めて
         # ファイルを閉じる。記録へ書くのは描くときなので、ここで済ませないと

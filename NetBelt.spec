@@ -28,7 +28,10 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    # Invoke は exe に入れない。paramiko.config が try で import するだけで、
+    # 使うのは SSHConfig の Match exec のときだけ（NetBelt は SSHConfig を
+    # 使わない）。入れると vendor の yaml などを含めて通知への記載が要る
+    excludes=['invoke'],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,

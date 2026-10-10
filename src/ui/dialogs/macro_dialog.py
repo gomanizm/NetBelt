@@ -11,7 +11,8 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, pyqtSignal
 from typing import List, Optional
 
-from core.config_manager import count_macros_named, is_readable_macro
+from core.config_manager import (count_macros_named, foreign_config_hint,
+                                 foreign_config_refusal, is_readable_macro)
 
 
 class MacroDialog(QDialog):
@@ -296,7 +297,8 @@ class MacroDialog(QDialog):
                 # 選んだ場合、案内だけでは利用者が一覧から消せない。
                 # 設定に合わせて読み直してから知らせる
                 self._load_presets()
-                QMessageBox.warning(self, "エラー", "プリセットの削除に失敗しました。")
+                QMessageBox.warning(self, "エラー", "プリセットの削除に失敗しました。"
+                                    + foreign_config_hint(self.config_manager))
     
     def _refuse_duplicate_name(self, preset_name: str, action: str) -> bool:
         """同じ名前のプリセットが複数あれば理由を出して True を返す（操作は断る）
@@ -465,14 +467,19 @@ class PresetEditDialog(QDialog):
                 QMessageBox.information(self, "成功", f"プリセット '{name}' を作成しました。")
                 self.accept()
             else:
+                # 他アプリの config.json で動いている回は、書き込めないのでは
+                # なく書かない。書き込めるかの確認ではなく、断った理由を出す
+                reason = foreign_config_refusal(self.config_manager)
                 QMessageBox.warning(
                     self, "エラー",
                     f"プリセット '{name}' を保存できませんでした。\n"
-                    "設定ファイル (config.json) に書き込めるか確認してください。")
+                    + (f"\n{reason}" if reason else
+                       "設定ファイル (config.json) に書き込めるか確認してください。"))
         else:
             # 更新
             if self.config_manager.update_global_macro(name, commands, description):
                 QMessageBox.information(self, "成功", f"プリセット '{name}' を更新しました。")
                 self.accept()
             else:
-                QMessageBox.warning(self, "エラー", "プリセットの更新に失敗しました。")
+                QMessageBox.warning(self, "エラー", "プリセットの更新に失敗しました。"
+                                    + foreign_config_hint(self.config_manager))

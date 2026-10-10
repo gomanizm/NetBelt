@@ -85,7 +85,11 @@ class SftpNoticeBacklogTest(unittest.TestCase):
         return m, port, log
 
     def _knock(self, m, port, times):
-        """認証を通さない接続→即切断を繰り返す（1 本ずつ終わらせる）"""
+        """認証を通さない接続→即切断を繰り返す。
+
+        次へ進むのはマネージャが掴んでいるソケットが無くなってからだが、待受が
+        accept する前にも無くなって見えるので、1 本ずつ終わるとは限らない
+        """
         for _ in range(times):
             c = socket.socket()
             c.settimeout(3)
@@ -106,9 +110,10 @@ class SftpNoticeBacklogTest(unittest.TestCase):
         """通知が出そろうまで待つ（増えなくなってから quiet 秒）。
 
         _knock は「マネージャが掴んでいるソケットが無くなったか」で待つが、
-        通知を出すのはその後片付けと同じスレッドの別の場所なので、戻った
-        時点ではまだ 1 件出ていないことがある（実測: 5 回に 1 回ほど
-        connected が 4 件のまま）。数を確かめる前にここで落ち着かせる。
+        待受がまだ accept していない接続や、ソケットを外した後でまだ切断を
+        数えていない接続は見えないので、戻った時点ではまだ 1 件出ていない
+        ことがある（実測: 5 回に 1 回ほど connected が 4 件のまま）。
+        数を確かめる前にここで落ち着かせる。
         """
         deadline = time.time() + timeout
         last = None
@@ -149,6 +154,27 @@ class SftpNoticeBacklogTest(unittest.TestCase):
     def test_the_omitted_count_is_reported_once_the_gui_catches_up(self):
         m, port, log = self._manager(max_pending=6)
         self._knock(m, port, 40)
+
+        # GUI を回す前に、40 回ぶんの接続と切断（80 件）が、出たか省略件数に
+        # 数えたかのどちらかになるまで待つ。_knock は待受の accept より先に
+        # 戻ることがあり、切断はソケットを外した後に数えるので、戻った時点では
+        # そろっていないことがある。この間は GUI を回さないので配送待ちは 0 に
+        # 戻らず、省略件数もリセットされない。この接続の流れでは接続と切断の
+        # ほかに通知は出ない
+        deadline = time.monotonic() + 5
+        while True:
+            with m._notice_lock:
+                pending, dropped = m._pending_notices, m._dropped_notices
+            connected = len(log["connected"])
+            disconnected = len(log["disconnected"])
+            if (connected + disconnected + dropped >= 2 * 40
+                    or time.monotonic() >= deadline):
+                break
+            time.sleep(0.01)
+        self.assertEqual(connected + disconnected + dropped, 2 * 40,
+                         "接続と切断が数え終わらない: connected %d・disconnected %d・"
+                         "_pending_notices %d・_dropped_notices %d"
+                         % (connected, disconnected, pending, dropped))
 
         # GUI が追いついた時点で 1 行だけ出る
         deadline = time.time() + 5

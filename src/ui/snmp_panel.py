@@ -114,6 +114,26 @@ class SNMPResultTableModel(QAbstractTableModel):
 
 
 
+# 走り始めた MIB 読み込みスレッドを、走り終えるまでここで持つ。
+#
+# スレッドは親を持たず、ほかの参照はパネルの mib_thread だけになる。
+# run() の実行中は、PyQt6 が run() を呼んでいる間の参照（束縛メソッドの
+# self）がスレッドを生かすが、start() から作業スレッドが run() に入るまで
+# の間（実測で普段は数 ms、CPU が混むと数百 ms）は誰も持たない。この間に
+# パネルが捨てられると、sip が実行中の QThread をその場で delete し、Qt が
+# qFatal（"QThread: Destroyed while thread '' is still running"）で
+# プロセスごと落とす（終了コード 0xC0000409。テストの実行では stderr にも
+# faulthandler にも何も残らなかった）。アプリではパネルは窓と同じだけ
+# 生きるが、テストはパネルを作って数 ms で捨てるので、CPU が混んだときに
+# これを踏んでいた。走り終えたスレッドは、次のスレッドを足すときに外す。
+_mib_loaders = []
+
+
+def _keep_until_finished(thread):
+    """thread を走り終えるまで持つ（走り終えたものは、ここで外す）"""
+    _mib_loaders[:] = [t for t in _mib_loaders if not t.isFinished()] + [thread]
+
+
 class MIBLoaderThread(QThread):
     """MIB読み込みスレッド"""
     progress = pyqtSignal(str)  # ステータスメッセージ
@@ -189,6 +209,8 @@ class SNMPPanel(QWidget):
         self.trap_tree_model = QStandardItemModel(self)
         self.trap_data_list = []  # 完全なTrapデータ（エクスポート用）
         self.max_traps = self._configured_max_traps()
+        # 配送待ちの上限で捨てた Trap の件数（受信開始とクリアで 0 に戻す）
+        self._trap_dropped = 0
         # WALK が途中で途切れたときの理由。結果より先に届き、結果を
         # 表示するときに使って忘れる
         self._partial_reason = None
@@ -463,7 +485,7 @@ class SNMPPanel(QWidget):
         # 手動FW許可（3CDaemon方式で通らない時の復旧用・押した時だけ管理者昇格/UAC）
         fw_layout = QHBoxLayout()
         self.fw_allow_btn = QPushButton("ファイアウォールで許可（管理者）")
-        self.fw_allow_btn.setToolTip("Trap が届かない場合に押してください。Windowsファイアウォールの受信許可を追加します（管理者昇格/UACが1回出ます）。")
+        self.fw_allow_btn.setToolTip("Trap が届かない場合に押してください。Windowsファイアウォールの受信許可を追加します（NetBelt.exe向けの既存の受信規則は削除し、NetBelt.exe全体を許可します。管理者昇格/UACが最大2回出ます）。")
         self.fw_allow_btn.clicked.connect(self._on_fw_allow)
         fw_layout.addWidget(self.fw_allow_btn)
         fw_layout.addStretch()
@@ -478,6 +500,13 @@ class SNMPPanel(QWidget):
         self.trap_status_label.setWordWrap(True)
         self.trap_status_label.setStyleSheet("color: #f44336; font-weight: bold; font-size: 14px;")
         trap_status_layout.addWidget(self.trap_status_label)
+        # 配送待ちの上限で捨てた Trap の件数（取りこぼしがあるときだけ出す）。
+        # 状態表示はファイアウォール許可の結果などで上書きされるので別に置く
+        self.trap_drop_label = QLabel()
+        self.trap_drop_label.setWordWrap(True)
+        self.trap_drop_label.setStyleSheet("color: #ff9800; font-weight: bold;")
+        self.trap_drop_label.setVisible(False)
+        trap_status_layout.addWidget(self.trap_drop_label)
         trap_status_group.setLayout(trap_status_layout)
         layout.addWidget(trap_status_group)
 
@@ -896,16 +925,15 @@ class SNMPPanel(QWidget):
         データを同じ数だけ削り、エクスポートの中身と画面が食い違わない
         ようにする。
 
-        制限: 上限が効くのは、GUI が Trap を1件受け取って表示へ入れた
-        後だけ。受信スレッドは1件ごとに完成した dict を queued シグナル
-        で送るので、GUI が止まっている間そのキューは上限と無関係に
-        伸びる（実測: 1件あたり約 2.3 KB、5万件で RSS +116 MB。GUI が
-        処理し終えると解放される）。定常状態では問題にならない。受信側の
-        復号が約 1,670 件/秒、GUI 側の処理が約 2,550 件/秒で、GUI の方が
-        速いため未処理は常に3件以下だった（毎秒 3,000 件を外から送った
-        実測でも同じ）。効くのは終了時の wait などで GUI が数十秒
-        止まっている間だけなので、まとめ配送（deque + QTimer）は
-        入れていない。
+        ここが効くのは、GUI が Trap を受け取って表示へ入れた後だけ。その
+        手前の配送待ち（受信スレッドから queued シグナルで届く前の Trap）は
+        SNMPManager が max(1000, max_traps) 件で止め、超えた分は新しく
+        届いた方を捨てて数える（SNMPManager.trap_dropped。上限が無かった
+        ころの実測は core.snmp_manager._TrapBacklog）。GUI が止まって上限を
+        超えた場合、一覧に入るのは先に届いた側（嵐の始まり）で、あふれて
+        いる間に届いた新しい Trap は入らない（件数はパネルの表示とログ）。
+        上限は max_traps より小さくしないので、あふれていなければ、ここで
+        残るのは届いた順の最新 N 件のまま。
         """
         while len(self.trap_data_list) > self.max_traps:
             self.trap_data_list.pop()
@@ -1053,9 +1081,12 @@ class SNMPPanel(QWidget):
         communities = [] if version == "v3" else [self.trap_community_edit.text()]
         v3_users = [] if version == "v1/v2c" else self._collect_trap_v3_users()
 
-        # 起動できなければ表示を変えない（エラーは error_occurred で通知済み）
-        if not self.snmp_manager.start_trap_receiver(port, communities, v3_users):
+        # 起動できなければ表示を変えない（エラーは error_occurred で通知済み）。
+        # 配送待ちの上限は保持件数より小さくしない（SNMPManager が決める）
+        if not self.snmp_manager.start_trap_receiver(
+                port, communities, v3_users, keep_traps=self.max_traps):
             return
+        self._reset_trap_dropped()
         self.trap_start_button.setVisible(False)
         self.trap_stop_button.setVisible(True)
         self.trap_status_label.setText(f"🔵 受信中 (ポート {port})")
@@ -1072,6 +1103,8 @@ class SNMPPanel(QWidget):
         # MIB読み込みスレッド作成
         self.mib_thread = MIBLoaderThread()
         self.mib_thread.finished_signal.connect(self._on_background_mib_load_finished)
+        # run() に入るまでの間、パネルの参照だけにしない（_mib_loaders の注記）
+        _keep_until_finished(self.mib_thread)
         self.mib_thread.start()
     
     # MIB 読み込みスレッドの終了を待つ上限（ミリ秒）。mibs/ が空なら
@@ -1097,7 +1130,7 @@ class SNMPPanel(QWidget):
         再現しないので落とした。実測（いずれも offscreen）:
           - 待ちを空実装にして MainWindow を閉じ、del して gc しても、
             実行中の QThread は破棄されない。3 周とも終了コード 0・
-            stderr 空（PyQt6 が実行中の QThread への参照を保つ）。
+            stderr 空（スレッドが run() の中にいたため。下の注意を参照）。
           - main() と同じく app.exec() を回し、6 秒かかる読み込みを残した
             まま終了しても、待つ／待たないの両方で 3 回とも終了コード 0、
             "QThread: Destroyed while thread is still running" も無し。
@@ -1108,6 +1141,15 @@ class SNMPPanel(QWidget):
         テストスイートを落としていた間欠 segfault の本当の原因は、
         SNMPManager が connect(signal.emit) でシグナルを中継していたこと
         だった（47ecbde）。
+
+        注意: 取り消したうちの abort の件は、run() に入る前なら実際に
+        起きる。PyQt6 がスレッドへの参照を保つのは run() を呼んでいる
+        間だけで、start() から作業スレッドが run() に入るまでの間に
+        パネルが破棄されると Qt が abort する（テストがパネルを作って
+        数 ms で捨てたとき、CPU が混んでいると踏んでいた）。abort を
+        確かめた上の 2 つの実測は、どれもスレッドが run() に入った後に
+        破棄していたので、この間を見ていなかった。いまはこの間を
+        _mib_loaders が持つ。
 
         制限: 待ちは MIB_LOADER_WAIT_MS が上限で、戻り値は見ていない。
         上限を過ぎたら待つのをやめ、読み込み中のまま閉じる処理を続ける。
@@ -1125,8 +1167,9 @@ class SNMPPanel(QWidget):
         超えても落ちない。遅延を 5.22〜5.6 秒に伸ばした 13 回の実行は
         いずれも終了コード 0・stderr 空で、8 秒かかるスレッドを残した
         まま閉じても "QThread: Destroyed while thread is still running"
-        は出なかった（PyQt6 が実行中の QThread への参照を保持するため、
-        パネルが破棄されてもスレッド側は破棄されない）。解析の途中で
+        は出なかった（スレッドは run() の中にいて、run() の呼び出しが
+        参照を持つため、パネルが破棄されてもスレッド側は破棄されない。
+        run() に入る前の間は _mib_loaders が持つ）。解析の途中で
         終了してもキャッシュは書かれないだけで、次回また作り直される。
 
         利用者に見える影響は、閉じる操作が最大でこの上限ぶん固まること。
@@ -1184,7 +1227,25 @@ class SNMPPanel(QWidget):
         self.trap_tree_model.setHorizontalHeaderLabels(
             ["時刻", "送信元IP", "セキュリティ", "Trap OID / VarBind", "値"])
         self.trap_data_list.clear()
+        self._reset_trap_dropped()
     
+    def _on_trap_dropped(self, count: int, limit: int, last):
+        """配送待ちの上限で捨てた Trap の件数を、一覧の外の表示へ足す
+
+        一覧の 1 行にすると、書き出し（CSV / JSON / TXT）に機器からではない
+        行が混ざる。受信状態の下の別の表示に出し、消えないようにする。
+        """
+        self._trap_dropped += count
+        self.trap_drop_label.setText(
+            "取りこぼし: %d 件（配送待ちの上限 %d 件。最後 %s）"
+            % (self._trap_dropped, limit, last.strftime("%H:%M:%S")))
+        self.trap_drop_label.setVisible(True)
+
+    def _reset_trap_dropped(self):
+        """取りこぼしの件数を 0 に戻して表示を隠す（受信開始・クリア）"""
+        self._trap_dropped = 0
+        self.trap_drop_label.setVisible(False)
+
     def _on_trap_expand_all_clicked(self):
         """すべてのTrapを展開"""
         self.trap_tree.expandAll()
@@ -1350,6 +1411,7 @@ class SNMPPanel(QWidget):
             self.snmp_manager.operation_cancelled.connect(self._on_operation_cancelled)
             self.snmp_manager.progress_update.connect(self._on_operation_progress)
             self.snmp_manager.trap_received.connect(self._on_trap_received)
+            self.snmp_manager.trap_dropped.connect(self._on_trap_dropped)
             self.snmp_manager.trap_receiver_started.connect(self._on_trap_receiver_started)
             self.snmp_manager.trap_receiver_stopped.connect(self._on_trap_receiver_stopped)
             self.snmp_manager.error_occurred.connect(self._on_error_occurred)
@@ -1493,34 +1555,33 @@ class SNMPPanel(QWidget):
         
         # 親アイテム作成（Trap情報）
         timestamp_item = QStandardItem(timestamp)
-        source_ip_item = QStandardItem(source_ip)
-        security_item = QStandardItem(security)
-        trap_oid_item = QStandardItem(trap_name)
         varbinds_count = f"{len(filtered_vbs)} VarBinds" if filtered_vbs else "VarBindsなし"
-        value_item = QStandardItem(varbinds_count)
-        
-        # 親行をツリーのルートに挿入（最新を先頭に）
-        self.trap_tree_model.insertRow(0, [timestamp_item, source_ip_item,
-                                          security_item, trap_oid_item, value_item])
-        
-        # 各VarBindを子アイテムとして追加
-        for vb in filtered_vbs:
-            oid = vb['oid']
-            value = vb['value']
-            
+
+        # 項目は 1 つずつ置く。insertRow / appendRow に Python のリストを渡すと、
+        # PyQt6 はその変換で new した QList を解放しない（/Transfer/ の引数を
+        # 所有権ごと渡した扱いにする）。1 回で 2 ブロック残り、max_traps に
+        # 達して古い行を捨てていても、Trap 1 件ごとにメモリが増え続けた
+        # （実測: 子 4 行で約 0.6 KB/件、子 28 行で約 3.3 KB/件）。
+
+        # 各VarBindを子アイテムとして、第0列の項目の下へ 1 行ずつ足す
+        # （親を一覧へ入れる前に組むので、行ごとの変更通知も出ない）
+        for row, vb in enumerate(filtered_vbs):
             # OIDを名前に変換
-            oid_name = resolver.resolve_oid(oid)
-            
-            # 子アイテム作成（1行につき1つのVarBind）
-            child_timestamp = QStandardItem("")  # 空
-            child_source = QStandardItem("")  # 空
-            child_security = QStandardItem("")  # 空
-            child_oid = QStandardItem(oid_name)
-            child_value = QStandardItem(value)
-            
-            # 親の最初の列に子行を追加
-            timestamp_item.appendRow([child_timestamp, child_source,
-                                      child_security, child_oid, child_value])
+            oid_name = resolver.resolve_oid(vb['oid'])
+            # 子アイテム（1行につき1つのVarBind。時刻・送信元・セキュリティは空）
+            children = (QStandardItem(""), QStandardItem(""), QStandardItem(""),
+                        QStandardItem(oid_name), QStandardItem(vb['value']))
+            for column, child in enumerate(children):
+                timestamp_item.setChild(row, column, child)
+
+        # 親行をツリーのルートに挿入（最新を先頭に）。残りの 4 列は setData で
+        # 置き、項目はモデルに作らせる。setItem だと 1 つごとに layoutChanged が
+        # 出て、見出しが伸ばしている最終列（値）を伸ばす前の幅（100 px）へ戻す。
+        # 列を広げて横スクロールが出ていると、Trap が届くたびに値の列が縮んだ
+        self.trap_tree_model.insertRow(0, timestamp_item)
+        for column, text in enumerate((source_ip, security, trap_name,
+                                       varbinds_count), 1):
+            self.trap_tree_model.setData(self.trap_tree_model.index(0, column), text)
 
         # 上限を超えたぶんの古い Trap を捨てる
         self._trim_traps()
@@ -1531,7 +1592,12 @@ class SNMPPanel(QWidget):
     
     def _on_trap_receiver_stopped(self):
         """Trap受信停止時の処理"""
-        print("[SNMPPanel] Trap受信が停止しました")
+        # 出力先へ書けなくても（容量不足など）例外を出さない（出すと表示を
+        # 戻す処理が飛び、stopped は 1 回しか来ないので開始ボタンが戻らない）
+        try:
+            print("[SNMPPanel] Trap受信が停止しました")
+        except Exception:
+            pass
         self._show_trap_stopped()
     
     def _on_error_occurred(self, error: str):

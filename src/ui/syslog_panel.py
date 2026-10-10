@@ -436,7 +436,7 @@ class SyslogPanel(QWidget):
         # 手動FW許可（3CDaemon方式で通らない時の復旧用・押した時だけ管理者昇格/UAC）
         fw_layout = QHBoxLayout()
         self.fw_allow_btn = QPushButton("ファイアウォールで許可（管理者）")
-        self.fw_allow_btn.setToolTip("受信できない場合に押してください。Windowsファイアウォールの受信許可を追加します（管理者昇格/UACが1回出ます）。")
+        self.fw_allow_btn.setToolTip("受信できない場合に押してください。Windowsファイアウォールの受信許可を追加します（NetBelt.exe向けの既存の受信規則は削除し、NetBelt.exe全体を許可します。管理者昇格/UACが最大3回出ます）。")
         self.fw_allow_btn.clicked.connect(self._on_fw_allow)
         fw_layout.addWidget(self.fw_allow_btn)
         fw_layout.addStretch()
