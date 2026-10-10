@@ -34,6 +34,21 @@ from datetime import datetime
 import os
 import time
 
+
+def _print_quietly(line):
+    """終了処理の行を 1 行出す。出力先へ書けないときの例外（容量不足など）は捨てる。
+
+    exe では標準出力がログファイルなので、保存先の容量不足などの間は print が
+    例外を出す。closeEvent で例外を出すと、その後ろのサーバーや受信の停止・
+    端末の記録の書き切り・知らせの切り離し・別ウィンドウの片付けが飛ぶ
+    （core.sftp_server の _print_quietly と同じ扱い）
+    """
+    try:
+        print(line)
+    except Exception:
+        pass
+
+
 class DetachableTabBar(QTabBar):
     """タブを下方向へ十分ドラッグすると、そのタブを別ウィンドウへ切り離すタブバー。"""
 
@@ -3075,7 +3090,7 @@ for details.
         self._save_layout()
         # Syslogレシーバーを停止
         if hasattr(self, 'syslog_receiver') and self.syslog_receiver.is_running:
-            print("[Main] Stopping Syslog receiver...")
+            _print_quietly("[Main] Stopping Syslog receiver...")
             self.syslog_receiver.stop()
         
         # SFTPサーバーを停止。is_running では判定しない。あのフラグを
@@ -3086,17 +3101,17 @@ for details.
         if hasattr(self, 'sftp_server_panel'):
             sftp_thread = self.sftp_server_panel.sftp_server.server_thread
             if sftp_thread is not None and sftp_thread.is_alive():
-                print("[Main] Stopping SFTP server...")
+                _print_quietly("[Main] Stopping SFTP server...")
                 self.sftp_server_panel.sftp_server.stop()
         
         # TFTPサーバーを停止
         if hasattr(self, 'tftp_server_panel') and self.tftp_server_panel.tftp_server.is_running:
-            print("[Main] Stopping TFTP server...")
+            _print_quietly("[Main] Stopping TFTP server...")
             self.tftp_server_panel.tftp_server.stop()
         
         # FTPサーバーを停止
         if hasattr(self, 'ftp_server_panel') and self.ftp_server_panel.ftp_server.is_running:
-            print("[Main] Stopping FTP server...")
+            _print_quietly("[Main] Stopping FTP server...")
             self.ftp_server_panel.ftp_server.stop()
         
         # SNMP Trap 受信とワーカースレッドを停止。受信スレッドを
@@ -3105,11 +3120,11 @@ for details.
         # 領域へ届いてプロセスが落ちていた（中継は 47ecbde で直した）。
         if hasattr(self, 'snmp_panel') and hasattr(self.snmp_panel, 'snmp_manager'):
             try:
-                print("[Main] Stopping SNMP threads...")
+                _print_quietly("[Main] Stopping SNMP threads...")
                 self.snmp_panel.snmp_manager.cancel_operation()
                 self.snmp_panel.snmp_manager.stop_trap_receiver()
             except Exception as e:
-                print(f"[Main] SNMP 停止エラー: {e}")
+                _print_quietly(f"[Main] SNMP 停止エラー: {e}")
         # バックグラウンドの MIB 読み込み（QThread）も待つ。起動直後に
         # 閉じると読み込み中のことがあり、待たないと MIB キャッシュの
         # 書き出しがプロセス終了で切られる（落ちはしない。詳細は
@@ -3118,7 +3133,7 @@ for details.
             try:
                 self.snmp_panel.wait_for_background_work()
             except Exception as e:
-                print(f"[Main] MIB 読み込みの待機エラー: {e}")
+                _print_quietly(f"[Main] MIB 読み込みの待機エラー: {e}")
 
         # すべてのマクロをクリーンアップ
         for device_name in list(self.connections.keys()):
@@ -3160,7 +3175,7 @@ for details.
             try:
                 self.snmp_panel.snmp_manager.discard_undelivered_traps()
             except Exception as e:
-                print(f"[Main] SNMP の後始末エラー: {e}")
+                _print_quietly(f"[Main] SNMP の後始末エラー: {e}")
 
         # 受信済みでまだ描いていない出力を記録し切ってから、記録を止めて
         # ファイルを閉じる。記録へ書くのは描くときなので、ここで済ませないと

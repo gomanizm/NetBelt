@@ -1607,8 +1607,13 @@ class SNMPManager(QObject):
         backlogs = self._earlier_backlogs + [self._trap_backlog]
         count = sum(b.discard_pending() for b in backlogs if b is not None)
         if count:
-            print("[SNMPManager] Discarded %d undelivered trap(s) at exit "
-                  "(not shown in the list)" % count)
+            # 出力先へ書けなくても（容量不足など）例外は出さない。件数は数え
+            # 終えている。出すと closeEvent の残り（記録の書き切りなど）が飛ぶ
+            try:
+                print("[SNMPManager] Discarded %d undelivered trap(s) at exit "
+                      "(not shown in the list)" % count)
+            except Exception:
+                pass
 
     def stop_trap_receiver(self):
         """SNMP Trap受信を停止
