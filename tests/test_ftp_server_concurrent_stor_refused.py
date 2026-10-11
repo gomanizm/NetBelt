@@ -25,6 +25,7 @@ pyftpdlib が開く前に保存先（実パスを realpath → normcase した�
 """
 import ftplib
 import os
+import socket
 import sys
 import tempfile
 import time
@@ -40,6 +41,38 @@ PASSWORD = "example-pass"
 class _FtpServerCase(unittest.TestCase):
     """FTP サーバーを 127.0.0.1 で起動して、ftplib で操作する土台（テストは持たない）"""
     anonymous = False
+    # パッシブの範囲。FTPServerManager.start() の既定値と同じ
+    passive_ports = (50100, 50150)
+
+    def _control_port(self):
+        """制御ポートを、パッシブの範囲の外から選ぶ。
+
+        port=0 で起動すると、制御ポートは OS の動的ポートの範囲（Windows の
+        既定は 49152〜65535）から選ばれ、既定のパッシブの範囲もその中にある。制御
+        ポートが範囲に入ると、PASV が 127.0.0.1 の同じ番号へ bind できてしまい
+        （Windows）、そのあいだに張った別の制御接続が、データ接続として受け
+        付けられる（全件テストでまれに落ちていた）。OS に番号を出させ、範囲の
+        外のものを使う。出させた番号はすぐ閉じるが、OS は番号を順に渡すので
+        （実測）、起動までにほかへ渡ることはまず無い
+
+        上の取り違えは、1.3.4 の dcfd77c（B2）・98cd5f2（B1）より前の製品の
+        振る舞い（この選び方は、その前の 30d370d で足した）。今は start() が
+        制御ポートを PASV の候補から除き、制御の待ち受けが排他で 127.0.0.1 の同じ
+        番号への bind も断るので、起きない。範囲の外から選ぶのは変えていない。
+        こうすると start() が範囲から除く番号は無く、既定の範囲のまま試せる。
+        また、B2・B1 を戻した形でも、この選び方では重ならない。重なりは、
+        制御ポートを範囲の中に置く PassiveSkipsControlPortTest
+        （test_ftp_server_passive_range_excludes_control_port.py）と
+        test_ftp_server_exclusive_control_port.py が確かめる
+        """
+        lo, hi = self.passive_ports
+        for _ in range(1000):
+            with socket.socket() as probe:
+                probe.bind(("0.0.0.0", 0))
+                port = probe.getsockname()[1]
+            if not lo <= port <= hi:
+                return port
+        self.fail("パッシブの範囲の外の制御ポートを選べなかった")
 
     def setUp(self):
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -58,12 +91,15 @@ class _FtpServerCase(unittest.TestCase):
             lambda ip, message: self.activity.append((ip, message)))
         # テストのあとに届く知らせが、GC で空にされた lambda を呼ばないよう外す
         self.addCleanup(self.m.client_activity.disconnect)
+        port = self._control_port()
         if self.anonymous:
-            started = self.m.start(port=0, root_dir=self.root,
-                                   anonymous=True, anonymous_write=True)
+            started = self.m.start(port=port, root_dir=self.root,
+                                   anonymous=True, anonymous_write=True,
+                                   passive_ports=self.passive_ports)
         else:
-            started = self.m.start(port=0, root_dir=self.root,
-                                   username=USER, password=PASSWORD)
+            started = self.m.start(port=port, root_dir=self.root,
+                                   username=USER, password=PASSWORD,
+                                   passive_ports=self.passive_ports)
         self.assertTrue(started)
         self.addCleanup(self.m.stop)
 

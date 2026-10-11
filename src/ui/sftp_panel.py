@@ -483,27 +483,33 @@ class SFTPPanel(QWidget):
             
             # サイズ
             if file_info['is_dir']:
-                size_item = QStandardItem("")
+                size_text = ""
             else:
-                size_item = QStandardItem(self._format_size(file_info['size']))
+                size_text = self._format_size(file_info['size'])
             
             # パーミッション。サーバが permissions を返さなければ None
-            # （QStandardItem(None) は TypeError になる）
+            # （そのまま置くと空欄になる）
             perms = file_info['permissions']
-            perm_item = QStandardItem(
-                perms if perms is not None else self.UNKNOWN_TEXT)
+            perm_text = perms if perms is not None else self.UNKNOWN_TEXT
             
             # 更新日時。サーバが ATTR_ACMODTIME を返さなければ None、
             # paramiko が符号付き 32bit で読むので負値にもなり得る。
             # ここは file_list_ready のスロット（キュー接続）なので、
             # 例外を漏らすと PyQt がプロセスごと落とす。
-            time_item = QStandardItem(self._format_mtime(file_info['mtime']))
+            time_text = self._format_mtime(file_info['mtime'])
             
             # データとして元のファイル情報を保持
             name_item.setData(file_info, Qt.ItemDataRole.UserRole)
             
-            # 行を追加
-            self.model.appendRow([name_item, size_item, perm_item, time_item])
+            # 行を追加。項目は 1 つずつ置く。appendRow に Python のリストを
+            # 渡すと、PyQt6 はその変換で new した QList を解放しない
+            # （snmp_panel._add_trap_to_tree と同じ）。1 行で 2 ブロック残り、
+            # 一覧を更新するたびに増え続けた（実測: 50 件で 1 回 100 ブロック・約 4.4 KB）。
+            # 残りの列は setData で置く。setItem だと 1 つごとに layoutChanged が出る
+            row = self.model.rowCount()
+            self.model.appendRow(name_item)
+            for column, text in enumerate((size_text, perm_text, time_text), 1):
+                self.model.setData(self.model.index(row, column), text)
         
         # 一覧の変換はロックの外なので、届く前に SFTP が切れていることがある。
         # 行は並べたまま（利用者の決定 2026-09-23）、切れた表示は残す

@@ -15,6 +15,7 @@ from pyftpdlib.ioloop import _ERRNOS_DISCONNECTED, _ERRNOS_RETRY
 from pyftpdlib.log import logger as _ftp_logger
 
 from .crypto import PasswordCrypto
+from .sockets import set_exclusive_bind
 
 # 復号できずに暗号文のまま残ったパスワードを渡されたときの通知文。
 # 暗号文そのものは含めない（画面・ログに出さない）。
@@ -48,32 +49,68 @@ def _enable_keepalive(sock):
         pass
 
 
-# 受信中のデータ接続の recv が返したとき、相手が消えたとみなすエラー。
-# keepalive の確かめが尽きたときに返るのはこのどれか（OS による。localhost
-# では作れないので、どれが返るかは確かめていない）
+# 受信中のデータ接続の recv が返したとき、相手が消えた（転送は未完了）と
+# みなすエラー。keepalive の確かめが尽きたときに返るのは ETIMEDOUT などの
+# どれか（OS による。localhost では作れないので、どれが返るかは確かめていない）。
+# RST（ECONNRESET）も、届いた時刻によらず含める。Windows は読み終えていない
+# 受信データを RST の到着で捨てるので、データの直後の RST でも、0 バイトや
+# 途中までのファイルになりうる（実測）。vsftpd も受信中の読み取りエラーは 426。
+# 中身が揃っていても RST で終われば未完了になるが、ストリームモードの終わりは
+# データ接続の閉じ方でしか示されず、ほかに揃ったかを確かめる手段が無い
 _DATA_LOST_ERRNOS = frozenset(
     getattr(errno, name) for name in
-    ("ETIMEDOUT", "ENOTCONN", "ECONNABORTED", "ENETRESET") if hasattr(errno, name))
-
-# 黙っていた時間を比べるときの余裕（秒）。測るのは最後のデータを読んだ時刻から
-# RST を読んだ時刻までで、時計の粒度（Python 3.12 の Windows の time.monotonic は
-# 約 16 ミリ秒刻み）や読む時刻の遅れの分だけ、確かめへの RST でも
-# DATA_KEEPALIVE_SECONDS をわずかに下回って測れることがある
-_SILENCE_MARGIN_SECONDS = 1.0
+    ("ETIMEDOUT", "ENOTCONN", "ECONNABORTED", "ENETRESET", "ECONNRESET")
+    if hasattr(errno, name))
 
 
-def _data_connection_lost(code, silent_seconds):
-    """受信中の recv のエラー code が、相手が消えたことを示すか。
+class _NoPassivePort(Exception):
+    """パッシブの範囲に待ち受けられる番号が無い（_RangePassiveDTP が投げる）"""
 
-    RST（ECONNRESET）は、相手が SO_LINGER 0 で閉じたときなどにも届き、
-    これまで完了として扱ってきたので変えない。ただし keepalive の確かめは
-    DATA_KEEPALIVE_SECONDS 黙った後にしか送らないので、それほど黙った
-    後の RST は、再起動した相手が確かめに返したものとみなす
+
+class _RangePassiveDTP(FTPHandler.passive_dtp):
+    """PASV / EPSV の待ち受け。パッシブの範囲の番号でしか待ち受けない。
+
+    pyftpdlib 2.2.0 の PassiveDTP は、範囲の番号を無作為な順に bind する。最後に
+    試した番号が使用中（EADDRINUSE）だと、黙って OS に任せた番号（範囲の外。
+    ファイアウォールで許可した範囲からも外れる）で待ち受ける。最後に試した番号が
+    断られた（WSAEACCES。ほかのアプリの排他の待ち受けなど）ときは、bind しない
+    まま listen へ進んで例外になり、制御接続ごと切れる（どちらも実測）。
+    待ち受ける直前に番号を確かめ、範囲の外（bind していないときを含む）なら
+    閉じて _NoPassivePort を投げる（_Handler._make_epasv が 425 で断る）。
+    範囲を指定しない（None）ときは pyftpdlib のまま（start() は必ず範囲を渡す）
     """
-    if code in _DATA_LOST_ERRNOS:
-        return True
-    return (code == errno.ECONNRESET and silent_seconds
-            >= DATA_KEEPALIVE_SECONDS - _SILENCE_MARGIN_SECONDS)
+
+    def listen(self, num):
+        ports = self.cmd_channel.passive_ports
+        try:
+            port = self.socket.getsockname()[1]
+        except OSError:     # bind していない（Windows は WSAEINVAL）
+            port = None
+        if ports is not None and port not in ports:
+            self.close()    # ioloop への登録も外す
+            raise _NoPassivePort()
+        super().listen(num)
+
+
+class _ExclusiveFTPServer(_PyFTPServer):
+    """制御の待ち受けを排他（SO_EXCLUSIVEADDRUSE）にした pyftpdlib の FTPServer。
+
+    pyftpdlib の待ち受けは排他でなく、Windows では同じ PC の同じユーザーの
+    ほかのソケットが特定アドレス（127.0.0.1 や LAN の IP）の同じ番号へ bind でき
+    （別のユーザーの bind は今の形でも OS が断る）、その宛先への
+    制御接続はそちらへ届く。PASV の待ち受けもその一つで、制御ポートが
+    パッシブの範囲に入ると、後から来た制御接続をデータ接続として受け付けた
+    （実測。今は start() が範囲から制御ポートを除くので、PASV はこの形にならない）。
+    ほかの受信機能（SFTP / TFTP / Syslog / SNMP Trap）と同じく排他にすると、
+    その bind は断られる。
+    排他の設定は bind の前でないと効かない。
+    pyftpdlib は bind の直前に set_reuse_addr() を呼ぶ（Windows では何も
+    しない形に上書きされている）ので、そこで掛ける
+    """
+
+    def set_reuse_addr(self):
+        super().set_reuse_addr()   # Windows 以外の SO_REUSEADDR はそのまま
+        set_exclusive_bind(self.socket)
 
 
 class FTPServerManager(QObject):
@@ -384,22 +421,22 @@ class FTPServerManager(QObject):
                 # 送れば確かめが尽きたところで recv がエラーになり、下の recv が
                 # 未完了として閉じて予約を外す。生きている相手は応答するだけ
                 # なので、黙っている転送は切らない
-                self._last_recv_at = time.monotonic()
                 _enable_keepalive(sock)
                 super().__init__(sock, cmd_channel)
             def recv(self, buffer_size):
-                # pyftpdlib（ioloop.AsyncChat.recv）は ETIMEDOUT・ENOTCONN など
-                # 接続断のエラーを EOF と同じく扱い、受信中なら完了（226）にする。
-                # keepalive で切れた書き手の途中までのファイルが完了と記録される
-                # （実測: エラーを差し込むと 226 と完了）ので、相手が消えたときは
-                # 未完了（426）で閉じる。それ以外は pyftpdlib と同じ扱い
+                # pyftpdlib（ioloop.AsyncChat.recv）は ETIMEDOUT・ENOTCONN・
+                # ECONNRESET など接続断のエラーを EOF と同じく扱い、受信中なら
+                # 完了（226）にする。keepalive や RST で切れた書き手の途中までの
+                # ファイルが完了と記録される（実測: エラーを差し込むと 226 と
+                # 完了。送り切った直後の RST では 0 バイトのファイルが完了）ので、
+                # 相手が消えたときは未完了（426）で閉じる。それ以外は pyftpdlib
+                # と同じ扱い
                 if not self.receive:
                     return super().recv(buffer_size)
                 try:
                     data = self.socket.recv(buffer_size)
                 except OSError as err:
-                    if _data_connection_lost(
-                            err.errno, time.monotonic() - self._last_recv_at):
+                    if err.errno in _DATA_LOST_ERRNOS:
                         self._resp = ("426 Connection lost; transfer aborted.",
                                       _ftp_logger.info)
                         self.close()   # on_incomplete_file_received が予約を外す
@@ -413,7 +450,6 @@ class FTPServerManager(QObject):
                 if not data:
                     self.handle_close()   # 通常の EOF（完了）
                     return b""
-                self._last_recv_at = time.monotonic()
                 return data
             def send(self, data):
                 result = super().send(data)
@@ -431,6 +467,7 @@ class FTPServerManager(QObject):
 
         class _Handler(FTPHandler):
             dtp_handler = _ProgressDTP
+            passive_dtp = _RangePassiveDTP
             # データ接続を使う転送コマンド
             _TRANSFER_COMMANDS = ("STOR", "APPE", "STOU", "RETR",
                                   "LIST", "NLST", "MLSD")
@@ -473,6 +510,22 @@ class FTPServerManager(QObject):
                          % (cmd, arg)).rstrip())
                     return
                 super().process_command(cmd, *args, **kwargs)
+
+            def _make_epasv(self, extmode=False):
+                # 範囲に待ち受けられる番号が無いときは、範囲の外の番号を使わずに
+                # 425 で断る（_RangePassiveDTP）。制御接続はそのまま続き、番号が
+                # 空けば次の PASV / EPSV から使える
+                try:
+                    super()._make_epasv(extmode)
+                except _NoPassivePort:
+                    self.respond("425 Can't open data connection: "
+                                 "no free port in the passive range.")
+                    mgr._emit_activity(
+                        self.remote_ip,
+                        "passiveポート範囲 %d-%d に待ち受けられる番号が無いため"
+                        " %s を断りました（ほかの接続の PASV や、ほかのアプリが"
+                        "使用中）" % (passive_ports[0], passive_ports[1],
+                                    "EPSV" if extmode else "PASV"))
 
             def ftp_RETR(self, file):
                 result = super().ftp_RETR(file)  # 成功時はftpパスを返す
@@ -758,13 +811,36 @@ class FTPServerManager(QObject):
             # （実測で、動いている側へログインできなくなった）。
             # 2 本の待受スレッドが同じ fd の一覧を同時に読み書きする
             # 状態も、pyftpdlib が想定していない
-            self._server = _PyFTPServer(("0.0.0.0", port), _Handler,
-                                        ioloop=_PyIOLoop.factory())
+            self._server = _ExclusiveFTPServer(("0.0.0.0", port), _Handler,
+                                               ioloop=_PyIOLoop.factory())
             self.port = self._server.address[1]
         except Exception as e:
             self.error_occurred.emit("FTP起動失敗: %s" % e)
             self._server = None
             return False
+        # 制御ポートはパッシブの範囲から外す。PASV の待ち受けは制御接続の自分側の
+        # アドレス（127.0.0.1 や LAN の IP）へ bind し、制御の待ち受けが排他でな
+        # かったころは、Windows では 0.0.0.0 で待ち受け中の制御ポートと同じ番号でも
+        # 通った。そうなると、その宛先へ来た別の制御接続がデータ接続として受け付け
+        # られた（127.0.0.1 で実測）。排他にした今（_ExclusiveFTPServer）はその
+        # bind は断られるが、範囲に残すと使えない番号が候補に混ざる。
+        # 外した結果、番号が残らない範囲（制御ポートだけ・下限が上限より大きい）
+        # では起動しない。起動すると、PASV のたびに 425 で断ることになる
+        # （排他と 425 の前は、別の制御接続の取り違えか、制御接続ごと切れた。実測）
+        passive = [p for p in _Handler.passive_ports if p != self.port]
+        if not passive:
+            self._server.close_all()
+            self._server = None
+            lo, hi = passive_ports[0], passive_ports[1]
+            if lo > hi:
+                reason = "下限が上限より大きく、使える番号がありません"
+            else:
+                reason = "制御ポート %d を除くと、使える番号がありません" % self.port
+            self.error_occurred.emit(
+                "passiveポート範囲 %d-%d は%s。下限を上限以下にし、"
+                "制御ポートと重ならない範囲にしてください" % (lo, hi, reason))
+            return False
+        _Handler.passive_ports = passive
         self._stop_event = threading.Event()
         # 前回の待受スレッドは終わっている（_await_previous_thread）ので、
         # 閉じ損ねた接続の予約が残っていても持ち越さない

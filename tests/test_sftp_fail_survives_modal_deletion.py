@@ -22,6 +22,13 @@
   キュー配送なのでこの経路には入らない。再入するのは GUI スレッドから
   呼ぶ操作だけ。
 
+  change_directory は 1.3.4 で normalize を使い捨てのスレッドへ移し、
+  失敗の通知もキュー配送になったので、この経路には入らなくなった
+  （tests/test_sftp_move_off_gui_thread.py。Codex レビュー R05）。
+  ここでは今も GUI スレッドで同期に通信する create_directory で再現する。
+  差し替えの前後で、_fail から切断までに通る sftp_manager.py の行と順序が
+  同じこと、防御を外す変異で落ちる組み合わせが同じことを確かめてある。
+
 どう直したか:
   _fail は通知のあとの disconnect を _disconnect_after_notice で包み、
   破棄済みの QObject に触ったときの RuntimeError だけを飲む。畳む仕事
@@ -45,7 +52,7 @@ class SftpFailSurvivesModalDeletionTest(unittest.TestCase):
         cls.app = QApplication.instance() or QApplication([])
 
     def _manager(self):
-        """機器が黙ったまま（normalize が期限切れ）のマネージャ"""
+        """機器が黙ったまま（mkdir が期限切れ）のマネージャ"""
         from PyQt6.QtCore import QObject
         from core.sftp_manager import SFTPManager
 
@@ -53,7 +60,7 @@ class SftpFailSurvivesModalDeletionTest(unittest.TestCase):
         m = SFTPManager(self.owner)
         m.is_connected = True
         self.client = m.sftp_client = mock.Mock()
-        self.client.normalize.side_effect = TimeoutError()
+        self.client.mkdir.side_effect = TimeoutError()
         m.list_directory = mock.Mock()
         self.errors, self.gone = [], []
         m.error_occurred.connect(self.errors.append)
@@ -94,7 +101,7 @@ class SftpFailSurvivesModalDeletionTest(unittest.TestCase):
         self._open_modal_on_error(m, drop=True)
 
         # 例外が抜ければ、ここで RuntimeError としてテストが落ちる
-        m.change_directory("/flash/config")
+        m.create_directory("/flash/config")
 
         self.assertTrue(sip.isdeleted(m),
                         "入れ子のループ中に破棄されていない（再現の条件が崩れた）")
@@ -109,7 +116,7 @@ class SftpFailSurvivesModalDeletionTest(unittest.TestCase):
         m = self._manager()
         self._open_modal_on_error(m, drop=False)
 
-        m.change_directory("/flash/config")
+        m.create_directory("/flash/config")
 
         self.assertFalse(m.is_connected, "使えないチャンネルを掴んだまま")
         self.assertIsNone(m.sftp_client)

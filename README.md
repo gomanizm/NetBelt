@@ -19,7 +19,7 @@
 - **デバイス管理** — グループに整理してツリーから接続
 - **複数タブ** — 複数機器へ同時接続してタブで切り替え
 - **マクロ** — よく使うコマンド列を登録して一括実行
-- **自動実行コマンド** — グループごとに登録したコマンドを、接続直後に自動投入（`terminal length 0` など）。ツリーでグループを右クリック →「グループを編集」から設定します。SSH / Telnet が対象です。**config.json に平文で保存されるため、パスワードは書かないでください**
+- **自動実行コマンド** — グループごとに登録したコマンドを、接続直後に自動投入（`terminal length 0` など）。ツリーでグループを右クリック →「グループを編集」から設定します。そのグループに登録した機器なら、SSH / Telnet / コンソール（シリアル）のどれで接続しても送られます。ツリーの「コンソール接続」に自動で並ぶ COM ポートはどのグループにも属さないため、送られません。**config.json に平文で保存されるため、パスワードは書かないでください**
 - **セッションログ** — 画面の内容をファイルへ保存
 - **コピー / ペースト** — マウスで範囲を選ぶと、その時点でクリップボードへコピーされます（`Ctrl+Shift+C` でもコピーできます。ターミナルの `Ctrl+C` は機器への中断送信（0x03）に使うため、端末ソフトの慣習に合わせています）。貼り付けはターミナルの右クリックで、接続中のタブでのみ動きます。改行を含む内容（行ごとにコマンドとして実行されます）や、`Ctrl+Z` などの制御文字（タブを除く）を含む内容は、送る前に確認ダイアログで中身を表示します（既定のボタンは「キャンセル」）。貼り付けにキーボードのショートカットはありません
 - **フォントサイズ変更** — 表示メニューから 6〜32pt。開いているタブすべてに即反映され、以降に開くタブにも引き継ぎます
@@ -65,6 +65,38 @@ v3 の認証情報は保存されません。アプリを起動するたびに�
 `v3 authPriv / netbelt`）。この列はエクスポートにも含まれます。
 パスワードと、v1/v2c のコミュニティ文字列は出ません。
 
+#### SNMP Trap の取りこぼしについて
+
+画面の処理が追いつかない間に届いた Trap は、表示を待つ列に溜まります。
+この列の上限は 1000 件（`settings.snmp.max_traps` をそれより大きくして
+いればその値）で、あふれている間に届いた Trap は捨てて数えます（先に
+届いていた方が残ります）。捨てた件数は「受信状態」の下に
+「取りこぼし: N 件（配送待ちの上限 1000 件。最後 HH:MM:SS）」と出て、
+受信開始とクリアで 0 に戻ります。一覧とエクスポートには入りません。
+あふれ始めたときと、捌けたあとの件数・時間帯はログ（exe 版は
+`%LOCALAPPDATA%\NetBelt\logs\`。`Trap backlog` を含む行）にも残ります。
+NetBelt を閉じたときと更新を当てたときに、まだ一覧に出ていなかった
+Trap は、出し終わるのを待たずに捨て、その件数を別の行
+（`Discarded N undelivered trap(s) at exit`。0 件のときは書きません）に
+残します。
+
+NetBelt が数えられるのは、自分の表示待ちで捨てた分だけです。それより
+手前で Windows の受信バッファがあふれて落ちた分（毎秒数千件の嵐で
+起こります）は NetBelt に届かないので数えられません。取りこぼしが
+無かったかは、送信側機器の Trap の送信数（Cisco IOS なら `show snmp` の
+Trap PDUs）と一覧の件数を比べて確かめてください。ただし一覧に残るのは
+`settings.snmp.max_traps` 件（既定 1000 件）までで、それを超えた分は
+落ちていなくても古い方から消えます。比べられるのは、送った数が
+その件数以下のときだけなので、確かめる前に一覧をクリアしてください。
+一覧に残す件数を増やすには、NetBelt を閉じてから `config.json` の
+`settings` の中に `"snmp": {"max_traps": 5000}` のように書き足して
+（既定の `config.json` にこの項目はありません。あればその値を大きく
+して）、起動し直してください。なお
+`netstat -s -p udp` の「IPv4 の UDP 統計」の「受信エラー」（英語版の
+Windows では「UDP Statistics for IPv4」の「Receive Errors」）は、
+Windows 11 で 127.0.0.1 宛てに試した範囲では、受信バッファで落ちた分を
+数えませんでした。
+
 ### その他
 - **ポートチェッカー** — この PC のポートが空いているかを調べます（ツール → ポートチェッカー）。指定ポートへ実際にバインドを試し、使用中なら `netstat` と `tasklist` で占有しているプロセスを特定します。Syslog・TFTP・SNMP Trap などの受信サーバが起動できないときの切り分け用です。リモート機器へのポートスキャンではありません
 - **設定** — ターミナルの配色とフォント、SFTP クライアントの動作、起動時の更新確認を変更できます（ツール → 設定）
@@ -105,14 +137,34 @@ v3 の認証情報は保存されません。アプリを起動するたびに�
 Windows SmartScreen の警告が出る場合は「詳細情報」→「実行」を選んでください
 （コード署名証明書を持たないため、署名なしの実行ファイルとして扱われます）。
 
+設定（機器・グループなど）は、起動したフォルダの `config.json` に保存されます（無ければ作ります）。
+NetBelt.exe と同じフォルダから起動してください。別のフォルダから起動すると、そのフォルダの
+`config.json` を使うので、設定が分かれます。使っているファイルの場所は、ヘルプ → バージョン情報の
+「設定ファイル」に出ます。
+
 ## ファイアウォールについて
 
 受信サーバ（FTP / TFTP / Syslog / SFTP / SNMP Trap）は、起動しても Windows Defender
 ファイアウォールの受信許可ルールを追加しません。起動しただけで管理者権限（UAC）を求めないためです。
+NetBelt を管理者として実行する必要はありません。
 
 そのポートで受信できないときは、各パネルの**「ファイアウォールで許可（管理者）」**を一度押してください。
-押したときだけ UAC が表示され、`NetBelt - <サービス> (<プロトコル>/<ポート>)` という名前で
-受信許可ルールを追加します。
+押したときだけ UAC が表示され、次の 3 つを行います。
+
+1. `NetBelt - <サービス> (<プロトコル>/<ポート>)` という名前で、そのポートの受信許可ルールを
+   追加します（プログラムを限定せず、すべてのプロファイルで有効）。
+2. NetBelt.exe を対象にした既存の受信ルールを、手動で作ったものやブロックのルールも含めて
+   すべて削除します。Windows の初回の確認画面をキャンセルしたときに作られるブロックのルールを
+   消すためです。ただし、グループ ポリシーで配られたルールは消せず、そのブロックのルールが
+   あると 3 の許可を足しても受信できません。消えたかどうかは確かめないので、1〜3 がすべて
+   済んだときも、パネルには「既存のブロック規則の除去は確認していません」と添えて表示されます。
+3. NetBelt.exe のすべてのポートの受信を、すべてのプロファイルで許可するルール
+   `NetBelt - app inbound (self)` を追加します。
+
+UAC は、1 のルールのうち無いものや有効な許可になっていないもの 1 つにつき 1 回（FTP のパッシブの
+ポート範囲は 1 つのルールです）と、2・3 で 1 回表示されます。初めて押したときは最大 3 回（FTP と、
+UDP・TCP の両方で受信中の Syslog。ほかは 2 回）、1 のルールがそろった後は 1 回です。
+途中の UAC を拒否しても、残りの UAC は表示されます。
 
 v1.3.0 より前の版が自動で作ったルールは、そのまま残っています。同じポートを使い続けるなら
 追加の操作は要りません。
@@ -222,7 +274,7 @@ application and a set of daemons.
   plus an SFTP client, for moving configs and images to and from network devices.
   The client rides the terminal's SSH session, so it becomes available once you
   connect to a device — provided that device supports SFTP.
-- **Auto commands** — commands registered per group are sent right after connecting (e.g. `terminal length 0`). Configure them by right-clicking a group in the tree and choosing 「グループを編集」 ("Edit group"). Applies to SSH and Telnet. They are stored in plain text in `config.json`, so do not put passwords there.
+- **Auto commands** — commands registered per group are sent right after connecting (e.g. `terminal length 0`). Configure them by right-clicking a group in the tree and choosing 「グループを編集」 ("Edit group"). They are sent to the group's registered devices whether you connect over SSH, Telnet or a console (serial) line; COM ports listed automatically under 「コンソール接続」 ("Console connections") belong to no group, so nothing is sent to them. They are stored in plain text in `config.json`, so do not put passwords there.
 - **Copy / paste** — selecting text with the mouse copies it to the clipboard right away (`Ctrl+Shift+C` also copies, following terminal-emulator convention: `Ctrl+C` in a terminal tab is left free to send an interrupt (0x03) to the device). Right-click in the terminal to paste; this only works on a connected tab. If the text contains a line break (each line would run as a command) or a control character such as `Ctrl+Z` (tabs excepted), a confirmation dialog shows it before anything is sent, with Cancel as the default. There is no keyboard shortcut for paste.
 - **SNMP GET / WALK** — v1/v2c/v3 with USM; fetch or walk arbitrary OIDs, export results as CSV / JSON / text
 - **Port checker** — checks whether a port on this PC is free (Tools → ポートチェッカー). It attempts a real bind, and when the port is taken it identifies the owning process via `netstat` and `tasklist`. Meant for troubleshooting why a receiving server (Syslog, TFTP, SNMP Trap, …) will not start. It is not a port scanner for remote devices.
@@ -265,6 +317,35 @@ level each trap arrived with, including the v3 username (e.g.
 `v3 authPriv / netbelt`). It is carried into the exports too. Passwords
 and v1/v2c community strings are not shown anywhere.
 
+#### Dropped traps
+
+Traps that arrive while the GUI cannot keep up wait in a queue capped at
+1000 (or `settings.snmp.max_traps`, if that is larger). While it is full,
+newly arriving traps are dropped and counted, and the earlier ones are
+kept. The count appears under the receiver status as
+「取りこぼし: N 件…」 ("N dropped"), is reset when reception starts or the
+list is cleared, and never goes into the list or the exports. The log
+(`%LOCALAPPDATA%\NetBelt\logs\` for the exe; lines containing
+`Trap backlog`) records when an overflow
+started and, once it drained, how many traps were dropped and when.
+Traps not yet shown when NetBelt closes or quits to apply an update are
+discarded without waiting for them, and their count goes on a separate
+line, `Discarded N undelivered trap(s) at exit` (omitted when there are
+none).
+
+NetBelt can only count what it drops itself. Datagrams that Windows
+discards because the receive buffer overflowed (storms of thousands per
+second) never reach it. To check for those, compare the sending device's
+trap counter (Trap PDUs in Cisco IOS `show snmp`) with the list. The list
+keeps at most `settings.snmp.max_traps` traps (1000 by default) and removes
+the oldest beyond that even when none were lost, so the comparison only
+works if no more traps were sent than that. Clear the list first. To
+keep more, close NetBelt, add `"snmp": {"max_traps": 5000}` (or another
+number) under `settings` in `config.json` (the default file does not have
+it; if yours does, raise the value) and start it again. In a test
+against 127.0.0.1 on Windows 11, the "Receive Errors" line of
+`netstat -s -p udp` did not count receive-buffer overflows.
+
 ### Requirements
 
 **Windows 10 / 11 only.** The password store uses Windows DPAPI, so it does not
@@ -275,6 +356,33 @@ run on other platforms. The portable build does not require Python.
 See [Releases](https://github.com/gomanizm/NetBelt/releases). Windows SmartScreen
 will warn about the executable because it is not code-signed; choose
 **More info** then **Run anyway**.
+
+Settings (devices, groups and so on) are kept in `config.json` in the folder
+NetBelt is started from, which is created if it is missing. Start NetBelt.exe
+from its own folder: started from another folder, it uses the `config.json`
+there, so your settings end up split. Help → バージョン情報 ("Version info")
+shows the full path of the file in use.
+
+### Firewall
+
+Starting a server does not add Windows Defender Firewall rules, so NetBelt never
+asks for administrator rights (UAC) just by starting, and it does not need to be
+run as administrator. If a server receives nothing, press
+「ファイアウォールで許可（管理者）」 ("Allow through firewall (admin)") in its panel. It:
+
+1. adds an inbound allow rule for that port, `NetBelt - <service> (<protocol>/<port>)`
+   (any program, all profiles);
+2. deletes every existing inbound rule for NetBelt.exe, including rules you created
+   yourself and block rules (this is how it removes the block rule Windows creates
+   when its first-run prompt is cancelled). Rules pushed by Group Policy are not
+   deleted, and a block rule among them still stops traffic after step 3. The
+   deletion is not checked, so the panel says so even when every step succeeds;
+3. allows all inbound traffic to NetBelt.exe on all profiles
+   (`NetBelt - app inbound (self)`).
+
+UAC appears once for each step 1 rule that is missing or not an enabled allow rule
+(the FTP passive port range is a single rule), plus once for steps 2 and 3: up to
+3 times on the first press, and once per press after the step 1 rules exist.
 
 ### A note on the built-in servers
 

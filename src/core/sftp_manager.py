@@ -99,8 +99,9 @@ class SFTPManager(QObject):
 
     # 共有チャンネルが機器の応答を待つ上限（秒）。None のままだと、機器が
     # SFTP サブシステムだけ黙ったとき（TCP は生きている）に mkdir や
-    # normalize が無期限に止まり、GUI スレッドから呼ばれるのでアプリ全体が
-    # 固まる。転送中は 1 回の recv/send がこの時間ゼロのまま止まったときに
+    # normalize が無期限に止まる。GUI スレッドから呼ぶ操作（mkdir など）は
+    # アプリ全体が固まり、ロックを持ったまま止まると以後の操作もすべて
+    # 断られる。転送中は 1 回の recv/send がこの時間ゼロのまま止まったときに
     # 限って切れる（データが流れている限り切れない）。
     CHANNEL_TIMEOUT_SECONDS = 30.0
 
@@ -1515,7 +1516,14 @@ class SFTPManager(QObject):
     
     def change_directory(self, path: str):
         """
-        ディレクトリを変更
+        ディレクトリを変更（機器への問い合わせはバックグラウンド）
+
+        normalize（REALPATH）を GUI スレッドで待つと、機器の応答 1 往復
+        （黙る機器では CHANNEL_TIMEOUT_SECONDS）のあいだアプリ全体が固まる。
+        ロックは今どおり GUI スレッドで取り（転送中なら 0.5 秒で断る）、
+        取れたロックを持ったまま normalize だけを使い捨てのスレッドで行う。
+        そのスレッドでロックを取り直すと、あとから頼まれた自動更新が先に
+        取れて、移動を待たずに場所を選ぶ（移動と自動更新の順序が崩れる）。
         
         Args:
             path: 移動先ディレクトリパス
@@ -1526,19 +1534,36 @@ class SFTPManager(QObject):
         
         if not self._acquire_for_gui("ディレクトリ移動"):
             return
-        err = None
+        client = self.sftp_client
+
+        def move_thread():
+            err = None
+            try:
+                # パスを正規化
+                normalized_path = client.normalize(path)
+                # 待つあいだに畳まれていたら頼まない（頼んでも「SFTP接続が
+                # ありません」が出るだけ）。一覧の控えはロックを放す前に置く。
+                # 放してからだと、ロックを待っていた自動更新が古い場所を選ぶ
+                if self.is_connected and self.sftp_client is client:
+                    # ディレクトリ一覧を取得（これによりパスの存在も確認）
+                    self.list_directory(normalized_path)
+            except Exception as e:
+                err = e
+            finally:
+                self._sftp_lock.release()
+            # 通知はロックを離してから（_fail が切断するときロックを取る）。
+            # 畳まれたあとの失敗は知らせない。畳んだ側が知らせ済みで、
+            # 期限切れなら切断の知らせが 2 回になる
+            if err is not None and self.is_connected and self.sftp_client is client:
+                self._fail("ディレクトリ変更エラー", err)
+
         try:
-            # パスを正規化
-            normalized_path = self.sftp_client.normalize(path)
-        except Exception as e:
-            err = e
-        finally:
+            threading.Thread(target=move_thread, daemon=True).start()
+        except RuntimeError as e:
+            # スレッドを作れない。ロックを持ったまま戻ると、以後の操作が
+            # すべて「転送中」で断られる
             self._sftp_lock.release()
-        if err is not None:
-            self._fail("ディレクトリ変更エラー", err)
-            return
-        # ディレクトリ一覧を取得（これによりパスの存在も確認）
-        self.list_directory(normalized_path)
+            self._fail("ディレクトリ変更エラー", e)
     
     def get_parent_directory(self) -> str:
         """
