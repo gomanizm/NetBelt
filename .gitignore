@@ -64,3 +64,8 @@ release/
 
 # Development work log (kept locally, not published)
 WORKLOG.md
+
+# Claude Code の個人設定（手元で許可したコマンドの規則などが入り、
+# C:\Users\<アカウント名> のような絶対パスが混ざり得る）
+.claude/settings.local.json
+CLAUDE.local.md
