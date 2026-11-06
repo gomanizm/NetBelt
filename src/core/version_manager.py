@@ -7,6 +7,7 @@ import os
 import sys
 import json
 import shutil
+import socket
 import subprocess
 import tempfile
 import threading
@@ -588,6 +589,10 @@ class VersionManager:
             return
 
         def _close():
+            # Response.close() は makefile の参照を減らすだけで OS のソケットを
+            # 閉じないので、相手が黙り込んだ recv は起きない。先に下のソケット
+            # そのものを閉じる（取れないときは今までどおり close() だけ）
+            self._close_raw_socket(response)
             try:
                 response.close()
             except Exception as e:
@@ -595,6 +600,23 @@ class VersionManager:
 
         threading.Thread(target=_close, daemon=True,
                          name="netbelt-update-abort").start()
+
+    @staticmethod
+    def _close_raw_socket(response) -> None:
+        """応答の下にある OS のソケットを閉じ、止まった recv を起こす。
+
+        requests / urllib3 の私有の属性をたどるので、見つからなければ
+        何もしない。detach してから閉じるのは、makefile の参照が残って
+        いても実体を閉じるため（socket.close() だけでは閉じない）。
+        """
+        conn = getattr(getattr(response, 'raw', None), '_connection', None)
+        sock = getattr(conn, 'sock', None)
+        if not isinstance(sock, socket.socket):
+            return
+        try:
+            socket.close(sock.detach())
+        except Exception as e:
+            print(f"[VersionManager] 受信ソケットを閉じられませんでした: {e}")
 
     @staticmethod
     def _safe_name_part(text) -> str:
