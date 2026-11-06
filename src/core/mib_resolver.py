@@ -11,7 +11,7 @@ from typing import Dict, Optional
 # MIB 解析器の版。抽出・解決の規則を変えたら上げる。mib_cache.json は
 # この値も鍵にするので、古い解析器が作ったキャッシュがアプリの更新後に
 # そのまま使われることがなくなる。
-MIB_PARSER_VERSION = '2026-09-26.1'
+MIB_PARSER_VERSION = '2026-11-06.1'
 
 
 def app_dir() -> str:
@@ -118,6 +118,7 @@ class MIBResolver:
             '1.3.6.1': 'internet',
             '1.3.6.1.2': 'mgmt',
             '1.3.6.1.2.1': 'mib-2',
+            '1.3.6.1.2.1.10': 'transmission',
             '1.3.6.1.3': 'experimental',
             '1.3.6.1.4': 'private',
             '1.3.6.1.4.1': 'enterprises',
@@ -160,7 +161,8 @@ class MIBResolver:
             '1.3.6.1.2.1.15.3.1.1': 'bgpPeerIdentifier',
             '1.3.6.1.2.1.15.3.1.2': 'bgpPeerState',
             '1.3.6.1.2.1.15.3.1.3': 'bgpPeerAdminStatus',
-            '1.3.6.1.2.1.15.3.1.7': 'bgpPeerRemoteAs',
+            '1.3.6.1.2.1.15.3.1.7': 'bgpPeerRemoteAddr',
+            '1.3.6.1.2.1.15.3.1.9': 'bgpPeerRemoteAs',
             '1.3.6.1.2.1.15.7': 'bgpTraps',
             '1.3.6.1.2.1.15.7.1': 'bgpEstablished',
             '1.3.6.1.2.1.15.7.2': 'bgpBackwardTransition',
