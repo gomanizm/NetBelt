@@ -1296,20 +1296,29 @@ class SFTPManager(QObject):
                                          callback=progress_callback)
                 
                 # 全部落とせてから最終名へ（同じディレクトリなので原子的）
-                if overwrite_granted:
-                    os.replace(tmp_local, local_path)
-                else:
-                    # 呼ばれた時点では無かった＝上書きは承認されていない。
-                    # 転送しているあいだに外から作られていたら置き換えない
-                    try:
+                try:
+                    if overwrite_granted:
+                        os.replace(tmp_local, local_path)
+                    else:
+                        # 呼ばれた時点では無かった＝上書きは承認されていない。
+                        # 転送しているあいだに外から作られていたら置き換えない
                         os.rename(tmp_local, local_path)
-                    except FileExistsError:
-                        keep_tmp[0] = True
+                except OSError as replace_error:
+                    # 落とした内容は一時名にしか無いので消さない（保存先を
+                    # 別のプロセスが開いている・読み取り専用、などで断られる）
+                    keep_tmp[0] = True
+                    if (not overwrite_granted
+                            and isinstance(replace_error, FileExistsError)):
                         raise OSError(
                             "転送しているあいだに保存先 '%s' が作られました。"
                             "上書きの確認を経ていないので置き換えていません。"
                             "落とした内容は %s に残っています"
                             % (os.path.basename(local_path), tmp_local))
+                    raise OSError(
+                        "保存先 '%s' へ置き換えられませんでした（%s）。"
+                        "落とした内容は %s に残っています"
+                        % (os.path.basename(local_path),
+                           replace_error.strerror or replace_error, tmp_local))
                 # 予約は通知より先に外す（完了を見てすぐ落とし直しても断られない）
                 self._release_download_target(target_key)
                 # 完了通知
