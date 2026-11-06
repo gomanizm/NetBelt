@@ -687,7 +687,8 @@ class TFTPServer:
             if a != addr or len(data) < 4:
                 continue
             op, block = struct.unpack("!HH", data[:4])
-            if op == OP_DATA and block == final_block                     and len(data) <= blksize + 4:
+            if op == OP_DATA and block == final_block \
+                    and len(data) <= blksize + 4:
                 xs.sendto(last_ack, addr)
                 reacks += 1
                 if reacks <= self._retries:
