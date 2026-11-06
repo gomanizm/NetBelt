@@ -427,7 +427,11 @@ class FTPServerManager(QObject):
             self.error_occurred.emit(UNDECRYPTABLE_PASSWORD_MESSAGE)
             return False
         import os
-        os.makedirs(root_dir, exist_ok=True)
+        try:
+            os.makedirs(root_dir, exist_ok=True)
+        except OSError as e:
+            self.error_occurred.emit("ルートディレクトリの作成に失敗: %s" % e)
+            return False
         # ファイアウォールは自動設定しない（3CDaemon 方式）。管理者昇格(UAC)を避けるため、
         # 制御21/passive の受信許可は Windows 標準の初回プロンプト／既存ルールに委ねる。
         self._emit_activity("", "ファイアウォール: 自動設定なし（Windowsの許可に委ねます）")
