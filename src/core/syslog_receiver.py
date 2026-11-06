@@ -599,7 +599,10 @@ class SyslogReceiver(QObject):
         RFC 6587 の octet-counting（"<len> <msg>"）と改行区切りの両方を受け付ける。
         どちらかはバッファ先頭で判定し、混在も許す。
 
-        最後に受信してから tcp_idle_timeout_seconds を過ぎた接続は切断する。
+        最後に完全なメッセージが届いてから（組み立て中の 1 件があればその
+        受信を始めてから）tcp_idle_timeout_seconds を過ぎた接続は切断する。
+        recv が何か返すたびに数え直すと、終端を送らず少しずつ送り続ける接続が
+        永久に切られず、同時接続の枠を握り続けられる。
 
         相手が閉じた・相手が RST で打ち切った・無通信で切った・停止要求で
         抜けた、のいずれで終わる場合も、残った終端なしの 1 行を配信してから
@@ -619,7 +622,9 @@ class SyslogReceiver(QObject):
                         # 消える）
                         self._flush_tcp_residual(buffer, client_ip, listen_port)
                         return
-                    last_activity = time.monotonic()
+                    if not buffer:
+                        # 新しい 1 件の受信が始まった
+                        last_activity = time.monotonic()
                     buffer += data
                     too_long = False
                     while buffer and not too_long:
@@ -635,6 +640,7 @@ class SyslogReceiver(QObject):
                                 break
                             self._emit_tcp_line(buffer[m.end() - 1:end], client_ip,
                                                 listen_port, octet_counted=True)
+                            last_activity = time.monotonic()
                             buffer = buffer[end:]
                             continue
                         # 改行区切り。いま組み立てている 1 行が上限を超えたら、
@@ -667,6 +673,7 @@ class SyslogReceiver(QObject):
                             break
                         line, buffer = buffer[:newline_at], buffer[newline_at + 1:]
                         self._emit_tcp_line(line, client_ip, listen_port)
+                        last_activity = time.monotonic()
                     if too_long:
                         # 一覧に並ぶので、機器からの行と同じ RFC 3164 の形で
                         # 組み立てる。生の文言のまま渡すと、先頭の語が
@@ -681,6 +688,14 @@ class SyslogReceiver(QObject):
                         self.message_count += 1
                         # 切り捨てた残りは配信しない（切断を伝えた直後に
                         # 切れ端を 1 件として出すことになる）
+                        return
+                    # 少しずつ送り続ける相手には recv が返り続け、下の
+                    # socket.timeout の枝に来ないので、ここでも期限を見る
+                    idle = self.tcp_idle_timeout_seconds
+                    if buffer and idle and time.monotonic() - last_activity > idle:
+                        print("[Syslog] TCP client sent no complete message"
+                              " for %ds, closing: %s" % (idle, client_ip))
+                        self._flush_tcp_residual(buffer, client_ip, listen_port)
                         return
                 except socket.timeout:
                     # 無通信のまま上限を過ぎた接続は切って枠を返す
