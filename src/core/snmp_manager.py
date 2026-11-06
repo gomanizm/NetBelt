@@ -513,6 +513,11 @@ class SNMPWorker(QThread):
     # result_ready とはどちらか一方だけが出る
     cancelled = pyqtSignal(object)
 
+    # 1 回の GET / WALK で受け取る行数の上限。部分木の中で OID を増やし
+    # ながら応答し続ける機器（故障・悪意）でメモリが際限なく伸びないよう、
+    # 超えたら打ち切って「途中まで」として渡す（Trap の max_traps と同じ考え方）
+    MAX_RESULT_ROWS = 100000
+
     def __init__(self, operation: str, params: dict):
         super().__init__()
         self.operation = operation
@@ -598,7 +603,13 @@ class SNMPWorker(QThread):
             value_type = varBind[1].__class__.__name__
             results.append((oid, value_type, value))
         
+        if len(results) > self.MAX_RESULT_ROWS:
+            self._partial_reason = self._row_limit_reason()
+            del results[self.MAX_RESULT_ROWS:]
         return results
+
+    def _row_limit_reason(self) -> str:
+        return f"行数の上限（{self.MAX_RESULT_ROWS}件）"
     
     def _perform_walk(self) -> List[Tuple[str, str, str]]:
         """SNMP WALKを実行"""
@@ -637,12 +648,18 @@ class SNMPWorker(QThread):
                     break
             
                 for varBind in varBinds:
+                    if len(results) >= self.MAX_RESULT_ROWS:
+                        self._partial_reason = self._row_limit_reason()
+                        break
                     oid_str = varBind[0].prettyPrint()
                     value = _value_text(varBind[1])
                     value_type = varBind[1].__class__.__name__
                     results.append((oid_str, value_type, value))
                     count += 1
             
+                if self._partial_reason:
+                    break
+
                 # 進捗更新（100件ごと）
                 if count % 100 == 0:
                     self.progress_update.emit(f"{count}件取得中...")
