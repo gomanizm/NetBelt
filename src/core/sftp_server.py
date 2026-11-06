@@ -683,7 +683,9 @@ class SFTPServerHandler(SFTPServerInterface):
             if writing:
                 dir_path = os.path.dirname(real_path)
                 if dir_path and not os.path.exists(dir_path):
-                    os.makedirs(dir_path)
+                    # 同じ新しいフォルダへの同時の書き込みで、後の方が
+                    # 「既にある」で失敗しないようにする（FTP・TFTP と同じ）
+                    os.makedirs(dir_path, exist_ok=True)
 
             if tracked and not self._open_writers.reserve(real_path):
                 # 開くと O_TRUNC が相手の書きかけを切り詰め、双方が成功で
