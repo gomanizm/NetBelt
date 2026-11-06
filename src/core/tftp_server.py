@@ -425,6 +425,7 @@ class TFTPServer:
         first_ack = _oack(neg) if neg else struct.pack("!HH", OP_ACK, 0)
         xs.sendto(first_ack, addr)
         deadline = time.monotonic() + timeout
+        give_up_at = time.monotonic() + self.ESTABLISH_WAIT_MAX_SECONDS
         expected = 1
         received = 0
         last_ack = first_ack
@@ -458,6 +459,8 @@ class TFTPServer:
                     if len(data) < 4 or len(data) > blksize + 4:
                         continue
                 except socket.timeout:
+                    if not established and time.monotonic() >= give_up_at:
+                        return  # 確立までの待ちの上限。孤児として黙って撤退
                     if time.monotonic() < deadline:
                         continue  # 合意した timeout まではまだ待つ（停止確認のため小刻みに戻る）
                     retries += 1
@@ -607,6 +610,12 @@ class TFTPServer:
         xs.settimeout(min(1.0, timeout))
         return timeout
 
+    # 確立まで（WRQ は最初の DATA、RRQ は OACK への ACK）待つ長さの上限（秒）。
+    # 相手が申告する timeout（最大 255 秒）のまま (再送回数 + 1) 回待つと、
+    # 要求だけ送って去った相手が 1 本で約 25 分ワーカー枠を握る。既定の待ち
+    # （timeout 2 秒 x 6 回 = 12 秒）は変えない。確立後は申告どおり待つ
+    ESTABLISH_WAIT_MAX_SECONDS = 30.0
+
     # 最終 ACK の後に待つ長さの下限と、長い timeout を受諾したときの上限（秒）
     DALLY_MIN_SECONDS = 6.0
     DALLY_MAX_SECONDS = 30.0
@@ -675,11 +684,13 @@ class TFTPServer:
                     # この再 ACK も落ちたときの次の再送に備える
                     deadline = time.monotonic() + window
 
-    def _send_and_wait_ack(self, xs, packet, addr, expect_block, timeout=None):
+    def _send_and_wait_ack(self, xs, packet, addr, expect_block, timeout=None,
+                           give_up_at=None):
         """packet を送り、block=expect_block の ACK を待つ。来なければ最大 _retries 回まで再送。
         古い/重複 ACK は無視。全再送失敗で socket.timeout を送出（呼び出し側が中断処理）。
         相手の TID からの ERROR は _PeerAborted を送出する。
-        timeout は 1 回の待ち秒数（省略時は既定の _timeout）。"""
+        timeout は 1 回の待ち秒数（省略時は既定の _timeout）。
+        give_up_at（time.monotonic() の時刻）を渡すと、再送が残っていてもそこで諦める。"""
         if timeout is None:
             timeout = self._timeout
         for attempt in range(self._retries + 1):
@@ -687,8 +698,12 @@ class TFTPServer:
             # 気づかず、止めたあとも DATA を送り続けることになる。
             if self._stopping:
                 raise _ServerStopped()
+            if give_up_at is not None and time.monotonic() >= give_up_at:
+                break
             xs.sendto(packet, addr)
             deadline = time.monotonic() + timeout
+            if give_up_at is not None:
+                deadline = min(deadline, give_up_at)
             deadline_tries = 0
             while True:
                 try:
@@ -760,7 +775,10 @@ class TFTPServer:
             with open(target, "rb") as f:
                 if neg:
                     try:
-                        self._send_and_wait_ack(xs, _oack(neg), addr, 0, timeout)  # OACKにACK(0)。再送付き
+                        # OACKにACK(0)。再送付き。確立前なので待ちに上限を設ける
+                        self._send_and_wait_ack(
+                            xs, _oack(neg), addr, 0, timeout,
+                            time.monotonic() + self.ESTABLISH_WAIT_MAX_SECONDS)
                     except socket.timeout:
                         return  # 未確立: 重複RRQの孤児。started/error とも出さない
                     except (_ServerStopped, _PeerAborted):
