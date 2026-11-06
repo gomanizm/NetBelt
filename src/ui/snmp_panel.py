@@ -1087,6 +1087,8 @@ class SNMPPanel(QWidget):
                 port, communities, v3_users, keep_traps=self.max_traps):
             return
         self._reset_trap_dropped()
+        # 受信中に変えても待ち受けは変わらない（FW 許可も受信中のポートを使う）
+        self.trap_port_spinbox.setEnabled(False)
         self.trap_start_button.setVisible(False)
         self.trap_stop_button.setVisible(True)
         self.trap_status_label.setText(f"🔵 受信中 (ポート {port})")
@@ -1219,6 +1221,7 @@ class SNMPPanel(QWidget):
         self.trap_start_button.setVisible(True)
         self.trap_stop_button.setVisible(False)
         self.trap_stop_button.setEnabled(True)
+        self.trap_port_spinbox.setEnabled(True)
         self.trap_status_label.setText("🔴 停止中")
         self.trap_status_label.setStyleSheet("color: #f44336; font-weight: bold; font-size: 14px;")
     
@@ -1358,7 +1361,7 @@ class SNMPPanel(QWidget):
 
     def _export_to_txt(self, file_path: str, traps):
         """テキスト形式で Trap を書き出す（traps は CSV と同じ）"""
-        resolver = get_resolver()
+        resolver = self._resolver_or_none()
         
         with atomic_text_write(file_path, encoding='utf-8') as f:
             f.write("=" * 80 + "\n")
@@ -1377,7 +1380,7 @@ class SNMPPanel(QWidget):
                 varbinds = trap['varbinds']
                 
                 # Trap OIDを名前に変換
-                trap_name = resolver.resolve_oid(trap_oid) if trap_oid else 'N/A'
+                trap_name = self._resolve_oid(resolver, trap_oid) if trap_oid else 'N/A'
                 
                 f.write(f"[{i}] Trap受信\n")
                 f.write(f"  時刻: {timestamp}\n")
@@ -1392,7 +1395,7 @@ class SNMPPanel(QWidget):
                     for j, vb in enumerate(varbinds, 1):
                         oid = vb['oid']
                         value = vb['value']
-                        oid_name = resolver.resolve_oid(oid)
+                        oid_name = self._resolve_oid(resolver, oid)
                         
                         f.write(f"    [{j}] {oid_name}\n")
                         if oid_name != oid:
@@ -1426,7 +1429,11 @@ class SNMPPanel(QWidget):
         if self.snmp_manager is None:
             self.trap_status_label.setText("SNMP マネージャがまだ用意されていません")
             return
-        ok, msg = self.snmp_manager.fix_firewall(self.trap_port_spinbox.value())
+        port = self.trap_port_spinbox.value()
+        if self.snmp_manager.is_trap_receiver_running():
+            # 受信中は、実際に待ち受けているポートの規則を足す
+            port = self.snmp_manager.trap_receiver.port
+        ok, msg = self.snmp_manager.fix_firewall(port)
         # 「反映待ち」等の理由を潰さず、そのまま見せる
         self.trap_status_label.setText(
             "ファイアウォール許可: %s (%s)" % ("完了" if ok else "未反映/失敗", msg))
@@ -1510,8 +1517,9 @@ class SNMPPanel(QWidget):
 
         Trap を受け取るのは受信スレッドで、ここが動くのは GUI スレッド。
         trap_received は queued 配送なので、その間に時間が空く。定常状態の
-        ずれはミリ秒だが、GUI が滞留するとき —— 大量 Trap の配送、終了待ち、
-        モーダルダイアログを開いている間 —— は意味のある差になる。now() で
+        ずれはミリ秒だが、GUI が滞留するとき —— 大量 Trap の配送、終了待ち
+        —— は意味のある差になる（モーダルダイアログはネストしたイベント
+        ループで配送するので、実測では遅れにならなかった）。now() で
         付け直すと滞留分だけ後ろへずれた時刻が表示され、そのままエクスポート
         にも入り、Trap の前後関係を時刻で追う用途で読み違える。
 
@@ -1526,6 +1534,20 @@ class SNMPPanel(QWidget):
             except (TypeError, ValueError):
                 pass
         return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    @staticmethod
+    def _resolver_or_none():
+        """名前解決器。作れなければ None（ログへ書けず MIB 読み込みが失敗した
+        等）。例外にすると、届いた Trap ごとに一覧へ入らず未捕捉例外になる"""
+        try:
+            return get_resolver()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _resolve_oid(resolver, oid):
+        """解決器が無ければ生の OID のまま返す"""
+        return resolver.resolve_oid(oid) if resolver is not None else oid
 
     def _add_trap_to_tree(self, trap_data: dict):
         """TrapデータをツリーViewに追加"""
@@ -1547,8 +1569,8 @@ class SNMPPanel(QWidget):
         })
         
         # Trap OIDを名前に変換
-        resolver = get_resolver()
-        trap_name = resolver.resolve_oid(trap_oid) if trap_oid else 'N/A'
+        resolver = self._resolver_or_none()
+        trap_name = self._resolve_oid(resolver, trap_oid) if trap_oid else 'N/A'
         
         # 標準的なVarBinds（sysUpTime, snmpTrapOID）を除外
         filtered_vbs = [vb for vb in varbinds if vb['oid'] not in ['1.3.6.1.2.1.1.3.0', '1.3.6.1.6.3.1.1.4.1.0']]
@@ -1567,7 +1589,7 @@ class SNMPPanel(QWidget):
         # （親を一覧へ入れる前に組むので、行ごとの変更通知も出ない）
         for row, vb in enumerate(filtered_vbs):
             # OIDを名前に変換
-            oid_name = resolver.resolve_oid(vb['oid'])
+            oid_name = self._resolve_oid(resolver, vb['oid'])
             # 子アイテム（1行につき1つのVarBind。時刻・送信元・セキュリティは空）
             children = (QStandardItem(""), QStandardItem(""), QStandardItem(""),
                         QStandardItem(oid_name), QStandardItem(vb['value']))
