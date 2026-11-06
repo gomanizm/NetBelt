@@ -2831,11 +2831,15 @@ for details.
         self.status_bar.showMessage(f"SFTP エラー ({device_name}): {error_message}")
     
     def _check_for_updates_on_startup(self):
-        """起動時の更新チェック"""
-        # 設定で無効化されている場合はスキップ
-        if not self.config_manager.get_check_on_startup():
-            return
-        
+        """起動時の更新チェック
+
+        未適用の更新の提示と古い更新ファイルの掃除は、設定に関係なく行う。
+        設定で切れるのは GitHub への問い合わせだけ。掃除までまとめて
+        飛ばしていたときは、起動時の確認を切った利用者の更新フォルダに
+        ZIP や中断した .part が積もり続けていた。
+        """
+        check_on_startup = self.config_manager.get_check_on_startup()
+
         # 未適用の更新をチェック。
         # 更新チェックの失敗で起動そのものを止めない。ここを素通しに
         # していたときは、走査中に ZIP が消えただけで MainWindow() が
@@ -2856,7 +2860,11 @@ for details.
                 
                 # 古い更新ファイルをクリーンアップ
                 version_mgr.cleanup_old_updates(24)
-                
+
+                # 設定で無効化されている場合は問い合わせない
+                if not check_on_startup:
+                    return
+
                 update_info = version_mgr.check_for_updates()
                 
                 if update_info and update_info.get('error'):
