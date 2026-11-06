@@ -57,6 +57,11 @@ def _declared_size(value):
 # WSAECONNRESET(10054) は ConnectionResetError として別に判定する
 _TRANSIENT_RECV_WINERRORS = frozenset([10040, 10052])
 
+# 転送用ソケットの受信バッファ。blksize に合わせて小さく取ると、Windows では
+# それより大きいデータグラムで recvfrom 自体が WSAEMSGSIZE を上げ、送信元（TID）を
+# 照合する前に転送が中断する。UDP の最大まで受けてから照合・長さの判定をする
+_RECV_BUFSIZE = 65536
+
 
 def _is_transient_recv_error(e):
     """UDP の recvfrom が上げた例外が、読み捨てて受信を続けてよいものか。
@@ -440,7 +445,7 @@ class TFTPServer:
                                       (filename, "upload"))
                     return
                 try:
-                    data, a = xs.recvfrom(blksize + 4)
+                    data, a = xs.recvfrom(_RECV_BUFSIZE)
                     # RFC1350: 確立後は相手の TID(IP:port) が一致するものだけ受理する。
                     # 照合しないと、同一セグメントの任意ホストが期待ブロック番号の
                     # DATA を1発撃つだけで進行中の転送へ任意データを混入させられる。
@@ -449,7 +454,8 @@ class TFTPServer:
                         continue
                     # 長さを見ずに unpack すると、空データグラム1発で struct.error に
                     # なり、進行中の転送が中断してしまう
-                    if len(data) < 4:
+                    # 合意した blksize を超える DATA は受理しない（読み捨てる）
+                    if len(data) < 4 or len(data) > blksize + 4:
                         continue
                 except socket.timeout:
                     if time.monotonic() < deadline:
@@ -643,11 +649,13 @@ class TFTPServer:
                 break
             xs.settimeout(min(0.2, remaining))
             try:
-                data, a = xs.recvfrom(blksize + 4)
+                data, a = xs.recvfrom(_RECV_BUFSIZE)
             except socket.timeout:
                 continue
             except OSError:
                 break
+            if len(data) > blksize + 4:
+                continue
             if a != addr or len(data) < 4:
                 continue
             op, block = struct.unpack("!HH", data[:4])
@@ -675,7 +683,7 @@ class TFTPServer:
             deadline_tries = 0
             while True:
                 try:
-                    ack, src = xs.recvfrom(516)
+                    ack, src = xs.recvfrom(_RECV_BUFSIZE)
                 except socket.timeout:
                     if time.monotonic() < deadline and not self._stopping:
                         continue  # 合意した timeout まではまだ待つ
