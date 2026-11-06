@@ -1172,7 +1172,9 @@ class MainWindow(QMainWindow):
         def connect_thread():
             try:
                 success = telnet.connect()
-                if not success:
+                # 接続待ちの間にタブが閉じられた接続は破棄済みのことがあり、
+                # emit が RuntimeError になる。捨てた接続の失敗は知らせない
+                if not success and not telnet._disposed:
                     # GUIスレッド外からウィジェットを直接触らない。
                     # 既に append_output へ接続済みのシグナルへ流す。
                     telnet.output_received.emit("\r\n接続失敗\r\n")
