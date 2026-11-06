@@ -1010,14 +1010,29 @@ class SyslogPanel(QWidget):
     def _on_receiver_error(self, error_message):
         """受信側の障害（ポート使用中・特権ポートなど）を利用者へ見せる
 
-        ここへ来るのは待ち受けそのものが始められなかった場合だけ。
-        受信したメッセージの不備は一覧に出るので、モーダルにはしない。
+        ここへ来るのは待ち受けそのものが始められなかった場合と、受信の
+        スレッドが想定外の例外で止まった場合だけ。受信したメッセージの
+        不備は一覧に出るので、モーダルにはしない。
         """
         if self._closing:
             # 終了処理の途中。開いても何もできない（_closing の説明を参照）
             print("[Syslog] %s" % error_message)
             return
+        self._sync_with_receiver()
         QMessageBox.critical(self, "Syslog受信 エラー", error_message)
+
+    def _sync_with_receiver(self):
+        """表示を受信側の実際の稼働状態へ合わせる
+
+        受信のスレッドが止まると受信側は登録を外すが、ボタンと状態ラベルは
+        「受信中」のまま残るので、ここで合わせる。すべて止まっていれば
+        停止の表示へ戻し、片方だけなら状態ラベルを稼働中のものだけにする。
+        """
+        recv = self.syslog_receiver
+        if recv is None or not recv.is_running:
+            self._stop_all()
+        else:
+            self._update_recv_status()
 
 
     def add_message(self, syslog_msg):

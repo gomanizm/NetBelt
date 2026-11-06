@@ -1,4 +1,5 @@
 """Syslogメッセージ受信サーバー"""
+import contextlib
 import socket
 import threading
 import re
@@ -480,6 +481,7 @@ class SyslogReceiver(QObject):
 
     def _run_udp_loop(self, sock, stop_event, listen_port=None):
         """UDP受信ループ"""
+        reason = None
         try:
             while not stop_event.is_set():
                 try:
@@ -494,14 +496,18 @@ class SyslogReceiver(QObject):
                     if stop_event.is_set():
                         break
                     print("[Syslog] Receive error: %s" % e)
+        except Exception as e:
+            reason = e
         finally:
             try:
                 sock.close()
             except Exception:
                 pass
+            self._on_loop_exit("UDP", stop_event, reason)
 
     def _run_tcp_loop(self, sock, stop_event, listen_port=None):
         """TCP接続受付ループ"""
+        reason = None
         try:
             while not stop_event.is_set():
                 try:
@@ -534,11 +540,38 @@ class SyslogReceiver(QObject):
                     if stop_event.is_set():
                         break
                     print("[Syslog] Accept error: %s" % e)
+        except Exception as e:
+            reason = e
         finally:
             try:
                 sock.close()
             except Exception:
                 pass
+            self._on_loop_exit("TCP", stop_event, reason)
+
+    def _on_loop_exit(self, proto, stop_event, reason):
+        """受信・受付のスレッドが終わるときの後始末（そのスレッドで動く）
+
+        停止要求なしに終わった（例外の枝の print まで失敗した、など）ときは、
+        登録を外して理由を知らせる。登録が残ると is_running が True のまま
+        になり、パネルは「受信中」と表示し続けるのに 1 件も受け付けない。
+        TCP は同じ stop_event を見ている接続のスレッドも畳ませる。
+        """
+        if stop_event.is_set():
+            return   # stop_protocol による通常の停止
+        entry = self._servers.get(proto)
+        if entry is None or entry["stop"] is not stop_event:
+            return
+        self._servers.pop(proto, None)
+        stop_event.set()
+        detail = reason if reason is not None else "不明な理由"
+        with contextlib.suppress(Exception):
+            print("[Syslog] %s receive thread ended unexpectedly: %s" % (proto, detail))
+        self.error_occurred.emit(
+            "Syslog の %s 受信が止まりました: %s\n受信を開始し直してください。"
+            % (proto, detail))
+        if not self._servers:
+            self.stopped.emit()
 
     # RFC 6587 §3.4.1 octet-counting: "MSG-LEN SP SYSLOG-MSG"。SYSLOG-MSG は
     # PRI（"<"）で始まるので、改行区切りの行が数字で始まる場合と区別できる
