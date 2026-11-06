@@ -577,7 +577,8 @@ class FTPServerManager(QObject):
                     mgr._emit_activity(
                         self.remote_ip,
                         "passiveポート範囲 %d-%d に待ち受けられる番号が無いため"
-                        " %s を断りました（ほかの接続の PASV や、ほかのアプリが"
+                        " %s を断りました（ほかの接続の PASV、NetBelt の SFTP"
+                        " サーバー・Syslog(TCP) などの受信機能、ほかのアプリが"
                         "使用中）" % (passive_ports[0], passive_ports[1],
                                     "EPSV" if extmode else "PASV"))
 
