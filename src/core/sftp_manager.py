@@ -409,7 +409,9 @@ class SFTPManager(QObject):
         # GUI スレッドから呼ばれるので、応答しない機器への転送中だと
         # 待った分だけアプリが固まる（終了できなくなる）。quiesce のあとは
         # その期限の残りだけ待つ（_teardown_wait）
-        acquired = self._sftp_lock.acquire(timeout=self._teardown_wait())
+        wait = self._teardown_wait()
+        wait_until = time.monotonic() + wait
+        acquired = self._sftp_lock.acquire(timeout=wait)
         try:
             client, self.sftp_client = self.sftp_client, None
             self.ssh_client = None
@@ -418,10 +420,20 @@ class SFTPManager(QObject):
                 self._sftp_lock.release()
 
         if client and acquired:
-            try:
-                client.close()
-            except Exception:
-                pass
+            def close_quietly():
+                try:
+                    client.close()
+                except Exception:
+                    pass
+            if threading.current_thread() is threading.main_thread():
+                # GUI スレッド。close はチャンネルの close を transport へ
+                # 送るので、送信が詰まった機器では戻らない。別のスレッドで
+                # 閉じ、待つのはロック待ちと合わせて同じ期限まで
+                closer = threading.Thread(target=close_quietly, daemon=True)
+                closer.start()
+                closer.join(max(0.0, wait_until - time.monotonic()))
+            else:
+                close_quietly()   # 作業スレッドからはこれまでどおり
         elif client:
             # 転送が掴んだまま。ここで閉じると、その最中のスレッドが
             # 閉じたハンドルを触ることになる。参照だけ手放し、後片付けは
