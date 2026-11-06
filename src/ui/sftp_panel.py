@@ -809,11 +809,22 @@ class SFTPPanel(QWidget):
         # 「上書きしますか」とは聞かない。観測済みの種別が最優先で、
         # まだ一覧に現れていない送信中の名前も既存ファイルとして扱う
         known_is_dir = self._current_entries.get(name)
+        # 綴りの大小だけ違う既存のファイル。大文字小文字を区別しない機器
+        # （Windows 上のサーバーなど）では同じファイルで、確認なしだと送る
+        # 直前の確かめで断られ続ける（一覧を更新しても綴りは変わらない）
+        case_twin = None
+        if known_is_dir is None and name not in self._pending_upload_names:
+            folded = name.casefold()
+            case_twin = next((entry for entry, is_dir
+                              in self._current_entries.items()
+                              if not is_dir and entry.casefold() == folded),
+                             None)
         if known_is_dir is True:
             overwrites_file = False
         else:
             overwrites_file = (known_is_dir is False
-                               or name in self._pending_upload_names)
+                               or name in self._pending_upload_names
+                               or case_twin is not None)
         # 上書きを許すのは、利用者が承認したときか、確認しない設定のとき
         # だけ。それ以外は SFTPManager が送る直前にリモートを確かめる。
         # ここの判定は「最後に観測した一覧」に基づくので、ダイアログの間に
@@ -822,7 +833,10 @@ class SFTPPanel(QWidget):
         if confirm and overwrites_file:
             reply = _plain_text(QMessageBox.question, self,
                 "上書き確認",
-                f"リモートに '{name}' が既にあります。上書きしますか？",
+                (f"リモートに '{case_twin}' があります。大文字小文字を区別"
+                 f"しない機器では、'{name}' を送るとこれを上書きします。"
+                 "上書きしますか？" if case_twin is not None else
+                 f"リモートに '{name}' が既にあります。上書きしますか？"),
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No
             )
