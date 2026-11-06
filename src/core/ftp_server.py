@@ -8,6 +8,7 @@ import time
 from PyQt6.QtCore import QObject, pyqtSignal
 from pyftpdlib.authorizers import DummyAuthorizer
 from pyftpdlib.exceptions import _RetryError
+from pyftpdlib.filesystems import AbstractedFS
 from pyftpdlib.handlers import FTPHandler, DTPHandler
 from pyftpdlib.servers import FTPServer as _PyFTPServer
 from pyftpdlib.ioloop import IOLoop as _PyIOLoop
@@ -15,6 +16,7 @@ from pyftpdlib.ioloop import _ERRNOS_DISCONNECTED, _ERRNOS_RETRY
 from pyftpdlib.log import logger as _ftp_logger
 
 from .crypto import PasswordCrypto
+from .safe_names import check_relative_path
 from .sockets import set_exclusive_bind
 
 # 復号できずに暗号文のまま残ったパスワードを渡されたときの通知文。
@@ -90,6 +92,47 @@ class _RangePassiveDTP(FTPHandler.passive_dtp):
             self.close()    # ioloop への登録も外す
             raise _NoPassivePort()
         super().listen(num)
+
+
+class _SafeNamesFS(AbstractedFS):
+    """Windows で別の実体に化ける名前（core.safe_names）をルート拘束で断るファイルシステム。
+
+    pyftpdlib の validpath は realpath と接頭辞の比較だけで、NUL・`name:stream`・
+    末尾のドットや空白をルート配下として通す。pyftpdlib はパスを取るコマンド
+    （STOR / APPE / RETR / DELE / RNFR / RNTO / MKD / RMD / SIZE / MDTM / CWD /
+    一覧など）をすべてここで確かめ、False なら 550 で断る（STOU は _Handler が呼ぶ）
+    """
+
+    _display_only = False
+
+    def validpath(self, path):
+        if not super().validpath(path):
+            return False
+        if self._display_only:
+            return True
+        root = os.path.normpath(self.root)
+        path = os.path.normpath(path)
+        if os.path.normcase(path[:len(root)]) == os.path.normcase(root):
+            rel = path[len(root):]
+        else:
+            rel = os.path.basename(path)
+        try:
+            check_relative_path(rel)
+        except ValueError as e:
+            notify = getattr(self.cmd_channel, "on_unsafe_name", None)
+            if notify is not None:
+                notify(self.fs2ftp(path), e)
+            return False
+        return True
+
+    def fs2ftp(self, fspath):
+        # 表示用の変換では名前を断らない（False だと "/" に化け、断った名前が
+        # ログにも応答にも出なくなる）
+        self._display_only = True
+        try:
+            return super().fs2ftp(fspath)
+        finally:
+            self._display_only = False
 
 
 class _ExclusiveFTPServer(_PyFTPServer):
@@ -468,6 +511,7 @@ class FTPServerManager(QObject):
         class _Handler(FTPHandler):
             dtp_handler = _ProgressDTP
             passive_dtp = _RangePassiveDTP
+            abstracted_fs = _SafeNamesFS
             # データ接続を使う転送コマンド
             _TRANSFER_COMMANDS = ("STOR", "APPE", "STOU", "RETR",
                                   "LIST", "NLST", "MLSD")
@@ -578,7 +622,16 @@ class FTPServerManager(QObject):
                         file, self.fs.fs2ftp(file))
                 return result
 
+            def on_unsafe_name(self, ftp_path, reason):
+                mgr._emit_activity(self.remote_ip,
+                                   "Windows で別の実体に化ける名前のため断りました"
+                                   "（%s）: %s" % (reason, ftp_path))
+
             def ftp_STOU(self, line):
+                # pyftpdlib は STOU の名前をルート拘束で確かめない
+                if line and not self.fs.validpath(self.fs.ftp2fs(line)):
+                    self.respond("550 Name not allowed on this server.")
+                    return None
                 prev = self._in_dtp_queue
                 result = super().ftp_STOU(line)
                 self._leave_overwritten_stor(prev)
