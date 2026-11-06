@@ -468,6 +468,13 @@ class TFTPServer:
                     xs.sendto(last_ack, addr)  # 最後の ACK を再送
                     deadline = time.monotonic() + timeout
                     continue
+                except OSError as e:
+                    # 閉じたポートへ送った後の 10054 など。何も受けなかったのと
+                    # 同じに扱う（要求して去った重複要求の敗者を失敗と誤報しない。
+                    # 照合で ERROR を返した第三者のポートが閉じていても切らない）
+                    if not _is_transient_recv_error(e):
+                        raise
+                    continue
                 retries = 0
                 deadline = time.monotonic() + timeout
                 op = struct.unpack("!H", data[:2])[0]
@@ -652,7 +659,9 @@ class TFTPServer:
                 data, a = xs.recvfrom(_RECV_BUFSIZE)
             except socket.timeout:
                 continue
-            except OSError:
+            except OSError as e:
+                if _is_transient_recv_error(e):
+                    continue
                 break
             if len(data) > blksize + 4:
                 continue
@@ -688,6 +697,11 @@ class TFTPServer:
                     if time.monotonic() < deadline and not self._stopping:
                         continue  # 合意した timeout まではまだ待つ
                     break  # この試行はタイムアウト。外側 for で再送
+                except OSError as e:
+                    # 閉じたポートへ送った後の 10054 など（WRQ 側と同じ扱い）
+                    if not _is_transient_recv_error(e):
+                        raise
+                    continue
                 # RFC1350: 相手の TID と一致しない ACK は受理せず、送信元へ通知する
                 if src != addr:
                     _err(xs, src, 5, "Unknown transfer ID")
