@@ -57,6 +57,10 @@ class DeviceTree(QWidget):
         
         # シリアルポート監視用
         self._current_serial_ports: Set[str] = set()  # 現在のポート一覧
+        # 最後に列挙できたポートの情報（列挙が失敗した回はこれを使う）
+        self._last_serial_ports: List[Dict] = []
+        # 記録済みの列挙失敗の理由（同じ理由を毎秒記録しないため）
+        self._serial_enum_error: Optional[str] = None
         self._serial_port_baudrates: Dict[str, int] = {}  # ポートごとのボーレート設定
         self._serial_monitor_timer = QTimer(self)
         self._serial_monitor_timer.timeout.connect(self._check_serial_ports)
@@ -128,9 +132,9 @@ class DeviceTree(QWidget):
     
     def _add_serial_ports_group(self):
         """コンソール接続（シリアルポート）グループを追加"""
-        # シリアルポート一覧を取得
-        serial_ports = list_serial_ports()
-        
+        # シリアルポート一覧を取得（失敗したときは前回の一覧）
+        serial_ports = self._list_serial_ports_or_last()
+
         # 現在のポート一覧を更新
         self._current_serial_ports = {port['port'] for port in serial_ports}
         
@@ -235,10 +239,31 @@ class DeviceTree(QWidget):
         """
         self._serial_monitor_timer.stop()
 
+    def _list_serial_ports_or_last(self) -> List[Dict]:
+        """シリアルポートを列挙する。失敗したときは前回の一覧を返す
+
+        pyserial の列挙は、ドライバーやレジストリ項目の壊れた機器が 1 台
+        あるだけで OSError を投げる。素通しにしていたときは、起動時は
+        MainWindow() が例外で止まり、動作中は 1 秒ごとのタイマーから
+        「予期しないエラー」のモーダルが出続けていた。同じ理由は 1 回だけ
+        記録する。
+        """
+        try:
+            ports = list_serial_ports()
+        except Exception as e:
+            reason = f"{type(e).__name__}: {e}"
+            if reason != self._serial_enum_error:
+                self._serial_enum_error = reason
+                print(f"[WARN] シリアルポートの一覧を取得できません: {reason}")
+            return list(self._last_serial_ports)
+        self._serial_enum_error = None
+        self._last_serial_ports = list(ports)
+        return ports
+
     def _check_serial_ports(self):
         """シリアルポートの変化を定期的にチェック"""
-        # 現在のシリアルポート一覧を取得
-        current_ports = list_serial_ports()
+        # 現在のシリアルポート一覧を取得（失敗したときは前回の一覧）
+        current_ports = self._list_serial_ports_or_last()
         new_ports = {port['port'] for port in current_ports}
         
         # 変化があった場合のみ更新
