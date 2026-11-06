@@ -1,5 +1,6 @@
 """FTP サーバー（pyftpdlib ラッパ）。UI 通知は Qt シグナル。"""
 import errno
+import logging
 import os
 import socket
 import threading
@@ -18,6 +19,8 @@ from pyftpdlib.log import logger as _ftp_logger
 from .crypto import PasswordCrypto
 from .safe_names import check_relative_path
 from .sockets import set_exclusive_bind
+
+_log = logging.getLogger(__name__)
 
 # 復号できずに暗号文のまま残ったパスワードを渡されたときの通知文。
 # 暗号文そのものは含めない（画面・ログに出さない）。
@@ -168,9 +171,12 @@ class FTPServerManager(QObject):
     transfer_complete = pyqtSignal(str, str, object, object, str)  # ip, filename, done, total, direction
     # 未完了で終わった転送（ABOR・接続断・停止）。TFTP と同じ口
     transfer_interrupted = pyqtSignal(str, str, str)            # ip, filename, direction
+    # 待受スレッドが想定外の例外で止まった（server, 理由）。GUI スレッドで受ける
+    _listener_failed = pyqtSignal(object, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._listener_failed.connect(self._on_listener_failed)
         self._server = None
         self._thread = None
         self._stop_event = threading.Event()
@@ -933,6 +939,7 @@ class FTPServerManager(QObject):
         落ちないことが後の実測で確かめられている。この形自体は
         pyftpdlib の前提に沿っていて害が無いので残している。
         """
+        failure = None
         try:
             while not stop_event.is_set():
                 if server.ioloop.socket_map:
@@ -942,11 +949,27 @@ class FTPServerManager(QObject):
                     # 待受ソケットまで閉じられた（外から close_all された
                     # など）。空回りせずに停止要求を待つ
                     stop_event.wait(self.POLL_INTERVAL_SECONDS)
+        except Exception as e:
+            # poll の想定外の例外（Windows の select は 512 本を超える fd で
+            # ValueError）。黙って抜けると、待受は閉じるのに起動中のまま残る
+            _log.exception("FTP listener thread stopped by an unexpected error")
+            failure = "%s: %s" % (type(e).__name__, e)
         finally:
             try:
                 server.close_all()
             except Exception:
                 pass
+        if failure is not None and not stop_event.is_set():
+            self._listener_failed.emit(server, failure)
+
+    def _on_listener_failed(self, server, reason):
+        """待受スレッドが止まったことを停止として扱い、理由を知らせる（GUI スレッド）。"""
+        if server is not self._server:
+            return   # 既に停止・再起動した後に届いた
+        self.stop()
+        self.error_occurred.emit(
+            "FTPサーバーの待受が想定外のエラーで止まりました（%s）。"
+            "もう一度起動してください" % reason)
 
     def _await_previous_thread(self):
         """前回の停止で抜けきらなかった待受スレッドを待ち直す。

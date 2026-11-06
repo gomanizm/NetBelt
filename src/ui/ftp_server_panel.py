@@ -295,6 +295,9 @@ class FTPServerPanel(QWidget):
         """サーバー停止時の処理"""
         self.status_label.setText("🔴 停止中")
         self.status_label.setStyleSheet("color: #f44336; font-weight: bold; font-size: 14px;")
+        # 待受が止まって停止したとき（停止ボタンを経ない）も入力を戻す
+        self.start_btn.setVisible(True); self.stop_btn.setVisible(False)
+        for w in self._inputs: w.setEnabled(True)
         # 進行中のまま残った行を確定させる。放置すると "1%" 等の表示が
         # 止めたあとも残り続ける
         for st in self._active.values():
