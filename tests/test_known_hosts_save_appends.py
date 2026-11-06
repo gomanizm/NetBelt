@@ -136,6 +136,20 @@ class KnownHostsSaveAppendsTest(unittest.TestCase):
              self._line("198.51.100.9", self.key_new)],
             self.path.read_bytes().decode("ascii").splitlines())
 
+    def test_non_utf8_lines_with_different_names_are_not_folded(self):
+        """UTF-8 で読めない名前（cp932 の日本語名）の行は、同じ鍵でも名前が違えば両方残すこと。"""
+        east = self._line("東", self.key_a).encode("cp932")
+        capital = self._line("京", self.key_a).encode("cp932")
+        before = east + b"\r\n" + capital + b"\r\n"
+        self.path.write_bytes(before)
+
+        self._save("198.51.100.9", self.key_new)
+
+        after = self.path.read_bytes()
+        self.assertTrue(
+            after.startswith(before),
+            "名前の違う cp932 の行が重複として落とされた: %r" % after)
+
 
 if __name__ == "__main__":
     unittest.main()

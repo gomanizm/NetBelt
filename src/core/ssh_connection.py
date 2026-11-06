@@ -478,7 +478,7 @@ def _known_hosts_bytes_to_keep(path):
     """保存のときに書き戻す、今の known_hosts の生バイト列。
 
     BOM は剥がし、末尾に改行が無ければ足す（新しい行がつながらないように）。
-    鍵の行がまったく同じ文字列で重なっているときだけ、後ろの行を落とす
+    鍵の行がまったく同じバイト列で重なっているときだけ、後ろの行を落とす
     （書き直していた頃と同じく、同一行の重複は 1 本に畳む）。コメント行・
     空行・読めない行は重なっていてもそのまま残す。
     """
@@ -486,12 +486,15 @@ def _known_hosts_bytes_to_keep(path):
     if raw.startswith(codecs.BOM_UTF8):
         raw = raw[len(codecs.BOM_UTF8):]
     seen, drop = set(), set()
-    for lineno, text, _raw, entry in _iter_known_hosts_lines(path):
+    for lineno, _text, raw_line, entry in _iter_known_hosts_lines(path):
         if entry is None:
             continue
-        if text in seen:
+        # 比べるのは復号前のバイト列。UTF-8 で読めない名前（cp932 の日本語
+        # 名）は復号すると U+FFFD の列になり、別の名前でも同じ文字列に見える
+        line = raw_line.strip()
+        if line in seen:
             drop.add(lineno)
-        seen.add(text)
+        seen.add(line)
     if drop:
         raw = b"\n".join(line for lineno, line in
                          enumerate(raw.split(b"\n"), 1) if lineno not in drop)
