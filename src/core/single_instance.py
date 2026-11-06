@@ -27,6 +27,10 @@ import time
 from PyQt6.QtCore import QLockFile, QObject, Qt
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 
+# このプロセスの中で実際に持っている錠ファイルのパス。錠に書かれた PID が
+# 自分と同じでも、ここに載っている錠は古い錠として外さない
+_held_lock_paths = set()
+
 
 def default_server_name(base: str = "NetBelt") -> str:
     """利用者ごとに分けた名前を返す。
@@ -81,6 +85,7 @@ class SingleInstanceGuard(QObject):
         self._window = None
         # 自分が持っている錠（持っていなければ None）
         self._lock = None
+        self._lock_path = None
         # 錠そのものを使えない環境（書けないディレクトリなど）かどうか
         self._lock_unusable = False
         # 窓を覚える前に届いた「前へ出せ」の合図。MainWindow を作る途中で
@@ -100,14 +105,26 @@ class SingleInstanceGuard(QObject):
         if self._lock is not None or self._lock_unusable:
             return True
         try:
-            lock = QLockFile(default_lock_path(self._name))
+            path = default_lock_path(self._name)
+            lock = QLockFile(path)
             # 既定の 30 秒で勝手に失効すると、長く動かしている方の錠が
             # 無効になって 2 つ目が開いてしまう。自動失効は切る。異常終了で
             # 残った錠は、持ち主のプロセスが居なくなった時点で取り直せる
             # （実測: 保持プロセスを kill したあとの tryLock(0) は True）
             lock.setStaleLockTime(0)
-            if lock.tryLock(0):
+            taken = lock.tryLock(0)
+            if (not taken
+                    and lock.error() == QLockFile.LockError.LockFailedError
+                    and path not in _held_lock_paths
+                    and lock.getLockInfo()[1] == os.getpid()):
+                # 異常終了で残った錠の PID を、PID の再利用で自分が引き継いだ。
+                # QLockFile は自分自身を持ち主と読むので、古い錠として外す
+                lock.removeStaleLockFile()
+                taken = lock.tryLock(0)
+            if taken:
                 self._lock = lock
+                self._lock_path = path
+                _held_lock_paths.add(path)
                 return True
             if lock.error() == QLockFile.LockError.LockFailedError:
                 return False
@@ -241,6 +258,7 @@ class SingleInstanceGuard(QObject):
             except Exception as e:
                 print(f"[WARNING] 多重起動の防止を解除できませんでした: {e}")
         if lock is not None:
+            _held_lock_paths.discard(self._lock_path)
             try:
                 lock.unlock()
             except Exception as e:
