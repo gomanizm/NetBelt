@@ -6,6 +6,7 @@ import struct
 import threading
 import time
 from PyQt6.QtCore import QObject, pyqtSignal
+from .safe_names import check_relative_path
 from .sockets import set_exclusive_bind
 
 OP_RRQ, OP_WRQ, OP_DATA, OP_ACK, OP_ERROR, OP_OACK = 1, 2, 3, 4, 5, 6
@@ -28,9 +29,15 @@ def _safe_join(root, filename):
     ジャンクションを解決しないため。root 配下にリンクを1つ置かれるだけで
     その先の任意の場所へ到達できてしまう（Windows のジャンクションは
     一般ユーザーでも作成できる）。
+
+    realpath の前に、予約デバイス名・代替データストリーム・末尾のドットや空白の
+    ように Windows で別の実体に化ける名前を断る（core.safe_names を参照）。
+    realpath はそれらをルート配下のパスとして通してしまう。
     """
+    relative = filename.lstrip("/\\")
+    check_relative_path(relative)
     root_abs = os.path.realpath(root)
-    target = os.path.realpath(os.path.join(root_abs, filename.lstrip("/\\")))
+    target = os.path.realpath(os.path.join(root_abs, relative))
     if os.path.commonpath([root_abs, target]) != root_abs:
         raise ValueError("path traversal blocked")
     return target
@@ -51,6 +58,27 @@ def _declared_size(value):
     except ValueError:
         return 0
     return size if 0 <= size < _MAX_DECLARED_SIZE else 0
+
+
+# 受信で出ても読み捨ててよい Winsock のエラー（WSAEMSGSIZE / WSAENETRESET）。
+# WSAECONNRESET(10054) は ConnectionResetError として別に判定する
+_TRANSIENT_RECV_WINERRORS = frozenset([10040, 10052])
+
+# 転送用ソケットの受信バッファ。blksize に合わせて小さく取ると、Windows では
+# それより大きいデータグラムで recvfrom 自体が WSAEMSGSIZE を上げ、送信元（TID）を
+# 照合する前に転送が中断する。UDP の最大まで受けてから照合・長さの判定をする
+_RECV_BUFSIZE = 65536
+
+
+def _is_transient_recv_error(e):
+    """UDP の recvfrom が上げた例外が、読み捨てて受信を続けてよいものか。
+
+    Windows の UDP は、送った相手のポートが閉じていると ICMP Port Unreachable を
+    受けて次の recvfrom が WinError 10054 になる。接続の無い UDP では、どの相手への
+    送信が原因かも分からないので、受信できなかっただけとして扱う
+    """
+    return (isinstance(e, ConnectionResetError)
+            or getattr(e, "winerror", None) in _TRANSIENT_RECV_WINERRORS)
 
 
 def _err(sock, addr, code, msg):
@@ -270,7 +298,17 @@ class TFTPServer:
                 pkt, addr = self._sock.recvfrom(65535)
             except socket.timeout:
                 continue
-            except Exception:
+            except Exception as e:
+                if not self._running:
+                    break                   # 停止の途中
+                if isinstance(e, OSError) and _is_transient_recv_error(e):
+                    # 断りの返事（_refuse）が閉じたポートへ向かった等。ここで
+                    # 抜けると待受だけが終わり、is_running は True のまま残る
+                    print("[TFTP] listener: ignoring receive error: %s" % e)
+                    continue
+                # 回復できない。起動中のままに見せず、マネージャーへ知らせる
+                self._running = False
+                self.on_event("listener_failed", "", str(e))
                 break
             if len(pkt) < 2:
                 continue
@@ -394,6 +432,7 @@ class TFTPServer:
         first_ack = _oack(neg) if neg else struct.pack("!HH", OP_ACK, 0)
         xs.sendto(first_ack, addr)
         deadline = time.monotonic() + timeout
+        give_up_at = time.monotonic() + self.ESTABLISH_WAIT_MAX_SECONDS
         expected = 1
         received = 0
         last_ack = first_ack
@@ -413,8 +452,12 @@ class TFTPServer:
                         self.on_event("interrupted", addr[0],
                                       (filename, "upload"))
                     return
+                # 確立までの待ちの上限は毎回見る。timeout の分岐だけで見ると、
+                # 1 秒より短い間隔で何か届き続ける限り上限が効かない
+                if not established and time.monotonic() >= give_up_at:
+                    return  # 孤児として黙って撤退
                 try:
-                    data, a = xs.recvfrom(blksize + 4)
+                    data, a = xs.recvfrom(_RECV_BUFSIZE)
                     # RFC1350: 確立後は相手の TID(IP:port) が一致するものだけ受理する。
                     # 照合しないと、同一セグメントの任意ホストが期待ブロック番号の
                     # DATA を1発撃つだけで進行中の転送へ任意データを混入させられる。
@@ -436,6 +479,13 @@ class TFTPServer:
                     xs.sendto(last_ack, addr)  # 最後の ACK を再送
                     deadline = time.monotonic() + timeout
                     continue
+                except OSError as e:
+                    # 閉じたポートへ送った後の 10054 など。何も受けなかったのと
+                    # 同じに扱う（要求して去った重複要求の敗者を失敗と誤報しない。
+                    # 照合で ERROR を返した第三者のポートが閉じていても切らない）
+                    if not _is_transient_recv_error(e):
+                        raise
+                    continue
                 retries = 0
                 deadline = time.monotonic() + timeout
                 op = struct.unpack("!H", data[:2])[0]
@@ -452,6 +502,8 @@ class TFTPServer:
                     continue
                 block = struct.unpack("!H", data[2:4])[0]
                 chunk = data[4:]
+                if len(chunk) > blksize:
+                    continue  # 合意した blksize を超える DATA は受理しない（読み捨てる）
                 if block == expected:
                     if not established:
                         # 予約は確立時（最初の DATA を受けたとき）に取る。
@@ -568,6 +620,12 @@ class TFTPServer:
         xs.settimeout(min(1.0, timeout))
         return timeout
 
+    # 確立まで（WRQ は最初の DATA、RRQ は OACK への ACK）待つ長さの上限（秒）。
+    # 相手が申告する timeout（最大 255 秒）のまま (再送回数 + 1) 回待つと、
+    # 要求だけ送って去った相手が 1 本で約 25 分ワーカー枠を握る。既定の待ち
+    # （timeout 2 秒 x 6 回 = 12 秒）は変えない。確立後は申告どおり待つ
+    ESTABLISH_WAIT_MAX_SECONDS = 30.0
+
     # 最終 ACK の後に待つ長さの下限と、長い timeout を受諾したときの上限（秒）
     DALLY_MIN_SECONDS = 6.0
     DALLY_MAX_SECONDS = 30.0
@@ -617,26 +675,33 @@ class TFTPServer:
                 break
             xs.settimeout(min(0.2, remaining))
             try:
-                data, a = xs.recvfrom(blksize + 4)
+                data, a = xs.recvfrom(_RECV_BUFSIZE)
             except socket.timeout:
                 continue
-            except OSError:
+            except OSError as e:
+                # 10054 などは何も受けなかったのと同じ。待ちを続ける（保存は
+                # 済んでいるので、ここで抜けても失うのは再 ACK の機会だけ）
+                if _is_transient_recv_error(e):
+                    continue
                 break
             if a != addr or len(data) < 4:
                 continue
             op, block = struct.unpack("!HH", data[:4])
-            if op == OP_DATA and block == final_block:
+            if op == OP_DATA and block == final_block \
+                    and len(data) <= blksize + 4:
                 xs.sendto(last_ack, addr)
                 reacks += 1
                 if reacks <= self._retries:
                     # この再 ACK も落ちたときの次の再送に備える
                     deadline = time.monotonic() + window
 
-    def _send_and_wait_ack(self, xs, packet, addr, expect_block, timeout=None):
+    def _send_and_wait_ack(self, xs, packet, addr, expect_block, timeout=None,
+                           give_up_at=None):
         """packet を送り、block=expect_block の ACK を待つ。来なければ最大 _retries 回まで再送。
         古い/重複 ACK は無視。全再送失敗で socket.timeout を送出（呼び出し側が中断処理）。
         相手の TID からの ERROR は _PeerAborted を送出する。
-        timeout は 1 回の待ち秒数（省略時は既定の _timeout）。"""
+        timeout は 1 回の待ち秒数（省略時は既定の _timeout）。
+        give_up_at（time.monotonic() の時刻）を渡すと、再送が残っていてもそこで諦める。"""
         if timeout is None:
             timeout = self._timeout
         for attempt in range(self._retries + 1):
@@ -644,16 +709,25 @@ class TFTPServer:
             # 気づかず、止めたあとも DATA を送り続けることになる。
             if self._stopping:
                 raise _ServerStopped()
+            if give_up_at is not None and time.monotonic() >= give_up_at:
+                break
             xs.sendto(packet, addr)
             deadline = time.monotonic() + timeout
+            if give_up_at is not None:
+                deadline = min(deadline, give_up_at)
             deadline_tries = 0
             while True:
                 try:
-                    ack, src = xs.recvfrom(516)
+                    ack, src = xs.recvfrom(_RECV_BUFSIZE)
                 except socket.timeout:
                     if time.monotonic() < deadline and not self._stopping:
                         continue  # 合意した timeout まではまだ待つ
                     break  # この試行はタイムアウト。外側 for で再送
+                except OSError as e:
+                    # 閉じたポートへ送った後の 10054 など（WRQ 側と同じ扱い）
+                    if not _is_transient_recv_error(e):
+                        raise
+                    continue
                 # RFC1350: 相手の TID と一致しない ACK は受理せず、送信元へ通知する
                 if src != addr:
                     _err(xs, src, 5, "Unknown transfer ID")
@@ -712,7 +786,10 @@ class TFTPServer:
             with open(target, "rb") as f:
                 if neg:
                     try:
-                        self._send_and_wait_ack(xs, _oack(neg), addr, 0, timeout)  # OACKにACK(0)。再送付き
+                        # OACKにACK(0)。再送付き。確立前なので待ちに上限を設ける
+                        self._send_and_wait_ack(
+                            xs, _oack(neg), addr, 0, timeout,
+                            time.monotonic() + self.ESTABLISH_WAIT_MAX_SECONDS)
                     except socket.timeout:
                         return  # 未確立: 重複RRQの孤児。started/error とも出さない
                     except (_ServerStopped, _PeerAborted):
@@ -799,9 +876,13 @@ class TFTPServerManager(QObject):
     transfer_interrupted = pyqtSignal(str, str, str)         # ip, filename, direction
     # 転送ごとのプロトコル事象。サーバ障害ではないのでモーダルにはしない
     protocol_event = pyqtSignal(str, str, str, str)          # ip, filename, reason, direction
+    # 待受スレッドが回復できない例外で終わった（理由）。待受スレッドから出し、
+    # GUI スレッドの _on_listener_failed で停止の扱いにする
+    _listener_failed = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._listener_failed.connect(self._on_listener_failed)
         self._srv = None
         # 停止しきれなかった旧サーバ。生き残りの転送が消えるまで捨てない
         self._stopped_srv = None
@@ -958,6 +1039,18 @@ class TFTPServerManager(QObject):
         self.is_running = False
         self.stopped.emit()
 
+    def _on_listener_failed(self, reason):
+        """待受が終わったサーバーを停止の扱いにして、理由を知らせる（GUI スレッド）。
+
+        届くまでに利用者が停止・再起動していたら何もしない（今のサーバーは無関係）
+        """
+        srv = self._srv
+        if srv is None or srv._running:
+            return
+        self.stop()
+        self.error_occurred.emit(
+            "TFTP の待ち受けが止まりました。もう一度起動してください: %s" % reason)
+
     def fix_firewall(self, port):
         """手動: Windows FW 受信許可を追加（管理者昇格/UAC）。3CDaemon 方式で通らない
         環境（過去のプロンプト拒否でブロック残り／FW通知が無効）の復旧用。押した時だけ昇格する。"""
@@ -1059,5 +1152,7 @@ class TFTPServerManager(QObject):
             if not suppress:
                 self._emit_protocol_event(ip, filename, reason, direction,
                                           force=closing)
+        elif kind == "listener_failed":
+            self._listener_failed.emit(payload)
         else:
             self._emit_activity(ip, payload)

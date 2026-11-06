@@ -474,20 +474,48 @@ def _refuse_conflicting_host_key(path, hostname, key, endpoint=None):
            path, note))
 
 
+def _known_hosts_bytes_to_keep(path):
+    """保存のときに書き戻す、今の known_hosts の生バイト列。
+
+    BOM は剥がし、末尾に改行が無ければ足す（新しい行がつながらないように）。
+    鍵の行がまったく同じバイト列で重なっているときだけ、後ろの行を落とす
+    （書き直していた頃と同じく、同一行の重複は 1 本に畳む）。コメント行・
+    空行・読めない行は重なっていてもそのまま残す。
+    """
+    raw = Path(str(path)).read_bytes()
+    if raw.startswith(codecs.BOM_UTF8):
+        raw = raw[len(codecs.BOM_UTF8):]
+    seen, drop = set(), set()
+    for lineno, _text, raw_line, entry in _iter_known_hosts_lines(path):
+        if entry is None:
+            continue
+        # 比べるのは復号前のバイト列。UTF-8 で読めない名前（cp932 の日本語
+        # 名）は復号すると U+FFFD の列になり、別の名前でも同じ文字列に見える
+        line = raw_line.strip()
+        if line in seen:
+            drop.add(lineno)
+        seen.add(line)
+    if drop:
+        raw = b"\n".join(line for lineno, line in
+                         enumerate(raw.split(b"\n"), 1) if lineno not in drop)
+    if raw and not raw.endswith(b"\n"):
+        raw += os.linesep.encode("ascii")
+    return raw
+
+
 def _write_known_hosts_file(hostkeys, preserved, tmp_path):
     """書き出す内容を一時ファイルへ作る（本体の差し替えはしない）。
 
-    HostKeys.save は _entries を 1 件 1 行で書き出すので、
-    SSHClient.save_host_keys（items() を回し、lookup がその接続先の
-    先頭エントリを返す）と違い、同じ行を何本も書いたり食い違う鍵を
-    取り違えたりしない。
+    preserved（今のファイルの生バイト列）をそのまま書き、その後ろへ
+    hostkeys の行を足す。足す行は HostKeys.save と同じく text モード・
+    既定の文字コードで書く（改行も paramiko の書き出しにそろう）。
     """
-    hostkeys.save(str(tmp_path))
-    if preserved:
-        # paramiko は text モードで書くので、改行もそれに合わせる
-        with open(str(tmp_path), "ab") as f:
-            for raw in preserved:
-                f.write(raw + os.linesep.encode("ascii"))
+    with open(str(tmp_path), "wb") as f:
+        for raw in preserved:
+            f.write(raw)
+    with open(str(tmp_path), "a") as f:
+        for e in hostkeys._entries:
+            f.write(e.to_line())
 
 
 def _save_known_hosts(known_hosts_path, entry, endpoint=None):
@@ -500,6 +528,12 @@ def _save_known_hosts(known_hosts_path, entry, endpoint=None):
     入れ直した鍵がファイルから消え、古い鍵が同じ行 3 本に増殖して唯一の
     正になる）。そこで、書く内容はそのつど錠の中でディスクから作り直し、
     今回保存する 1 件だけを足す。
+
+    OpenSSH と同じく、保存は今のファイルの末尾へ 1 行足すだけにする。
+    ファイル全体を HostKeys.save で書き直すと、コメント行・空行・4 列目
+    以降の注釈が消え、カンマ区切りの名前の行は名前ごとに割れ、
+    @revoked などの行は末尾へ移っていた。同じ名前・同じ鍵の行が
+    すでにあれば何も書かない。
 
     paramiko 4.0.0 の SSHClient.save_host_keys は保存先を "w" で開いて
     先に切り詰めるため、書いている途中で落ちると保存済みの鍵をまとめて
@@ -517,15 +551,16 @@ def _save_known_hosts(known_hosts_path, entry, endpoint=None):
         # 確かめてから書くまでを錠の中で通す。外で見ると、その間に
         # 別のプロセスが保存した鍵を見落とす
         _refuse_conflicting_host_key(path, entry[0], entry[1], endpoint)
-        hostkeys = paramiko.HostKeys()
         preserved = []
         if path.exists():
-            # paramiko が読めない行は書き出しに入らないので、黙って消える。
-            # 利用者が直すはずの行なので、そのまま書き戻す
-            broken = unreadable_known_hosts_lines(path)
-            preserved = [raw for _, _, raw in broken]
-            # ほかの行は、いまディスクにあるものだけを引き継ぐ
-            load_known_hosts(hostkeys, path)
+            disk = paramiko.HostKeys()
+            load_known_hosts(disk, path)
+            if (entry[0], entry[1].get_name(), entry[1].asbytes()) in \
+                    _entry_names_and_keys(disk._entries):
+                return      # 同じ名前・同じ鍵の行がすでにある
+            # 読めない行・コメント・注釈も含め、今の中身をそのまま残す
+            preserved = [_known_hosts_bytes_to_keep(path)]
+        hostkeys = paramiko.HostKeys()
         hostkeys.add(entry[0], entry[1].get_name(), entry[1])
         path.parent.mkdir(parents=True, exist_ok=True)
         # os.replace はドライブを跨げないので一時ファイルは同階層に作る

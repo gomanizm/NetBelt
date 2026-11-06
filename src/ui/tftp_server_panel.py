@@ -241,7 +241,15 @@ class TFTPServerPanel(QWidget):
         self._add_log(f"サーバー起動: ポート {self.port_spin.value()}, ルート {self.root_dir_edit.text()}")
 
     def _on_server_stopped(self):
-        """サーバー停止時の処理"""
+        """サーバー停止時の処理
+
+        停止ボタンを押さなくても届く（待受が止まったときのマネージャーの停止）。
+        ボタンと入力欄もここで停止中の形へ戻す
+        """
+        self.start_btn.setVisible(True)
+        self.stop_btn.setVisible(False)
+        for w in self._inputs:
+            w.setEnabled(True)
         self.status_label.setText("🔴 停止中")
         self.status_label.setStyleSheet("color: #f44336; font-weight: bold; font-size: 14px;")
         self._add_log("サーバー停止")

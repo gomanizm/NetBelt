@@ -269,6 +269,10 @@ class SFTPServerPanel(QWidget):
     
     def _on_server_started(self):
         """サーバー起動時の処理"""
+        # started は待受スレッドからキューで遅れて届き、stopped は stop() から
+        # すぐ届く。停止の後に届いた started で「起動中」へ戻さない
+        if not self.sftp_server.is_running:
+            return
         port = self.port_spin.value()
         root_dir = self.root_dir_edit.text()
         

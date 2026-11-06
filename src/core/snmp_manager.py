@@ -39,6 +39,39 @@ try:
 except Exception:
     _PYSNMP_AVAILABLE = False
 
+
+def _guard_notification_receiver(engine, receiver):
+    """処理に失敗した通知でも、pysnmp の受信側の控えを残さないようにする
+
+    v1 Trap は ntfrcv の process_pdu の先頭で v2 の形へ変換される。INTEGER が
+    Integer32 の範囲外だと ValueConstraintError、generic-trap が 0〜6 以外
+    だと KeyError になり、rfc3412 の receive_message は processPdu の後ろの
+    後始末（__transportInfo の削除。try/finally でない）を飛ばす。1 件
+    ごとに 1 エントリ残り、受信を止めるまで増え続けた（7.1.28〜7.1.31 で
+    実測）。登録を、例外を握って戻る版に差し替える。その Trap は捨てる。
+    """
+    process_pdu = receiver.process_pdu
+
+    def guarded_process_pdu(*args, **kwargs):
+        try:
+            return process_pdu(*args, **kwargs)
+        except Exception as e:
+            # 例外の文には受信した値が入りうるので、型名と場所だけ出す
+            try:
+                frames = traceback.extract_tb(e.__traceback__)
+                where = (f"（{os.path.basename(frames[-1].filename)}:"
+                         f"{frames[-1].lineno}）" if frames else "")
+                print(f"[SNMPTrapReceiver] 処理できない通知を捨てました: "
+                      f"{type(e).__name__}{where}")
+            except Exception:
+                pass
+
+    dispatcher = engine.message_dispatcher
+    dispatcher.unregister_context_engine_id(b"", receiver.SUPPORTED_PDU_TYPES)
+    dispatcher.register_context_engine_id(
+        b"", receiver.SUPPORTED_PDU_TYPES, guarded_process_pdu)
+
+
 try:
     from .mib_resolver import get_resolver
 except Exception:
@@ -513,6 +546,11 @@ class SNMPWorker(QThread):
     # result_ready とはどちらか一方だけが出る
     cancelled = pyqtSignal(object)
 
+    # 1 回の GET / WALK で受け取る行数の上限。部分木の中で OID を増やし
+    # ながら応答し続ける機器（故障・悪意）でメモリが際限なく伸びないよう、
+    # 超えたら打ち切って「途中まで」として渡す（Trap の max_traps と同じ考え方）
+    MAX_RESULT_ROWS = 100000
+
     def __init__(self, operation: str, params: dict):
         super().__init__()
         self.operation = operation
@@ -598,7 +636,13 @@ class SNMPWorker(QThread):
             value_type = varBind[1].__class__.__name__
             results.append((oid, value_type, value))
         
+        if len(results) > self.MAX_RESULT_ROWS:
+            self._partial_reason = self._row_limit_reason()
+            del results[self.MAX_RESULT_ROWS:]
         return results
+
+    def _row_limit_reason(self) -> str:
+        return f"行数の上限（{self.MAX_RESULT_ROWS}件）"
     
     def _perform_walk(self) -> List[Tuple[str, str, str]]:
         """SNMP WALKを実行"""
@@ -637,12 +681,18 @@ class SNMPWorker(QThread):
                     break
             
                 for varBind in varBinds:
+                    if len(results) >= self.MAX_RESULT_ROWS:
+                        self._partial_reason = self._row_limit_reason()
+                        break
                     oid_str = varBind[0].prettyPrint()
                     value = _value_text(varBind[1])
                     value_type = varBind[1].__class__.__name__
                     results.append((oid_str, value_type, value))
                     count += 1
             
+                if self._partial_reason:
+                    break
+
                 # 進捗更新（100件ごと）
                 if count % 100 == 0:
                     self.progress_update.emit(f"{count}件取得中...")
@@ -929,18 +979,38 @@ class SNMPTrapReceiver(QThread):
             # する（5.1.0 は pysnmp が自前のソケットへ REUSEADDR 系を無条件に
             # 立てていたので、それを戻す意味もあった）。
             set_exclusive_bind(sock)
+            self._enlarge_receive_buffer(sock)
             sock.bind(('0.0.0.0', self.port))
             sock.setblocking(False)
 
             self._engine = SnmpEngine()
             self._register_credentials()
             self._register_observer()
-            ntfrcv.NotificationReceiver(self._engine, self._on_notification)
+            _guard_notification_receiver(self._engine, ntfrcv.NotificationReceiver(
+                self._engine, self._on_notification))
             return True
         except Exception as e:
             self._close_engine()
             self.error_occurred.emit(f"ポート {self.port} で待ち受けできません: {e}")
             return False
+
+    # 受信バッファとして要求する大きさ。OS の既定のままだと、Trap の嵐で
+    # GUI より手前（OS）で落ち、その分は数えられない
+    RECEIVE_BUFFER_BYTES = 1 << 20
+
+    def _enlarge_receive_buffer(self, sock):
+        """受信バッファを広げ、OS が与えた大きさをログへ出す（失敗しても続ける）"""
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF,
+                            self.RECEIVE_BUFFER_BYTES)
+            granted = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+            print(f"[SNMPTrapReceiver] 受信バッファ: {granted} バイト"
+                  f"（要求 {self.RECEIVE_BUFFER_BYTES}）")
+        except Exception as e:
+            try:
+                print(f"[SNMPTrapReceiver] 受信バッファを広げられません: {e}")
+            except Exception:
+                pass
 
     def _register_credentials(self):
         """許可するコミュニティと v3 ユーザをエンジンへ登録する"""
@@ -1051,9 +1121,10 @@ class SNMPTrapReceiver(QThread):
         上限（max(1000, max_traps)）に達している間に届いた Trap を捨てて数える
         （理由と上限が無かったころの実測は _TrapBacklog）。
         制限: 数えられるのは自分の配送待ちで捨てた分だけ。それより手前の
-        OS の受信バッファで落ちた分は見えない（実測: 毎秒 2,000 件前後から
-        落ち始め、毎秒 5,000 件を 10 秒送ると 49,998 件中 23,781 件しか
-        届かなかった）。
+        OS の受信バッファで落ちた分は見えない（OS の既定の受信バッファでの
+        実測: 毎秒 2,000 件前後から落ち始め、毎秒 5,000 件を 10 秒送ると
+        49,998 件中 23,781 件しか届かなかった。今は RECEIVE_BUFFER_BYTES を
+        要求する）。
         """
         try:
             if self._is_weaker_than_registered():

@@ -7,8 +7,9 @@ import uuid
 from typing import List, Dict, Optional, Callable
 from PyQt6.QtCore import QObject, pyqtSignal
 import paramiko
-from paramiko.sftp import (CMD_HANDLE, CMD_OPEN, SFTP_FLAG_CREATE, SFTP_FLAG_EXCL,
-                           SFTP_FLAG_WRITE)
+from paramiko.sftp import (CMD_CLOSE, CMD_HANDLE, CMD_NAME, CMD_OPEN,
+                           CMD_OPENDIR, CMD_READDIR, SFTP_FLAG_CREATE,
+                           SFTP_FLAG_EXCL, SFTP_FLAG_WRITE)
 
 
 class _DroppedConnection(IOError):
@@ -38,6 +39,39 @@ _UNUSABLE_CONNECT_ERRORS = (TimeoutError, EOFError, paramiko.SSHException)
 def _is_dropped_connection(e: Exception) -> bool:
     """接続が切れた・応答が壊れたと分かる失敗か"""
     return isinstance(e, _DROPPED_CONNECTION_ERRORS)
+
+
+def _listdir_attr(client, path: str) -> list:
+    """listdir_attr の代わり。UTF-8 として読めない名前は置き換え文字で読む
+
+    paramiko の listdir_attr は名前を errors 指定なしの UTF-8 で読むので、
+    cp932 などの名前が 1 件あるだけで UnicodeDecodeError で抜け、ほかの
+    項目も出ない（末尾の CMD_CLOSE も送られず、機器側にハンドルが残る）。
+    手順は paramiko 4.0.0 の listdir_attr と同じで、名前の読み方だけ変える。
+    paramiko の実物でないクライアントは、その listdir_attr に任せる。
+    """
+    if not isinstance(client, paramiko.SFTPClient):
+        return client.listdir_attr(path)
+    t, msg = client._request(CMD_OPENDIR, client._adjust_cwd(path))
+    if t != CMD_HANDLE:
+        raise paramiko.SFTPError("Expected handle")
+    handle = msg.get_binary()
+    filelist = []
+    while True:
+        try:
+            t, msg = client._request(CMD_READDIR, handle)
+        except EOFError:
+            break   # 読み終えた（paramiko と同じ）
+        if t != CMD_NAME:
+            raise paramiko.SFTPError("Expected name response")
+        for _ in range(msg.get_int()):
+            filename = msg.get_string().decode("utf-8", errors="replace")
+            longname = msg.get_string().decode("utf-8", errors="replace")
+            attr = paramiko.SFTPAttributes._from_msg(msg, filename, longname)
+            if filename not in (".", ".."):
+                filelist.append(attr)
+    client._request(CMD_CLOSE, handle)
+    return filelist
 
 
 class SFTPManager(QObject):
@@ -96,6 +130,12 @@ class SFTPManager(QObject):
     # 切断のときに、進行中の転送が手を離すのを待つ上限。GUI スレッドから
     # 呼ばれるため、長く待つとアプリが終了できなくなる。
     _DISCONNECT_WAIT_SECONDS = 3.0
+
+    # ダウンロードで同時に飛ばす READ 要求の上限（paramiko の get() の
+    # max_concurrent_prefetch_requests）。渡さないとファイル全体ぶん
+    # （32 KB 単位）を一度に送り、応答がファイルの大きさに比例して溜まる。
+    # 64 なら 2 MB ほど
+    _PREFETCH_REQUESTS = 64
 
     # 共有チャンネルが機器の応答を待つ上限（秒）。None のままだと、機器が
     # SFTP サブシステムだけ黙ったとき（TCP は生きている）に mkdir や
@@ -369,7 +409,9 @@ class SFTPManager(QObject):
         # GUI スレッドから呼ばれるので、応答しない機器への転送中だと
         # 待った分だけアプリが固まる（終了できなくなる）。quiesce のあとは
         # その期限の残りだけ待つ（_teardown_wait）
-        acquired = self._sftp_lock.acquire(timeout=self._teardown_wait())
+        wait = self._teardown_wait()
+        wait_until = time.monotonic() + wait
+        acquired = self._sftp_lock.acquire(timeout=wait)
         try:
             client, self.sftp_client = self.sftp_client, None
             self.ssh_client = None
@@ -378,10 +420,20 @@ class SFTPManager(QObject):
                 self._sftp_lock.release()
 
         if client and acquired:
-            try:
-                client.close()
-            except Exception:
-                pass
+            def close_quietly():
+                try:
+                    client.close()
+                except Exception:
+                    pass
+            if threading.current_thread() is threading.main_thread():
+                # GUI スレッド。close はチャンネルの close を transport へ
+                # 送るので、送信が詰まった機器では戻らない。別のスレッドで
+                # 閉じ、待つのはロック待ちと合わせて同じ期限まで
+                closer = threading.Thread(target=close_quietly, daemon=True)
+                closer.start()
+                closer.join(max(0.0, wait_until - time.monotonic()))
+            else:
+                close_quietly()   # 作業スレッドからはこれまでどおり
         elif client:
             # 転送が掴んだまま。ここで閉じると、その最中のスレッドが
             # 閉じたハンドルを触ることになる。参照だけ手放し、後片付けは
@@ -455,7 +507,7 @@ class SFTPManager(QObject):
                     # 既存の except / _fail 経路へ寄せて通知する
                     if not self.is_connected or self.sftp_client is None:
                         raise IOError("SFTP接続がありません")
-                    items = self.sftp_client.listdir_attr(path)
+                    items = _listdir_attr(self.sftp_client, path)
                     # listdir_attr の st_mode は lstat 相当（リンク自身）で、
                     # そのまま S_ISDIR に掛けるとディレクトリへのリンクが
                     # 常にファイルになる。パネルは is_dir を見てから移動を
@@ -1292,24 +1344,39 @@ class SFTPManager(QObject):
                     # 何も起きない。後始末と通知のある経路へ寄せる
                     if not self.is_connected or self.sftp_client is None:
                         raise IOError("SFTP接続がありません")
+                    # 上限の引数は paramiko の get() のもの。実物でない
+                    # クライアントには渡さない
+                    cap = ({"max_concurrent_prefetch_requests":
+                            self._PREFETCH_REQUESTS}
+                           if isinstance(self.sftp_client, paramiko.SFTPClient)
+                           else {})
                     self.sftp_client.get(remote_path, tmp_local,
-                                         callback=progress_callback)
-                
+                                         callback=progress_callback, **cap)
+
                 # 全部落とせてから最終名へ（同じディレクトリなので原子的）
-                if overwrite_granted:
-                    os.replace(tmp_local, local_path)
-                else:
-                    # 呼ばれた時点では無かった＝上書きは承認されていない。
-                    # 転送しているあいだに外から作られていたら置き換えない
-                    try:
+                try:
+                    if overwrite_granted:
+                        os.replace(tmp_local, local_path)
+                    else:
+                        # 呼ばれた時点では無かった＝上書きは承認されていない。
+                        # 転送しているあいだに外から作られていたら置き換えない
                         os.rename(tmp_local, local_path)
-                    except FileExistsError:
-                        keep_tmp[0] = True
+                except OSError as replace_error:
+                    # 落とした内容は一時名にしか無いので消さない（保存先を
+                    # 別のプロセスが開いている・読み取り専用、などで断られる）
+                    keep_tmp[0] = True
+                    if (not overwrite_granted
+                            and isinstance(replace_error, FileExistsError)):
                         raise OSError(
                             "転送しているあいだに保存先 '%s' が作られました。"
                             "上書きの確認を経ていないので置き換えていません。"
                             "落とした内容は %s に残っています"
                             % (os.path.basename(local_path), tmp_local))
+                    raise OSError(
+                        "保存先 '%s' へ置き換えられませんでした（%s）。"
+                        "落とした内容は %s に残っています"
+                        % (os.path.basename(local_path),
+                           replace_error.strerror or replace_error, tmp_local))
                 # 予約は通知より先に外す（完了を見てすぐ落とし直しても断られない）
                 self._release_download_target(target_key)
                 # 完了通知

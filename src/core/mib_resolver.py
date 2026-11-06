@@ -11,7 +11,7 @@ from typing import Dict, Optional
 # MIB 解析器の版。抽出・解決の規則を変えたら上げる。mib_cache.json は
 # この値も鍵にするので、古い解析器が作ったキャッシュがアプリの更新後に
 # そのまま使われることがなくなる。
-MIB_PARSER_VERSION = '2026-09-26.1'
+MIB_PARSER_VERSION = '2026-11-06.1'
 
 
 def app_dir() -> str:
@@ -118,6 +118,7 @@ class MIBResolver:
             '1.3.6.1': 'internet',
             '1.3.6.1.2': 'mgmt',
             '1.3.6.1.2.1': 'mib-2',
+            '1.3.6.1.2.1.10': 'transmission',
             '1.3.6.1.3': 'experimental',
             '1.3.6.1.4': 'private',
             '1.3.6.1.4.1': 'enterprises',
@@ -160,7 +161,8 @@ class MIBResolver:
             '1.3.6.1.2.1.15.3.1.1': 'bgpPeerIdentifier',
             '1.3.6.1.2.1.15.3.1.2': 'bgpPeerState',
             '1.3.6.1.2.1.15.3.1.3': 'bgpPeerAdminStatus',
-            '1.3.6.1.2.1.15.3.1.7': 'bgpPeerRemoteAs',
+            '1.3.6.1.2.1.15.3.1.7': 'bgpPeerRemoteAddr',
+            '1.3.6.1.2.1.15.3.1.9': 'bgpPeerRemoteAs',
             '1.3.6.1.2.1.15.7': 'bgpTraps',
             '1.3.6.1.2.1.15.7.1': 'bgpEstablished',
             '1.3.6.1.2.1.15.7.2': 'bgpBackwardTransition',
@@ -1175,9 +1177,12 @@ class MIBResolver:
         if oid in self.oid_to_name:
             return self.oid_to_name[oid]
         
-        # 部分一致で最長マッチを探す
+        # 部分一致で最長マッチを探す。登録済みの OID より深い前方部分は
+        # 辞書に載りえないので、その段数から削り始める（全段から削ると、
+        # 毎回 join し直すので段数の二乗になり、Trap に載った数万段の
+        # OID 1 つで GUI スレッドが 10 秒ほど固まった）
         parts = oid.split('.')
-        for i in range(len(parts), 0, -1):
+        for i in range(min(len(parts), self._max_oid_depth()), 0, -1):
             partial_oid = '.'.join(parts[:i])
             if partial_oid in self.oid_to_name:
                 # 残りの部分をインデックスとして追加
@@ -1190,6 +1195,19 @@ class MIBResolver:
         # 解決できない場合は元のOIDを返す
         return oid
     
+    def _max_oid_depth(self) -> int:
+        """oid_to_name のキーの最大段数（表が変わったときだけ数え直す）
+
+        表の差し替え（別の dict）と、キーの追加・削除（件数の変化）で
+        数え直す。
+        """
+        table = self.oid_to_name
+        cached = getattr(self, '_depth_cache', None)
+        if cached is None or cached[0] is not table or cached[1] != len(table):
+            depth = max((k.count('.') + 1 for k in table), default=0)
+            cached = self._depth_cache = (table, len(table), depth)
+        return cached[2]
+
     def resolve_name(self, name: str) -> Optional[str]:
         """
         名前をOIDに変換

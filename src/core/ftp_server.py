@@ -1,5 +1,6 @@
 """FTP サーバー（pyftpdlib ラッパ）。UI 通知は Qt シグナル。"""
 import errno
+import logging
 import os
 import socket
 import threading
@@ -8,6 +9,7 @@ import time
 from PyQt6.QtCore import QObject, pyqtSignal
 from pyftpdlib.authorizers import DummyAuthorizer
 from pyftpdlib.exceptions import _RetryError
+from pyftpdlib.filesystems import AbstractedFS
 from pyftpdlib.handlers import FTPHandler, DTPHandler
 from pyftpdlib.servers import FTPServer as _PyFTPServer
 from pyftpdlib.ioloop import IOLoop as _PyIOLoop
@@ -15,7 +17,10 @@ from pyftpdlib.ioloop import _ERRNOS_DISCONNECTED, _ERRNOS_RETRY
 from pyftpdlib.log import logger as _ftp_logger
 
 from .crypto import PasswordCrypto
+from .safe_names import check_relative_path
 from .sockets import set_exclusive_bind
+
+_log = logging.getLogger(__name__)
 
 # 復号できずに暗号文のまま残ったパスワードを渡されたときの通知文。
 # 暗号文そのものは含めない（画面・ログに出さない）。
@@ -92,6 +97,47 @@ class _RangePassiveDTP(FTPHandler.passive_dtp):
         super().listen(num)
 
 
+class _SafeNamesFS(AbstractedFS):
+    """Windows で別の実体に化ける名前（core.safe_names）をルート拘束で断るファイルシステム。
+
+    pyftpdlib の validpath は realpath と接頭辞の比較だけで、NUL・`name:stream`・
+    末尾のドットや空白をルート配下として通す。pyftpdlib はパスを取るコマンド
+    （STOR / APPE / RETR / DELE / RNFR / RNTO / MKD / RMD / SIZE / MDTM / CWD /
+    一覧など）をすべてここで確かめ、False なら 550 で断る（STOU は _Handler が呼ぶ）
+    """
+
+    _display_only = False
+
+    def validpath(self, path):
+        if not super().validpath(path):
+            return False
+        if self._display_only:
+            return True
+        root = os.path.normpath(self.root)
+        path = os.path.normpath(path)
+        if os.path.normcase(path[:len(root)]) == os.path.normcase(root):
+            rel = path[len(root):]
+        else:
+            rel = os.path.basename(path)
+        try:
+            check_relative_path(rel)
+        except ValueError as e:
+            notify = getattr(self.cmd_channel, "on_unsafe_name", None)
+            if notify is not None:
+                notify(self.fs2ftp(path), e)
+            return False
+        return True
+
+    def fs2ftp(self, fspath):
+        # 表示用の変換では名前を断らない（False だと "/" に化け、断った名前が
+        # ログにも応答にも出なくなる）
+        self._display_only = True
+        try:
+            return super().fs2ftp(fspath)
+        finally:
+            self._display_only = False
+
+
 class _ExclusiveFTPServer(_PyFTPServer):
     """制御の待ち受けを排他（SO_EXCLUSIVEADDRUSE）にした pyftpdlib の FTPServer。
 
@@ -125,9 +171,12 @@ class FTPServerManager(QObject):
     transfer_complete = pyqtSignal(str, str, object, object, str)  # ip, filename, done, total, direction
     # 未完了で終わった転送（ABOR・接続断・停止）。TFTP と同じ口
     transfer_interrupted = pyqtSignal(str, str, str)            # ip, filename, direction
+    # 待受スレッドが想定外の例外で止まった（server, 理由）。GUI スレッドで受ける
+    _listener_failed = pyqtSignal(object, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._listener_failed.connect(self._on_listener_failed)
         self._server = None
         self._thread = None
         self._stop_event = threading.Event()
@@ -378,7 +427,11 @@ class FTPServerManager(QObject):
             self.error_occurred.emit(UNDECRYPTABLE_PASSWORD_MESSAGE)
             return False
         import os
-        os.makedirs(root_dir, exist_ok=True)
+        try:
+            os.makedirs(root_dir, exist_ok=True)
+        except OSError as e:
+            self.error_occurred.emit("ルートディレクトリの作成に失敗: %s" % e)
+            return False
         # ファイアウォールは自動設定しない（3CDaemon 方式）。管理者昇格(UAC)を避けるため、
         # 制御21/passive の受信許可は Windows 標準の初回プロンプト／既存ルールに委ねる。
         self._emit_activity("", "ファイアウォール: 自動設定なし（Windowsの許可に委ねます）")
@@ -468,6 +521,7 @@ class FTPServerManager(QObject):
         class _Handler(FTPHandler):
             dtp_handler = _ProgressDTP
             passive_dtp = _RangePassiveDTP
+            abstracted_fs = _SafeNamesFS
             # データ接続を使う転送コマンド
             _TRANSFER_COMMANDS = ("STOR", "APPE", "STOU", "RETR",
                                   "LIST", "NLST", "MLSD")
@@ -523,7 +577,8 @@ class FTPServerManager(QObject):
                     mgr._emit_activity(
                         self.remote_ip,
                         "passiveポート範囲 %d-%d に待ち受けられる番号が無いため"
-                        " %s を断りました（ほかの接続の PASV や、ほかのアプリが"
+                        " %s を断りました（ほかの接続の PASV、NetBelt の SFTP"
+                        " サーバー・Syslog(TCP) などの受信機能、ほかのアプリが"
                         "使用中）" % (passive_ports[0], passive_ports[1],
                                     "EPSV" if extmode else "PASV"))
 
@@ -578,7 +633,16 @@ class FTPServerManager(QObject):
                         file, self.fs.fs2ftp(file))
                 return result
 
+            def on_unsafe_name(self, ftp_path, reason):
+                mgr._emit_activity(self.remote_ip,
+                                   "Windows で別の実体に化ける名前のため断りました"
+                                   "（%s）: %s" % (reason, ftp_path))
+
             def ftp_STOU(self, line):
+                # pyftpdlib は STOU の名前をルート拘束で確かめない
+                if line and not self.fs.validpath(self.fs.ftp2fs(line)):
+                    self.respond("550 Name not allowed on this server.")
+                    return None
                 prev = self._in_dtp_queue
                 result = super().ftp_STOU(line)
                 self._leave_overwritten_stor(prev)
@@ -880,6 +944,7 @@ class FTPServerManager(QObject):
         落ちないことが後の実測で確かめられている。この形自体は
         pyftpdlib の前提に沿っていて害が無いので残している。
         """
+        failure = None
         try:
             while not stop_event.is_set():
                 if server.ioloop.socket_map:
@@ -889,11 +954,27 @@ class FTPServerManager(QObject):
                     # 待受ソケットまで閉じられた（外から close_all された
                     # など）。空回りせずに停止要求を待つ
                     stop_event.wait(self.POLL_INTERVAL_SECONDS)
+        except Exception as e:
+            # poll の想定外の例外（Windows の select は 512 本を超える fd で
+            # ValueError）。黙って抜けると、待受は閉じるのに起動中のまま残る
+            _log.exception("FTP listener thread stopped by an unexpected error")
+            failure = "%s: %s" % (type(e).__name__, e)
         finally:
             try:
                 server.close_all()
             except Exception:
                 pass
+        if failure is not None and not stop_event.is_set():
+            self._listener_failed.emit(server, failure)
+
+    def _on_listener_failed(self, server, reason):
+        """待受スレッドが止まったことを停止として扱い、理由を知らせる（GUI スレッド）。"""
+        if server is not self._server:
+            return   # 既に停止・再起動した後に届いた
+        self.stop()
+        self.error_occurred.emit(
+            "FTPサーバーの待受が想定外のエラーで止まりました（%s）。"
+            "もう一度起動してください" % reason)
 
     def _await_previous_thread(self):
         """前回の停止で抜けきらなかった待受スレッドを待ち直す。

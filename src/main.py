@@ -6,6 +6,54 @@ import traceback
 # 痕跡が残らない。必要になった場所で読み込む
 
 
+class _TolerantStream:
+    """書けなくても例外にしない、ログ用ストリームの包み。
+
+    exe では stdout/stderr をログファイルへ向けるので、容量不足・切断された
+    共有・権限の変化などで write が OSError になると、各所の print がその
+    まま例外になって受信スレッドや後始末が途中で止まる。ログの行が欠ける
+    だけで済むよう、write / flush の失敗は握って回数と最後の理由を覚える。
+    encode できない文字は置き換えて書く。それ以外の属性は元へ委譲する。
+    """
+
+    def __init__(self, stream):
+        self._stream = stream
+        self.failures = 0
+        self.last_error = None
+
+    def _failed(self, exc):
+        self.failures += 1
+        self.last_error = exc
+
+    def write(self, s):
+        try:
+            return self._stream.write(s)
+        except UnicodeEncodeError as exc:
+            self._failed(exc)
+            try:
+                enc = getattr(self._stream, "encoding", None) or "utf-8"
+                self._stream.write(
+                    s.encode(enc, "replace").decode(enc, "replace"))
+            except (OSError, ValueError) as exc2:
+                self._failed(exc2)
+        except OSError as exc:
+            self._failed(exc)
+        return len(s)
+
+    def writelines(self, lines):
+        for line in lines:
+            self.write(line)
+
+    def flush(self):
+        try:
+            self._stream.flush()
+        except OSError as exc:
+            self._failed(exc)
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
 def _setup_logging():
     """凍結(exe)ビルド時は stdout/stderr をログファイルへ退避する。
     windowedビルドでは print 出力先が無いため、診断用にファイルへ残す。
@@ -21,7 +69,7 @@ def _setup_logging():
         log_dir = os.path.join(base, "NetBelt", "logs")
         os.makedirs(log_dir, exist_ok=True)
         log_path = os.path.join(log_dir, f"app_{datetime.now():%Y%m%d}.log")
-        f = open(log_path, "a", encoding="utf-8", buffering=1)
+        f = _TolerantStream(open(log_path, "a", encoding="utf-8", buffering=1))
         sys.stdout = f
         sys.stderr = f
         return log_path

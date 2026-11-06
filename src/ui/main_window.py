@@ -1172,7 +1172,9 @@ class MainWindow(QMainWindow):
         def connect_thread():
             try:
                 success = telnet.connect()
-                if not success:
+                # 接続待ちの間にタブが閉じられた接続は破棄済みのことがあり、
+                # emit が RuntimeError になる。捨てた接続の失敗は知らせない
+                if not success and not telnet._disposed:
                     # GUIスレッド外からウィジェットを直接触らない。
                     # 既に append_output へ接続済みのシグナルへ流す。
                     telnet.output_received.emit("\r\n接続失敗\r\n")
@@ -2831,11 +2833,15 @@ for details.
         self.status_bar.showMessage(f"SFTP エラー ({device_name}): {error_message}")
     
     def _check_for_updates_on_startup(self):
-        """起動時の更新チェック"""
-        # 設定で無効化されている場合はスキップ
-        if not self.config_manager.get_check_on_startup():
-            return
-        
+        """起動時の更新チェック
+
+        未適用の更新の提示と古い更新ファイルの掃除は、設定に関係なく行う。
+        設定で切れるのは GitHub への問い合わせだけ。掃除までまとめて
+        飛ばしていたときは、起動時の確認を切った利用者の更新フォルダに
+        ZIP や中断した .part が積もり続けていた。
+        """
+        check_on_startup = self.config_manager.get_check_on_startup()
+
         # 未適用の更新をチェック。
         # 更新チェックの失敗で起動そのものを止めない。ここを素通しに
         # していたときは、走査中に ZIP が消えただけで MainWindow() が
@@ -2850,13 +2856,20 @@ for details.
         import threading
         def check_thread():
             try:
+                # 設定で無効化されている場合は問い合わせず、掃除だけ行う。
+                # 掃除にトークンは要らないので読まない（別の PC で保存された
+                # トークンだと、問い合わせないのに復号の失敗がログに残る）
+                if not check_on_startup:
+                    VersionManager().cleanup_old_updates(24)
+                    return
+
                 # GitHubトークンを取得
                 github_token = self.config_manager.get_github_token()
                 version_mgr = VersionManager(github_token=github_token)
                 
                 # 古い更新ファイルをクリーンアップ
                 version_mgr.cleanup_old_updates(24)
-                
+
                 update_info = version_mgr.check_for_updates()
                 
                 if update_info and update_info.get('error'):

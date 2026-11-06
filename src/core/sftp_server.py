@@ -12,6 +12,7 @@ from PyQt6.QtCore import QObject, pyqtSignal
 import stat as stat_module
 from .sockets import set_exclusive_bind
 from .crypto import PasswordCrypto
+from .safe_names import check_relative_path
 from .ftp_server import UNDECRYPTABLE_PASSWORD_MESSAGE
 # 停止のあとも書き込みが生き残っている間に、次の起動を断る理由の文言。
 # 生き残りは保存先のファイルを握ったままなので、TFTP と同じ扱いにする
@@ -494,8 +495,18 @@ class SFTPServerHandler(SFTPServerInterface):
         ジャンクションを解決しないため、root 配下にリンクを1つ置かれるだけで
         その先の任意の場所へ到達できてしまう（Windows のジャンクションは
         一般ユーザーでも作成できる）。
+
+        realpath の前に、Windows で別の実体に化ける名前（NUL などの予約
+        デバイス名・コロン・末尾のドットや空白）を断る（core.safe_names）。
+        realpath はそれらをルート配下のパスとして通し、open が後でデバイスや
+        別のファイルに解決する。まだ無い data. は data と別の文字列のまま
+        なので、同時書き込みを断る予約の鍵（_OpenWriters._key）も割れる。
         """
         relative = path.replace("\\", "/").lstrip("/")
+        try:
+            check_relative_path(relative)
+        except ValueError:
+            raise IOError("Access denied") from None
         root_real = os.path.realpath(self.root_dir)
         real_path = os.path.realpath(os.path.join(root_real, relative))
 
@@ -531,6 +542,11 @@ class SFTPServerHandler(SFTPServerInterface):
         # コロンを含む名前は Windows では作成できないので、正規の要求では起きない。
         if os.path.splitdrive(leaf)[0] or os.path.isabs(leaf):
             raise IOError("Access denied")
+        # leaf も化ける名前を断る（親は _get_real_path が確かめる）
+        try:
+            check_relative_path(leaf)
+        except ValueError:
+            raise IOError("Access denied") from None
         parent_real = self._get_real_path(parent_rel)
         return os.path.join(parent_real, leaf)
 
@@ -667,7 +683,9 @@ class SFTPServerHandler(SFTPServerInterface):
             if writing:
                 dir_path = os.path.dirname(real_path)
                 if dir_path and not os.path.exists(dir_path):
-                    os.makedirs(dir_path)
+                    # 同じ新しいフォルダへの同時の書き込みで、後の方が
+                    # 「既にある」で失敗しないようにする（FTP・TFTP と同じ）
+                    os.makedirs(dir_path, exist_ok=True)
 
             if tracked and not self._open_writers.reserve(real_path):
                 # 開くと O_TRUNC が相手の書きかけを切り詰め、双方が成功で
@@ -1512,8 +1530,19 @@ class SFTPServerManager(QObject):
             # SSHネゴシエーション開始
             transport.start_server(server=server)
             
-            # クライアントがチャネルを開くのを待つ
-            channel = transport.accept(timeout=20)
+            # 認証が済むまでは auth_timeout_seconds を期限に待つ。paramiko の
+            # サーバー側は auth_timeout を見ないので、鍵交換の直後から 20 秒を
+            # 数えると、認証に 20 秒より長く掛かった正規の相手を期限より前に切る
+            channel = None
+            deadline = time.monotonic() + self.auth_timeout_seconds
+            while (channel is None and transport.is_active()
+                   and not transport.is_authenticated()
+                   and not stop_event.is_set()
+                   and time.monotonic() < deadline):
+                channel = transport.accept(timeout=0.5)
+            # 認証が済んだら、クライアントがチャネルを開くのを待つ
+            if channel is None and transport.is_authenticated():
+                channel = transport.accept(timeout=20)
             if channel is None:
                 _log_limited("no channel",
                              f"[SFTP Server] No channel from {client_addr[0]}")

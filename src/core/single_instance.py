@@ -100,13 +100,25 @@ class SingleInstanceGuard(QObject):
         if self._lock is not None or self._lock_unusable:
             return True
         try:
-            lock = QLockFile(default_lock_path(self._name))
+            path = default_lock_path(self._name)
+            lock = QLockFile(path)
             # 既定の 30 秒で勝手に失効すると、長く動かしている方の錠が
             # 無効になって 2 つ目が開いてしまう。自動失効は切る。異常終了で
             # 残った錠は、持ち主のプロセスが居なくなった時点で取り直せる
             # （実測: 保持プロセスを kill したあとの tryLock(0) は True）
             lock.setStaleLockTime(0)
-            if lock.tryLock(0):
+            taken = lock.tryLock(0)
+            if (not taken
+                    and lock.error() == QLockFile.LockError.LockFailedError
+                    and lock.getLockInfo()[1] == os.getpid()):
+                # 異常終了で残った錠の PID を、PID の再利用で自分が引き継いだ。
+                # QLockFile は自分自身を持ち主と読むので、古い錠として外す。
+                # 同じプロセスの別の guard が今持っている錠なら、持ち主の
+                # ハンドルが開いたままなので Windows では削除が失敗し
+                # （実測: removeStaleLockFile は False）、取り直しも断られる
+                lock.removeStaleLockFile()
+                taken = lock.tryLock(0)
+            if taken:
                 self._lock = lock
                 return True
             if lock.error() == QLockFile.LockError.LockFailedError:

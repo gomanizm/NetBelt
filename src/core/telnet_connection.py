@@ -129,12 +129,18 @@ class TelnetConnection(QObject):
                 return False
             self.port = port
 
-            # ソケット作成
-            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.socket.settimeout(10)
-            
-            # 接続
-            self.socket.connect((self.host, self.port))
+            # ソケット作成と接続。AF_INET 固定だと名前解決も IPv4 に限られ、
+            # IPv6 の接続先が getaddrinfo の失敗として断られていた（SSH は
+            # 繋がる）。名前解決の結果を IPv4/IPv6 とも順に試す
+            sock = socket.create_connection((self.host, self.port),
+                                            timeout=10)
+            if self._disposed:
+                # 名前解決や TCP 接続を待っている間にタブが閉じられた。
+                # 待っている間は self.socket が空で dispose() が閉じる相手が
+                # 無かったので、ここで閉じる
+                sock.close()
+                return False
+            self.socket = sock
             
             # タイムアウトを短く設定（ノンブロッキング読み取り用）
             self.socket.settimeout(0.1)
@@ -163,14 +169,24 @@ class TelnetConnection(QObject):
             return True
             
         except socket.timeout:
-            self.error_occurred.emit(f"接続タイムアウト: {self.host}:{self.port}")
+            self._report_connect_error(f"接続タイムアウト: {self.host}:{self.port}")
             return False
         except socket.error as e:
-            self.error_occurred.emit(f"接続エラー: {str(e)}")
+            self._report_connect_error(f"接続エラー: {str(e)}")
             return False
         except Exception as e:
-            self.error_occurred.emit(f"予期しないエラー: {str(e)}")
+            self._report_connect_error(f"予期しないエラー: {str(e)}")
             return False
+
+    def _report_connect_error(self, message: str):
+        """接続の失敗を知らせる（待ちの間に捨てられた接続なら黙って終わる）
+
+        接続待ち（最大 10 秒）の間にタブが閉じられると、このオブジェクトは
+        deleteLater で破棄されていることがあり、emit が RuntimeError になる。
+        捨てられた接続の失敗は、もう誰も受け取らない。
+        """
+        if not self._disposed:
+            self.error_occurred.emit(message)
     
     def dispose(self):
         """ソケットを閉じて資源を手放す（切断の通知は出さない）
