@@ -6,6 +6,7 @@ import struct
 import threading
 import time
 from PyQt6.QtCore import QObject, pyqtSignal
+from .safe_names import check_relative_path
 from .sockets import set_exclusive_bind
 
 OP_RRQ, OP_WRQ, OP_DATA, OP_ACK, OP_ERROR, OP_OACK = 1, 2, 3, 4, 5, 6
@@ -28,9 +29,15 @@ def _safe_join(root, filename):
     ジャンクションを解決しないため。root 配下にリンクを1つ置かれるだけで
     その先の任意の場所へ到達できてしまう（Windows のジャンクションは
     一般ユーザーでも作成できる）。
+
+    realpath の前に、予約デバイス名・代替データストリーム・末尾のドットや空白の
+    ように Windows で別の実体に化ける名前を断る（core.safe_names を参照）。
+    realpath はそれらをルート配下のパスとして通してしまう。
     """
+    relative = filename.lstrip("/\\")
+    check_relative_path(relative)
     root_abs = os.path.realpath(root)
-    target = os.path.realpath(os.path.join(root_abs, filename.lstrip("/\\")))
+    target = os.path.realpath(os.path.join(root_abs, relative))
     if os.path.commonpath([root_abs, target]) != root_abs:
         raise ValueError("path traversal blocked")
     return target
