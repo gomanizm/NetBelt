@@ -2856,16 +2856,19 @@ for details.
         import threading
         def check_thread():
             try:
+                # 設定で無効化されている場合は問い合わせず、掃除だけ行う。
+                # 掃除にトークンは要らないので読まない（別の PC で保存された
+                # トークンだと、問い合わせないのに復号の失敗がログに残る）
+                if not check_on_startup:
+                    VersionManager().cleanup_old_updates(24)
+                    return
+
                 # GitHubトークンを取得
                 github_token = self.config_manager.get_github_token()
                 version_mgr = VersionManager(github_token=github_token)
                 
                 # 古い更新ファイルをクリーンアップ
                 version_mgr.cleanup_old_updates(24)
-
-                # 設定で無効化されている場合は問い合わせない
-                if not check_on_startup:
-                    return
 
                 update_info = version_mgr.check_for_updates()
                 
