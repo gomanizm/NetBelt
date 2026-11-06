@@ -4,13 +4,49 @@ from datetime import datetime
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTreeView, QToolBar,
     QPushButton, QLabel, QProgressBar, QMenu, QMessageBox,
-    QFileDialog, QInputDialog, QHeaderView
+    QFileDialog, QInputDialog, QHeaderView, QApplication
 )
-from PyQt6.QtCore import Qt, QModelIndex, pyqtSignal
+from PyQt6.QtCore import Qt, QEvent, QModelIndex, QObject, pyqtSignal
 from PyQt6.QtGui import QStandardItemModel, QStandardItem, QIcon, QAction, QDragEnterEvent, QDropEvent
 from typing import Optional
 from core.sftp_manager import SFTPManager
 from ui import theme
+
+
+class _PlainTextDialogs(QObject):
+    """parent が開くメッセージボックス・入力ダイアログを、表示の直前に平文へ切り替える"""
+
+    def __init__(self, parent_widget):
+        super().__init__()
+        self._parent_widget = parent_widget
+
+    def eventFilter(self, obj, event):
+        if (event.type() == QEvent.Type.Show
+                and isinstance(obj, (QMessageBox, QInputDialog))
+                and obj.parentWidget() is self._parent_widget):
+            if isinstance(obj, QMessageBox):
+                obj.setTextFormat(Qt.TextFormat.PlainText)
+            else:
+                for label in obj.findChildren(QLabel):
+                    label.setTextFormat(Qt.TextFormat.PlainText)
+        return False
+
+
+def _plain_text(dialog_function, parent, *args, **kwargs):
+    """dialog_function（QMessageBox.warning など）を、本文を平文にして呼ぶ
+
+    本文には機器から届いた文字列（STATUS の文・一覧の名前・リンク先）が
+    入る。既定の AutoText のままだと <a href=...> などを HTML として描き、
+    QMessageBox はそのリンクを外部で開く。静的関数は文字の形式を渡せない
+    ので、開いているあいだだけアプリにフィルタを掛けて表示の前に切り替える
+    """
+    app = QApplication.instance()
+    hook = _PlainTextDialogs(parent)
+    app.installEventFilter(hook)
+    try:
+        return dialog_function(parent, *args, **kwargs)
+    finally:
+        app.removeEventFilter(hook)
 
 
 class SFTPPanel(QWidget):
@@ -186,6 +222,9 @@ class SFTPPanel(QWidget):
         
         # ステータスラベル
         self.status_label = QLabel("")
+        # パスとエラーの文面は機器から届く。HTML として描かない
+        self.status_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.path_label.setTextFormat(Qt.TextFormat.PlainText)
         layout.addWidget(self.status_label)
 
         # 使い方の案内。このパネルはターミナルの SSH セッションに相乗りする
@@ -599,7 +638,7 @@ class SFTPPanel(QWidget):
         if self._closing:
             # 終了処理の途中。表示だけ残して戻る（_closing の説明を参照）
             return
-        QMessageBox.warning(self, "SFTP エラー", error_message)
+        _plain_text(QMessageBox.warning, self, "SFTP エラー", error_message)
     
     def _on_item_double_clicked(self, index: QModelIndex):
         """
@@ -781,8 +820,7 @@ class SFTPPanel(QWidget):
         # 別ディレクトリの一覧が届く／初回の一覧が未到着だと既存を見落とす
         overwrite_granted = not confirm
         if confirm and overwrites_file:
-            reply = QMessageBox.question(
-                self,
+            reply = _plain_text(QMessageBox.question, self,
                 "上書き確認",
                 f"リモートに '{name}' が既にあります。上書きしますか？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -930,8 +968,7 @@ class SFTPPanel(QWidget):
         # 確認ダイアログ（settings.sftp.confirm_delete）
         if self._get_sftp_setting(
                 "confirm_delete", self.SFTP_SETTING_DEFAULTS["confirm_delete"]):
-            reply = QMessageBox.question(
-                self,
+            reply = _plain_text(QMessageBox.question, self,
                 "削除確認",
                 f"'{file_info['name']}' を削除しますか？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -1013,8 +1050,7 @@ class SFTPPanel(QWidget):
             current_mode_str = format(current_mode, '04o')  # 0o1777 -> '1777'
 
         # 新しいパーミッションを入力
-        new_mode_str, ok = QInputDialog.getText(
-            self,
+        new_mode_str, ok = _plain_text(QInputDialog.getText, self,
             "パーミッション変更",
             applies_to +
             "新しいパーミッションを8進数で入力してください:\n"
