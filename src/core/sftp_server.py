@@ -12,6 +12,7 @@ from PyQt6.QtCore import QObject, pyqtSignal
 import stat as stat_module
 from .sockets import set_exclusive_bind
 from .crypto import PasswordCrypto
+from .safe_names import check_relative_path
 from .ftp_server import UNDECRYPTABLE_PASSWORD_MESSAGE
 # 停止のあとも書き込みが生き残っている間に、次の起動を断る理由の文言。
 # 生き残りは保存先のファイルを握ったままなので、TFTP と同じ扱いにする
@@ -494,8 +495,18 @@ class SFTPServerHandler(SFTPServerInterface):
         ジャンクションを解決しないため、root 配下にリンクを1つ置かれるだけで
         その先の任意の場所へ到達できてしまう（Windows のジャンクションは
         一般ユーザーでも作成できる）。
+
+        realpath の前に、Windows で別の実体に化ける名前（NUL などの予約
+        デバイス名・コロン・末尾のドットや空白）を断る（core.safe_names）。
+        realpath はそれらをルート配下のパスとして通し、open が後でデバイスや
+        別のファイルに解決する。まだ無い data. は data と別の文字列のまま
+        なので、同時書き込みを断る予約の鍵（_OpenWriters._key）も割れる。
         """
         relative = path.replace("\\", "/").lstrip("/")
+        try:
+            check_relative_path(relative)
+        except ValueError:
+            raise IOError("Access denied") from None
         root_real = os.path.realpath(self.root_dir)
         real_path = os.path.realpath(os.path.join(root_real, relative))
 
@@ -531,6 +542,11 @@ class SFTPServerHandler(SFTPServerInterface):
         # コロンを含む名前は Windows では作成できないので、正規の要求では起きない。
         if os.path.splitdrive(leaf)[0] or os.path.isabs(leaf):
             raise IOError("Access denied")
+        # leaf も化ける名前を断る（親は _get_real_path が確かめる）
+        try:
+            check_relative_path(leaf)
+        except ValueError:
+            raise IOError("Access denied") from None
         parent_real = self._get_real_path(parent_rel)
         return os.path.join(parent_real, leaf)
 
