@@ -53,6 +53,22 @@ def _declared_size(value):
     return size if 0 <= size < _MAX_DECLARED_SIZE else 0
 
 
+# 受信で出ても読み捨ててよい Winsock のエラー（WSAEMSGSIZE / WSAENETRESET）。
+# WSAECONNRESET(10054) は ConnectionResetError として別に判定する
+_TRANSIENT_RECV_WINERRORS = frozenset([10040, 10052])
+
+
+def _is_transient_recv_error(e):
+    """UDP の recvfrom が上げた例外が、読み捨てて受信を続けてよいものか。
+
+    Windows の UDP は、送った相手のポートが閉じていると ICMP Port Unreachable を
+    受けて次の recvfrom が WinError 10054 になる。接続の無い UDP では、どの相手への
+    送信が原因かも分からないので、受信できなかっただけとして扱う
+    """
+    return (isinstance(e, ConnectionResetError)
+            or getattr(e, "winerror", None) in _TRANSIENT_RECV_WINERRORS)
+
+
 def _err(sock, addr, code, msg):
     sock.sendto(struct.pack("!HH", OP_ERROR, code) + msg.encode() + b"\x00", addr)
 
@@ -270,7 +286,17 @@ class TFTPServer:
                 pkt, addr = self._sock.recvfrom(65535)
             except socket.timeout:
                 continue
-            except Exception:
+            except Exception as e:
+                if not self._running:
+                    break                   # 停止の途中
+                if isinstance(e, OSError) and _is_transient_recv_error(e):
+                    # 断りの返事（_refuse）が閉じたポートへ向かった等。ここで
+                    # 抜けると待受だけが終わり、is_running は True のまま残る
+                    print("[TFTP] listener: ignoring receive error: %s" % e)
+                    continue
+                # 回復できない。起動中のままに見せず、マネージャーへ知らせる
+                self._running = False
+                self.on_event("listener_failed", "", str(e))
                 break
             if len(pkt) < 2:
                 continue
@@ -799,9 +825,13 @@ class TFTPServerManager(QObject):
     transfer_interrupted = pyqtSignal(str, str, str)         # ip, filename, direction
     # 転送ごとのプロトコル事象。サーバ障害ではないのでモーダルにはしない
     protocol_event = pyqtSignal(str, str, str, str)          # ip, filename, reason, direction
+    # 待受スレッドが回復できない例外で終わった（理由）。待受スレッドから出し、
+    # GUI スレッドの _on_listener_failed で停止の扱いにする
+    _listener_failed = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._listener_failed.connect(self._on_listener_failed)
         self._srv = None
         # 停止しきれなかった旧サーバ。生き残りの転送が消えるまで捨てない
         self._stopped_srv = None
@@ -958,6 +988,18 @@ class TFTPServerManager(QObject):
         self.is_running = False
         self.stopped.emit()
 
+    def _on_listener_failed(self, reason):
+        """待受が終わったサーバーを停止の扱いにして、理由を知らせる（GUI スレッド）。
+
+        届くまでに利用者が停止・再起動していたら何もしない（今のサーバーは無関係）
+        """
+        srv = self._srv
+        if srv is None or srv._running:
+            return
+        self.stop()
+        self.error_occurred.emit(
+            "TFTP の待ち受けが止まりました。もう一度起動してください: %s" % reason)
+
     def fix_firewall(self, port):
         """手動: Windows FW 受信許可を追加（管理者昇格/UAC）。3CDaemon 方式で通らない
         環境（過去のプロンプト拒否でブロック残り／FW通知が無効）の復旧用。押した時だけ昇格する。"""
@@ -1059,5 +1101,7 @@ class TFTPServerManager(QObject):
             if not suppress:
                 self._emit_protocol_event(ip, filename, reason, direction,
                                           force=closing)
+        elif kind == "listener_failed":
+            self._listener_failed.emit(payload)
         else:
             self._emit_activity(ip, payload)
