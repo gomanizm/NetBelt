@@ -406,7 +406,11 @@ class SyslogPanel(QWidget):
             syslog_config = self._syslog_settings()
             self.max_messages = self._sanitize_max_messages(
                 syslog_config.get("max_messages", self.DEFAULT_MAX_MESSAGES))
-            self.auto_scroll = syslog_config.get("auto_scroll", True)
+            # 手編集で "true" や null が入ると setChecked が TypeError を出し、
+            # パネル（MainWindow）の構築が失敗する。bool と従来も通った整数
+            # （0 / 1 など）以外は既定値へ戻す
+            value = syslog_config.get("auto_scroll", True)
+            self.auto_scroll = bool(value) if isinstance(value, int) else True
         else:
             self.max_messages = self.DEFAULT_MAX_MESSAGES
             self.auto_scroll = True
