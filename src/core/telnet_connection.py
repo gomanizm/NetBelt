@@ -129,12 +129,11 @@ class TelnetConnection(QObject):
                 return False
             self.port = port
 
-            # ソケット作成
-            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.socket.settimeout(10)
-            
-            # 接続
-            self.socket.connect((self.host, self.port))
+            # ソケット作成と接続。AF_INET 固定だと名前解決も IPv4 に限られ、
+            # IPv6 の接続先が getaddrinfo の失敗として断られていた（SSH は
+            # 繋がる）。名前解決の結果を IPv4/IPv6 とも順に試す
+            self.socket = socket.create_connection((self.host, self.port),
+                                                   timeout=10)
             
             # タイムアウトを短く設定（ノンブロッキング読み取り用）
             self.socket.settimeout(0.1)
