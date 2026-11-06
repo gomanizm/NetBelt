@@ -131,6 +131,12 @@ class SFTPManager(QObject):
     # 呼ばれるため、長く待つとアプリが終了できなくなる。
     _DISCONNECT_WAIT_SECONDS = 3.0
 
+    # ダウンロードで同時に飛ばす READ 要求の上限（paramiko の get() の
+    # max_concurrent_prefetch_requests）。渡さないとファイル全体ぶん
+    # （32 KB 単位）を一度に送り、応答がファイルの大きさに比例して溜まる。
+    # 64 なら 2 MB ほど
+    _PREFETCH_REQUESTS = 64
+
     # 共有チャンネルが機器の応答を待つ上限（秒）。None のままだと、機器が
     # SFTP サブシステムだけ黙ったとき（TCP は生きている）に mkdir や
     # normalize が無期限に止まる。GUI スレッドから呼ぶ操作（mkdir など）は
@@ -1326,9 +1332,15 @@ class SFTPManager(QObject):
                     # 何も起きない。後始末と通知のある経路へ寄せる
                     if not self.is_connected or self.sftp_client is None:
                         raise IOError("SFTP接続がありません")
+                    # 上限の引数は paramiko の get() のもの。実物でない
+                    # クライアントには渡さない
+                    cap = ({"max_concurrent_prefetch_requests":
+                            self._PREFETCH_REQUESTS}
+                           if isinstance(self.sftp_client, paramiko.SFTPClient)
+                           else {})
                     self.sftp_client.get(remote_path, tmp_local,
-                                         callback=progress_callback)
-                
+                                         callback=progress_callback, **cap)
+
                 # 全部落とせてから最終名へ（同じディレクトリなので原子的）
                 try:
                     if overwrite_granted:
