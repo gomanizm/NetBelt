@@ -614,6 +614,9 @@ class VersionManager:
         if not isinstance(sock, socket.socket):
             return
         try:
+            if sock.fileno() == -1:
+                # もう閉じている（受信が終わった直後や 2 回目の abort）
+                return
             socket.close(sock.detach())
         except Exception as e:
             print(f"[VersionManager] 受信ソケットを閉じられませんでした: {e}")
