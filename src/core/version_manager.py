@@ -392,35 +392,12 @@ class VersionManager:
              0: version1 == version2
              1: version1 > version2
         """
-        # "v"プレフィックスを削除
-        v1 = version1.lstrip('v')
-        v2 = version2.lstrip('v')
-        
-        # バージョン番号を分割
-        def _seg(s):
-            n = ''
-            for ch in s:
-                if ch.isdigit():
-                    n += ch
-                else:
-                    break
-            return int(n) if n else 0
-        parts1 = [_seg(x) for x in v1.split('.')]
-        parts2 = [_seg(x) for x in v2.split('.')]
-        
-        # 長さを揃える
-        max_len = max(len(parts1), len(parts2))
-        parts1.extend([0] * (max_len - len(parts1)))
-        parts2.extend([0] * (max_len - len(parts2)))
-        
-        # 比較
-        for p1, p2 in zip(parts1, parts2):
-            if p1 < p2:
-                return -1
-            elif p1 > p2:
-                return 1
-        
-        return 0
+        # 並べ替え（_published）と同じ読み方で比べる。読み方が食い違って
+        # いたときは、接尾辞付きのタグが新版より上に並んで「最新」になり、
+        # 本物の新版が通知されなかった
+        k1 = VersionManager._version_key(version1)
+        k2 = VersionManager._version_key(version2)
+        return (k1 > k2) - (k1 < k2)
     
     @staticmethod
     def _published(payload) -> list:
@@ -445,14 +422,25 @@ class VersionManager:
 
     @staticmethod
     def _version_key(version: str) -> tuple:
-        """並べ替え用に版を数値の組へ。読めない部分は 0 として扱う。"""
+        """比較・並べ替え用に版を読む。compare_versions もこれで比べる。
+
+        区切りごとに先頭の数字だけを読み（読めない部分は 0）、数字の並びで
+        比べる（末尾の 0 は無視するので 1.3 と 1.3.0 は同じ）。数字の並びが
+        同じなら、接尾辞付き（1.3.4-rc1 など）を正式版（1.3.4）より前とする。
+        """
         parts = []
-        for chunk in str(version).split('.')[:4]:
-            digits = ''.join(c for c in chunk if c.isdigit())
+        suffixed = False
+        for chunk in str(version).lstrip('v').split('.'):
+            digits = ''
+            for ch in chunk:
+                if not ch.isdigit():
+                    break
+                digits += ch
+            suffixed = suffixed or len(digits) != len(chunk)
             parts.append(int(digits) if digits else 0)
-        while len(parts) < 4:
-            parts.append(0)
-        return tuple(parts)
+        while parts and parts[-1] == 0:
+            parts.pop()
+        return (tuple(parts), 0 if suffixed else 1)
 
     def collect_notes(self, releases: list) -> str:
         """いま入っている版より新しいリリースの内容を、まとめて返す。
