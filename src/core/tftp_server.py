@@ -452,6 +452,10 @@ class TFTPServer:
                         self.on_event("interrupted", addr[0],
                                       (filename, "upload"))
                     return
+                # 確立までの待ちの上限は毎回見る。timeout の分岐だけで見ると、
+                # 1 秒より短い間隔で何か届き続ける限り上限が効かない
+                if not established and time.monotonic() >= give_up_at:
+                    return  # 孤児として黙って撤退
                 try:
                     data, a = xs.recvfrom(_RECV_BUFSIZE)
                     # RFC1350: 確立後は相手の TID(IP:port) が一致するものだけ受理する。
@@ -462,12 +466,9 @@ class TFTPServer:
                         continue
                     # 長さを見ずに unpack すると、空データグラム1発で struct.error に
                     # なり、進行中の転送が中断してしまう
-                    # 合意した blksize を超える DATA は受理しない（読み捨てる）
-                    if len(data) < 4 or len(data) > blksize + 4:
+                    if len(data) < 4:
                         continue
                 except socket.timeout:
-                    if not established and time.monotonic() >= give_up_at:
-                        return  # 確立までの待ちの上限。孤児として黙って撤退
                     if time.monotonic() < deadline:
                         continue  # 合意した timeout まではまだ待つ（停止確認のため小刻みに戻る）
                     retries += 1
@@ -501,6 +502,8 @@ class TFTPServer:
                     continue
                 block = struct.unpack("!H", data[2:4])[0]
                 chunk = data[4:]
+                if len(chunk) > blksize:
+                    continue  # 合意した blksize を超える DATA は受理しない（読み捨てる）
                 if block == expected:
                     if not established:
                         # 予約は確立時（最初の DATA を受けたとき）に取る。
@@ -676,15 +679,15 @@ class TFTPServer:
             except socket.timeout:
                 continue
             except OSError as e:
+                # 10054 などは何も受けなかったのと同じ。待ちを続ける（保存は
+                # 済んでいるので、ここで抜けても失うのは再 ACK の機会だけ）
                 if _is_transient_recv_error(e):
                     continue
                 break
-            if len(data) > blksize + 4:
-                continue
             if a != addr or len(data) < 4:
                 continue
             op, block = struct.unpack("!HH", data[:4])
-            if op == OP_DATA and block == final_block:
+            if op == OP_DATA and block == final_block                     and len(data) <= blksize + 4:
                 xs.sendto(last_ack, addr)
                 reacks += 1
                 if reacks <= self._retries:
