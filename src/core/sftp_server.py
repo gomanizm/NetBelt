@@ -1530,8 +1530,19 @@ class SFTPServerManager(QObject):
             # SSHネゴシエーション開始
             transport.start_server(server=server)
             
-            # クライアントがチャネルを開くのを待つ
-            channel = transport.accept(timeout=20)
+            # 認証が済むまでは auth_timeout_seconds を期限に待つ。paramiko の
+            # サーバー側は auth_timeout を見ないので、鍵交換の直後から 20 秒を
+            # 数えると、認証に 20 秒より長く掛かった正規の相手を期限より前に切る
+            channel = None
+            deadline = time.monotonic() + self.auth_timeout_seconds
+            while (channel is None and transport.is_active()
+                   and not transport.is_authenticated()
+                   and not stop_event.is_set()
+                   and time.monotonic() < deadline):
+                channel = transport.accept(timeout=0.5)
+            # 認証が済んだら、クライアントがチャネルを開くのを待つ
+            if channel is None and transport.is_authenticated():
+                channel = transport.accept(timeout=20)
             if channel is None:
                 _log_limited("no channel",
                              f"[SFTP Server] No channel from {client_addr[0]}")
