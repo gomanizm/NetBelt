@@ -1175,9 +1175,12 @@ class MIBResolver:
         if oid in self.oid_to_name:
             return self.oid_to_name[oid]
         
-        # 部分一致で最長マッチを探す
+        # 部分一致で最長マッチを探す。登録済みの OID より深い前方部分は
+        # 辞書に載りえないので、その段数から削り始める（全段から削ると、
+        # 毎回 join し直すので段数の二乗になり、Trap に載った数万段の
+        # OID 1 つで GUI スレッドが 10 秒ほど固まった）
         parts = oid.split('.')
-        for i in range(len(parts), 0, -1):
+        for i in range(min(len(parts), self._max_oid_depth()), 0, -1):
             partial_oid = '.'.join(parts[:i])
             if partial_oid in self.oid_to_name:
                 # 残りの部分をインデックスとして追加
@@ -1190,6 +1193,19 @@ class MIBResolver:
         # 解決できない場合は元のOIDを返す
         return oid
     
+    def _max_oid_depth(self) -> int:
+        """oid_to_name のキーの最大段数（表が変わったときだけ数え直す）
+
+        表の差し替え（別の dict）と、キーの追加・削除（件数の変化）で
+        数え直す。
+        """
+        table = self.oid_to_name
+        cached = getattr(self, '_depth_cache', None)
+        if cached is None or cached[0] is not table or cached[1] != len(table):
+            depth = max((k.count('.') + 1 for k in table), default=0)
+            cached = self._depth_cache = (table, len(table), depth)
+        return cached[2]
+
     def resolve_name(self, name: str) -> Optional[str]:
         """
         名前をOIDに変換
