@@ -7,8 +7,9 @@ import uuid
 from typing import List, Dict, Optional, Callable
 from PyQt6.QtCore import QObject, pyqtSignal
 import paramiko
-from paramiko.sftp import (CMD_HANDLE, CMD_OPEN, SFTP_FLAG_CREATE, SFTP_FLAG_EXCL,
-                           SFTP_FLAG_WRITE)
+from paramiko.sftp import (CMD_CLOSE, CMD_HANDLE, CMD_NAME, CMD_OPEN,
+                           CMD_OPENDIR, CMD_READDIR, SFTP_FLAG_CREATE,
+                           SFTP_FLAG_EXCL, SFTP_FLAG_WRITE)
 
 
 class _DroppedConnection(IOError):
@@ -38,6 +39,39 @@ _UNUSABLE_CONNECT_ERRORS = (TimeoutError, EOFError, paramiko.SSHException)
 def _is_dropped_connection(e: Exception) -> bool:
     """接続が切れた・応答が壊れたと分かる失敗か"""
     return isinstance(e, _DROPPED_CONNECTION_ERRORS)
+
+
+def _listdir_attr(client, path: str) -> list:
+    """listdir_attr の代わり。UTF-8 として読めない名前は置き換え文字で読む
+
+    paramiko の listdir_attr は名前を errors 指定なしの UTF-8 で読むので、
+    cp932 などの名前が 1 件あるだけで UnicodeDecodeError で抜け、ほかの
+    項目も出ない（末尾の CMD_CLOSE も送られず、機器側にハンドルが残る）。
+    手順は paramiko 4.0.0 の listdir_attr と同じで、名前の読み方だけ変える。
+    paramiko の実物でないクライアントは、その listdir_attr に任せる。
+    """
+    if not isinstance(client, paramiko.SFTPClient):
+        return client.listdir_attr(path)
+    t, msg = client._request(CMD_OPENDIR, client._adjust_cwd(path))
+    if t != CMD_HANDLE:
+        raise paramiko.SFTPError("Expected handle")
+    handle = msg.get_binary()
+    filelist = []
+    while True:
+        try:
+            t, msg = client._request(CMD_READDIR, handle)
+        except EOFError:
+            break   # 読み終えた（paramiko と同じ）
+        if t != CMD_NAME:
+            raise paramiko.SFTPError("Expected name response")
+        for _ in range(msg.get_int()):
+            filename = msg.get_string().decode("utf-8", errors="replace")
+            longname = msg.get_string().decode("utf-8", errors="replace")
+            attr = paramiko.SFTPAttributes._from_msg(msg, filename, longname)
+            if filename not in (".", ".."):
+                filelist.append(attr)
+    client._request(CMD_CLOSE, handle)
+    return filelist
 
 
 class SFTPManager(QObject):
@@ -455,7 +489,7 @@ class SFTPManager(QObject):
                     # 既存の except / _fail 経路へ寄せて通知する
                     if not self.is_connected or self.sftp_client is None:
                         raise IOError("SFTP接続がありません")
-                    items = self.sftp_client.listdir_attr(path)
+                    items = _listdir_attr(self.sftp_client, path)
                     # listdir_attr の st_mode は lstat 相当（リンク自身）で、
                     # そのまま S_ISDIR に掛けるとディレクトリへのリンクが
                     # 常にファイルになる。パネルは is_dir を見てから移動を
