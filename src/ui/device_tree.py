@@ -688,6 +688,11 @@ class DeviceTree(QWidget):
         if device_name:
             self.device_moved.emit(source_group_name, target_group_name,
                                    device_name, device_data)
+            # 移動は受け手が設定に対して行い、通ればツリーを作り直す。
+            # MoveAction のまま受け付けると、Qt の startDrag が掴んだ行を
+            # 自分で消す。移動が断られた回（保存できない等）は作り直さない
+            # ので、設定に残る機器の行だけが画面から消えていた
+            event.setDropAction(Qt.DropAction.IgnoreAction)
             event.accept()
         else:
             event.ignore()
